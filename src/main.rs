@@ -68,7 +68,7 @@ fn main() -> anyhow::Result<()> {
     println!("Tokenizer loaded.");
 
     println!("Loading model from '{}'...", model_dir);
-    let model = model::load_model(&model_dir, &device)?;
+    let mut model = model::load_model(&model_dir, &device)?;
     println!("Model loaded. vocab_size={}", model.vocab_size());
     println!("Sampling: {:?}", sampling_params);
 
@@ -83,7 +83,7 @@ fn main() -> anyhow::Result<()> {
     let prompt_tokens = tokenizer.encode(&prompt)?;
     println!("Prompt ({} tokens)", prompt_tokens.len());
 
-    let output_tokens = model::generate(model.as_ref(), prompt_tokens, &sampling_params)?;
+    let output_tokens = model::generate(model.as_mut(), prompt_tokens, &sampling_params)?;
     let output_text = tokenizer.decode(&output_tokens)?;
     println!("\n{}", output_text);
 

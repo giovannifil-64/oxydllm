@@ -4,6 +4,7 @@ use crate::model::common::{
     block::TransformerBlock,
     config::BlockConfig,
     ffn::Activation,
+    kv_cache::KvCache,
     linear::{Embedding, Linear},
     mask::causal_mask,
     norm::RMSNorm,
@@ -18,6 +19,7 @@ pub struct Qwen3 {
     norm: RMSNorm,
     lm_head: Linear,
     rope: RotaryEmbedding,
+    caches: Vec<KvCache>,
     device: Device,
     eos_token_id: u32,
     vocab_size: usize,
@@ -51,12 +53,15 @@ impl Qwen3 {
 
         let rope = RotaryEmbedding::new(head_dim, cfg.max_position_embeddings, cfg.rope_theta, device)?;
 
+        let caches = (0..cfg.num_hidden_layers).map(|_| KvCache::new()).collect();
+
         Ok(Self {
             embed_tokens,
             blocks,
             norm,
             lm_head,
             rope,
+            caches,
             device: device.clone(),
             eos_token_id: 151645,
             vocab_size: cfg.vocab_size,
@@ -66,7 +71,7 @@ impl Qwen3 {
 }
 
 impl Model for Qwen3 {
-    fn forward(&self, tokens: &Tensor, start_pos: usize) -> Result<Tensor> {
+    fn forward(&mut self, tokens: &Tensor, start_pos: usize) -> Result<Tensor> {
         let (_b, seq) = tokens.dims2()?;
         let mut x = self.embed_tokens.forward(tokens)?;
 
@@ -76,12 +81,18 @@ impl Model for Qwen3 {
             None
         };
 
-        for block in &self.blocks {
-            x = block.forward(&x, &self.rope, start_pos, mask.as_ref())?;
+        for (block, cache) in self.blocks.iter().zip(self.caches.iter_mut()) {
+            x = block.forward(&x, &self.rope, start_pos, mask.as_ref(), cache)?;
         }
 
         let x = self.norm.forward(&x)?;
         self.lm_head.forward(&x)
+    }
+
+    fn clear_cache(&mut self) {
+        for cache in &mut self.caches {
+            cache.clear();
+        }
     }
 
     fn vocab_size(&self) -> usize { self.vocab_size }

@@ -3,6 +3,7 @@ use super::{
     attention::Attention,
     config::BlockConfig,
     ffn::FeedForward,
+    kv_cache::KvCache,
     norm::RMSNorm,
     rope::RotaryEmbedding,
     weights::ModelWeights,
@@ -31,9 +32,10 @@ impl TransformerBlock {
         rope: &RotaryEmbedding,
         start_pos: usize,
         mask: Option<&Tensor>,
+        cache: &mut KvCache,
     ) -> Result<Tensor> {
         let residual = x;
-        let x = (residual + self.attention.forward(&self.input_norm.forward(x)?, rope, start_pos, mask)?)?;
+        let x = (residual + self.attention.forward(&self.input_norm.forward(x)?, rope, start_pos, mask, cache)?)?;
         let residual = &x;
         let x = (residual + self.ffn.forward(&self.post_attn_norm.forward(&x)?)?)?;
         Ok(x)

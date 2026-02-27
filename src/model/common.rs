@@ -4,6 +4,7 @@ pub mod config;
 pub mod ffn;
 pub mod kv_cache;
 pub mod linear;
+pub mod paged;
 pub mod mask;
 pub mod norm;
 pub mod rope;

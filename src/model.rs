@@ -77,7 +77,7 @@ pub fn load_model(model_dir: &str, device: &Device) -> anyhow::Result<Box<dyn Mo
             let weight_paths = resolve_weight_paths(model_dir)?;
             let weight_path_refs: Vec<&str> = weight_paths.iter().map(|s| s.as_str()).collect();
             let weights = ModelWeights::load(&weight_path_refs, device, dtype)?;
-            Ok(Box::new(Qwen3::load(cfg, &weights, device)?))
+            Ok(Box::new(Qwen3::load(cfg, &weights, device, dtype)?))
         }
         other => anyhow::bail!("Architecture not supported: {}", other),
     }

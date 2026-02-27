@@ -1,13 +1,15 @@
-use candle_core::{Device, Result, Tensor};
+use candle_core::{DType, Device, Result, Tensor};
+use std::cell::RefCell;
+use std::rc::Rc;
 use crate::model::traits::Model;
 use crate::model::common::{
     block::TransformerBlock,
     config::BlockConfig,
     ffn::Activation,
-    kv_cache::KvCache,
     linear::{Embedding, Linear},
     mask::causal_mask,
     norm::RMSNorm,
+    paged::{BlockAllocator, PagedKvCache, DEFAULT_BLOCK_SIZE},
     rope::RotaryEmbedding,
     weights::ModelWeights,
 };
@@ -19,7 +21,7 @@ pub struct Qwen3 {
     norm: RMSNorm,
     lm_head: Linear,
     rope: RotaryEmbedding,
-    caches: Vec<KvCache>,
+    caches: Vec<PagedKvCache>,
     device: Device,
     eos_token_id: u32,
     vocab_size: usize,
@@ -27,7 +29,7 @@ pub struct Qwen3 {
 }
 
 impl Qwen3 {
-    pub fn load(cfg: Qwen3Config, weights: &ModelWeights, device: &Device) -> Result<Self> {
+    pub fn load(cfg: Qwen3Config, weights: &ModelWeights, device: &Device, dtype: DType) -> Result<Self> {
         let embed_tokens = Embedding::new(weights.get("model.embed_tokens.weight")?.clone());
 
         let head_dim = cfg.head_dim();
@@ -53,7 +55,22 @@ impl Qwen3 {
 
         let rope = RotaryEmbedding::new(head_dim, cfg.max_position_embeddings, cfg.rope_theta, device)?;
 
-        let caches = (0..cfg.num_hidden_layers).map(|_| KvCache::new()).collect();
+        let num_blocks = (cfg.max_position_embeddings + DEFAULT_BLOCK_SIZE - 1) / DEFAULT_BLOCK_SIZE;
+        let caches = (0..cfg.num_hidden_layers)
+            .map(|_| {
+                let allocator = Rc::new(RefCell::new(
+                    BlockAllocator::new(
+                        num_blocks,
+                        DEFAULT_BLOCK_SIZE,
+                        cfg.num_key_value_heads,
+                        head_dim,
+                        dtype,
+                        device,
+                    )?
+                ));
+                Ok(PagedKvCache::new(allocator))
+            })
+            .collect::<Result<Vec<_>>>()?;
 
         Ok(Self {
             embed_tokens,

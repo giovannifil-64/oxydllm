@@ -1,6 +1,6 @@
 use candle_core::{Result, Tensor, D};
 use super::config::BlockConfig;
-use super::kv_cache::KvCache;
+use super::paged::PagedKvCache;
 use super::linear::{softmax_last_dim, Linear};
 use super::norm::RMSNorm;
 use super::rope::RotaryEmbedding;
@@ -69,7 +69,7 @@ impl Attention {
         rope: &RotaryEmbedding,
         start_pos: usize,
         mask: Option<&Tensor>,
-        cache: &mut KvCache,
+        cache: &mut PagedKvCache,
     ) -> Result<Tensor> {
         let (b, seq, _) = x.dims3()?;
         let hd = self.head_dim;

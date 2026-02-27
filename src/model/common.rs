@@ -2,7 +2,6 @@ pub mod attention;
 pub mod block;
 pub mod config;
 pub mod ffn;
-pub mod kv_cache;
 pub mod linear;
 pub mod paged;
 pub mod mask;

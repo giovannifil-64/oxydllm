@@ -1,4 +1,5 @@
 mod engine;
+mod hf_hub;
 mod model;
 mod model_manager;
 mod sampling;
@@ -12,6 +13,14 @@ use std::time::Duration;
 use sampling::SamplingParams;
 use server::ChatMessage;
 use tokenizer::Tokenizer;
+
+struct PullArgs {
+    repo_id: String,
+    models_dir: PathBuf,
+    name: Option<String>,
+    token: Option<String>,
+    force: bool,
+}
 
 struct StartArgs {
     models_dir: PathBuf,
@@ -41,8 +50,15 @@ fn print_usage() {
 Usage: rllm <command> [options]
 
 Commands:
+  pull  <user/model>   Download a model from HuggingFace
   start                Start the HTTP inference server
   run   <model-name>   Interactive chat in terminal
+
+Download options (pull):
+  --models-dir <DIR>        Destination directory (default: ~/.rllm/models/)
+  --name <NAME>             Folder name override (default: model name)
+  --token <TOKEN>           HuggingFace token for gated models
+  --force                   Overwrite if model already exists
 
 Server options (start):
   --port <PORT>             Listen port (default: 11313)
@@ -52,11 +68,65 @@ Server options (start):
 Chat options (run):
   --models-dir <DIR>        Models directory (default: ~/.rllm/models/)
   --temperature <T>         Sampling temperature (default: 0.7)
-  --top-k <K>              Top-k filtering (default: 0, disabled)
-  --top-p <P>              Nucleus sampling (default: 1.0)
-  --min-p <P>              Min-p filtering (default: 0.0)
-  --repeat-penalty <R>     Repetition penalty (default: 1.0)"
+  --top-k <K>               Top-k filtering (default: 0, disabled)
+  --top-p <P>               Nucleus sampling (default: 1.0)
+  --min-p <P>               Min-p filtering (default: 0.0)
+  --repeat-penalty <R>      Repetition penalty (default: 1.0)"
     );
+}
+
+fn parse_pull_args(args: &[String]) -> Result<PullArgs, String> {
+    let mut repo_id = String::new();
+    let mut models_dir: Option<PathBuf> = None;
+    let mut name: Option<String> = None;
+    let mut token: Option<String> = None;
+    let mut force = false;
+    let mut i = 0;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            "--models-dir" => {
+                i += 1;
+                models_dir = Some(PathBuf::from(
+                    args.get(i).ok_or("--models-dir requires a value")?,
+                ));
+            }
+            "--name" => {
+                i += 1;
+                name = Some(args.get(i).ok_or("--name requires a value")?.clone());
+            }
+            "--token" => {
+                i += 1;
+                token = Some(args.get(i).ok_or("--token requires a value")?.clone());
+            }
+            "--force" => {
+                force = true;
+            }
+            _ if !args[i].starts_with('-') && repo_id.is_empty() => {
+                repo_id = args[i].clone();
+            }
+            other => return Err(format!("Unknown option: {}", other)),
+        }
+        i += 1;
+    }
+
+    if repo_id.is_empty() {
+        return Err("Missing <username/model-name>  (e.g. Qwen/Qwen3-0.6B)".to_string());
+    }
+    if !repo_id.contains('/') {
+        return Err(format!(
+            "Invalid repo format '{}': expected 'username/model-name' (e.g. Qwen/Qwen3-0.6B)",
+            repo_id
+        ));
+    }
+
+    Ok(PullArgs {
+        repo_id,
+        models_dir: models_dir.unwrap_or_else(default_models_dir),
+        name,
+        token,
+        force,
+    })
 }
 
 fn parse_start_args(args: &[String]) -> Result<StartArgs, String> {
@@ -289,6 +359,35 @@ fn main() -> anyhow::Result<()> {
                 std::process::exit(1);
             });
             run_interactive(&run_args)?;
+        }
+        "pull" => {
+            let pull_args = parse_pull_args(&args[2..]).unwrap_or_else(|e| {
+                eprintln!("Error: {e}");
+                print_usage();
+                std::process::exit(1);
+            });
+            let dest_name = pull_args.name.unwrap_or_else(|| {
+                pull_args
+                    .repo_id
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or(&pull_args.repo_id)
+                    .to_string()
+            });
+            let token = pull_args
+                .token
+                .or_else(|| std::env::var("HF_TOKEN").ok())
+                .or_else(|| std::env::var("HUGGING_FACE_HUB_TOKEN").ok());
+            if !pull_args.models_dir.exists() {
+                std::fs::create_dir_all(&pull_args.models_dir)?;
+            }
+            hf_hub::pull(&hf_hub::PullConfig {
+                repo_id: pull_args.repo_id,
+                dest_name,
+                models_dir: pull_args.models_dir,
+                token,
+                force: pull_args.force,
+            })?;
         }
         "--help" | "-h" | "help" => {
             print_usage();

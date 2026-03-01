@@ -1416,7 +1416,7 @@ checksum = "a96887878f22d7bad8a3b6dc5b7440e0ada9a245242924394987b21cf2210a4c"
 
 [[package]]
 name = "rllm"
-version = "0.0.0-alpha.4"
+version = "0.0.0-alpha.5"
 dependencies = [
  "anyhow",
  "candle-core",

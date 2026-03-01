@@ -1,6 +1,6 @@
 [package]
 name = "rllm"
-version = "0.0.0-alpha.4"
+version = "0.0.0-alpha.5"
 edition = "2024"
 
 [features]

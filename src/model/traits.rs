@@ -1,5 +1,6 @@
-use candle_core::{Device, Result, Tensor};
+use candle_core::{DType, Device, Result, Tensor};
 use crate::sampling::{self, SamplingParams};
+use super::common::paged::{PagedKvCache, SharedBlockAllocator};
 
 pub trait Model {
     fn forward(&mut self, tokens: &Tensor, start_pos: usize) -> Result<Tensor>;
@@ -8,6 +9,26 @@ pub trait Model {
     fn eos_token_id(&self) -> u32;
     fn max_seq_len(&self) -> usize;
     fn device(&self) -> &Device;
+}
+
+pub trait BatchModel {
+    fn forward_with_cache(
+        &self,
+        tokens: &Tensor,
+        start_pos: usize,
+        caches: &mut [PagedKvCache],
+    ) -> Result<Tensor>;
+
+    fn vocab_size(&self) -> usize;
+    fn eos_token_id(&self) -> u32;
+    fn max_seq_len(&self) -> usize;
+    fn device(&self) -> &Device;
+    fn num_layers(&self) -> usize;
+    fn n_kv_heads(&self) -> usize;
+    fn head_dim(&self) -> usize;
+    fn dtype(&self) -> DType;
+
+    fn allocators(&self) -> &[SharedBlockAllocator];
 }
 
 pub fn generate(

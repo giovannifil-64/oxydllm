@@ -2,7 +2,7 @@ pub mod traits;
 pub mod common;
 mod qwen3;
 
-pub use traits::{generate, Model};
+pub use traits::{generate, BatchModel, Model};
 
 use candle_core::{DType, Device};
 use common::weights::ModelWeights;
@@ -60,6 +60,29 @@ pub fn select_device() -> anyhow::Result<Device> {
     Ok(Device::Cpu)
 }
 
+pub fn load_batch_model(model_dir: &str, device: &Device) -> anyhow::Result<Box<dyn BatchModel>> {
+    let raw = std::fs::read_to_string(format!("{}/config.json", model_dir))?;
+    let value: serde_json::Value = serde_json::from_str(&raw)?;
+    let arch = value["architectures"][0].as_str().unwrap_or("Unknown");
+
+    let dtype = if matches!(device, Device::Cpu) {
+        DType::F32
+    } else {
+        DType::BF16
+    };
+
+    match arch {
+        "Qwen3ForCausalLM" => {
+            let cfg = Qwen3Config::from_file(&format!("{}/config.json", model_dir))?;
+            let weight_paths = resolve_weight_paths(model_dir)?;
+            let weight_path_refs: Vec<&str> = weight_paths.iter().map(|s| s.as_str()).collect();
+            let weights = ModelWeights::load(&weight_path_refs, device, dtype)?;
+            Ok(Box::new(Qwen3::load(cfg, &weights, device, dtype, 2)?))
+        }
+        other => anyhow::bail!("Architecture not supported: {}", other),
+    }
+}
+
 pub fn load_model(model_dir: &str, device: &Device) -> anyhow::Result<Box<dyn Model>> {
     let raw = std::fs::read_to_string(format!("{}/config.json", model_dir))?;
     let value: serde_json::Value = serde_json::from_str(&raw)?;
@@ -77,7 +100,7 @@ pub fn load_model(model_dir: &str, device: &Device) -> anyhow::Result<Box<dyn Mo
             let weight_paths = resolve_weight_paths(model_dir)?;
             let weight_path_refs: Vec<&str> = weight_paths.iter().map(|s| s.as_str()).collect();
             let weights = ModelWeights::load(&weight_path_refs, device, dtype)?;
-            Ok(Box::new(Qwen3::load(cfg, &weights, device, dtype)?))
+            Ok(Box::new(Qwen3::load(cfg, &weights, device, dtype, 1)?))
         }
         other => anyhow::bail!("Architecture not supported: {}", other),
     }

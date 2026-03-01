@@ -52,6 +52,10 @@ impl BlockAllocator {
         self.block_size
     }
 
+    pub fn num_total_blocks(&self) -> usize {
+        self.num_blocks
+    }
+
     pub fn write(
         &self,
         block_id: usize,
@@ -79,17 +83,17 @@ impl BlockAllocator {
 
 pub type SharedBlockAllocator = Rc<RefCell<BlockAllocator>>;
 
-struct BlockTable {
-    block_ids: Vec<usize>,
-    num_tokens: usize,
+pub struct BlockTable {
+    pub block_ids: Vec<usize>,
+    pub num_tokens: usize,
 }
 
 impl BlockTable {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self { block_ids: Vec::new(), num_tokens: 0 }
     }
 
-    fn slot_indices(&self, block_size: usize) -> Vec<u32> {
+    pub fn slot_indices(&self, block_size: usize) -> Vec<u32> {
         let mut indices = Vec::with_capacity(self.num_tokens);
         let full_blocks = self.num_tokens / block_size;
         let remainder = self.num_tokens % block_size;
@@ -154,6 +158,14 @@ impl PagedKvCache {
         let idx = Tensor::from_vec(slots, (self.table.num_tokens,), new_k.device())?;
 
         self.allocator.borrow().gather(&idx)
+    }
+
+    pub fn num_blocks_used(&self) -> usize {
+        self.table.block_ids.len()
+    }
+
+    pub fn num_tokens_cached(&self) -> usize {
+        self.table.num_tokens
     }
 
     pub fn clear(&mut self) {

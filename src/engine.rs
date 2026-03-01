@@ -64,17 +64,22 @@ impl Engine {
 
             let next_token = sampling::sample(&last_logits, &seq.sampling_params, &seq.all_tokens)?;
 
+            let is_eos = next_token == self.model.eos_token_id();
+
             seq.all_tokens.push(next_token);
-            seq.generated_tokens.push(next_token);
             seq.num_processed_tokens = seq.all_tokens.len() - 1;
             seq.phase = SequencePhase::Decode;
 
-            new_tokens.push(NewToken { seq_id: seq.id, token: next_token });
-
-            if next_token == self.model.eos_token_id()
-                || seq.generated_tokens.len() >= seq.max_tokens
-            {
+            if is_eos {
                 seq.status = SequenceStatus::Finished;
+                seq.finish_reason = Some("stop".to_string());
+            } else {
+                seq.generated_tokens.push(next_token);
+                new_tokens.push(NewToken { seq_id: seq.id, token: next_token });
+                if seq.generated_tokens.len() >= seq.max_tokens {
+                    seq.status = SequenceStatus::Finished;
+                    seq.finish_reason = Some("length".to_string());
+                }
             }
         }
 

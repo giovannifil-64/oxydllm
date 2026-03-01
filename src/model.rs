@@ -2,11 +2,66 @@ pub mod traits;
 pub mod common;
 mod qwen3;
 
-pub use traits::{generate, BatchModel, Model};
+pub use traits::BatchModel;
 
 use candle_core::{DType, Device};
 use common::weights::ModelWeights;
 use qwen3::{config::Qwen3Config, model::Qwen3};
+
+use std::path::Path;
+
+#[derive(Debug, Clone)]
+pub struct DiscoveredModel {
+    pub id: String,
+    pub architecture: String,
+    pub vocab_size: usize,
+    pub num_layers: usize,
+}
+
+pub fn discover_models(models_dir: &Path) -> Vec<DiscoveredModel> {
+    let mut models = Vec::new();
+    let entries = match std::fs::read_dir(models_dir) {
+        Ok(e) => e,
+        Err(_) => return models,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let config_path = path.join("config.json");
+        if !config_path.exists() {
+            continue;
+        }
+        let raw = match std::fs::read_to_string(&config_path) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        let value: serde_json::Value = match serde_json::from_str(&raw) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let architecture = value["architectures"][0]
+            .as_str()
+            .unwrap_or("Unknown")
+            .to_string();
+        let vocab_size = value["vocab_size"].as_u64().unwrap_or(0) as usize;
+        let num_layers = value["num_hidden_layers"].as_u64().unwrap_or(0) as usize;
+        let id = path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        models.push(DiscoveredModel {
+            id,
+            architecture,
+            vocab_size,
+            num_layers,
+        });
+    }
+    models.sort_by(|a, b| a.id.cmp(&b.id));
+    models
+}
 
 fn resolve_weight_paths(model_dir: &str) -> anyhow::Result<Vec<String>> {
     let index_path = format!("{}/model.safetensors.index.json", model_dir);
@@ -60,7 +115,11 @@ pub fn select_device() -> anyhow::Result<Device> {
     Ok(Device::Cpu)
 }
 
-pub fn load_batch_model(model_dir: &str, device: &Device) -> anyhow::Result<Box<dyn BatchModel>> {
+pub fn load_batch_model(
+    model_dir: &str,
+    device: &Device,
+    kv_block_multiplier: usize,
+) -> anyhow::Result<Box<dyn BatchModel>> {
     let raw = std::fs::read_to_string(format!("{}/config.json", model_dir))?;
     let value: serde_json::Value = serde_json::from_str(&raw)?;
     let arch = value["architectures"][0].as_str().unwrap_or("Unknown");
@@ -77,30 +136,7 @@ pub fn load_batch_model(model_dir: &str, device: &Device) -> anyhow::Result<Box<
             let weight_paths = resolve_weight_paths(model_dir)?;
             let weight_path_refs: Vec<&str> = weight_paths.iter().map(|s| s.as_str()).collect();
             let weights = ModelWeights::load(&weight_path_refs, device, dtype)?;
-            Ok(Box::new(Qwen3::load(cfg, &weights, device, dtype, 2)?))
-        }
-        other => anyhow::bail!("Architecture not supported: {}", other),
-    }
-}
-
-pub fn load_model(model_dir: &str, device: &Device) -> anyhow::Result<Box<dyn Model>> {
-    let raw = std::fs::read_to_string(format!("{}/config.json", model_dir))?;
-    let value: serde_json::Value = serde_json::from_str(&raw)?;
-    let arch = value["architectures"][0].as_str().unwrap_or("Unknown");
-
-    let dtype = if matches!(device, Device::Cpu) {
-        DType::F32
-    } else {
-        DType::BF16
-    };
-
-    match arch {
-        "Qwen3ForCausalLM" => {
-            let cfg = Qwen3Config::from_file(&format!("{}/config.json", model_dir))?;
-            let weight_paths = resolve_weight_paths(model_dir)?;
-            let weight_path_refs: Vec<&str> = weight_paths.iter().map(|s| s.as_str()).collect();
-            let weights = ModelWeights::load(&weight_path_refs, device, dtype)?;
-            Ok(Box::new(Qwen3::load(cfg, &weights, device, dtype, 1)?))
+            Ok(Box::new(Qwen3::load(cfg, &weights, device, dtype, kv_block_multiplier)?))
         }
         other => anyhow::bail!("Architecture not supported: {}", other),
     }

@@ -83,6 +83,7 @@ impl Scheduler {
             caches,
             num_processed_tokens: 0,
             max_tokens,
+            finish_reason: None,
         };
 
         self.waiting.push_back(seq);

@@ -27,4 +27,5 @@ pub struct SequenceState {
     pub caches: Vec<PagedKvCache>,
     pub num_processed_tokens: usize,
     pub max_tokens: usize,
+    pub finish_reason: Option<String>,
 }

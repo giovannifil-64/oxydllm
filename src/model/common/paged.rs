@@ -25,7 +25,6 @@ impl BlockAllocator {
         let total_slots = num_blocks * block_size;
         let pool_k = Tensor::zeros((total_slots, n_kv_heads, head_dim), dtype, device)?;
         let pool_v = Tensor::zeros((total_slots, n_kv_heads, head_dim), dtype, device)?;
-        // Stack: pop gives block 0 first, then 1, …
         let free_list = (0..num_blocks).rev().collect();
         Ok(Self { pool_k, pool_v, free_list, num_blocks, block_size })
     }
@@ -70,10 +69,8 @@ impl BlockAllocator {
     }
 
     pub fn gather(&self, slot_indices: &Tensor) -> Result<(Tensor, Tensor)> {
-        // index_select → (num_tokens, n_kv_heads, head_dim)
         let k = self.pool_k.index_select(slot_indices, 0)?;
         let v = self.pool_v.index_select(slot_indices, 0)?;
-        // → (1, n_kv_heads, num_tokens, head_dim)
         let k = k.transpose(0, 1)?.unsqueeze(0)?;
         let v = v.transpose(0, 1)?.unsqueeze(0)?;
         Ok((k, v))

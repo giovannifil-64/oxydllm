@@ -60,6 +60,7 @@ pub struct ModelManager {
     keep_alive: Duration,
     memory_budget_bytes: Option<usize>,
     registry: HashMap<String, RegistryEntry>,
+    cuda_devices: Vec<usize>,
 }
 
 pub type SharedModelManager = Arc<tokio::sync::Mutex<ModelManager>>;
@@ -119,6 +120,7 @@ impl ModelManager {
         models_dir: PathBuf,
         keep_alive: Duration,
         memory_budget_bytes: Option<usize>,
+        cuda_devices: Vec<usize>,
     ) -> Self {
         let registry = load_registry(&models_dir);
         Self {
@@ -127,6 +129,7 @@ impl ModelManager {
             keep_alive,
             memory_budget_bytes,
             registry,
+            cuda_devices,
         }
     }
 
@@ -272,6 +275,7 @@ impl ModelManager {
             model_path,
             manager_handle,
             effective_keep_alive,
+            self.cuda_devices.clone(),
         );
 
         GetResult::Wait(rx)
@@ -331,11 +335,13 @@ fn spawn_load(
     model_path: PathBuf,
     manager: SharedModelManager,
     effective_keep_alive: Duration,
+    cuda_devices: Vec<usize>,
 ) {
     let (result_tx, result_rx) = oneshot::channel::<Result<LoadResult, String>>();
 
     let model_id_thread = model_id.clone();
     let model_path_thread = model_path.clone();
+    let cuda_devices_thread = cuda_devices;
     std::thread::spawn(move || {
         let model_dir = model_path_thread.to_string_lossy().to_string();
 
@@ -347,7 +353,8 @@ fn spawn_load(
             }
         };
 
-        let device = match model::select_device() {
+        let cuda_idx = cuda_devices_thread.first().copied().unwrap_or(0);
+        let device = match model::select_device_at(cuda_idx) {
             Ok(d) => d,
             Err(e) => {
                 let _ = result_tx.send(Err(format!("Failed to select device: {e}")));

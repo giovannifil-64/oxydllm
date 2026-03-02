@@ -461,6 +461,7 @@ pub fn start_server(
     port: u16,
     keep_alive: Duration,
     memory_budget_bytes: Option<usize>,
+    cuda_devices: Vec<usize>,
 ) -> anyhow::Result<()> {
     if !models_dir.exists() {
         std::fs::create_dir_all(&models_dir)?;
@@ -477,6 +478,7 @@ pub fn start_server(
         models_dir,
         keep_alive,
         memory_budget_bytes,
+        cuda_devices,
     )));
 
     let state = Arc::new(AppState {

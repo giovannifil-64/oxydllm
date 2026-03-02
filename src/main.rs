@@ -27,11 +27,13 @@ struct StartArgs {
     port: u16,
     keep_alive: Duration,
     memory_budget_bytes: Option<usize>,
+    cuda_devices: Vec<usize>,
 }
 
 struct RunArgs {
     model_dir: String,
     sampling_params: SamplingParams,
+    cuda_device: Option<usize>,
 }
 
 fn default_models_dir() -> PathBuf {
@@ -43,6 +45,31 @@ fn dirs_home() -> PathBuf {
         .or_else(|_| std::env::var("USERPROFILE"))
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("."))
+}
+
+fn parse_devices(s: &str) -> Result<Vec<usize>, String> {
+    s.split(',')
+        .map(|part| {
+            part.trim()
+                .parse::<usize>()
+                .map_err(|_| format!("Invalid device index: '{}'  (expected integer)", part.trim()))
+        })
+        .collect()
+}
+
+fn resolve_devices(explicit: Option<Vec<usize>>) -> Vec<usize> {
+    if let Some(d) = explicit {
+        return d;
+    }
+    if let Ok(env) = std::env::var("RLLM_DEVICES") {
+        if !env.trim().is_empty() {
+            match parse_devices(&env) {
+                Ok(d) => return d,
+                Err(e) => eprintln!("Warning: RLLM_DEVICES ignored — {}", e),
+            }
+        }
+    }
+    vec![]
 }
 
 fn print_usage() {
@@ -66,9 +93,12 @@ Server options (start):
   --models-dir <DIR>        Models directory (default: ~/.rllm/models/)
   --keep-alive <SECS>       Keep-alive seconds before eviction (default: 900)
   --memory-budget <MB>      Max total VRAM for loaded models in MB; LRU eviction when exceeded
+  --devices <IDS>           Comma-separated CUDA device indices to use (default: auto, env: RLLM_DEVICES)
+                            Examples: --devices 0   --devices 0,1,2
 
 Chat options (run):
   --models-dir <DIR>        Models directory (default: ~/.rllm/models/)
+  --devices <ID>            CUDA device index to use (default: auto, env: RLLM_DEVICES)
   --temperature <T>         Sampling temperature (default: 0.7)
   --top-k <K>               Top-k filtering (default: 0, disabled)
   --top-p <P>               Nucleus sampling (default: 1.0)
@@ -136,6 +166,7 @@ fn parse_start_args(args: &[String]) -> Result<StartArgs, String> {
     let mut port: u16 = 11313;
     let mut keep_alive_secs: u64 = 900;
     let mut memory_budget_mb: Option<usize> = None;
+    let mut devices_raw: Option<Vec<usize>> = None;
     let mut i = 0;
 
     while i < args.len() {
@@ -171,6 +202,13 @@ fn parse_start_args(args: &[String]) -> Result<StartArgs, String> {
                     .map_err(|_| "Invalid memory-budget value (expected MB integer)")?;
                 memory_budget_mb = Some(mb);
             }
+            "--devices" => {
+                i += 1;
+                devices_raw = Some(
+                    parse_devices(args.get(i).ok_or("--devices requires a value")?)
+                        .map_err(|e| e)?,
+                );
+            }
             other => return Err(format!("Unknown option: {}", other)),
         }
         i += 1;
@@ -181,12 +219,14 @@ fn parse_start_args(args: &[String]) -> Result<StartArgs, String> {
         port,
         keep_alive: Duration::from_secs(keep_alive_secs),
         memory_budget_bytes: memory_budget_mb.map(|mb| mb * 1024 * 1024),
+        cuda_devices: resolve_devices(devices_raw),
     })
 }
 
 fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
     let mut model_name = String::new();
     let mut models_dir: Option<PathBuf> = None;
+    let mut devices_raw: Option<Vec<usize>> = None;
     let mut params = SamplingParams {
         temperature: 0.7,
         ..SamplingParams::default()
@@ -200,6 +240,12 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
                 models_dir = Some(PathBuf::from(
                     args.get(i).ok_or("--models-dir requires a value")?,
                 ));
+            }
+            "--devices" => {
+                i += 1;
+                let raw = args.get(i).ok_or("--devices requires a value")?;
+                let d = parse_devices(raw)?;
+                devices_raw = Some(d);
             }
             "--temperature" | "-t" => {
                 i += 1;
@@ -263,13 +309,15 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
     Ok(RunArgs {
         model_dir,
         sampling_params: params,
+        cuda_device: resolve_devices(devices_raw).into_iter().next(),
     })
 }
 
 fn run_interactive(args: &RunArgs) -> anyhow::Result<()> {
     use std::io::{BufRead, Write};
 
-    let device = model::select_device()?;
+    let cuda_idx = args.cuda_device.unwrap_or(0);
+    let device = model::select_device_at(cuda_idx)?;
 
     let tokenizer = Tokenizer::from_dir(&args.model_dir)?;
     println!("Tokenizer loaded.");
@@ -363,7 +411,7 @@ fn main() -> anyhow::Result<()> {
                 print_usage();
                 std::process::exit(1);
             });
-            server::start_server(start_args.models_dir, start_args.port, start_args.keep_alive, start_args.memory_budget_bytes)?;
+            server::start_server(start_args.models_dir, start_args.port, start_args.keep_alive, start_args.memory_budget_bytes, start_args.cuda_devices)?;
         }
         "run" => {
             let run_args = parse_run_args(&args[2..]).unwrap_or_else(|e| {

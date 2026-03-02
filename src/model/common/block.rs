@@ -1,6 +1,6 @@
 use candle_core::{Result, Tensor};
 use super::{
-    attention::Attention,
+    attention::{Attention, SegmentInfo},
     config::BlockConfig,
     ffn::FeedForward,
     paged::PagedKvCache,
@@ -36,6 +36,23 @@ impl TransformerBlock {
     ) -> Result<Tensor> {
         let residual = x;
         let x = (residual + self.attention.forward(&self.input_norm.forward(x)?, rope, start_pos, mask, cache)?)?;
+        let residual = &x;
+        let x = (residual + self.ffn.forward(&self.post_attn_norm.forward(&x)?)?)?;
+        Ok(x)
+    }
+
+    pub fn forward_batch(
+        &self,
+        x: &Tensor,
+        rope: &RotaryEmbedding,
+        position_ids: &Tensor,
+        mask: Option<&Tensor>,
+        segments: &mut [SegmentInfo],
+    ) -> Result<Tensor> {
+        let residual = x;
+        let normed = self.input_norm.forward(x)?;
+        let attn_out = self.attention.forward_batch(&normed, rope, position_ids, mask, segments)?;
+        let x = (residual + attn_out)?;
         let residual = &x;
         let x = (residual + self.ffn.forward(&self.post_attn_norm.forward(&x)?)?)?;
         Ok(x)

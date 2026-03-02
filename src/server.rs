@@ -468,7 +468,7 @@ pub fn start_server(
     }
     let available = crate::model::discover_models(&models_dir);
     println!("Models directory: {}", models_dir.display());
-    println!("Discovered {} model(s):", available.len());
+    println!("Discovered {} {}:", available.len(), if available.len() == 1 { "model" } else { "models" });
     for m in &available {
         println!("  - {} ({})", m.id, m.architecture);
     }
@@ -521,7 +521,7 @@ pub fn start_server(
                 "Memory budget: {:.1} GB (LRU eviction when exceeded)\n",
                 b as f64 / 1_073_741_824.0
             ),
-            None => println!("Memory budget: unlimited\n"),
+            None => println!("Memory budget: unlimited"),
         }
 
         let listener = tokio::net::TcpListener::bind(&addr).await?;

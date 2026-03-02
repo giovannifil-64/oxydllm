@@ -6,6 +6,11 @@ use super::norm::RMSNorm;
 use super::rope::RotaryEmbedding;
 use super::weights::ModelWeights;
 
+pub struct SegmentInfo<'a> {
+    pub num_tokens: usize,
+    pub cache: &'a mut PagedKvCache,
+}
+
 pub struct Attention {
     q_proj: Linear,
     k_proj: Linear,
@@ -105,6 +110,119 @@ impl Attention {
 
         let attn = softmax_last_dim(&scores)?;
         let out = attn.matmul(&v)?.transpose(1, 2)?.reshape((b, seq, self.n_heads * hd))?;
+        self.o_proj.forward(&out)
+    }
+
+    pub fn forward_batch(
+        &self,
+        x: &Tensor,
+        rope: &RotaryEmbedding,
+        position_ids: &Tensor,
+        mask: Option<&Tensor>,
+        segments: &mut [SegmentInfo],
+    ) -> Result<Tensor> {
+        let (b, total_seq, _) = x.dims3()?;
+        let hd = self.head_dim;
+
+        let q = self.q_proj.forward(x)?.reshape((b, total_seq, self.n_heads, hd))?.transpose(1, 2)?;
+        let k = self.k_proj.forward(x)?.reshape((b, total_seq, self.n_kv_heads, hd))?.transpose(1, 2)?;
+        let v = self.v_proj.forward(x)?.reshape((b, total_seq, self.n_kv_heads, hd))?.transpose(1, 2)?;
+
+        let q = match &self.q_norm {
+            Some(norm) => norm.forward(&q)?,
+            None => q,
+        };
+        let k = match &self.k_norm {
+            Some(norm) => norm.forward(&k)?,
+            None => k,
+        };
+
+        let q = rope.apply_with_positions(&q, position_ids)?;
+        let k = rope.apply_with_positions(&k, position_ids)?;
+
+        let mut k_parts: Vec<Tensor> = Vec::with_capacity(segments.len());
+        let mut v_parts: Vec<Tensor> = Vec::with_capacity(segments.len());
+        let mut max_kv = 0usize;
+        let mut kv_lengths: Vec<usize> = Vec::with_capacity(segments.len());
+        let mut offset = 0usize;
+
+        for seg in segments.iter_mut() {
+            let seg_k = k.narrow(2, offset, seg.num_tokens)?;
+            let seg_v = v.narrow(2, offset, seg.num_tokens)?;
+            let (full_k, full_v) = seg.cache.append(&seg_k, &seg_v)?;
+            let kv_len = full_k.dim(2)?;
+            max_kv = max_kv.max(kv_len);
+            kv_lengths.push(kv_len);
+            k_parts.push(full_k);
+            v_parts.push(full_v);
+            offset += seg.num_tokens;
+        }
+
+        let device = x.device();
+        let dtype = x.dtype();
+        let mut padded_k_parts: Vec<Tensor> = Vec::new();
+        let mut padded_v_parts: Vec<Tensor> = Vec::new();
+
+        for (i, (kp, vp)) in k_parts.iter().zip(v_parts.iter()).enumerate() {
+            let kv_len = kv_lengths[i];
+            if kv_len < max_kv {
+                let pad_len = max_kv - kv_len;
+                let pad = Tensor::zeros((1, self.n_kv_heads, pad_len, hd), dtype, device)?;
+                padded_k_parts.push(Tensor::cat(&[kp, &pad], 2)?);
+                padded_v_parts.push(Tensor::cat(&[vp, &pad], 2)?);
+            } else {
+                padded_k_parts.push(kp.clone());
+                padded_v_parts.push(vp.clone());
+            }
+        }
+
+        let k_cat = Tensor::cat(&padded_k_parts, 0)?;
+        let v_cat = Tensor::cat(&padded_v_parts, 0)?;
+
+        let k_cat = self.repeat_kv(k_cat)?;
+        let v_cat = self.repeat_kv(v_cat)?;
+
+        let mut out_parts: Vec<Tensor> = Vec::new();
+        let mut q_offset = 0usize;
+
+        for (i, seg) in segments.iter().enumerate() {
+            let q_seg = q.narrow(2, q_offset, seg.num_tokens)?;
+            let k_seg = k_cat.narrow(0, i, 1)?;
+            let v_seg = v_cat.narrow(0, i, 1)?;
+            let kv_len = kv_lengths[i];
+            let k_seg = k_seg.narrow(2, 0, kv_len)?;
+            let v_seg = v_seg.narrow(2, 0, kv_len)?;
+
+            let scores = q_seg.matmul(&k_seg.transpose(D::Minus1, D::Minus2)?)?.affine(self.scale, 0.)?;
+
+            let scores = if let Some(m) = mask {
+                let seg_mask = m.narrow(2, q_offset, seg.num_tokens)?.narrow(3, 0, kv_len)?;
+                scores.broadcast_add(&seg_mask.to_dtype(scores.dtype())?)?
+            } else if seg.num_tokens > 1 {
+                let cm = super::mask::causal_mask(seg.num_tokens, device)?;
+                if kv_len > seg.num_tokens {
+                    let visible = Tensor::zeros(
+                        (1, 1, seg.num_tokens, kv_len - seg.num_tokens),
+                        candle_core::DType::F32,
+                        device,
+                    )?;
+                    let full_mask = Tensor::cat(&[&visible, &cm], 3)?;
+                    scores.broadcast_add(&full_mask.to_dtype(scores.dtype())?)?
+                } else {
+                    scores.broadcast_add(&cm.to_dtype(scores.dtype())?)?
+                }
+            } else {
+                scores
+            };
+
+            let attn = softmax_last_dim(&scores)?;
+            let seg_out = attn.matmul(&v_seg)?;
+            out_parts.push(seg_out);
+            q_offset += seg.num_tokens;
+        }
+
+        let out = Tensor::cat(&out_parts, 2)?;
+        let out = out.transpose(1, 2)?.reshape((b, total_seq, self.n_heads * hd))?;
         self.o_proj.forward(&out)
     }
 }

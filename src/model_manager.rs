@@ -355,7 +355,7 @@ fn spawn_load(
             }
         };
 
-        println!("Loading model '{}'...", model_id_thread);
+        println!("\nLoading model '{}'...", model_id_thread);
         let batch_model = match model::load_batch_model(&model_dir, &device, 2) {
             Ok(m) => m,
             Err(e) => {

@@ -3,6 +3,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use crate::model::traits::{Model, BatchModel};
 use crate::model::common::{
+    attention::SegmentInfo,
     block::TransformerBlock,
     config::BlockConfig,
     ffn::Activation,
@@ -122,6 +123,30 @@ impl Qwen3 {
         let x = self.norm.forward(&x)?;
         self.lm_head.forward(&x)
     }
+
+    fn forward_batch_impl(
+        &self,
+        token_ids: &Tensor,
+        position_ids: &Tensor,
+        seq_caches: &mut [&mut [PagedKvCache]],
+        token_counts: &[usize],
+    ) -> Result<Tensor> {
+        let mut x = self.embed_tokens.forward(token_ids)?;
+
+        for (layer_idx, block) in self.blocks.iter().enumerate() {
+            let mut segments: Vec<SegmentInfo> = Vec::with_capacity(seq_caches.len());
+            for (seq_idx, seq_cache) in seq_caches.iter_mut().enumerate() {
+                segments.push(SegmentInfo {
+                    num_tokens: token_counts[seq_idx],
+                    cache: &mut seq_cache[layer_idx],
+                });
+            }
+            x = block.forward_batch(&x, &self.rope, position_ids, None, &mut segments)?;
+        }
+
+        let x = self.norm.forward(&x)?;
+        self.lm_head.forward(&x)
+    }
 }
 
 impl Model for Qwen3 {
@@ -154,6 +179,16 @@ impl BatchModel for Qwen3 {
         caches: &mut [PagedKvCache],
     ) -> Result<Tensor> {
         self.forward_impl(tokens, start_pos, caches)
+    }
+
+    fn forward_batch(
+        &self,
+        token_ids: &Tensor,
+        position_ids: &Tensor,
+        seq_caches: &mut [&mut [PagedKvCache]],
+        token_counts: &[usize],
+    ) -> Result<Tensor> {
+        self.forward_batch_impl(token_ids, position_ids, seq_caches, token_counts)
     }
 
     fn vocab_size(&self) -> usize { self.vocab_size }

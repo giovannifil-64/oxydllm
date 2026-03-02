@@ -19,6 +19,14 @@ pub trait BatchModel {
         caches: &mut [PagedKvCache],
     ) -> Result<Tensor>;
 
+    fn forward_batch(
+        &self,
+        token_ids: &Tensor,
+        position_ids: &Tensor,
+        seq_caches: &mut [&mut [PagedKvCache]],
+        token_counts: &[usize],
+    ) -> Result<Tensor>;
+
     fn vocab_size(&self) -> usize;
     fn eos_token_id(&self) -> u32;
     fn max_seq_len(&self) -> usize;

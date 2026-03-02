@@ -74,20 +74,8 @@ pub fn pull(config: &PullConfig) -> anyhow::Result<()> {
         anyhow::bail!("Download incomplete.");
     }
 
-    println!();
-    println!("Model '{}' saved to {}", config.dest_name, dest.display());
-    println!();
-    println!("To use it:");
-    println!(
-        "  rllm run  {} --models-dir {}",
-        config.dest_name,
-        config.models_dir.display()
-    );
-    println!(
-        "  rllm start --models-dir {}   (then model: \"{}\" in API)",
-        config.models_dir.display(),
-        config.dest_name
-    );
+    println!("\nModel '{}' saved to {}", config.dest_name, dest.display());
+
     Ok(())
 }
 

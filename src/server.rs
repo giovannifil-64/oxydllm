@@ -40,6 +40,8 @@ pub struct ChatCompletionRequest {
     pub min_p: Option<f32>,
     #[serde(default)]
     pub repetition_penalty: Option<f32>,
+    #[serde(default)]
+    pub keep_alive: Option<u64>,
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug)]
@@ -191,18 +193,33 @@ async fn health() -> impl IntoResponse {
 }
 
 async fn list_models(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let models_dir = state.manager.lock().await.models_dir().clone();
+    let mgr = state.manager.lock().await;
+    let models_dir = mgr.models_dir().clone();
+    let registry = mgr.list_registry().clone();
+    drop(mgr);
+
     let discovered = crate::model::discover_models(&models_dir);
 
     let data: Vec<serde_json::Value> = discovered
         .iter()
         .map(|m| {
+            let size_bytes = registry
+                .get(&m.id)
+                .map(|e| e.size_bytes)
+                .unwrap_or(0);
+            let last_used_secs = registry
+                .get(&m.id)
+                .map(|e| e.last_used_secs)
+                .unwrap_or(0);
             serde_json::json!({
                 "id": m.id,
                 "object": "model",
                 "architecture": m.architecture,
                 "vocab_size": m.vocab_size,
                 "num_layers": m.num_layers,
+                "size_bytes": size_bytes,
+                "size_gb": (size_bytes as f64 / 1_073_741_824.0 * 100.0).round() / 100.0,
+                "last_used_secs": last_used_secs,
             })
         })
         .collect();
@@ -216,6 +233,8 @@ async fn list_models(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 async fn list_running_models(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let mgr = state.manager.lock().await;
     let running = mgr.list_running();
+    let budget_bytes = mgr.memory_budget_bytes();
+    let total_loaded = mgr.total_loaded_bytes();
     drop(mgr);
 
     let data: Vec<serde_json::Value> = running
@@ -228,14 +247,26 @@ async fn list_running_models(State(state): State<Arc<AppState>>) -> impl IntoRes
                 "vocab_size": m.vocab_size,
                 "num_layers": m.num_layers,
                 "idle_seconds": m.idle_seconds,
+                "size_bytes": m.weights_size_bytes,
+                "size_gb": (m.weights_size_bytes as f64 / 1_073_741_824.0 * 100.0).round() / 100.0,
             })
         })
         .collect();
 
-    Json(serde_json::json!({
+    let mut resp = serde_json::json!({
         "object": "list",
-        "data": data
-    }))
+        "data": data,
+        "total_loaded_bytes": total_loaded,
+        "total_loaded_gb": (total_loaded as f64 / 1_073_741_824.0 * 100.0).round() / 100.0,
+    });
+
+    if let Some(budget) = budget_bytes {
+        resp["memory_budget_bytes"] = budget.into();
+        resp["memory_budget_gb"] = ((budget as f64 / 1_073_741_824.0 * 100.0).round() / 100.0).into();
+        resp["memory_free_bytes"] = budget.saturating_sub(total_loaded).into();
+    }
+
+    Json(resp)
 }
 
 async fn chat_completions(
@@ -259,7 +290,8 @@ async fn chat_completions(
 
     let get_result = {
         let mut mgr = state.manager.lock().await;
-        mgr.get_or_load(&model_id, Arc::clone(&state.manager))
+        let keep_alive_override = body.keep_alive.map(Duration::from_secs);
+        mgr.get_or_load(&model_id, Arc::clone(&state.manager), keep_alive_override)
     };
 
     let handle = match get_result {
@@ -424,7 +456,12 @@ fn make_chat_id() -> String {
     format!("chatcmpl-{:x}{:x}", t.as_secs(), t.subsec_nanos())
 }
 
-pub fn start_server(models_dir: PathBuf, port: u16, keep_alive: Duration) -> anyhow::Result<()> {
+pub fn start_server(
+    models_dir: PathBuf,
+    port: u16,
+    keep_alive: Duration,
+    memory_budget_bytes: Option<usize>,
+) -> anyhow::Result<()> {
     if !models_dir.exists() {
         std::fs::create_dir_all(&models_dir)?;
         println!("Created models directory: {}", models_dir.display());
@@ -439,6 +476,7 @@ pub fn start_server(models_dir: PathBuf, port: u16, keep_alive: Duration) -> any
     let manager = Arc::new(tokio::sync::Mutex::new(ModelManager::new(
         models_dir,
         keep_alive,
+        memory_budget_bytes,
     )));
 
     let state = Arc::new(AppState {
@@ -475,9 +513,16 @@ pub fn start_server(models_dir: PathBuf, port: u16, keep_alive: Duration) -> any
             port
         );
         println!(
-            "\nKeep-alive: {}s (models evicted after idle timeout)\n",
+            "\nKeep-alive: {}s (models evicted after idle timeout)",
             keep_alive.as_secs()
         );
+        match memory_budget_bytes {
+            Some(b) => println!(
+                "Memory budget: {:.1} GB (LRU eviction when exceeded)\n",
+                b as f64 / 1_073_741_824.0
+            ),
+            None => println!("Memory budget: unlimited\n"),
+        }
 
         let listener = tokio::net::TcpListener::bind(&addr).await?;
         axum::serve(listener, app).await?;

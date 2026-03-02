@@ -26,6 +26,7 @@ struct StartArgs {
     models_dir: PathBuf,
     port: u16,
     keep_alive: Duration,
+    memory_budget_bytes: Option<usize>,
 }
 
 struct RunArgs {
@@ -64,6 +65,7 @@ Server options (start):
   --port <PORT>             Listen port (default: 11313)
   --models-dir <DIR>        Models directory (default: ~/.rllm/models/)
   --keep-alive <SECS>       Keep-alive seconds before eviction (default: 900)
+  --memory-budget <MB>      Max total VRAM for loaded models in MB; LRU eviction when exceeded
 
 Chat options (run):
   --models-dir <DIR>        Models directory (default: ~/.rllm/models/)
@@ -133,6 +135,7 @@ fn parse_start_args(args: &[String]) -> Result<StartArgs, String> {
     let mut models_dir: Option<PathBuf> = None;
     let mut port: u16 = 11313;
     let mut keep_alive_secs: u64 = 900;
+    let mut memory_budget_mb: Option<usize> = None;
     let mut i = 0;
 
     while i < args.len() {
@@ -159,6 +162,15 @@ fn parse_start_args(args: &[String]) -> Result<StartArgs, String> {
                     .parse()
                     .map_err(|_| "Invalid keep-alive value")?;
             }
+            "--memory-budget" => {
+                i += 1;
+                let mb: usize = args
+                    .get(i)
+                    .ok_or("--memory-budget requires a value")?
+                    .parse()
+                    .map_err(|_| "Invalid memory-budget value (expected MB integer)")?;
+                memory_budget_mb = Some(mb);
+            }
             other => return Err(format!("Unknown option: {}", other)),
         }
         i += 1;
@@ -168,6 +180,7 @@ fn parse_start_args(args: &[String]) -> Result<StartArgs, String> {
         models_dir: models_dir.unwrap_or_else(default_models_dir),
         port,
         keep_alive: Duration::from_secs(keep_alive_secs),
+        memory_budget_bytes: memory_budget_mb.map(|mb| mb * 1024 * 1024),
     })
 }
 
@@ -350,7 +363,7 @@ fn main() -> anyhow::Result<()> {
                 print_usage();
                 std::process::exit(1);
             });
-            server::start_server(start_args.models_dir, start_args.port, start_args.keep_alive)?;
+            server::start_server(start_args.models_dir, start_args.port, start_args.keep_alive, start_args.memory_budget_bytes)?;
         }
         "run" => {
             let run_args = parse_run_args(&args[2..]).unwrap_or_else(|e| {

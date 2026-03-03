@@ -102,6 +102,8 @@ pub struct IncomingRequest {
     pub sampling_params: SamplingParams,
     pub max_tokens: usize,
     pub response_tx: tokio_mpsc::UnboundedSender<EngineEvent>,
+    pub model_id: String,
+    pub enqueued_at: std::time::Instant,
 }
 
 pub enum EngineEvent {
@@ -136,27 +138,52 @@ pub fn apply_chat_template(tokenizer: &Tokenizer, messages: &[ChatMessage]) -> S
     }
 }
 
+struct SeqTracker {
+    tx: tokio_mpsc::UnboundedSender<EngineEvent>,
+    model_id: String,
+    enqueued_at: std::time::Instant,
+    first_token_sent: bool,
+    token_count: usize,
+}
+
 pub fn engine_loop(
     mut engine: Engine,
     tokenizer: Arc<Tokenizer>,
     mut request_rx: tokio_mpsc::UnboundedReceiver<IncomingRequest>,
 ) {
-    let mut response_channels: HashMap<SequenceId, tokio_mpsc::UnboundedSender<EngineEvent>> =
-        HashMap::new();
+    let mut trackers: HashMap<SequenceId, SeqTracker> = HashMap::new();
 
     loop {
         if engine.has_pending_work() {
             while let Ok(req) = request_rx.try_recv() {
+                let model_id = req.model_id.clone();
+                let enqueued_at = req.enqueued_at;
                 let seq_id =
                     engine.add_request(req.prompt_tokens, req.sampling_params, req.max_tokens);
-                response_channels.insert(seq_id, req.response_tx);
+                eprintln!("[req] {} seq={} enqueued", model_id, seq_id);
+                trackers.insert(seq_id, SeqTracker {
+                    tx: req.response_tx,
+                    model_id,
+                    enqueued_at,
+                    first_token_sent: false,
+                    token_count: 0,
+                });
             }
         } else {
             match request_rx.blocking_recv() {
                 Some(req) => {
+                    let model_id = req.model_id.clone();
+                    let enqueued_at = req.enqueued_at;
                     let seq_id =
                         engine.add_request(req.prompt_tokens, req.sampling_params, req.max_tokens);
-                    response_channels.insert(seq_id, req.response_tx);
+                    eprintln!("[req] {} seq={} enqueued", model_id, seq_id);
+                    trackers.insert(seq_id, SeqTracker {
+                        tx: req.response_tx,
+                        model_id,
+                        enqueued_at,
+                        first_token_sent: false,
+                        token_count: 0,
+                    });
                 }
                 None => break,
             }
@@ -166,25 +193,38 @@ pub fn engine_loop(
             match engine.step() {
                 Ok(step) => {
                     for tok in &step.new_tokens {
-                        if let Some(tx) = response_channels.get(&tok.seq_id) {
+                        if let Some(tracker) = trackers.get_mut(&tok.seq_id) {
+                            if !tracker.first_token_sent {
+                                let ttft_ms = tracker.enqueued_at.elapsed().as_secs_f64() * 1000.0;
+                                eprintln!("[timing] {} seq={} TTFT: {:.1}ms", tracker.model_id, tok.seq_id, ttft_ms);
+                                tracker.first_token_sent = true;
+                            }
+                            tracker.token_count += 1;
                             let text = tokenizer.decode(&[tok.token]).unwrap_or_default();
-                            let _ = tx.send(EngineEvent::Token(text));
+                            let _ = tracker.tx.send(EngineEvent::Token(text));
                         }
                     }
                     for completed in &step.completed {
-                        if let Some(tx) = response_channels.remove(&completed.id) {
-                            let _ = tx.send(EngineEvent::Finish {
+                        if let Some(tracker) = trackers.remove(&completed.id) {
+                            let elapsed_s = tracker.enqueued_at.elapsed().as_secs_f64();
+                            let tps = tracker.token_count as f64 / elapsed_s.max(0.001);
+                            eprintln!(
+                                "[timing] {} seq={} done: {} tokens in {:.1}ms ({:.1} tok/s)",
+                                tracker.model_id, completed.id,
+                                tracker.token_count, elapsed_s * 1000.0, tps
+                            );
+                            let _ = tracker.tx.send(EngineEvent::Finish {
                                 finish_reason: "stop".to_string(),
                             });
-                            let _ = tx.send(EngineEvent::StreamEnd);
+                            let _ = tracker.tx.send(EngineEvent::StreamEnd);
                         }
                     }
                 }
                 Err(e) => {
                     eprintln!("Engine error: {e}");
-                    for (_, tx) in response_channels.drain() {
-                        let _ = tx.send(EngineEvent::Error(e.to_string()));
-                        let _ = tx.send(EngineEvent::StreamEnd);
+                    for (_, tracker) in trackers.drain() {
+                        let _ = tracker.tx.send(EngineEvent::Error(e.to_string()));
+                        let _ = tracker.tx.send(EngineEvent::StreamEnd);
                     }
                     break;
                 }
@@ -192,9 +232,9 @@ pub fn engine_loop(
         }
     }
 
-    for (_, tx) in response_channels.drain() {
-        let _ = tx.send(EngineEvent::Error("Model unloaded".to_string()));
-        let _ = tx.send(EngineEvent::StreamEnd);
+    for (_, tracker) in trackers.drain() {
+        let _ = tracker.tx.send(EngineEvent::Error("Model unloaded".to_string()));
+        let _ = tracker.tx.send(EngineEvent::StreamEnd);
     }
 }
 
@@ -374,6 +414,8 @@ async fn chat_completions(
             sampling_params,
             max_tokens,
             response_tx,
+            model_id: model_id.clone(),
+            enqueued_at: std::time::Instant::now(),
         })
         .map_err(|_| {
             (

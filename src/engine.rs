@@ -100,9 +100,14 @@ impl Engine {
             let seq = self.scheduler.get_running_mut(seq_id).unwrap();
             let last_token = *seq.all_tokens.last().unwrap();
             let start_pos = seq.num_processed_tokens;
+            let is_first_decode = seq.generated_tokens.len() == 1;
 
+            let t_decode = std::time::Instant::now();
             let input = Tensor::from_vec(vec![last_token], (1, 1), &self.device)?;
             let logits = self.model.forward_with_cache(&input, start_pos, &mut seq.caches)?;
+            if is_first_decode {
+                eprintln!("[timing] decode step 1: {:.1}ms", t_decode.elapsed().as_secs_f64() * 1000.0);
+            }
             let last_logits = logits.squeeze(0)?.get(0)?;
 
             let next_token = sampling::sample(&last_logits, &seq.sampling_params, &seq.all_tokens)?;

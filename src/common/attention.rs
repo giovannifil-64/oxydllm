@@ -16,11 +16,14 @@ pub struct Attention {
     k_proj: Linear,
     v_proj: Linear,
     o_proj: Linear,
+    qkv_proj: Option<Linear>,
     q_norm: Option<RMSNorm>,
     k_norm: Option<RMSNorm>,
     n_heads: usize,
     n_kv_heads: usize,
     head_dim: usize,
+    q_dim: usize,
+    kv_dim: usize,
     scale: f64,
 }
 
@@ -47,14 +50,39 @@ impl Attention {
             )
         });
 
+        let q_dim = cfg.n_heads * hd;
+        let kv_dim = cfg.n_kv_heads * hd;
+
+        let qkv_w = Tensor::cat(&[
+            q_proj.weight(),
+            k_proj.weight(),
+            v_proj.weight(),
+        ], 0)?;
+        let qkv_proj = Some(Linear::new(qkv_w, None));
+
         Ok(Self {
             q_proj, k_proj, v_proj, o_proj,
+            qkv_proj,
             q_norm, k_norm,
             n_heads: cfg.n_heads,
             n_kv_heads: cfg.n_kv_heads,
             head_dim: hd,
+            q_dim,
+            kv_dim,
             scale: 1.0 / (hd as f64).sqrt(),
         })
+    }
+
+    fn qkv_split(&self, x: &Tensor) -> Result<(Tensor, Tensor, Tensor)> {
+        if let Some(ref qkv) = self.qkv_proj {
+            let out = qkv.forward(x)?; // [..., q_dim + 2*kv_dim]
+            let q = out.narrow(D::Minus1, 0, self.q_dim)?;
+            let k = out.narrow(D::Minus1, self.q_dim, self.kv_dim)?;
+            let v = out.narrow(D::Minus1, self.q_dim + self.kv_dim, self.kv_dim)?;
+            Ok((q, k, v))
+        } else {
+            Ok((self.q_proj.forward(x)?, self.k_proj.forward(x)?, self.v_proj.forward(x)?))
+        }
     }
 
     fn repeat_kv(&self, x: Tensor) -> Result<Tensor> {
@@ -79,9 +107,10 @@ impl Attention {
         let (b, seq, _) = x.dims3()?;
         let hd = self.head_dim;
 
-        let q = self.q_proj.forward(x)?.reshape((b, seq, self.n_heads, hd))?.transpose(1, 2)?;
-        let k = self.k_proj.forward(x)?.reshape((b, seq, self.n_kv_heads, hd))?.transpose(1, 2)?;
-        let v = self.v_proj.forward(x)?.reshape((b, seq, self.n_kv_heads, hd))?.transpose(1, 2)?;
+        let (q_raw, k_raw, v_raw) = self.qkv_split(x)?;
+        let q = q_raw.reshape((b, seq, self.n_heads, hd))?.transpose(1, 2)?;
+        let k = k_raw.reshape((b, seq, self.n_kv_heads, hd))?.transpose(1, 2)?;
+        let v = v_raw.reshape((b, seq, self.n_kv_heads, hd))?.transpose(1, 2)?;
 
         let q = match &self.q_norm {
             Some(norm) => norm.forward(&q)?,
@@ -96,6 +125,27 @@ impl Attention {
         let k = rope.apply(&k, start_pos)?;
 
         let (k, v) = cache.append(&k, &v)?;
+
+        let n_rep = self.n_heads / self.n_kv_heads;
+
+        if n_rep > 1 && seq == 1 {
+            let q_g = q.reshape((b, self.n_kv_heads, n_rep, hd))?.affine(self.scale, 0.0)?;
+            let scores = q_g.matmul(&k.contiguous()?.transpose(D::Minus1, D::Minus2)?)?;
+
+            let scores = match mask {
+                Some(m) => scores.broadcast_add(&m.to_dtype(scores.dtype())?)?,
+                None => scores,
+            };
+
+            let attn = softmax_last_dim(&scores)?;
+            let out = attn.matmul(&v.contiguous()?)?;
+
+            let out = out
+                .reshape((b, self.n_heads, 1, hd))?
+                .transpose(1, 2)?
+                .reshape((b, 1, self.n_heads * hd))?;
+            return self.o_proj.forward(&out);
+        }
 
         let k = self.repeat_kv(k)?;
         let v = self.repeat_kv(v)?;
@@ -123,9 +173,10 @@ impl Attention {
         let (b, total_seq, _) = x.dims3()?;
         let hd = self.head_dim;
 
-        let q = self.q_proj.forward(x)?.reshape((b, total_seq, self.n_heads, hd))?.transpose(1, 2)?;
-        let k = self.k_proj.forward(x)?.reshape((b, total_seq, self.n_kv_heads, hd))?.transpose(1, 2)?;
-        let v = self.v_proj.forward(x)?.reshape((b, total_seq, self.n_kv_heads, hd))?.transpose(1, 2)?;
+        let (q_raw, k_raw, v_raw) = self.qkv_split(x)?;
+        let q = q_raw.reshape((b, total_seq, self.n_heads, hd))?.transpose(1, 2)?;
+        let k = k_raw.reshape((b, total_seq, self.n_kv_heads, hd))?.transpose(1, 2)?;
+        let v = v_raw.reshape((b, total_seq, self.n_kv_heads, hd))?.transpose(1, 2)?;
 
         let q = match &self.q_norm {
             Some(norm) => norm.forward(&q)?,

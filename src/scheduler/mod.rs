@@ -3,7 +3,7 @@ pub mod sequence;
 use std::collections::VecDeque;
 use std::rc::Rc;
 
-use crate::model::common::paged::{PagedKvCache, SharedBlockAllocator, DEFAULT_BLOCK_SIZE};
+use crate::common::paged::{PagedKvCache, SharedBlockAllocator, DEFAULT_BLOCK_SIZE};
 use crate::sampling::SamplingParams;
 use sequence::*;
 
@@ -219,7 +219,7 @@ impl Scheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::common::paged::BlockAllocator;
+    use crate::common::paged::BlockAllocator;
     use candle_core::{DType, Device};
     use std::cell::RefCell;
 

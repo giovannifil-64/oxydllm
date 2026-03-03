@@ -1,8 +1,8 @@
 use candle_core::{DType, Device, Result, Tensor};
 use std::cell::RefCell;
 use std::rc::Rc;
-use crate::model::traits::BatchModel;
-use crate::model::common::{
+use crate::models::traits::BatchModel;
+use crate::common::{
     attention::SegmentInfo,
     block::TransformerBlock,
     config::BlockConfig,

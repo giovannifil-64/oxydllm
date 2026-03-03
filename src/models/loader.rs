@@ -1,14 +1,8 @@
-pub mod traits;
-pub mod common;
-mod qwen3;
-mod llama;
-
-pub use traits::BatchModel;
-
 use candle_core::{DType, Device};
-use common::weights::ModelWeights;
-use qwen3::{config::Qwen3Config, model::Qwen3};
-use llama::{config::LlamaConfig, model::Llama};
+use crate::common::weights::ModelWeights;
+use crate::models::traits::BatchModel;
+use crate::models::qwen3::{config::Qwen3Config, model::Qwen3};
+use crate::models::llama::{config::LlamaConfig, model::Llama};
 
 use std::path::Path;
 

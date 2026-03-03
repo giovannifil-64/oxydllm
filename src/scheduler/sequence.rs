@@ -1,4 +1,4 @@
-use crate::model::common::paged::PagedKvCache;
+use crate::common::paged::PagedKvCache;
 use crate::sampling::SamplingParams;
 
 pub type SequenceId = u64;

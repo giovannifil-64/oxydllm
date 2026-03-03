@@ -16,7 +16,7 @@ use tokio_stream::StreamExt;
 
 use crate::chat_template;
 use crate::engine::Engine;
-use crate::model_manager::{self, GetResult, ModelManager, SharedModelManager};
+use crate::models::manager::{self, GetResult, ModelManager, SharedModelManager};
 use crate::sampling::SamplingParams;
 use crate::scheduler::sequence::SequenceId;
 use crate::tokenizer::Tokenizer;
@@ -208,7 +208,7 @@ async fn list_models(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let registry = mgr.list_registry().clone();
     drop(mgr);
 
-    let discovered = crate::model::discover_models(&models_dir);
+    let discovered = crate::models::loader::discover_models(&models_dir);
 
     let data: Vec<serde_json::Value> = discovered
         .iter()
@@ -478,7 +478,7 @@ pub fn start_server(
         std::fs::create_dir_all(&models_dir)?;
         println!("Created models directory: {}", models_dir.display());
     }
-    let available = crate::model::discover_models(&models_dir);
+    let available = crate::models::loader::discover_models(&models_dir);
     println!("Models directory: {}", models_dir.display());
     println!("Discovered {} {}:", available.len(), if available.len() == 1 { "model" } else { "models" });
     for m in &available {
@@ -505,7 +505,7 @@ pub fn start_server(
 
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
-        model_manager::spawn_eviction_task(manager);
+        manager::spawn_eviction_task(manager);
 
         let addr = format!("0.0.0.0:{}", port);
         println!("\nServer listening on http://{}", addr);

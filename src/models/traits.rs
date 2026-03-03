@@ -1,5 +1,5 @@
 use candle_core::{Device, Result, Tensor};
-use super::common::paged::{PagedKvCache, SharedBlockAllocator};
+use crate::common::paged::{PagedKvCache, SharedBlockAllocator};
 
 pub trait BatchModel {
     fn forward_with_cache(

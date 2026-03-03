@@ -1,6 +1,6 @@
 use candle_core::{Device, Result, Tensor};
 
-use crate::model::traits::BatchModel;
+use crate::models::traits::BatchModel;
 use crate::sampling::{self, SamplingParams};
 use crate::scheduler::sequence::*;
 use crate::scheduler::*;

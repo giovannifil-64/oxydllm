@@ -1,8 +1,7 @@
 mod chat_template;
+mod common;
 mod engine;
-mod hf_hub;
-mod model;
-mod model_manager;
+mod models;
 mod sampling;
 mod scheduler;
 mod server;
@@ -318,13 +317,13 @@ fn run_interactive(args: &RunArgs) -> anyhow::Result<()> {
     use std::io::{BufRead, Write};
 
     let cuda_idx = args.cuda_device.unwrap_or(0);
-    let device = model::select_device_at(cuda_idx)?;
+    let device = models::loader::select_device_at(cuda_idx)?;
 
     let tokenizer = Tokenizer::from_dir(&args.model_dir)?;
     println!("Tokenizer loaded.");
 
     println!("Loading model from '{}'...", args.model_dir);
-    let batch_model = model::load_batch_model(&args.model_dir, &device, 1)?;
+    let batch_model = models::loader::load_batch_model(&args.model_dir, &device, 1)?;
     let max_seq_len = batch_model.max_seq_len();
     println!(
         "Model loaded. vocab_size={}, max_seq_len={}",
@@ -444,7 +443,7 @@ fn main() -> anyhow::Result<()> {
             if !pull_args.models_dir.exists() {
                 std::fs::create_dir_all(&pull_args.models_dir)?;
             }
-            hf_hub::pull(&hf_hub::PullConfig {
+            models::hub::pull(&models::hub::PullConfig {
                 repo_id: pull_args.repo_id,
                 dest_name,
                 models_dir: pull_args.models_dir,

@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc as tokio_mpsc, oneshot};
 
 use crate::engine::Engine;
-use crate::model;
+use crate::models::loader;
 use crate::scheduler::SchedulerConfig;
 use crate::server::{engine_loop, IncomingRequest};
 use crate::tokenizer::Tokenizer;
@@ -350,7 +350,7 @@ fn spawn_load(
         };
 
         let cuda_idx = cuda_devices_thread.first().copied().unwrap_or(0);
-        let device = match model::select_device_at(cuda_idx) {
+        let device = match loader::select_device_at(cuda_idx) {
             Ok(d) => d,
             Err(e) => {
                 let _ = result_tx.send(Err(format!("Failed to select device: {e}")));
@@ -359,7 +359,7 @@ fn spawn_load(
         };
 
         println!("\nLoading model '{}'...", model_id_thread);
-        let batch_model = match model::load_batch_model(&model_dir, &device, 2) {
+        let batch_model = match loader::load_batch_model(&model_dir, &device, 2) {
             Ok(m) => m,
             Err(e) => {
                 let _ = result_tx.send(Err(format!("Failed to load model: {e}")));

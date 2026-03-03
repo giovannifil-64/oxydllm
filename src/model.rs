@@ -1,12 +1,14 @@
 pub mod traits;
 pub mod common;
 mod qwen3;
+mod llama;
 
 pub use traits::BatchModel;
 
 use candle_core::{DType, Device};
 use common::weights::ModelWeights;
 use qwen3::{config::Qwen3Config, model::Qwen3};
+use llama::{config::LlamaConfig, model::Llama};
 
 use std::path::Path;
 
@@ -141,6 +143,13 @@ pub fn load_batch_model(
             let weight_path_refs: Vec<&str> = weight_paths.iter().map(|s| s.as_str()).collect();
             let weights = ModelWeights::load(&weight_path_refs, device, dtype)?;
             Ok(Box::new(Qwen3::load(cfg, &weights, device, dtype, kv_block_multiplier)?))
+        }
+        "LlamaForCausalLM" => {
+            let cfg = LlamaConfig::from_file(&format!("{}/config.json", model_dir))?;
+            let weight_paths = resolve_weight_paths(model_dir)?;
+            let weight_path_refs: Vec<&str> = weight_paths.iter().map(|s| s.as_str()).collect();
+            let weights = ModelWeights::load(&weight_path_refs, device, dtype)?;
+            Ok(Box::new(Llama::load(cfg, &weights, device, dtype, kv_block_multiplier)?))
         }
         other => anyhow::bail!("Architecture not supported: {}", other),
     }

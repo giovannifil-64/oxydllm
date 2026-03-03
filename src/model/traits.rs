@@ -29,6 +29,7 @@ pub trait BatchModel {
 
     fn vocab_size(&self) -> usize;
     fn eos_token_id(&self) -> u32;
+    fn stop_token_ids(&self) -> &[u32];
     fn max_seq_len(&self) -> usize;
     fn device(&self) -> &Device;
     fn num_layers(&self) -> usize;

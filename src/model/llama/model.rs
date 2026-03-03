@@ -1,7 +1,7 @@
 use candle_core::{DType, Device, Result, Tensor};
 use std::cell::RefCell;
 use std::rc::Rc;
-use crate::model::traits::{Model, BatchModel};
+use crate::model::traits::{BatchModel, Model};
 use crate::model::common::{
     attention::SegmentInfo,
     block::TransformerBlock,
@@ -14,9 +14,9 @@ use crate::model::common::{
     rope::RotaryEmbedding,
     weights::ModelWeights,
 };
-use super::config::Qwen3Config;
+use super::config::LlamaConfig;
 
-pub struct Qwen3 {
+pub struct Llama {
     embed_tokens: Embedding,
     blocks: Vec<TransformerBlock>,
     norm: RMSNorm,
@@ -35,11 +35,32 @@ pub struct Qwen3 {
     dtype: DType,
 }
 
-impl Qwen3 {
-    pub fn load(cfg: Qwen3Config, weights: &ModelWeights, device: &Device, dtype: DType, kv_block_multiplier: usize) -> Result<Self> {
-        let embed_tokens = Embedding::new(weights.get("model.embed_tokens.weight")?.clone());
+impl Llama {
+    pub fn load(
+        cfg: LlamaConfig,
+        weights: &ModelWeights,
+        device: &Device,
+        dtype: DType,
+        kv_block_multiplier: usize,
+    ) -> Result<Self> {
+        let mut stop_token_ids = cfg.eos_token_ids.clone();
+        if !stop_token_ids.contains(&128009) {
+            stop_token_ids.push(128009); // <|eot_id|>
+        }
+        if !stop_token_ids.contains(&128008) {
+            stop_token_ids.push(128008); // <|eom_id|>
+        }
 
         let head_dim = cfg.head_dim();
+
+        // When tie_word_embeddings is true, lm_head reuses the embedding table.
+        let embed_weight = weights.get("model.embed_tokens.weight")?.clone();
+        let lm_head = if cfg.tie_word_embeddings {
+            Linear::new(embed_weight.clone(), None)
+        } else {
+            Linear::new(weights.get("lm_head.weight")?.clone(), None)
+        };
+        let embed_tokens = Embedding::new(embed_weight);
 
         let block_cfg = BlockConfig {
             hidden_size: cfg.hidden_size,
@@ -48,7 +69,8 @@ impl Qwen3 {
             n_kv_heads: cfg.num_key_value_heads,
             head_dim,
             rms_norm_eps: cfg.rms_norm_eps,
-            qk_norm: true,
+            // Llama does not apply QK-norm.
+            qk_norm: false,
             sliding_window: None,
             activation: Activation::Silu,
         };
@@ -58,25 +80,27 @@ impl Qwen3 {
             .collect::<Result<Vec<_>>>()?;
 
         let norm = RMSNorm::load(weights, "model.norm", cfg.rms_norm_eps)?;
-        let lm_head = Linear::new(weights.get("lm_head.weight")?.clone(), None);
 
-        let rope = RotaryEmbedding::new(head_dim, cfg.max_position_embeddings, cfg.rope_theta, device)?;
+        let rope = RotaryEmbedding::new(
+            head_dim,
+            cfg.max_position_embeddings,
+            cfg.rope_theta,
+            device,
+        )?;
 
-        // Paged KV cache — one BlockAllocator per layer, shared across sequences.
-        let num_blocks = kv_block_multiplier * ((cfg.max_position_embeddings + DEFAULT_BLOCK_SIZE - 1) / DEFAULT_BLOCK_SIZE);
+        let num_blocks = kv_block_multiplier
+            * ((cfg.max_position_embeddings + DEFAULT_BLOCK_SIZE - 1) / DEFAULT_BLOCK_SIZE);
         let mut allocators = Vec::with_capacity(cfg.num_hidden_layers);
         let mut caches = Vec::with_capacity(cfg.num_hidden_layers);
         for _ in 0..cfg.num_hidden_layers {
-            let allocator = Rc::new(RefCell::new(
-                BlockAllocator::new(
-                    num_blocks,
-                    DEFAULT_BLOCK_SIZE,
-                    cfg.num_key_value_heads,
-                    head_dim,
-                    dtype,
-                    device,
-                )?
-            ));
+            let allocator = Rc::new(RefCell::new(BlockAllocator::new(
+                num_blocks,
+                DEFAULT_BLOCK_SIZE,
+                cfg.num_key_value_heads,
+                head_dim,
+                dtype,
+                device,
+            )?));
             caches.push(PagedKvCache::new(Rc::clone(&allocator)));
             allocators.push(allocator);
         }
@@ -90,8 +114,8 @@ impl Qwen3 {
             caches,
             allocators,
             device: device.clone(),
-            eos_token_id: 151645,
-            stop_token_ids: vec![151645],
+            eos_token_id: cfg.primary_eos_token_id(),
+            stop_token_ids,
             vocab_size: cfg.vocab_size,
             max_seq_len: cfg.max_position_embeddings,
             num_layers: cfg.num_hidden_layers,
@@ -102,7 +126,7 @@ impl Qwen3 {
     }
 }
 
-impl Qwen3 {
+impl Llama {
     fn forward_impl(
         &self,
         tokens: &Tensor,
@@ -151,10 +175,8 @@ impl Qwen3 {
     }
 }
 
-impl Model for Qwen3 {
+impl Model for Llama {
     fn forward(&mut self, tokens: &Tensor, start_pos: usize) -> Result<Tensor> {
-        // Split borrow: take caches out, run forward, put them back via pointer.
-        // Safe because forward_impl only reads &self fields other than caches.
         let mut caches = std::mem::take(&mut self.caches);
         let result = self.forward_impl(tokens, start_pos, &mut caches);
         self.caches = caches;
@@ -173,7 +195,7 @@ impl Model for Qwen3 {
     fn device(&self) -> &Device { &self.device }
 }
 
-impl BatchModel for Qwen3 {
+impl BatchModel for Llama {
     fn forward_with_cache(
         &self,
         tokens: &Tensor,

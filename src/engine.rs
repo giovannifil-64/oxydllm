@@ -19,6 +19,7 @@ pub struct Engine {
     model: Box<dyn BatchModel>,
     scheduler: Scheduler,
     device: Device,
+    stop_token_ids: Vec<u32>,
 }
 
 impl Engine {
@@ -26,8 +27,27 @@ impl Engine {
         let allocators = model.allocators().iter().map(|a| std::rc::Rc::clone(a)).collect();
         let num_layers = model.num_layers();
         let device = model.device().clone();
+        let stop_token_ids = model.stop_token_ids().to_vec();
         let scheduler = Scheduler::new(config, allocators, num_layers);
-        Self { model, scheduler, device }
+        Self { model, scheduler, device, stop_token_ids }
+    }
+
+    pub fn new_with_stop_tokens(
+        model: Box<dyn BatchModel>,
+        config: SchedulerConfig,
+        extra_stop_ids: &[u32],
+    ) -> Self {
+        let allocators = model.allocators().iter().map(|a| std::rc::Rc::clone(a)).collect();
+        let num_layers = model.num_layers();
+        let device = model.device().clone();
+        let mut stop_token_ids = model.stop_token_ids().to_vec();
+        for &id in extra_stop_ids {
+            if !stop_token_ids.contains(&id) {
+                stop_token_ids.push(id);
+            }
+        }
+        let scheduler = Scheduler::new(config, allocators, num_layers);
+        Self { model, scheduler, device, stop_token_ids }
     }
 
     pub fn add_request(
@@ -63,13 +83,13 @@ impl Engine {
             let last_logits = logits.squeeze(0)?.get(seq_len - 1)?;
 
             let next_token = sampling::sample(&last_logits, &seq.sampling_params, &seq.all_tokens)?;
-            let is_eos = next_token == self.model.eos_token_id();
+            let is_stop = self.stop_token_ids.contains(&next_token);
 
             seq.all_tokens.push(next_token);
             seq.num_processed_tokens = seq.all_tokens.len() - 1;
             seq.phase = SequencePhase::Decode;
 
-            if is_eos {
+            if is_stop {
                 seq.status = SequenceStatus::Finished;
                 seq.finish_reason = Some("stop".to_string());
             } else {
@@ -93,12 +113,12 @@ impl Engine {
             let last_logits = logits.squeeze(0)?.get(0)?;
 
             let next_token = sampling::sample(&last_logits, &seq.sampling_params, &seq.all_tokens)?;
-            let is_eos = next_token == self.model.eos_token_id();
+            let is_stop = self.stop_token_ids.contains(&next_token);
 
             seq.all_tokens.push(next_token);
             seq.num_processed_tokens = seq.all_tokens.len() - 1;
 
-            if is_eos {
+            if is_stop {
                 seq.status = SequenceStatus::Finished;
                 seq.finish_reason = Some("stop".to_string());
             } else {
@@ -156,12 +176,12 @@ impl Engine {
                 let seq_logits = batch_logits.get(i)?;
                 let seq = self.scheduler.get_running_mut(seq_id).unwrap();
                 let next_token = sampling::sample(&seq_logits, &seq.sampling_params, &seq.all_tokens)?;
-                let is_eos = next_token == self.model.eos_token_id();
+                let is_stop = self.stop_token_ids.contains(&next_token);
 
                 seq.all_tokens.push(next_token);
                 seq.num_processed_tokens = seq.all_tokens.len() - 1;
 
-                if is_eos {
+                if is_stop {
                     seq.status = SequenceStatus::Finished;
                     seq.finish_reason = Some("stop".to_string());
                 } else {

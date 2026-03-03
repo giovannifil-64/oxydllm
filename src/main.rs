@@ -1,3 +1,4 @@
+mod chat_template;
 mod engine;
 mod hf_hub;
 mod model;
@@ -335,7 +336,8 @@ fn run_interactive(args: &RunArgs) -> anyhow::Result<()> {
         max_num_sequences: 1,
         max_tokens_per_step: 4096,
     };
-    let mut engine = engine::Engine::new(batch_model, config);
+    let extra_stop_ids = tokenizer.stop_token_ids();
+    let mut engine = engine::Engine::new_with_stop_tokens(batch_model, config, &extra_stop_ids);
 
     let mut messages: Vec<ChatMessage> = vec![ChatMessage {
         role: "system".to_string(),
@@ -369,7 +371,7 @@ fn run_interactive(args: &RunArgs) -> anyhow::Result<()> {
             content: input,
         });
 
-        let prompt = server::format_chatml(&messages);
+        let prompt = server::apply_chat_template(&tokenizer, &messages);
         let prompt_tokens = tokenizer.encode(&prompt)?;
         let max_tokens = max_seq_len.saturating_sub(prompt_tokens.len());
 

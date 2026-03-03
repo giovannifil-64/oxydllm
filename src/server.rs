@@ -14,6 +14,7 @@ use tokio::sync::mpsc as tokio_mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_stream::StreamExt;
 
+use crate::chat_template;
 use crate::engine::Engine;
 use crate::model_manager::{self, GetResult, ModelManager, SharedModelManager};
 use crate::sampling::SamplingParams;
@@ -114,16 +115,25 @@ struct AppState {
     manager: SharedModelManager,
 }
 
-pub fn format_chatml(messages: &[ChatMessage]) -> String {
-    let mut prompt = String::new();
-    for msg in messages {
-        prompt.push_str(&format!(
-            "<|im_start|>{}\n{}<|im_end|>\n",
-            msg.role, msg.content
-        ));
+pub fn apply_chat_template(tokenizer: &Tokenizer, messages: &[ChatMessage]) -> String {
+    match tokenizer.chat_template() {
+        Some(template) => {
+            match chat_template::apply_chat_template(
+                template,
+                messages,
+                tokenizer.bos_token(),
+                tokenizer.eos_token(),
+                true,
+            ) {
+                Ok(prompt) => prompt,
+                Err(e) => {
+                    eprintln!("Warning: chat template rendering failed: {e:#}. Falling back to plain text.");
+                    chat_template::format_plain_chat(messages)
+                }
+            }
+        }
+        None => chat_template::format_plain_chat(messages),
     }
-    prompt.push_str("<|im_start|>assistant\n");
-    prompt
 }
 
 pub fn engine_loop(
@@ -314,7 +324,7 @@ async fn chat_completions(
         }
     };
 
-    let prompt = format_chatml(&body.messages);
+    let prompt = apply_chat_template(&handle.tokenizer, &body.messages);
     let prompt_tokens = handle.tokenizer.encode(&prompt).map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -331,9 +341,10 @@ async fn chat_completions(
         repetition_penalty: body.repetition_penalty.unwrap_or(1.0),
     };
 
+    let remaining = handle.max_seq_len.saturating_sub(prompt_len);
     let max_tokens = body
         .max_tokens
-        .unwrap_or_else(|| handle.max_seq_len.saturating_sub(prompt_len));
+        .unwrap_or(remaining.min(512));
 
     let (response_tx, response_rx) = tokio_mpsc::unbounded_channel();
 

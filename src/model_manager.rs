@@ -410,7 +410,8 @@ fn spawn_load(
             max_num_sequences: 8,
             max_tokens_per_step: 4096,
         };
-        let engine = Engine::new(batch_model, config);
+        let extra_stop_ids = tokenizer.stop_token_ids();
+        let engine = Engine::new_with_stop_tokens(batch_model, config, &extra_stop_ids);
         engine_loop(engine, tokenizer, request_rx);
     });
 

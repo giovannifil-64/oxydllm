@@ -190,7 +190,15 @@ pub fn engine_loop(
         }
 
         if engine.has_pending_work() {
-            match engine.step() {
+            // Acquire the global GPU lock so that only one model
+            // does a forward pass at a time (prevents Metal/CUDA contention
+            // when multiple models are loaded simultaneously).
+            let step_result = {
+                let lock = crate::gpu_lock::gpu_lock();
+                let _gpu = lock.acquire();
+                engine.step()
+            };
+            match step_result {
                 Ok(step) => {
                     for tok in &step.new_tokens {
                         if let Some(tracker) = trackers.get_mut(&tok.seq_id) {

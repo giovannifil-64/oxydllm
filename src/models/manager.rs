@@ -337,6 +337,11 @@ fn warm_up_model(model: &dyn BatchModel) {
     let device = model.device();
     let allocators = model.allocators();
 
+    // Acquire the global GPU lock so warmup doesn't contend with any
+    // model that is already running inference on the same device.
+    let lock = crate::gpu_lock::gpu_lock();
+    let _gpu = lock.acquire();
+
     // --- Phase 1: prefill-shaped forward (compile kernels for seq_len > 1) ---
     {
         let mut caches: Vec<PagedKvCache> = allocators

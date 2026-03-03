@@ -1,6 +1,7 @@
 mod chat_template;
 mod common;
 mod engine;
+mod gpu_lock;
 mod models;
 mod sampling;
 mod scheduler;

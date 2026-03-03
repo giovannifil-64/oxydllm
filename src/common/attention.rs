@@ -126,6 +126,33 @@ impl Attention {
 
         let (k, v) = cache.append(&k, &v)?;
 
+        // ── Metal SDPA path ─────────────────────────────────────────
+        // Use candle's built-in fused SDPA Metal kernels (derived from MLX).
+        // Handles GQA natively — no repeat_kv needed.
+        #[cfg(feature = "metal")]
+        {
+            if super::metal_ops::sdpa_available(&q, self.head_dim) {
+                let q_c = q.contiguous()?;
+                let k_c = k.contiguous()?;
+                let v_c = v.contiguous()?;
+
+                let out = super::metal_ops::sdpa(
+                    &q_c,
+                    &k_c,
+                    &v_c,
+                    None,      // mask — SDPA supports causal flag directly
+                    seq > 1,   // do_causal: true for prefill, false for decode
+                    self.scale as f32,
+                )?;
+
+                let out = out
+                    .transpose(1, 2)?
+                    .reshape((b, seq, self.n_heads * hd))?;
+                return self.o_proj.forward(&out);
+            }
+        }
+
+        // ── Fallback: standard attention (CPU / CUDA / unsupported head dims)
         let n_rep = self.n_heads / self.n_kv_heads;
 
         if n_rep > 1 && seq == 1 {
@@ -229,46 +256,81 @@ impl Attention {
         let k_cat = Tensor::cat(&padded_k_parts, 0)?;
         let v_cat = Tensor::cat(&padded_v_parts, 0)?;
 
-        let k_cat = self.repeat_kv(k_cat)?;
-        let v_cat = self.repeat_kv(v_cat)?;
-
         let mut out_parts: Vec<Tensor> = Vec::new();
         let mut q_offset = 0usize;
 
-        for (i, seg) in segments.iter().enumerate() {
-            let q_seg = q.narrow(2, q_offset, seg.num_tokens)?;
-            let k_seg = k_cat.narrow(0, i, 1)?;
-            let v_seg = v_cat.narrow(0, i, 1)?;
-            let kv_len = kv_lengths[i];
-            let k_seg = k_seg.narrow(2, 0, kv_len)?;
-            let v_seg = v_seg.narrow(2, 0, kv_len)?;
+        // ── Metal SDPA path for batch ────────────────────────────────
+        #[cfg(feature = "metal")]
+        let use_sdpa = super::metal_ops::sdpa_available(&q, self.head_dim);
+        #[cfg(not(feature = "metal"))]
+        let use_sdpa = false;
 
-            let scores = q_seg.matmul(&k_seg.transpose(D::Minus1, D::Minus2)?)?.affine(self.scale, 0.)?;
+        if use_sdpa {
+            #[cfg(feature = "metal")]
+            for (i, seg) in segments.iter().enumerate() {
+                let q_seg = q.narrow(2, q_offset, seg.num_tokens)?;
+                let k_seg = k_cat.narrow(0, i, 1)?;
+                let v_seg = v_cat.narrow(0, i, 1)?;
+                let kv_len = kv_lengths[i];
+                let k_seg = k_seg.narrow(2, 0, kv_len)?;
+                let v_seg = v_seg.narrow(2, 0, kv_len)?;
 
-            let scores = if let Some(m) = mask {
-                let seg_mask = m.narrow(2, q_offset, seg.num_tokens)?.narrow(3, 0, kv_len)?;
-                scores.broadcast_add(&seg_mask.to_dtype(scores.dtype())?)?
-            } else if seg.num_tokens > 1 {
-                let cm = super::mask::causal_mask(seg.num_tokens, device)?;
-                if kv_len > seg.num_tokens {
-                    let visible = Tensor::zeros(
-                        (1, 1, seg.num_tokens, kv_len - seg.num_tokens),
-                        candle_core::DType::F32,
-                        device,
-                    )?;
-                    let full_mask = Tensor::cat(&[&visible, &cm], 3)?;
-                    scores.broadcast_add(&full_mask.to_dtype(scores.dtype())?)?
+                // SDPA handles GQA natively — no repeat_kv needed.
+                let q_c = q_seg.contiguous()?;
+                let k_c = k_seg.contiguous()?;
+                let v_c = v_seg.contiguous()?;
+
+                let seg_out = super::metal_ops::sdpa(
+                    &q_c,
+                    &k_c,
+                    &v_c,
+                    None,
+                    seg.num_tokens > 1, // causal for prefill segments
+                    self.scale as f32,
+                )?;
+                out_parts.push(seg_out);
+                q_offset += seg.num_tokens;
+            }
+        } else {
+            // ── Fallback: standard attention ─────────────────────────
+            let k_cat = self.repeat_kv(k_cat)?;
+            let v_cat = self.repeat_kv(v_cat)?;
+
+            for (i, seg) in segments.iter().enumerate() {
+                let q_seg = q.narrow(2, q_offset, seg.num_tokens)?;
+                let k_seg = k_cat.narrow(0, i, 1)?;
+                let v_seg = v_cat.narrow(0, i, 1)?;
+                let kv_len = kv_lengths[i];
+                let k_seg = k_seg.narrow(2, 0, kv_len)?;
+                let v_seg = v_seg.narrow(2, 0, kv_len)?;
+
+                let scores = q_seg.matmul(&k_seg.transpose(D::Minus1, D::Minus2)?)?.affine(self.scale, 0.)?;
+
+                let scores = if let Some(m) = mask {
+                    let seg_mask = m.narrow(2, q_offset, seg.num_tokens)?.narrow(3, 0, kv_len)?;
+                    scores.broadcast_add(&seg_mask.to_dtype(scores.dtype())?)?
+                } else if seg.num_tokens > 1 {
+                    let cm = super::mask::causal_mask(seg.num_tokens, device)?;
+                    if kv_len > seg.num_tokens {
+                        let visible = Tensor::zeros(
+                            (1, 1, seg.num_tokens, kv_len - seg.num_tokens),
+                            candle_core::DType::F32,
+                            device,
+                        )?;
+                        let full_mask = Tensor::cat(&[&visible, &cm], 3)?;
+                        scores.broadcast_add(&full_mask.to_dtype(scores.dtype())?)?
+                    } else {
+                        scores.broadcast_add(&cm.to_dtype(scores.dtype())?)?
+                    }
                 } else {
-                    scores.broadcast_add(&cm.to_dtype(scores.dtype())?)?
-                }
-            } else {
-                scores
-            };
+                    scores
+                };
 
-            let attn = softmax_last_dim(&scores)?;
-            let seg_out = attn.matmul(&v_seg)?;
-            out_parts.push(seg_out);
-            q_offset += seg.num_tokens;
+                let attn = softmax_last_dim(&scores)?;
+                let seg_out = attn.matmul(&v_seg)?;
+                out_parts.push(seg_out);
+                q_offset += seg.num_tokens;
+            }
         }
 
         let out = Tensor::cat(&out_parts, 2)?;

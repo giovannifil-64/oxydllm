@@ -4,6 +4,8 @@ pub mod config;
 pub mod ffn;
 pub mod linear;
 pub mod mask;
+#[cfg(feature = "metal")]
+pub mod metal_ops;
 pub mod norm;
 pub mod paged;
 pub mod rope;

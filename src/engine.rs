@@ -23,15 +23,6 @@ pub struct Engine {
 }
 
 impl Engine {
-    pub fn new(model: Box<dyn BatchModel>, config: SchedulerConfig) -> Self {
-        let allocators = model.allocators().iter().map(|a| std::rc::Rc::clone(a)).collect();
-        let num_layers = model.num_layers();
-        let device = model.device().clone();
-        let stop_token_ids = model.stop_token_ids().to_vec();
-        let scheduler = Scheduler::new(config, allocators, num_layers);
-        Self { model, scheduler, device, stop_token_ids }
-    }
-
     pub fn new_with_stop_tokens(
         model: Box<dyn BatchModel>,
         config: SchedulerConfig,
@@ -170,7 +161,7 @@ impl Engine {
                 seq.caches = std::mem::take(&mut cache_vecs[i]);
             }
 
-            let batch_logits = logits.squeeze(0)?; // (total_tokens, vocab)
+            let batch_logits = logits.squeeze(0)?;
 
             for (i, &seq_id) in decode_ids.iter().enumerate() {
                 let seq_logits = batch_logits.get(i)?;
@@ -201,14 +192,5 @@ impl Engine {
 
     pub fn has_pending_work(&self) -> bool {
         self.scheduler.has_pending_work()
-    }
-
-    pub fn run_to_completion(&mut self) -> Result<Vec<CompletedSequence>> {
-        let mut all_completed = Vec::new();
-        while self.has_pending_work() {
-            let step = self.step()?;
-            all_completed.extend(step.completed);
-        }
-        Ok(all_completed)
     }
 }

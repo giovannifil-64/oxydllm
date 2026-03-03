@@ -94,14 +94,14 @@ fn resolve_weight_paths(model_dir: &str) -> anyhow::Result<Vec<String>> {
     }
 }
 
-pub fn select_device_at(cuda_idx: usize) -> anyhow::Result<Device> {
+pub fn select_device_at(_cuda_idx: usize) -> anyhow::Result<Device> {
     #[cfg(feature = "cuda")]
-    match Device::new_cuda(cuda_idx) {
+    match Device::new_cuda(_cuda_idx) {
         Ok(d) => {
             println!("Device: CUDA:{}", cuda_idx);
             return Ok(d);
         }
-        Err(e) => eprintln!("CUDA:{} not available: {e}", cuda_idx),
+        Err(e) => eprintln!("CUDA:{} not available: {e}", _cuda_idx),
     }
 
     #[cfg(feature = "metal")]
@@ -115,10 +115,6 @@ pub fn select_device_at(cuda_idx: usize) -> anyhow::Result<Device> {
 
     println!("Device: CPU");
     Ok(Device::Cpu)
-}
-
-pub fn select_device() -> anyhow::Result<Device> {
-    select_device_at(0)
 }
 
 pub fn load_batch_model(

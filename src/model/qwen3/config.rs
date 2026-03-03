@@ -3,7 +3,6 @@ use serde::Deserialize;
 #[derive(Debug, Deserialize, Clone)]
 pub struct Qwen3Config {
     pub hidden_size: usize,
-    pub intermediate_size: usize,
     pub num_hidden_layers: usize,
     pub num_attention_heads: usize,
     pub num_key_value_heads: usize,

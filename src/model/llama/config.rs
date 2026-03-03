@@ -36,7 +36,6 @@ fn default_eos_token_ids() -> Vec<u32> {
 #[derive(Debug, Deserialize, Clone)]
 pub struct LlamaConfig {
     pub hidden_size: usize,
-    pub intermediate_size: usize,
     pub num_hidden_layers: usize,
     pub num_attention_heads: usize,
     pub num_key_value_heads: usize,
@@ -62,9 +61,5 @@ impl LlamaConfig {
 
     pub fn head_dim(&self) -> usize {
         self.hidden_size / self.num_attention_heads
-    }
-
-    pub fn primary_eos_token_id(&self) -> u32 {
-        *self.eos_token_ids.last().unwrap_or(&128_001)
     }
 }

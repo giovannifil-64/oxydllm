@@ -95,7 +95,6 @@ impl Attention {
         let q = rope.apply(&q, start_pos)?;
         let k = rope.apply(&k, start_pos)?;
 
-        // Append nuovi K,V alla cache e ottieni la sequenza completa.
         let (k, v) = cache.append(&k, &v)?;
 
         let k = self.repeat_kv(k)?;

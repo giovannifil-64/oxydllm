@@ -6,7 +6,6 @@ use super::weights::ModelWeights;
 #[derive(Clone, Copy)]
 pub enum Activation {
     Silu,
-    GeLU,
 }
 
 pub struct FeedForward {
@@ -29,7 +28,6 @@ impl FeedForward {
         let gate = self.gate_proj.forward(x)?;
         let gate = match self.activation {
             Activation::Silu => silu(&gate)?,
-            Activation::GeLU => gate.gelu()?
         };
         let up = self.up_proj.forward(x)?;
         self.down_proj.forward(&(gate * up)?)

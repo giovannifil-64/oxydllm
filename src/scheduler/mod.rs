@@ -23,7 +23,6 @@ pub struct SchedulerOutput {
 
 pub struct CompletedSequence {
     pub id: SequenceId,
-    pub generated_tokens: Vec<u32>,
 }
 
 pub struct Scheduler {
@@ -74,7 +73,6 @@ impl Scheduler {
         let all_tokens = prompt_tokens.clone();
         let seq = SequenceState {
             id,
-            prompt_tokens,
             generated_tokens: Vec::new(),
             all_tokens,
             sampling_params,
@@ -90,7 +88,6 @@ impl Scheduler {
         id
     }
 
-    /// Returns the number of free blocks in layer 0's allocator (representative of all layers).
     fn num_free_blocks(&self) -> usize {
         if self.allocators.is_empty() {
             return 0;
@@ -98,16 +95,12 @@ impl Scheduler {
         self.allocators[0].borrow().num_free()
     }
 
-    /// Estimate how many blocks a prefill needs.
     fn blocks_needed_for_prefill(&self, seq: &SequenceState) -> usize {
         let total_tokens = seq.all_tokens.len();
         (total_tokens + self.block_size - 1) / self.block_size
     }
 
-    /// Check if a decode step might need a new block for a sequence.
     fn decode_needs_new_block(&self, seq: &SequenceState) -> bool {
-        // A decode step adds 1 token. Check if the current token count
-        // is at a block boundary.
         seq.num_processed_tokens % self.block_size == 0 && seq.num_processed_tokens > 0
     }
 
@@ -115,15 +108,12 @@ impl Scheduler {
         let mut scheduled = Vec::new();
         let mut budget = self.config.max_tokens_per_step;
 
-        // 1. Schedule existing running sequences (decode phase, 1 token each)
         let mut to_preempt = Vec::new();
         for (idx, seq) in self.running.iter().enumerate() {
             if budget == 0 {
                 break;
             }
-            // Check if this decode step needs a new block
             if self.decode_needs_new_block(seq) && self.num_free_blocks() == 0 {
-                // Need to preempt — pick this sequence (lowest priority = last added)
                 to_preempt.push(idx);
                 continue;
             }
@@ -134,11 +124,8 @@ impl Scheduler {
             budget -= 1;
         }
 
-        // Preempt sequences that can't get blocks (recompute mode)
-        // Process in reverse order to maintain indices
         for &idx in to_preempt.iter().rev() {
             let mut seq = self.running.remove(idx);
-            // Clear all caches — blocks return to pool
             for cache in &mut seq.caches {
                 cache.clear();
             }
@@ -148,14 +135,12 @@ impl Scheduler {
             self.waiting.push_front(seq);
         }
 
-        // Remove preempted sequences from scheduled list
         if !to_preempt.is_empty() {
             let running_ids: std::collections::HashSet<SequenceId> =
                 self.running.iter().map(|s| s.id).collect();
             scheduled.retain(|s| running_ids.contains(&s.id));
         }
 
-        // 2. Admit new sequences from waiting queue
         let mut newly_admitted = Vec::new();
         while self.running.len() + newly_admitted.len() < self.config.max_num_sequences
             && budget > 0
@@ -208,7 +193,6 @@ impl Scheduler {
                 }
                 completed.push(CompletedSequence {
                     id: seq.id,
-                    generated_tokens: seq.generated_tokens,
                 });
             } else {
                 i += 1;
@@ -325,13 +309,8 @@ mod tests {
 
         // Add a second request that needs 1 block
         let id1 = sched.add_request(tokens, SamplingParams::default(), 100);
-
-        // Schedule again — seq0 decode needs a new block at boundary,
-        // but both blocks are used. The decode_needs_new_block check
-        // will trigger since num_processed_tokens % block_size == 0.
         let output = sched.schedule();
 
-        // The system should handle this — either preempt or schedule what it can
         assert!(sched.has_pending_work());
         let _ = (id1, output);
     }
@@ -345,19 +324,15 @@ mod tests {
         };
         let mut sched = Scheduler::new(config, allocators.clone(), 2);
 
-        let total_blocks = allocators[0].borrow().num_total_blocks();
         let initial_free = allocators[0].borrow().num_free();
-        assert_eq!(total_blocks, initial_free);
 
         let id0 = sched.add_request(vec![1, 2, 3], SamplingParams::default(), 10);
         sched.schedule();
 
-        // After scheduling, blocks are not yet allocated (that happens during forward pass)
-        // But the caches exist. Mark finished and retire.
+
         sched.get_running_mut(id0).unwrap().status = SequenceStatus::Finished;
         sched.retire_finished();
 
-        // All blocks should be returned
         let final_free = allocators[0].borrow().num_free();
         assert_eq!(final_free, initial_free);
     }

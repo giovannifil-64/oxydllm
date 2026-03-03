@@ -151,10 +151,6 @@ impl ModelManager {
             .sum()
     }
 
-    pub fn list_available(&self) -> Vec<model::DiscoveredModel> {
-        model::discover_models(&self.models_dir)
-    }
-
     pub fn list_running(&self) -> Vec<RunningModelInfo> {
         let now = Instant::now();
         self.slots

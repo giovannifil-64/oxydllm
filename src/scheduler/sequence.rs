@@ -18,7 +18,6 @@ pub enum SequenceStatus {
 
 pub struct SequenceState {
     pub id: SequenceId,
-    pub prompt_tokens: Vec<u32>,
     pub generated_tokens: Vec<u32>,
     pub all_tokens: Vec<u32>,
     pub sampling_params: SamplingParams,

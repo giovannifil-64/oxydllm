@@ -51,10 +51,6 @@ impl BlockAllocator {
         self.block_size
     }
 
-    pub fn num_total_blocks(&self) -> usize {
-        self.num_blocks
-    }
-
     pub fn write(
         &self,
         block_id: usize,
@@ -155,14 +151,6 @@ impl PagedKvCache {
         let idx = Tensor::from_vec(slots, (self.table.num_tokens,), new_k.device())?;
 
         self.allocator.borrow().gather(&idx)
-    }
-
-    pub fn num_blocks_used(&self) -> usize {
-        self.table.block_ids.len()
-    }
-
-    pub fn num_tokens_cached(&self) -> usize {
-        self.table.num_tokens
     }
 
     pub fn clear(&mut self) {

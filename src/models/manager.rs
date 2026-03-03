@@ -3,11 +3,14 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use candle_core::Tensor;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc as tokio_mpsc, oneshot};
 
+use crate::common::paged::PagedKvCache;
 use crate::engine::Engine;
 use crate::models::loader;
+use crate::models::traits::BatchModel;
 use crate::scheduler::SchedulerConfig;
 use crate::server::{engine_loop, IncomingRequest};
 use crate::tokenizer::Tokenizer;
@@ -326,6 +329,66 @@ struct LoadResult {
     weights_size_bytes: usize,
 }
 
+/// Runs dummy forward passes to force the device (Metal/CUDA) to JIT-compile
+/// GPU kernels for **both** prefill (multi-token) and decode (single-token) paths
+/// before the model is marked as Ready.  Without this, the very first real
+/// request pays the compilation cost, causing multi-second TTFT spikes.
+fn warm_up_model(model: &dyn BatchModel) {
+    let device = model.device();
+    let allocators = model.allocators();
+
+    // --- Phase 1: prefill-shaped forward (compile kernels for seq_len > 1) ---
+    {
+        let mut caches: Vec<PagedKvCache> = allocators
+            .iter()
+            .map(|a| PagedKvCache::new(std::rc::Rc::clone(a)))
+            .collect();
+
+        // Use 8 dummy tokens – close enough to a short chat-template prompt to
+        // trigger the same Metal/CUDA kernel specialisations that real prefills use.
+        let dummy_tokens: Vec<u32> = (1..=8).collect();
+        let input = match Tensor::from_vec(dummy_tokens, (1, 8), device) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("[warmup] failed to create prefill tensor: {e}");
+                return;
+            }
+        };
+
+        if let Err(e) = model.forward_with_cache(&input, 0, &mut caches) {
+            eprintln!("[warmup] prefill forward failed (non-fatal): {e}");
+        }
+
+        for cache in &mut caches {
+            cache.clear();
+        }
+    }
+
+    // --- Phase 2: decode-shaped forward (compile kernels for seq_len == 1) ---
+    {
+        let mut caches: Vec<PagedKvCache> = allocators
+            .iter()
+            .map(|a| PagedKvCache::new(std::rc::Rc::clone(a)))
+            .collect();
+
+        let input = match Tensor::from_vec(vec![1u32], (1, 1), device) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("[warmup] failed to create decode tensor: {e}");
+                return;
+            }
+        };
+
+        if let Err(e) = model.forward_with_cache(&input, 0, &mut caches) {
+            eprintln!("[warmup] decode forward failed (non-fatal): {e}");
+        }
+
+        for cache in &mut caches {
+            cache.clear();
+        }
+    }
+}
+
 fn spawn_load(
     model_id: String,
     model_path: PathBuf,
@@ -388,6 +451,11 @@ fn spawn_load(
             num_layers,
             weights_size_bytes as f64 / 1_073_741_824.0,
         );
+
+        println!("Warming up model '{}'...", model_id_thread);
+        let t_warmup = std::time::Instant::now();
+        warm_up_model(batch_model.as_ref());
+        println!("Model '{}' ready ({:.1}s warmup).", model_id_thread, t_warmup.elapsed().as_secs_f32());
 
         let (request_tx, request_rx) = tokio_mpsc::unbounded_channel();
 

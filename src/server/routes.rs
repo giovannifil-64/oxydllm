@@ -298,14 +298,21 @@ async fn chat_completions(
         ));
     }
 
+    let t_request = std::time::Instant::now();
+
     let get_result = {
         let mut mgr = state.manager.lock().await;
         let keep_alive_override = body.keep_alive.map(Duration::from_secs);
         mgr.get_or_load(&model_id, Arc::clone(&state.manager), keep_alive_override)
     };
 
+    let t_after_lock = t_request.elapsed();
+
     let handle = match get_result {
-        GetResult::Ready(h) => h,
+        GetResult::Ready(h) => {
+            eprintln!("[timing] {} manager lock+ready: {:.1}ms", model_id, t_after_lock.as_secs_f64() * 1000.0);
+            h
+        }
         GetResult::Wait(rx) => {
             let load_result = rx.await.map_err(|_| {
                 (
@@ -313,25 +320,37 @@ async fn chat_completions(
                     Json(serde_json::json!({"error": {"message": "Model loader dropped"}})),
                 )
             })?;
-            load_result.map_err(|e| {
+            let h = load_result.map_err(|e| {
                 let status = if e.contains("not found") {
                     StatusCode::NOT_FOUND
                 } else {
                     StatusCode::INTERNAL_SERVER_ERROR
                 };
                 (status, Json(serde_json::json!({"error": {"message": e}})))
-            })?
+            })?;
+            eprintln!("[timing] {} load completed: {:.1}ms", model_id, t_request.elapsed().as_secs_f64() * 1000.0);
+            h
         }
     };
 
+    let t_template = std::time::Instant::now();
     let prompt = apply_chat_template(&handle.tokenizer, &body.messages);
+    let template_ms = t_template.elapsed().as_secs_f64() * 1000.0;
+
+    let t_encode = std::time::Instant::now();
     let prompt_tokens = handle.tokenizer.encode(&prompt).map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": {"message": e.to_string()}})),
         )
     })?;
+    let encode_ms = t_encode.elapsed().as_secs_f64() * 1000.0;
     let prompt_len = prompt_tokens.len();
+
+    eprintln!(
+        "[timing] {} template: {:.1}ms, encode: {:.1}ms ({} tokens), total pre-engine: {:.1}ms",
+        model_id, template_ms, encode_ms, prompt_len, t_request.elapsed().as_secs_f64() * 1000.0
+    );
 
     let sampling_params = SamplingParams {
         temperature: body.temperature.unwrap_or(0.7),

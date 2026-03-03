@@ -69,8 +69,10 @@ impl Engine {
             let tokens = seq.all_tokens.clone();
             let seq_len = tokens.len();
 
+            let t_prefill = std::time::Instant::now();
             let input = Tensor::from_vec(tokens, (1, seq_len), &self.device)?;
             let logits = self.model.forward_with_cache(&input, 0, &mut seq.caches)?;
+            eprintln!("[timing] prefill forward: {:.1}ms ({} tokens)", t_prefill.elapsed().as_secs_f64() * 1000.0, seq_len);
             let last_logits = logits.squeeze(0)?.get(seq_len - 1)?;
 
             let next_token = sampling::sample(&last_logits, &seq.sampling_params, &seq.all_tokens)?;

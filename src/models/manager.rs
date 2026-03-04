@@ -346,7 +346,7 @@ fn warm_up_model(model: &dyn BatchModel) {
     {
         let mut caches: Vec<PagedKvCache> = allocators
             .iter()
-            .map(|a| PagedKvCache::new(std::rc::Rc::clone(a)))
+            .map(|a| PagedKvCache::new(std::sync::Arc::clone(a)))
             .collect();
 
         // Use 8 dummy tokens – close enough to a short chat-template prompt to
@@ -373,7 +373,7 @@ fn warm_up_model(model: &dyn BatchModel) {
     {
         let mut caches: Vec<PagedKvCache> = allocators
             .iter()
-            .map(|a| PagedKvCache::new(std::rc::Rc::clone(a)))
+            .map(|a| PagedKvCache::new(std::sync::Arc::clone(a)))
             .collect();
 
         let input = match Tensor::from_vec(vec![1u32], (1, 1), device) {

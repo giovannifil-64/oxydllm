@@ -28,7 +28,7 @@ impl Engine {
         config: SchedulerConfig,
         extra_stop_ids: &[u32],
     ) -> Self {
-        let allocators = model.allocators().iter().map(|a| std::rc::Rc::clone(a)).collect();
+        let allocators = model.allocators().iter().map(|a| std::sync::Arc::clone(a)).collect();
         let num_layers = model.num_layers();
         let device = model.device().clone();
         let mut stop_token_ids = model.stop_token_ids().to_vec();

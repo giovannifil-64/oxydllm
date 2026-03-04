@@ -1,5 +1,4 @@
-use std::cell::RefCell;
-use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 use candle_core::{DType, Device, Result, Tensor};
 
@@ -74,7 +73,7 @@ impl BlockAllocator {
 }
 
 
-pub type SharedBlockAllocator = Rc<RefCell<BlockAllocator>>;
+pub type SharedBlockAllocator = Arc<Mutex<BlockAllocator>>;
 
 pub struct BlockTable {
     pub block_ids: Vec<usize>,
@@ -121,7 +120,7 @@ impl PagedKvCache {
         let (_, _, new_seq, _) = new_k.dims4()?;
         let k_flat = new_k.squeeze(0)?.transpose(0, 1)?;
         let v_flat = new_v.squeeze(0)?.transpose(0, 1)?;
-        let block_size = self.allocator.borrow().block_size();
+        let block_size = self.allocator.lock().unwrap().block_size();
 
         let mut written = 0;
         
@@ -129,7 +128,7 @@ impl PagedKvCache {
             let current_offset = self.table.num_tokens % block_size;
 
             if current_offset == 0 {
-                let block_id = self.allocator.borrow_mut().allocate()?;
+                let block_id = self.allocator.lock().unwrap().allocate()?;
                 self.table.block_ids.push(block_id);
             }
 
@@ -140,7 +139,7 @@ impl PagedKvCache {
             let block_id = *self.table.block_ids.last().unwrap();
 
             self.allocator
-                .borrow()
+                .lock().unwrap()
                 .write(block_id, current_offset, &k_chunk, &v_chunk)?;
 
             self.table.num_tokens += n;
@@ -150,12 +149,12 @@ impl PagedKvCache {
         let slots = self.table.slot_indices(block_size);
         let idx = Tensor::from_vec(slots, (self.table.num_tokens,), new_k.device())?;
 
-        self.allocator.borrow().gather(&idx)
+        self.allocator.lock().unwrap().gather(&idx)
     }
 
     pub fn clear(&mut self) {
         for &bid in &self.table.block_ids {
-            self.allocator.borrow_mut().free(bid);
+            self.allocator.lock().unwrap().free(bid);
         }
         self.table.block_ids.clear();
         self.table.num_tokens = 0;
@@ -168,7 +167,7 @@ mod tests {
     use candle_core::{DType, Device};
 
     fn make_allocator(num_blocks: usize, block_size: usize) -> SharedBlockAllocator {
-        Rc::new(RefCell::new(
+        Arc::new(Mutex::new(
             BlockAllocator::new(num_blocks, block_size, 2, 4, DType::F32, &Device::Cpu)
                 .unwrap(),
         ))
@@ -177,25 +176,25 @@ mod tests {
     #[test]
     fn allocator_alloc_free() {
         let alloc = make_allocator(4, 2);
-        assert_eq!(alloc.borrow().num_free(), 4);
+        assert_eq!(alloc.lock().unwrap().num_free(), 4);
 
-        let b0 = alloc.borrow_mut().allocate().unwrap();
-        let b1 = alloc.borrow_mut().allocate().unwrap();
-        let b2 = alloc.borrow_mut().allocate().unwrap();
-        let b3 = alloc.borrow_mut().allocate().unwrap();
-        assert_eq!(alloc.borrow().num_free(), 0);
-        assert!(alloc.borrow_mut().allocate().is_err());
+        let b0 = alloc.lock().unwrap().allocate().unwrap();
+        let b1 = alloc.lock().unwrap().allocate().unwrap();
+        let b2 = alloc.lock().unwrap().allocate().unwrap();
+        let b3 = alloc.lock().unwrap().allocate().unwrap();
+        assert_eq!(alloc.lock().unwrap().num_free(), 0);
+        assert!(alloc.lock().unwrap().allocate().is_err());
 
-        alloc.borrow_mut().free(b1);
-        assert_eq!(alloc.borrow().num_free(), 1);
-        let b1_again = alloc.borrow_mut().allocate().unwrap();
+        alloc.lock().unwrap().free(b1);
+        assert_eq!(alloc.lock().unwrap().num_free(), 1);
+        let b1_again = alloc.lock().unwrap().allocate().unwrap();
         assert_eq!(b1_again, b1);
 
-        alloc.borrow_mut().free(b0);
-        alloc.borrow_mut().free(b1_again);
-        alloc.borrow_mut().free(b2);
-        alloc.borrow_mut().free(b3);
-        assert_eq!(alloc.borrow().num_free(), 4);
+        alloc.lock().unwrap().free(b0);
+        alloc.lock().unwrap().free(b1_again);
+        alloc.lock().unwrap().free(b2);
+        alloc.lock().unwrap().free(b3);
+        assert_eq!(alloc.lock().unwrap().num_free(), 4);
     }
 
     #[test]
@@ -241,17 +240,17 @@ mod tests {
     #[test]
     fn clear_returns_blocks() {
         let alloc = make_allocator(4, 2);
-        let mut cache = PagedKvCache::new(Rc::clone(&alloc));
+        let mut cache = PagedKvCache::new(Arc::clone(&alloc));
         let dev = Device::Cpu;
 
         // Fill 4 tokens → 2 blocks
         let k = Tensor::zeros((1, 2, 4, 4), DType::F32, &dev).unwrap();
         let v = Tensor::zeros((1, 2, 4, 4), DType::F32, &dev).unwrap();
         cache.append(&k, &v).unwrap();
-        assert_eq!(alloc.borrow().num_free(), 2); // 4 total - 2 used
+        assert_eq!(alloc.lock().unwrap().num_free(), 2); // 4 total - 2 used
 
         cache.clear();
-        assert_eq!(alloc.borrow().num_free(), 4); // all returned
+        assert_eq!(alloc.lock().unwrap().num_free(), 4); // all returned
     }
 
     #[test]

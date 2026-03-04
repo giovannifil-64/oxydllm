@@ -1,7 +1,7 @@
 pub mod sequence;
 
 use std::collections::VecDeque;
-use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::common::paged::{PagedKvCache, SharedBlockAllocator, DEFAULT_BLOCK_SIZE};
 use crate::sampling::SamplingParams;
@@ -44,7 +44,7 @@ impl Scheduler {
         let block_size = if allocators.is_empty() {
             DEFAULT_BLOCK_SIZE
         } else {
-            allocators[0].borrow().block_size()
+            allocators[0].lock().unwrap().block_size()
         };
         Self {
             config,
@@ -67,7 +67,7 @@ impl Scheduler {
         self.next_id += 1;
 
         let caches = (0..self.num_layers)
-            .map(|i| PagedKvCache::new(Rc::clone(&self.allocators[i])))
+            .map(|i| PagedKvCache::new(Arc::clone(&self.allocators[i])))
             .collect();
 
         let all_tokens = prompt_tokens.clone();
@@ -92,7 +92,7 @@ impl Scheduler {
         if self.allocators.is_empty() {
             return 0;
         }
-        self.allocators[0].borrow().num_free()
+        self.allocators[0].lock().unwrap().num_free()
     }
 
     fn blocks_needed_for_prefill(&self, seq: &SequenceState) -> usize {
@@ -221,12 +221,12 @@ mod tests {
     use super::*;
     use crate::common::paged::BlockAllocator;
     use candle_core::{DType, Device};
-    use std::cell::RefCell;
+    use std::sync::Mutex;
 
     fn make_allocators(num_layers: usize, num_blocks: usize) -> Vec<SharedBlockAllocator> {
         (0..num_layers)
             .map(|_| {
-                Rc::new(RefCell::new(
+                Arc::new(Mutex::new(
                     BlockAllocator::new(num_blocks, DEFAULT_BLOCK_SIZE, 2, 4, DType::F32, &Device::Cpu)
                         .unwrap(),
                 ))
@@ -324,7 +324,7 @@ mod tests {
         };
         let mut sched = Scheduler::new(config, allocators.clone(), 2);
 
-        let initial_free = allocators[0].borrow().num_free();
+        let initial_free = allocators[0].lock().unwrap().num_free();
 
         let id0 = sched.add_request(vec![1, 2, 3], SamplingParams::default(), 10);
         sched.schedule();
@@ -333,7 +333,7 @@ mod tests {
         sched.get_running_mut(id0).unwrap().status = SequenceStatus::Finished;
         sched.retire_finished();
 
-        let final_free = allocators[0].borrow().num_free();
+        let final_free = allocators[0].lock().unwrap().num_free();
         assert_eq!(final_free, initial_free);
     }
 }

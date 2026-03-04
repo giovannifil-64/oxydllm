@@ -1,6 +1,5 @@
 use candle_core::{DType, Device, Result, Tensor};
-use std::cell::RefCell;
-use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 use crate::models::traits::BatchModel;
 use crate::common::{
     attention::SegmentInfo,
@@ -81,7 +80,7 @@ impl Llama {
             * ((cfg.max_position_embeddings + DEFAULT_BLOCK_SIZE - 1) / DEFAULT_BLOCK_SIZE);
         let mut allocators = Vec::with_capacity(cfg.num_hidden_layers);
         for _ in 0..cfg.num_hidden_layers {
-            let allocator = Rc::new(RefCell::new(BlockAllocator::new(
+            let allocator = Arc::new(Mutex::new(BlockAllocator::new(
                 num_blocks,
                 DEFAULT_BLOCK_SIZE,
                 cfg.num_key_value_heads,

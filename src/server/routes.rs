@@ -142,7 +142,7 @@ struct SeqTracker {
     tx: tokio_mpsc::UnboundedSender<EngineEvent>,
     model_id: String,
     enqueued_at: std::time::Instant,
-    first_token_sent: bool,
+    first_token_at: Option<std::time::Instant>,
     token_count: usize,
 }
 
@@ -165,7 +165,7 @@ pub fn engine_loop(
                     tx: req.response_tx,
                     model_id,
                     enqueued_at,
-                    first_token_sent: false,
+                    first_token_at: None,
                     token_count: 0,
                 });
             }
@@ -181,7 +181,7 @@ pub fn engine_loop(
                         tx: req.response_tx,
                         model_id,
                         enqueued_at,
-                        first_token_sent: false,
+                        first_token_at: None,
                         token_count: 0,
                     });
                 }
@@ -202,10 +202,10 @@ pub fn engine_loop(
                 Ok(step) => {
                     for tok in &step.new_tokens {
                         if let Some(tracker) = trackers.get_mut(&tok.seq_id) {
-                            if !tracker.first_token_sent {
+                            if tracker.first_token_at.is_none() {
                                 let ttft_ms = tracker.enqueued_at.elapsed().as_secs_f64() * 1000.0;
                                 eprintln!("[timing] {} seq={} TTFT: {:.1}ms", tracker.model_id, tok.seq_id, ttft_ms);
-                                tracker.first_token_sent = true;
+                                tracker.first_token_at = Some(std::time::Instant::now());
                             }
                             tracker.token_count += 1;
                             let text = tokenizer.decode(&[tok.token]).unwrap_or_default();
@@ -214,12 +214,18 @@ pub fn engine_loop(
                     }
                     for completed in &step.completed {
                         if let Some(tracker) = trackers.remove(&completed.id) {
-                            let elapsed_s = tracker.enqueued_at.elapsed().as_secs_f64();
-                            let tps = tracker.token_count as f64 / elapsed_s.max(0.001);
+                            let total_ms = tracker.enqueued_at.elapsed().as_secs_f64() * 1000.0;
+                            let decode_s = tracker.first_token_at
+                                .map(|t| t.elapsed().as_secs_f64())
+                                .unwrap_or(0.001);
+                            let tps = tracker.token_count as f64 / decode_s.max(0.001);
                             eprintln!(
-                                "[timing] {} seq={} done: {} tokens in {:.1}ms ({:.1} tok/s)",
+                                "[timing] {} seq={} done: {} tokens, total={:.1}ms, decode={:.1}ms ({:.1} tok/s)",
                                 tracker.model_id, completed.id,
-                                tracker.token_count, elapsed_s * 1000.0, tps
+                                tracker.token_count,
+                                total_ms,
+                                decode_s * 1000.0,
+                                tps,
                             );
                             let _ = tracker.tx.send(EngineEvent::Finish {
                                 finish_reason: "stop".to_string(),

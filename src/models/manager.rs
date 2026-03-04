@@ -101,6 +101,10 @@ fn now_unix_secs() -> u64 {
         .as_secs()
 }
 
+/// Returns the best available size estimate for `model_id` before it is loaded.
+/// Priority:
+///   1. Registry entry — real in-memory footprint from a previous load (accurate).
+///   2. Disk safetensors size — corrected by dtype: ×2 on CPU (F32), ×1 on GPU (BF16).
 pub fn estimate_model_size(model_dir: &Path) -> usize {
     std::fs::read_dir(model_dir)
         .into_iter()
@@ -183,6 +187,33 @@ impl ModelManager {
         &self.registry
     }
 
+    /// Returns the best pre-load size estimate for eviction decisions.
+    /// Uses real measured registry data when available; falls back to a
+    /// corrected disk estimate otherwise.
+    fn projected_size_bytes(&self, model_id: &str, model_path: &Path) -> usize {
+        // Case 1: previously loaded — use the real in-memory footprint.
+        if let Some(entry) = self.registry.get(model_id) {
+            if entry.size_bytes > 0 {
+                return entry.size_bytes;
+            }
+        }
+
+        // Case 2: first-ever load — estimate from disk.
+        // On GPU we load BF16 (≈ same size as on-disk BF16 safetensors).
+        // On CPU we load F32 (2× larger than BF16 on-disk files).
+        let disk_bytes = estimate_model_size(model_path);
+        let is_cpu = self.cuda_devices.is_empty();
+        let corrected = if is_cpu { disk_bytes * 2 } else { disk_bytes };
+
+        println!(
+            "[memory] '{}' not in registry — disk estimate: {:.2} GB{}",
+            model_id,
+            corrected as f64 / 1_073_741_824.0,
+            if is_cpu { " (×2 for F32/CPU)" } else { " (BF16/GPU)" },
+        );
+        corrected
+    }
+
     pub fn evict_lru_for_bytes(&mut self, needed_bytes: usize) -> usize {
         let budget = match self.memory_budget_bytes {
             Some(b) => b,
@@ -205,7 +236,20 @@ impl ModelManager {
                 .map(|(id, _)| id);
             match lru_id {
                 Some(id) => {
-                    println!("[memory pressure] Evicting LRU model '{}'", id);
+                    let freed = self.slots.get(&id)
+                        .and_then(|s| match s {
+                            SlotState::Ready { weights_size_bytes, .. } => Some(*weights_size_bytes),
+                            _ => None,
+                        })
+                        .unwrap_or(0);
+                    println!(
+                        "[memory pressure] Evicting LRU model '{}' ({:.2} GB) — need {:.2} GB, budget {:.2} GB, used {:.2} GB",
+                        id,
+                        freed as f64 / 1_073_741_824.0,
+                        needed_bytes as f64 / 1_073_741_824.0,
+                        budget as f64 / 1_073_741_824.0,
+                        used as f64 / 1_073_741_824.0,
+                    );
                     self.slots.remove(&id);
                     evicted += 1;
                 }
@@ -256,8 +300,8 @@ impl ModelManager {
             }
         }
 
-        let estimated_size = estimate_model_size(&model_path);
-        self.evict_lru_for_bytes(estimated_size);
+        let needed_bytes = self.projected_size_bytes(model_id, &model_path);
+        self.evict_lru_for_bytes(needed_bytes);
 
         let effective_keep_alive = keep_alive_override.unwrap_or(self.keep_alive);
 
@@ -427,7 +471,7 @@ fn spawn_load(
         };
 
         println!("\nLoading model '{}'...", model_id_thread);
-        let batch_model = match loader::load_batch_model(&model_dir, &device, 2) {
+        let (batch_model, weights_size_bytes) = match loader::load_batch_model(&model_dir, &device, 2) {
             Ok(m) => m,
             Err(e) => {
                 let _ = result_tx.send(Err(format!("Failed to load model: {e}")));
@@ -446,15 +490,17 @@ fn spawn_load(
             .and_then(|v| v["architectures"][0].as_str().map(|s| s.to_string()))
             .unwrap_or_else(|| "Unknown".to_string());
 
-        let weights_size_bytes = estimate_model_size(&model_path_thread);
-
+        // weights_size_bytes is the real in-memory footprint (post dtype-conversion).
+        // On GPU: BF16 = 2 bytes/param → roughly half the on-disk F32 safetensors size.
+        // On CPU: F32 = 4 bytes/param → matches or slightly exceeds on-disk size.
         println!(
-            "Model '{}' loaded. vocab_size={}, max_seq_len={}, num_layers={}, size={:.2} GB",
+            "Model '{}' loaded. vocab_size={}, max_seq_len={}, num_layers={}, size={:.2} GB (in-memory, {})",
             model_id_thread,
             vocab_size,
             max_seq_len,
             num_layers,
             weights_size_bytes as f64 / 1_073_741_824.0,
+            if matches!(device, candle_core::Device::Cpu) { "F32/CPU" } else { "BF16/GPU" },
         );
 
         println!("Warming up model '{}'...", model_id_thread);

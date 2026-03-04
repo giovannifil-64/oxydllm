@@ -324,12 +324,13 @@ fn run_interactive(args: &RunArgs) -> anyhow::Result<()> {
     println!("Tokenizer loaded.");
 
     println!("Loading model from '{}'...", args.model_dir);
-    let batch_model = models::loader::load_batch_model(&args.model_dir, &device, 1)?;
+    let (batch_model, weights_size_bytes) = models::loader::load_batch_model(&args.model_dir, &device, 1)?;
     let max_seq_len = batch_model.max_seq_len();
     println!(
-        "Model loaded. vocab_size={}, max_seq_len={}",
+        "Model loaded. vocab_size={}, max_seq_len={}, size={:.2} GB (in-memory)",
         batch_model.vocab_size(),
-        max_seq_len
+        max_seq_len,
+        weights_size_bytes as f64 / 1_073_741_824.0,
     );
 
     let config = scheduler::SchedulerConfig {

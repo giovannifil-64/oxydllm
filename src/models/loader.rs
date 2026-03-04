@@ -111,11 +111,14 @@ pub fn select_device_at(_cuda_idx: usize) -> anyhow::Result<Device> {
     Ok(Device::Cpu)
 }
 
+/// Loads a model and returns both the model and its **real** in-memory footprint.
+/// The footprint is computed from the tensors after dtype conversion (BF16 on GPU,
+/// F32 on CPU), which is more accurate than reading raw file sizes from disk.
 pub fn load_batch_model(
     model_dir: &str,
     device: &Device,
     kv_block_multiplier: usize,
-) -> anyhow::Result<Box<dyn BatchModel>> {
+) -> anyhow::Result<(Box<dyn BatchModel>, usize)> {
     let raw = std::fs::read_to_string(format!("{}/config.json", model_dir))?;
     let value: serde_json::Value = serde_json::from_str(&raw)?;
     let arch = value["architectures"][0].as_str().unwrap_or("Unknown");
@@ -132,14 +135,16 @@ pub fn load_batch_model(
             let weight_paths = resolve_weight_paths(model_dir)?;
             let weight_path_refs: Vec<&str> = weight_paths.iter().map(|s| s.as_str()).collect();
             let weights = ModelWeights::load(&weight_path_refs, device, dtype)?;
-            Ok(Box::new(Qwen3::load(cfg, &weights, device, dtype, kv_block_multiplier)?))
+            let weights_size = weights.total_size_bytes();
+            Ok((Box::new(Qwen3::load(cfg, &weights, device, dtype, kv_block_multiplier)?), weights_size))
         }
         "LlamaForCausalLM" => {
             let cfg = LlamaConfig::from_file(&format!("{}/config.json", model_dir))?;
             let weight_paths = resolve_weight_paths(model_dir)?;
             let weight_path_refs: Vec<&str> = weight_paths.iter().map(|s| s.as_str()).collect();
             let weights = ModelWeights::load(&weight_path_refs, device, dtype)?;
-            Ok(Box::new(Llama::load(cfg, &weights, device, dtype, kv_block_multiplier)?))
+            let weights_size = weights.total_size_bytes();
+            Ok((Box::new(Llama::load(cfg, &weights, device, dtype, kv_block_multiplier)?), weights_size))
         }
         other => anyhow::bail!("Architecture not supported: {}", other),
     }

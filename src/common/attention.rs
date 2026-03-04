@@ -1,10 +1,27 @@
 use candle_core::{Result, Tensor, D};
+use std::cell::Cell;
 use super::config::BlockConfig;
 use super::paged::PagedKvCache;
 use super::linear::{softmax_last_dim, Linear};
 use super::norm::RMSNorm;
 use super::rope::RotaryEmbedding;
 use super::weights::ModelWeights;
+
+thread_local! {
+    static SDPA_FALLBACK_LOGGED: Cell<bool> = const { Cell::new(false) };
+}
+
+fn log_sdpa_fallback_once(head_dim: usize, dtype: candle_core::DType) {
+    SDPA_FALLBACK_LOGGED.with(|logged| {
+        if !logged.get() {
+            eprintln!(
+                "[attention] Metal SDPA unavailable (head_dim={}, dtype={:?}) — using standard attention",
+                head_dim, dtype
+            );
+            logged.set(true);
+        }
+    });
+}
 
 pub struct SegmentInfo<'a> {
     pub num_tokens: usize,
@@ -162,6 +179,8 @@ impl Attention {
                     .transpose(1, 2)?
                     .reshape((b, seq, self.n_heads * hd))?;
                 return self.o_proj.forward(&out);
+            } else {
+                log_sdpa_fallback_once(self.head_dim, q.dtype());
             }
         }
 
@@ -291,6 +310,11 @@ impl Attention {
         #[cfg(not(feature = "metal"))]
         let use_sdpa = false;
 
+        #[cfg(feature = "metal")]
+        if !use_sdpa {
+            log_sdpa_fallback_once(self.head_dim, q.dtype());
+        }
+
         if use_sdpa {
             #[cfg(feature = "metal")]
             for (i, seg) in segments.iter().enumerate() {
@@ -336,7 +360,7 @@ impl Attention {
                     let seg_mask = m.narrow(2, q_offset, seg.num_tokens)?.narrow(3, 0, kv_len)?;
                     scores.broadcast_add(&seg_mask.to_dtype(scores.dtype())?)?
                 } else if seg.num_tokens > 1 {
-                    let cm = super::mask::causal_mask(seg.num_tokens, device)?;
+                    let cm = super::mask::causal_mask_cached(seg.num_tokens, device)?;
                     if kv_len > seg.num_tokens {
                         let visible = Tensor::zeros(
                             (1, 1, seg.num_tokens, kv_len - seg.num_tokens),

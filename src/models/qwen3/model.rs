@@ -6,7 +6,7 @@ use crate::common::{
     block::TransformerBlock,
     config::BlockConfig,
     linear::{Embedding, Linear},
-    mask::causal_mask,
+    mask::causal_mask_cached,
     norm::RMSNorm,
     paged::{BlockAllocator, PagedKvCache, SharedBlockAllocator, DEFAULT_BLOCK_SIZE},
     rope::RotaryEmbedding,
@@ -94,7 +94,7 @@ impl Qwen3 {
         let mut x = self.embed_tokens.forward(tokens)?;
 
         let mask = if seq > 1 {
-            Some(causal_mask(seq, tokens.device())?)
+            Some(causal_mask_cached(seq, tokens.device())?)
         } else {
             None
         };

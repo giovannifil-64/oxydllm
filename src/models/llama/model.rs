@@ -6,7 +6,6 @@ use crate::common::{
     attention::SegmentInfo,
     block::TransformerBlock,
     config::BlockConfig,
-    ffn::Activation,
     linear::{Embedding, Linear},
     mask::causal_mask,
     norm::RMSNorm,
@@ -62,7 +61,7 @@ impl Llama {
             head_dim,
             rms_norm_eps: cfg.rms_norm_eps,
             qk_norm: false,
-            activation: Activation::Silu,
+            attention_scale: None,
         };
 
         let blocks = (0..cfg.num_hidden_layers)

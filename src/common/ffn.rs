@@ -1,12 +1,6 @@
 use candle_core::{Result, Tensor, D};
-use super::config::BlockConfig;
 use super::linear::{silu, Linear};
 use super::weights::ModelWeights;
-
-#[derive(Clone, Copy)]
-pub enum Activation {
-    Silu,
-}
 
 pub struct FeedForward {
     gate_proj: Linear,
@@ -14,11 +8,10 @@ pub struct FeedForward {
     down_proj: Linear,
     gate_up_proj: Option<Linear>,
     intermediate_size: usize,
-    activation: Activation,
 }
 
 impl FeedForward {
-    pub fn load(cfg: &BlockConfig, layer_idx: usize, weights: &ModelWeights) -> Result<Self> {
+    pub fn load(layer_idx: usize, weights: &ModelWeights) -> Result<Self> {
         let p = format!("model.layers.{}.mlp", layer_idx);
         let gate_proj = Linear::new(weights.get(&format!("{}.gate_proj.weight", p))?.clone(), None);
         let up_proj   = Linear::new(weights.get(&format!("{}.up_proj.weight",   p))?.clone(), None);
@@ -27,7 +20,7 @@ impl FeedForward {
         let gate_up_w = Tensor::cat(&[gate_proj.weight(), up_proj.weight()], 0)?;
         let gate_up_proj = Some(Linear::new(gate_up_w, None));
 
-        Ok(Self { gate_proj, up_proj, down_proj, gate_up_proj, intermediate_size, activation: cfg.activation })
+        Ok(Self { gate_proj, up_proj, down_proj, gate_up_proj, intermediate_size })
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
@@ -35,15 +28,11 @@ impl FeedForward {
             let out = gu.forward(x)?; // [..., 2*intermediate_size]
             let gate = out.narrow(D::Minus1, 0, self.intermediate_size)?;
             let up   = out.narrow(D::Minus1, self.intermediate_size, self.intermediate_size)?;
-            let gate = match self.activation {
-                Activation::Silu => silu(&gate)?,
-            };
+            let gate = silu(&gate)?;
             return self.down_proj.forward(&(gate * up)?);
         }
         let gate = self.gate_proj.forward(x)?;
-        let gate = match self.activation {
-            Activation::Silu => silu(&gate)?,
-        };
+        let gate = silu(&gate)?;
         let up = self.up_proj.forward(x)?;
         self.down_proj.forward(&(gate * up)?)
     }

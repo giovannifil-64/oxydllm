@@ -22,7 +22,7 @@ impl TransformerBlock {
         let input_norm = RMSNorm::load(weights, &format!("{}.input_layernorm", p), cfg.rms_norm_eps)?;
         let post_attn_norm = RMSNorm::load(weights, &format!("{}.post_attention_layernorm", p), cfg.rms_norm_eps)?;
         let attention = Attention::load(cfg, layer_idx, weights)?;
-        let ffn = FeedForward::load(cfg, layer_idx, weights)?;
+        let ffn = FeedForward::load(layer_idx, weights)?;
         Ok(Self { input_norm, attention, post_attn_norm, ffn })
     }
 

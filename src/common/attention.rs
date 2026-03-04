@@ -69,7 +69,7 @@ impl Attention {
             head_dim: hd,
             q_dim,
             kv_dim,
-            scale: 1.0 / (hd as f64).sqrt(),
+            scale: cfg.attention_scale.unwrap_or(1.0 / (hd as f64).sqrt()),
         })
     }
 
@@ -104,6 +104,16 @@ impl Attention {
         mask: Option<&Tensor>,
         cache: &mut PagedKvCache,
     ) -> Result<Tensor> {
+        self.forward_optional_rope(x, Some((rope, start_pos)), mask, cache)
+    }
+
+    pub fn forward_optional_rope(
+        &self,
+        x: &Tensor,
+        rope: Option<(&RotaryEmbedding, usize)>,
+        mask: Option<&Tensor>,
+        cache: &mut PagedKvCache,
+    ) -> Result<Tensor> {
         let (b, seq, _) = x.dims3()?;
         let hd = self.head_dim;
 
@@ -121,8 +131,11 @@ impl Attention {
             None => k,
         };
 
-        let q = rope.apply(&q, start_pos)?;
-        let k = rope.apply(&k, start_pos)?;
+        let (q, k) = if let Some((r, start_pos)) = rope {
+            (r.apply(&q, start_pos)?, r.apply(&k, start_pos)?)
+        } else {
+            (q, k)
+        };
 
         let (k, v) = cache.append(&k, &v)?;
 
@@ -197,6 +210,16 @@ impl Attention {
         mask: Option<&Tensor>,
         segments: &mut [SegmentInfo],
     ) -> Result<Tensor> {
+        self.forward_batch_optional_rope(x, Some((rope, position_ids)), mask, segments)
+    }
+
+    pub fn forward_batch_optional_rope(
+        &self,
+        x: &Tensor,
+        rope: Option<(&RotaryEmbedding, &Tensor)>,
+        mask: Option<&Tensor>,
+        segments: &mut [SegmentInfo],
+    ) -> Result<Tensor> {
         let (b, total_seq, _) = x.dims3()?;
         let hd = self.head_dim;
 
@@ -214,8 +237,11 @@ impl Attention {
             None => k,
         };
 
-        let q = rope.apply_with_positions(&q, position_ids)?;
-        let k = rope.apply_with_positions(&k, position_ids)?;
+        let (q, k) = if let Some((r, position_ids)) = rope {
+            (r.apply_with_positions(&q, position_ids)?, r.apply_with_positions(&k, position_ids)?)
+        } else {
+            (q, k)
+        };
 
         let mut k_parts: Vec<Tensor> = Vec::with_capacity(segments.len());
         let mut v_parts: Vec<Tensor> = Vec::with_capacity(segments.len());

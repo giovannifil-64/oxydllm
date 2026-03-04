@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use std::time::{Duration, Instant};
 
 use candle_core::Tensor;
@@ -36,6 +36,7 @@ enum SlotState {
         last_used: Instant,
         effective_keep_alive: Duration,
         weights_size_bytes: usize,
+        shutdown: Arc<AtomicBool>,
     },
 }
 
@@ -236,12 +237,12 @@ impl ModelManager {
                 .map(|(id, _)| id);
             match lru_id {
                 Some(id) => {
-                    let freed = self.slots.get(&id)
-                        .and_then(|s| match s {
-                            SlotState::Ready { weights_size_bytes, .. } => Some(*weights_size_bytes),
-                            _ => None,
-                        })
-                        .unwrap_or(0);
+                    let (freed, shutdown) = match self.slots.get(&id) {
+                        Some(SlotState::Ready { weights_size_bytes, shutdown, .. }) => {
+                            (*weights_size_bytes, Some(Arc::clone(shutdown)))
+                        }
+                        _ => (0, None),
+                    };
                     println!(
                         "[memory pressure] Evicting LRU model '{}' ({:.2} GB) — need {:.2} GB, budget {:.2} GB, used {:.2} GB",
                         id,
@@ -251,6 +252,9 @@ impl ModelManager {
                         used as f64 / 1_073_741_824.0,
                     );
                     self.slots.remove(&id);
+                    if let Some(s) = shutdown {
+                        s.store(true, Ordering::Release);
+                    }
                     evicted += 1;
                 }
                 None => break,
@@ -340,8 +344,15 @@ impl ModelManager {
             .collect();
 
         for id in &expired {
+            let shutdown = match self.slots.get(id) {
+                Some(SlotState::Ready { shutdown, .. }) => Some(Arc::clone(shutdown)),
+                _ => None,
+            };
             println!("Evicting idle model '{}' (keep-alive expired)", id);
             self.slots.remove(id);
+            if let Some(s) = shutdown {
+                s.store(true, Ordering::Release);
+            }
         }
     }
 
@@ -371,6 +382,7 @@ struct LoadResult {
     vocab_size: usize,
     num_layers: usize,
     weights_size_bytes: usize,
+    shutdown: Arc<AtomicBool>,
 }
 
 /// Runs dummy forward passes to force the device (Metal/CUDA) to JIT-compile
@@ -509,6 +521,7 @@ fn spawn_load(
         println!("Model '{}' ready ({:.1}s warmup).", model_id_thread, t_warmup.elapsed().as_secs_f32());
 
         let (request_tx, request_rx) = tokio_mpsc::unbounded_channel();
+        let shutdown = Arc::new(AtomicBool::new(false));
 
         let result = LoadResult {
             request_tx,
@@ -518,6 +531,7 @@ fn spawn_load(
             vocab_size,
             num_layers,
             weights_size_bytes,
+            shutdown: Arc::clone(&shutdown),
         };
         let _ = result_tx.send(Ok(result));
 
@@ -527,7 +541,7 @@ fn spawn_load(
         };
         let extra_stop_ids = tokenizer.stop_token_ids();
         let engine = Engine::new_with_stop_tokens(batch_model, config, &extra_stop_ids);
-        engine_loop(engine, tokenizer, request_rx);
+        engine_loop(engine, tokenizer, request_rx, shutdown);
     });
 
     tokio::spawn(async move {
@@ -566,6 +580,7 @@ fn spawn_load(
                         last_used: Instant::now(),
                         effective_keep_alive,
                         weights_size_bytes: result.weights_size_bytes,
+                        shutdown: result.shutdown,
                     },
                 );
                 drop(mgr);

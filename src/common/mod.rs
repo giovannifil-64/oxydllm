@@ -8,5 +8,6 @@ pub mod mask;
 pub mod metal_ops;
 pub mod norm;
 pub mod paged;
+pub mod prefix_cache;
 pub mod rope;
 pub mod weights;

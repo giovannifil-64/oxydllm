@@ -8,6 +8,7 @@ pub struct BlockAllocator {
     pool_k: Tensor,
     pool_v: Tensor,
     free_list: Vec<usize>,
+    ref_counts: Vec<u32>,
     num_blocks: usize,
     block_size: usize,
 }
@@ -25,21 +26,34 @@ impl BlockAllocator {
         let pool_k = Tensor::zeros((total_slots, n_kv_heads, head_dim), dtype, device)?;
         let pool_v = Tensor::zeros((total_slots, n_kv_heads, head_dim), dtype, device)?;
         let free_list = (0..num_blocks).rev().collect();
-        Ok(Self { pool_k, pool_v, free_list, num_blocks, block_size })
+        let ref_counts = vec![0u32; num_blocks];
+        Ok(Self { pool_k, pool_v, free_list, ref_counts, num_blocks, block_size })
     }
 
     pub fn allocate(&mut self) -> Result<usize> {
-        self.free_list.pop().ok_or_else(|| {
+        let id = self.free_list.pop().ok_or_else(|| {
             candle_core::Error::Msg(format!(
                 "KV cache memory exhausted: all {} blocks allocated",
                 self.num_blocks,
             ))
-        })
+        })?;
+        self.ref_counts[id] = 1;
+        Ok(id)
+    }
+
+    pub fn share(&mut self, block_id: usize) {
+        debug_assert!(block_id < self.num_blocks, "invalid block_id {block_id}");
+        debug_assert!(self.ref_counts[block_id] > 0, "share on un-allocated block {block_id}");
+        self.ref_counts[block_id] += 1;
     }
 
     pub fn free(&mut self, block_id: usize) {
         debug_assert!(block_id < self.num_blocks, "invalid block_id {block_id}");
-        self.free_list.push(block_id);
+        debug_assert!(self.ref_counts[block_id] > 0, "double-free of block {block_id}");
+        self.ref_counts[block_id] -= 1;
+        if self.ref_counts[block_id] == 0 {
+            self.free_list.push(block_id);
+        }
     }
 
     pub fn num_free(&self) -> usize {
@@ -158,6 +172,24 @@ impl PagedKvCache {
         }
         self.table.block_ids.clear();
         self.table.num_tokens = 0;
+    }
+
+    pub fn prepopulate_block(&mut self, block_id: usize) {
+        self.allocator.lock().unwrap().share(block_id);
+        self.table.block_ids.push(block_id);
+    }
+
+    pub fn set_num_tokens(&mut self, n: usize) {
+        self.table.num_tokens = n;
+    }
+
+    #[allow(dead_code)]
+    pub fn num_tokens(&self) -> usize {
+        self.table.num_tokens
+    }
+
+    pub fn block_id_at(&self, idx: usize) -> Option<usize> {
+        self.table.block_ids.get(idx).copied()
     }
 }
 

@@ -126,6 +126,10 @@ impl Scheduler {
 
         for &idx in to_preempt.iter().rev() {
             let mut seq = self.running.remove(idx);
+            eprintln!(
+                "[scheduler] seq={} preempted (memory pressure) — KV cache cleared, re-queued for prefill",
+                seq.id
+            );
             for cache in &mut seq.caches {
                 cache.clear();
             }

@@ -150,10 +150,15 @@ pub fn engine_loop(
     mut engine: Engine,
     tokenizer: Arc<Tokenizer>,
     mut request_rx: tokio_mpsc::UnboundedReceiver<IncomingRequest>,
+    shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) {
     let mut trackers: HashMap<SequenceId, SeqTracker> = HashMap::new();
 
     loop {
+        if shutdown.load(std::sync::atomic::Ordering::Acquire) {
+            break;
+        }
+
         if engine.has_pending_work() {
             while let Ok(req) = request_rx.try_recv() {
                 let model_id = req.model_id.clone();

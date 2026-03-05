@@ -593,7 +593,7 @@ fn spawn_load(
                 );
 
                 mgr.slots.insert(
-                    model_id,
+                    model_id.clone(),
                     SlotState::Ready {
                         request_tx: result.request_tx,
                         tokenizer: result.tokenizer,
@@ -608,6 +608,44 @@ fn spawn_load(
                         shutdown: result.shutdown,
                     },
                 );
+
+                if let Some(budget) = mgr.memory_budget_bytes {
+                    let total = mgr.total_loaded_bytes();
+                    if total > budget {
+                        let model_bytes = result.weights_size_bytes + result.kv_cache_bytes;
+                        println!(
+                            "[memory] Post-load budget exceeded: {:.2} GB used / {:.2} GB budget \
+                             — unloading '{}' ({:.2} GB)",
+                            total as f64 / 1_073_741_824.0,
+                            budget as f64 / 1_073_741_824.0,
+                            model_id,
+                            model_bytes as f64 / 1_073_741_824.0,
+                        );
+                        let shutdown = match mgr.slots.get(&model_id) {
+                            Some(SlotState::Ready { shutdown, .. }) => Some(Arc::clone(shutdown)),
+                            _ => None,
+                        };
+                        mgr.slots.remove(&model_id);
+                        drop(mgr);
+                        if let Some(s) = shutdown {
+                            s.store(true, Ordering::Release);
+                        }
+                        let err = format!(
+                            "model '{}' ({:.2} GB) exceeds memory budget ({:.2} GB) — \
+                             use --memory-budget to increase the limit or --max-context-len \
+                             to reduce KV cache size",
+                            model_id,
+                            model_bytes as f64 / 1_073_741_824.0,
+                            budget as f64 / 1_073_741_824.0,
+                        );
+                        eprintln!("{}", err);
+                        for waiter in waiters {
+                            let _ = waiter.send(Err(err.clone()));
+                        }
+                        return;
+                    }
+                }
+
                 drop(mgr);
 
                 for waiter in waiters {

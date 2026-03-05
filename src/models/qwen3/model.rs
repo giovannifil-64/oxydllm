@@ -29,7 +29,7 @@ pub struct Qwen3 {
 }
 
 impl Qwen3 {
-    pub fn load(cfg: Qwen3Config, weights: &ModelWeights, device: &Device, dtype: DType, kv_block_multiplier: usize) -> Result<Self> {
+    pub fn load(cfg: Qwen3Config, weights: &ModelWeights, device: &Device, dtype: DType, num_kv_blocks: usize) -> Result<Self> {
         let embed_tokens = Embedding::new(weights.get("model.embed_tokens.weight")?.clone());
 
         let head_dim = cfg.head_dim();
@@ -50,13 +50,12 @@ impl Qwen3 {
         let norm = RMSNorm::load(weights, "model.norm", cfg.rms_norm_eps)?;
         let lm_head = Linear::new(weights.get("lm_head.weight")?.clone(), None);
         let rope = RotaryEmbedding::new(head_dim, cfg.max_position_embeddings, cfg.rope_theta, device)?;
-        let num_blocks = kv_block_multiplier * ((cfg.max_position_embeddings + DEFAULT_BLOCK_SIZE - 1) / DEFAULT_BLOCK_SIZE);
         let mut allocators = Vec::with_capacity(cfg.num_hidden_layers);
 
         for _ in 0..cfg.num_hidden_layers {
             let allocator = Arc::new(Mutex::new(
                 BlockAllocator::new(
-                    num_blocks,
+                    num_kv_blocks,
                     DEFAULT_BLOCK_SIZE,
                     cfg.num_key_value_heads,
                     head_dim,

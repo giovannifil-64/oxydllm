@@ -34,7 +34,7 @@ impl Llama {
         weights: &ModelWeights,
         device: &Device,
         dtype: DType,
-        kv_block_multiplier: usize,
+        num_kv_blocks: usize,
     ) -> Result<Self> {
         let mut stop_token_ids = cfg.eos_token_ids.clone();
         if !stop_token_ids.contains(&128009) {
@@ -76,8 +76,7 @@ impl Llama {
             device,
         )?;
 
-        let num_blocks = kv_block_multiplier
-            * ((cfg.max_position_embeddings + DEFAULT_BLOCK_SIZE - 1) / DEFAULT_BLOCK_SIZE);
+        let num_blocks = num_kv_blocks;
         let mut allocators = Vec::with_capacity(cfg.num_hidden_layers);
         for _ in 0..cfg.num_hidden_layers {
             let allocator = Arc::new(Mutex::new(BlockAllocator::new(

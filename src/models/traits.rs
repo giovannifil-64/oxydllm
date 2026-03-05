@@ -24,4 +24,15 @@ pub trait BatchModel {
     fn num_layers(&self) -> usize;
 
     fn allocators(&self) -> &[SharedBlockAllocator];
+
+    /// Returns the total bytes allocated for KV caches across all layers.
+    fn kv_cache_bytes(&self) -> usize {
+        self.allocators()
+            .iter()
+            .map(|a| {
+                let alloc = a.lock().unwrap();
+                alloc.pool_bytes()
+            })
+            .sum()
+    }
 }

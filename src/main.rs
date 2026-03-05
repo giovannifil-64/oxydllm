@@ -29,12 +29,14 @@ struct StartArgs {
     keep_alive: Duration,
     memory_budget_bytes: Option<usize>,
     cuda_devices: Vec<usize>,
+    max_context_len: usize,
 }
 
 struct RunArgs {
     model_dir: String,
     sampling_params: SamplingParams,
     cuda_device: Option<usize>,
+    max_context_len: usize,
 }
 
 fn default_models_dir() -> PathBuf {
@@ -94,12 +96,14 @@ Server options (start):
   --models-dir <DIR>        Models directory (default: ~/.rllm/models/)
   --keep-alive <SECS>       Keep-alive seconds before eviction (default: 900)
   --memory-budget <MB>      Max total VRAM for loaded models in MB; LRU eviction when exceeded
+  --max-context-len <N>     Max tokens per sequence for KV cache (default: 4096)
   --devices <IDS>           Comma-separated CUDA device indices to use (default: auto, env: RLLM_DEVICES)
                             Examples: --devices 0   --devices 0,1,2
 
 Chat options (run):
   --models-dir <DIR>        Models directory (default: ~/.rllm/models/)
   --devices <ID>            CUDA device index to use (default: auto, env: RLLM_DEVICES)
+  --max-context-len <N>     Max tokens per sequence for KV cache (default: 4096)
   --temperature <T>         Sampling temperature (default: 0.7)
   --top-k <K>               Top-k filtering (default: 0, disabled)
   --top-p <P>               Nucleus sampling (default: 1.0)
@@ -168,6 +172,7 @@ fn parse_start_args(args: &[String]) -> Result<StartArgs, String> {
     let mut keep_alive_secs: u64 = 900;
     let mut memory_budget_mb: Option<usize> = None;
     let mut devices_raw: Option<Vec<usize>> = None;
+    let mut max_context_len: usize = 4096;
     let mut i = 0;
 
     while i < args.len() {
@@ -210,6 +215,14 @@ fn parse_start_args(args: &[String]) -> Result<StartArgs, String> {
                         .map_err(|e| e)?,
                 );
             }
+            "--max-context-len" => {
+                i += 1;
+                max_context_len = args
+                    .get(i)
+                    .ok_or("--max-context-len requires a value")?
+                    .parse()
+                    .map_err(|_| "Invalid max-context-len value (expected integer)")?;
+            }
             other => return Err(format!("Unknown option: {}", other)),
         }
         i += 1;
@@ -221,6 +234,7 @@ fn parse_start_args(args: &[String]) -> Result<StartArgs, String> {
         keep_alive: Duration::from_secs(keep_alive_secs),
         memory_budget_bytes: memory_budget_mb.map(|mb| mb * 1024 * 1024),
         cuda_devices: resolve_devices(devices_raw),
+        max_context_len,
     })
 }
 
@@ -228,6 +242,7 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
     let mut model_name = String::new();
     let mut models_dir: Option<PathBuf> = None;
     let mut devices_raw: Option<Vec<usize>> = None;
+    let mut max_context_len: usize = 4096;
     let mut params = SamplingParams {
         temperature: 0.7,
         ..SamplingParams::default()
@@ -247,6 +262,14 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
                 let raw = args.get(i).ok_or("--devices requires a value")?;
                 let d = parse_devices(raw)?;
                 devices_raw = Some(d);
+            }
+            "--max-context-len" => {
+                i += 1;
+                max_context_len = args
+                    .get(i)
+                    .ok_or("--max-context-len requires a value")?
+                    .parse()
+                    .map_err(|_| "Invalid max-context-len value")?;
             }
             "--temperature" | "-t" => {
                 i += 1;
@@ -311,6 +334,7 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
         model_dir,
         sampling_params: params,
         cuda_device: resolve_devices(devices_raw).into_iter().next(),
+        max_context_len,
     })
 }
 
@@ -324,13 +348,19 @@ fn run_interactive(args: &RunArgs) -> anyhow::Result<()> {
     println!("Tokenizer loaded.");
 
     println!("Loading model from '{}'...", args.model_dir);
-    let (batch_model, weights_size_bytes) = models::loader::load_batch_model(&args.model_dir, &device, 1)?;
+    let (batch_model, weights_size_bytes) = models::loader::load_batch_model(
+        &args.model_dir, &device, args.max_context_len, 1,
+    )?;
     let max_seq_len = batch_model.max_seq_len();
+    let kv_cache_bytes = batch_model.kv_cache_bytes();
+    let total_bytes = weights_size_bytes + kv_cache_bytes;
     println!(
-        "Model loaded. vocab_size={}, max_seq_len={}, size={:.2} GB (in-memory)",
+        "Model loaded. vocab_size={}, max_seq_len={}, size={:.2} GB (weights) + {:.2} GB (KV cache) = {:.2} GB total",
         batch_model.vocab_size(),
         max_seq_len,
         weights_size_bytes as f64 / 1_073_741_824.0,
+        kv_cache_bytes as f64 / 1_073_741_824.0,
+        total_bytes as f64 / 1_073_741_824.0,
     );
 
     let config = scheduler::SchedulerConfig {
@@ -414,7 +444,7 @@ fn main() -> anyhow::Result<()> {
                 print_usage();
                 std::process::exit(1);
             });
-            server::start_server(start_args.models_dir, start_args.port, start_args.keep_alive, start_args.memory_budget_bytes, start_args.cuda_devices)?;
+            server::start_server(start_args.models_dir, start_args.port, start_args.keep_alive, start_args.memory_budget_bytes, start_args.cuda_devices, start_args.max_context_len)?;
         }
         "run" => {
             let run_args = parse_run_args(&args[2..]).unwrap_or_else(|e| {

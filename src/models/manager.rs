@@ -36,6 +36,7 @@ enum SlotState {
         last_used: Instant,
         effective_keep_alive: Duration,
         weights_size_bytes: usize,
+        kv_cache_bytes: usize,
         shutdown: Arc<AtomicBool>,
     },
 }
@@ -47,6 +48,7 @@ pub struct RunningModelInfo {
     pub num_layers: usize,
     pub idle_seconds: u64,
     pub weights_size_bytes: usize,
+    pub kv_cache_bytes: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -55,6 +57,8 @@ pub struct RegistryEntry {
     pub vocab_size: usize,
     pub num_layers: usize,
     pub size_bytes: usize,
+    #[serde(default)]
+    pub kv_cache_bytes: usize,
     pub last_used_secs: u64,
 }
 
@@ -65,6 +69,7 @@ pub struct ModelManager {
     memory_budget_bytes: Option<usize>,
     registry: HashMap<String, RegistryEntry>,
     cuda_devices: Vec<usize>,
+    max_context_len: usize,
 }
 
 pub type SharedModelManager = Arc<tokio::sync::Mutex<ModelManager>>;
@@ -129,6 +134,7 @@ impl ModelManager {
         keep_alive: Duration,
         memory_budget_bytes: Option<usize>,
         cuda_devices: Vec<usize>,
+        max_context_len: usize,
     ) -> Self {
         let registry = load_registry(&models_dir);
         Self {
@@ -138,6 +144,7 @@ impl ModelManager {
             memory_budget_bytes,
             registry,
             cuda_devices,
+            max_context_len,
         }
     }
 
@@ -153,7 +160,9 @@ impl ModelManager {
         self.slots
             .values()
             .filter_map(|s| match s {
-                SlotState::Ready { weights_size_bytes, .. } => Some(*weights_size_bytes),
+                SlotState::Ready { weights_size_bytes, kv_cache_bytes, .. } => {
+                    Some(*weights_size_bytes + *kv_cache_bytes)
+                }
                 _ => None,
             })
             .sum()
@@ -170,6 +179,7 @@ impl ModelManager {
                     num_layers,
                     last_used,
                     weights_size_bytes,
+                    kv_cache_bytes,
                     ..
                 } => Some(RunningModelInfo {
                     id: id.clone(),
@@ -178,6 +188,7 @@ impl ModelManager {
                     num_layers: *num_layers,
                     idle_seconds: now.duration_since(*last_used).as_secs(),
                     weights_size_bytes: *weights_size_bytes,
+                    kv_cache_bytes: *kv_cache_bytes,
                 }),
                 _ => None,
             })
@@ -191,11 +202,12 @@ impl ModelManager {
     /// Returns the best pre-load size estimate for eviction decisions.
     /// Uses real measured registry data when available; falls back to a
     /// corrected disk estimate otherwise.
+    /// The estimate includes both weights and KV cache.
     fn projected_size_bytes(&self, model_id: &str, model_path: &Path) -> usize {
-        // Case 1: previously loaded — use the real in-memory footprint.
+        // Case 1: previously loaded — use the real in-memory footprint (weights + kv).
         if let Some(entry) = self.registry.get(model_id) {
             if entry.size_bytes > 0 {
-                return entry.size_bytes;
+                return entry.size_bytes + entry.kv_cache_bytes;
             }
         }
 
@@ -238,8 +250,8 @@ impl ModelManager {
             match lru_id {
                 Some(id) => {
                     let (freed, shutdown) = match self.slots.get(&id) {
-                        Some(SlotState::Ready { weights_size_bytes, shutdown, .. }) => {
-                            (*weights_size_bytes, Some(Arc::clone(shutdown)))
+                        Some(SlotState::Ready { weights_size_bytes, kv_cache_bytes, shutdown, .. }) => {
+                            (*weights_size_bytes + *kv_cache_bytes, Some(Arc::clone(shutdown)))
                         }
                         _ => (0, None),
                     };
@@ -323,6 +335,7 @@ impl ModelManager {
             manager_handle,
             effective_keep_alive,
             self.cuda_devices.clone(),
+            self.max_context_len,
         );
 
         GetResult::Wait(rx)
@@ -363,12 +376,14 @@ impl ModelManager {
         vocab_size: usize,
         num_layers: usize,
         size_bytes: usize,
+        kv_cache_bytes: usize,
     ) {
         let entry = self.registry.entry(model_id.to_string()).or_default();
         entry.architecture = architecture.to_string();
         entry.vocab_size = vocab_size;
         entry.num_layers = num_layers;
         entry.size_bytes = size_bytes;
+        entry.kv_cache_bytes = kv_cache_bytes;
         entry.last_used_secs = now_unix_secs();
         save_registry(&self.models_dir, &self.registry);
     }
@@ -382,6 +397,7 @@ struct LoadResult {
     vocab_size: usize,
     num_layers: usize,
     weights_size_bytes: usize,
+    kv_cache_bytes: usize,
     shutdown: Arc<AtomicBool>,
 }
 
@@ -456,6 +472,7 @@ fn spawn_load(
     manager: SharedModelManager,
     effective_keep_alive: Duration,
     cuda_devices: Vec<usize>,
+    max_context_len: usize,
 ) {
     let (result_tx, result_rx) = oneshot::channel::<Result<LoadResult, String>>();
 
@@ -483,7 +500,8 @@ fn spawn_load(
         };
 
         println!("\nLoading model '{}'...", model_id_thread);
-        let (batch_model, weights_size_bytes) = match loader::load_batch_model(&model_dir, &device, 2) {
+        let max_num_sequences: usize = 8;
+        let (batch_model, weights_size_bytes) = match loader::load_batch_model(&model_dir, &device, max_context_len, max_num_sequences) {
             Ok(m) => m,
             Err(e) => {
                 let _ = result_tx.send(Err(format!("Failed to load model: {e}")));
@@ -494,6 +512,7 @@ fn spawn_load(
         let max_seq_len = batch_model.max_seq_len();
         let vocab_size = batch_model.vocab_size();
         let num_layers = batch_model.num_layers();
+        let kv_cache_bytes = batch_model.kv_cache_bytes();
 
         let config_path = model_path_thread.join("config.json");
         let architecture = std::fs::read_to_string(&config_path)
@@ -505,13 +524,16 @@ fn spawn_load(
         // weights_size_bytes is the real in-memory footprint (post dtype-conversion).
         // On GPU: BF16 = 2 bytes/param → roughly half the on-disk F32 safetensors size.
         // On CPU: F32 = 4 bytes/param → matches or slightly exceeds on-disk size.
+        let total_bytes = weights_size_bytes + kv_cache_bytes;
         println!(
-            "Model '{}' loaded. vocab_size={}, max_seq_len={}, num_layers={}, size={:.2} GB (in-memory, {})",
+            "Model '{}' loaded. vocab_size={}, max_seq_len={}, num_layers={}, size={:.2} GB (weights) + {:.2} GB (KV cache) = {:.2} GB total ({})",
             model_id_thread,
             vocab_size,
             max_seq_len,
             num_layers,
             weights_size_bytes as f64 / 1_073_741_824.0,
+            kv_cache_bytes as f64 / 1_073_741_824.0,
+            total_bytes as f64 / 1_073_741_824.0,
             if matches!(device, candle_core::Device::Cpu) { "F32/CPU" } else { "BF16/GPU" },
         );
 
@@ -531,6 +553,7 @@ fn spawn_load(
             vocab_size,
             num_layers,
             weights_size_bytes,
+            kv_cache_bytes,
             shutdown: Arc::clone(&shutdown),
         };
         let _ = result_tx.send(Ok(result));
@@ -566,6 +589,7 @@ fn spawn_load(
                     result.vocab_size,
                     result.num_layers,
                     result.weights_size_bytes,
+                    result.kv_cache_bytes,
                 );
 
                 mgr.slots.insert(
@@ -580,6 +604,7 @@ fn spawn_load(
                         last_used: Instant::now(),
                         effective_keep_alive,
                         weights_size_bytes: result.weights_size_bytes,
+                        kv_cache_bytes: result.kv_cache_bytes,
                         shutdown: result.shutdown,
                     },
                 );

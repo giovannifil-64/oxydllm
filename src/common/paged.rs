@@ -64,6 +64,13 @@ impl BlockAllocator {
         self.block_size
     }
 
+    /// Total bytes occupied by the K and V pool tensors.
+    pub fn pool_bytes(&self) -> usize {
+        let k_bytes = self.pool_k.elem_count() * self.pool_k.dtype().size_in_bytes();
+        let v_bytes = self.pool_v.elem_count() * self.pool_v.dtype().size_in_bytes();
+        k_bytes + v_bytes
+    }
+
     pub fn write(
         &self,
         block_id: usize,

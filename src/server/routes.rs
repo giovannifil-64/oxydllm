@@ -309,16 +309,21 @@ async fn list_running_models(State(state): State<Arc<AppState>>) -> impl IntoRes
     let data: Vec<serde_json::Value> = running
         .iter()
         .map(|m| {
-            serde_json::json!({
-                "id": m.id,
-                "object": "model",
-                "architecture": m.architecture,
-                "vocab_size": m.vocab_size,
-                "num_layers": m.num_layers,
-                "idle_seconds": m.idle_seconds,
-                "size_bytes": m.weights_size_bytes,
-                "size_gb": (m.weights_size_bytes as f64 / 1_073_741_824.0 * 100.0).round() / 100.0,
-            })
+            {
+                let total = m.weights_size_bytes + m.kv_cache_bytes;
+                serde_json::json!({
+                    "id": m.id,
+                    "object": "model",
+                    "architecture": m.architecture,
+                    "vocab_size": m.vocab_size,
+                    "num_layers": m.num_layers,
+                    "idle_seconds": m.idle_seconds,
+                    "weights_size_bytes": m.weights_size_bytes,
+                    "kv_cache_bytes": m.kv_cache_bytes,
+                    "total_size_bytes": total,
+                    "total_size_gb": (total as f64 / 1_073_741_824.0 * 100.0).round() / 100.0,
+                })
+            }
         })
         .collect();
 
@@ -553,6 +558,7 @@ pub fn start_server(
     keep_alive: Duration,
     memory_budget_bytes: Option<usize>,
     cuda_devices: Vec<usize>,
+    max_context_len: usize,
 ) -> anyhow::Result<()> {
     if !models_dir.exists() {
         std::fs::create_dir_all(&models_dir)?;
@@ -570,6 +576,7 @@ pub fn start_server(
         keep_alive,
         memory_budget_bytes,
         cuda_devices,
+        max_context_len,
     )));
 
     let state = Arc::new(AppState {
@@ -611,11 +618,12 @@ pub fn start_server(
         );
         match memory_budget_bytes {
             Some(b) => println!(
-                "Memory budget: {:.1} GB (LRU eviction when exceeded)\n",
+                "Memory budget: {:.1} GB (LRU eviction when exceeded)",
                 b as f64 / 1_073_741_824.0
             ),
             None => println!("Memory budget: unlimited"),
         }
+        println!("Max context length: {} tokens per sequence\n", max_context_len);
 
         let listener = tokio::net::TcpListener::bind(&addr).await?;
         axum::serve(listener, app).await?;

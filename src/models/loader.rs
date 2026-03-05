@@ -159,8 +159,8 @@ fn resolve_weight_paths(model_dir: &str) -> anyhow::Result<Vec<String>> {
 
 pub fn find_gguf_files(dir: &Path) -> Option<Vec<std::path::PathBuf>> {
     let index_path = dir.join("gguf.index");
-    if index_path.exists() {
-        if let Ok(content) = std::fs::read_to_string(&index_path) {
+    if index_path.exists()
+        && let Ok(content) = std::fs::read_to_string(&index_path) {
             let files: Vec<std::path::PathBuf> = content
                 .lines()
                 .map(|l| l.trim())
@@ -171,23 +171,20 @@ pub fn find_gguf_files(dir: &Path) -> Option<Vec<std::path::PathBuf>> {
                 return Some(files);
             }
         }
-    }
     find_gguf_file(dir).map(|p| vec![p])
 }
 
 pub fn find_gguf_file(dir: &Path) -> Option<std::path::PathBuf> {
     let index_path = dir.join("gguf.index");
-    if index_path.exists() {
-        if let Ok(content) = std::fs::read_to_string(&index_path) {
-            if let Some(first) = content
+    if index_path.exists()
+        && let Ok(content) = std::fs::read_to_string(&index_path)
+            && let Some(first) = content
                 .lines()
                 .map(|l| l.trim())
                 .find(|l| !l.is_empty() && !l.starts_with('#'))
             {
                 return Some(dir.join(first));
             }
-        }
-    }
     let entries = std::fs::read_dir(dir).ok()?;
     for entry in entries.flatten() {
         let p = entry.path();
@@ -206,8 +203,7 @@ fn discover_gguf_model(id: &str, gguf_path: &Path) -> Option<DiscoveredModel> {
     let arch = content
         .metadata
         .get("general.architecture")
-        .and_then(|v| v.to_string().ok())
-        .map(|s| s.clone())
+        .and_then(|v| v.to_string().ok()).cloned()
         .unwrap_or_else(|| "unknown".to_string());
 
     let prefix = &arch;
@@ -455,7 +451,7 @@ fn compute_kv_blocks(
 ) -> usize {
     // Total token slots needed = sequences × context per sequence.
     let total_slots = max_num_sequences * max_context_len;
-    let desired_blocks = (total_slots + DEFAULT_BLOCK_SIZE - 1) / DEFAULT_BLOCK_SIZE;
+    let desired_blocks = total_slots.div_ceil(DEFAULT_BLOCK_SIZE);
 
     // Cost of one KV block summed across all layers (K + V pools).
     let per_block_bytes =

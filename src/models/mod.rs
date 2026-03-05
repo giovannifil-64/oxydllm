@@ -4,3 +4,5 @@ pub mod manager;
 pub mod hub;
 pub mod llama;
 pub mod qwen3;
+pub mod gguf_model;
+pub mod estimate;

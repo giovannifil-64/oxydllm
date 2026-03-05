@@ -1,4 +1,5 @@
-use candle_core::{D, Result, Tensor};
+use candle_core::{DType, Device, D, Result, Tensor};
+use candle_core::quantized::QTensor;
 use super::weights::ModelWeights;
 
 pub struct RMSNorm {
@@ -11,6 +12,10 @@ impl RMSNorm {
     }
     pub fn load(weights: &ModelWeights, name: &str, eps: f64) -> Result<Self> {
         let weight = weights.get(&format!("{}.weight", name))?.clone();
+        Ok(Self::new(weight, eps))
+    }
+    pub fn from_qtensor(qtensor: &QTensor, device: &Device, dtype: DType, eps: f64) -> Result<Self> {
+        let weight = qtensor.dequantize(device)?.to_dtype(dtype)?;
         Ok(Self::new(weight, eps))
     }
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {

@@ -1,8 +1,9 @@
 use candle_core::{Result, Tensor, D};
 use std::cell::Cell;
 use super::config::BlockConfig;
+use super::gguf_weights::GgufWeights;
 use super::paged::PagedKvCache;
-use super::linear::{softmax_last_dim, Linear};
+use super::linear::{softmax_last_dim, AnyLinear, Linear, QLinear};
 use super::norm::RMSNorm;
 use super::rope::RotaryEmbedding;
 use super::weights::ModelWeights;
@@ -29,10 +30,10 @@ pub struct SegmentInfo<'a> {
 }
 
 pub struct Attention {
-    q_proj: Linear,
-    k_proj: Linear,
-    v_proj: Linear,
-    o_proj: Linear,
+    q_proj: AnyLinear,
+    k_proj: AnyLinear,
+    v_proj: AnyLinear,
+    o_proj: AnyLinear,
     qkv_proj: Option<Linear>,
     q_norm: Option<RMSNorm>,
     k_norm: Option<RMSNorm>,
@@ -78,8 +79,57 @@ impl Attention {
         let qkv_proj = Some(Linear::new(qkv_w, None));
 
         Ok(Self {
-            q_proj, k_proj, v_proj, o_proj,
+            q_proj: AnyLinear::Float(q_proj),
+            k_proj: AnyLinear::Float(k_proj),
+            v_proj: AnyLinear::Float(v_proj),
+            o_proj: AnyLinear::Float(o_proj),
             qkv_proj,
+            q_norm, k_norm,
+            n_heads: cfg.n_heads,
+            n_kv_heads: cfg.n_kv_heads,
+            head_dim: hd,
+            q_dim,
+            kv_dim,
+            scale: cfg.attention_scale.unwrap_or(1.0 / (hd as f64).sqrt()),
+        })
+    }
+
+    pub fn load_gguf(
+        cfg: &BlockConfig,
+        layer_idx: usize,
+        gguf: &GgufWeights,
+        device: &candle_core::Device,
+        dtype: candle_core::DType,
+    ) -> Result<Self> {
+        let prefix = format!("blk.{}", layer_idx);
+        let hd = cfg.head_dim;
+        let q_proj = QLinear::from_arc(gguf.get(&format!("{prefix}.attn_q.weight"))?, dtype)?;
+        let k_proj = QLinear::from_arc(gguf.get(&format!("{prefix}.attn_k.weight"))?, dtype)?;
+        let v_proj = QLinear::from_arc(gguf.get(&format!("{prefix}.attn_v.weight"))?, dtype)?;
+        let o_proj = QLinear::from_arc(gguf.get(&format!("{prefix}.attn_output.weight"))?, dtype)?;
+
+        let q_norm = if cfg.qk_norm {
+            let qt = gguf.get(&format!("{prefix}.attn_q_norm.weight"))?;
+            Some(RMSNorm::from_qtensor(&qt, device, dtype, cfg.rms_norm_eps)?)
+        } else {
+            None
+        };
+        let k_norm = if cfg.qk_norm {
+            let qt = gguf.get(&format!("{prefix}.attn_k_norm.weight"))?;
+            Some(RMSNorm::from_qtensor(&qt, device, dtype, cfg.rms_norm_eps)?)
+        } else {
+            None
+        };
+
+        let q_dim = cfg.n_heads * hd;
+        let kv_dim = cfg.n_kv_heads * hd;
+
+        Ok(Self {
+            q_proj: AnyLinear::Quantized(q_proj),
+            k_proj: AnyLinear::Quantized(k_proj),
+            v_proj: AnyLinear::Quantized(v_proj),
+            o_proj: AnyLinear::Quantized(o_proj),
+            qkv_proj: None,
             q_norm, k_norm,
             n_heads: cfg.n_heads,
             n_kv_heads: cfg.n_kv_heads,

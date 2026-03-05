@@ -281,12 +281,20 @@ impl ModelManager {
         manager_handle: SharedModelManager,
         keep_alive_override: Option<Duration>,
     ) -> GetResult {
-        let model_path = self.models_dir.join(model_id);
-        if !model_path.join("config.json").exists() {
-            let (tx, rx) = oneshot::channel();
-            let _ = tx.send(Err(format!("model '{}' not found in models directory", model_id)));
-            return GetResult::Wait(rx);
-        }
+        let model_path = match crate::models::loader::resolve_model_path(
+            &self.models_dir,
+            model_id,
+        ) {
+            Some(p) => p,
+            None => {
+                let (tx, rx) = oneshot::channel();
+                let _ = tx.send(Err(format!(
+                    "model '{}' not found in models directory",
+                    model_id
+                )));
+                return GetResult::Wait(rx);
+            }
+        };
 
         if let Some(slot) = self.slots.get_mut(model_id) {
             match slot {
@@ -501,7 +509,7 @@ fn spawn_load(
 
         println!("\nLoading model '{}'...", model_id_thread);
         let max_num_sequences: usize = 8;
-        let (batch_model, weights_size_bytes) = match loader::load_batch_model(&model_dir, &device, max_context_len, max_num_sequences) {
+        let (batch_model, weights_size_bytes) = match loader::load_batch_model(&model_dir, &model_id_thread, &device, max_context_len, max_num_sequences) {
             Ok(m) => m,
             Err(e) => {
                 let _ = result_tx.send(Err(format!("Failed to load model: {e}")));
@@ -519,7 +527,14 @@ fn spawn_load(
             .ok()
             .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
             .and_then(|v| v["architectures"][0].as_str().map(|s| s.to_string()))
-            .unwrap_or_else(|| "Unknown".to_string());
+            .unwrap_or_else(|| {
+                // Try GGUF metadata for architecture
+                if loader::is_gguf_model(&model_dir) {
+                    "GGUF".to_string()
+                } else {
+                    "Unknown".to_string()
+                }
+            });
 
         // weights_size_bytes is the real in-memory footprint (post dtype-conversion).
         // On GPU: BF16 = 2 bytes/param → roughly half the on-disk F32 safetensors size.

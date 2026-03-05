@@ -190,11 +190,6 @@ impl PagedKvCache {
         self.table.num_tokens = n;
     }
 
-    #[allow(dead_code)]
-    pub fn num_tokens(&self) -> usize {
-        self.table.num_tokens
-    }
-
     pub fn block_id_at(&self, idx: usize) -> Option<usize> {
         self.table.block_ids.get(idx).copied()
     }

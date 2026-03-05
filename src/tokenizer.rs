@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use std::collections::HashMap;
+use std::path::Path;
 
 pub struct Tokenizer {
     inner: tokenizers::Tokenizer,
@@ -10,6 +11,24 @@ pub struct Tokenizer {
 
 impl Tokenizer {
     pub fn from_dir(model_dir: &str) -> Result<Self> {
+        let dir = Path::new(model_dir);
+
+        let json_path = dir.join("tokenizer.json");
+        if json_path.exists() {
+            return Self::from_tokenizer_json(model_dir);
+        }
+
+        if let Some(gguf_path) = crate::models::loader::find_gguf_file(dir) {
+            return Self::from_gguf_file(gguf_path.to_str().unwrap());
+        }
+
+        anyhow::bail!(
+            "No tokenizer found in '{}': expected tokenizer.json or a .gguf file",
+            model_dir
+        )
+    }
+
+    fn from_tokenizer_json(model_dir: &str) -> Result<Self> {
         let path = format!("{}/tokenizer.json", model_dir);
         let inner = tokenizers::Tokenizer::from_file(&path)
             .map_err(|e| anyhow::anyhow!("{}", e))
@@ -63,6 +82,87 @@ impl Tokenizer {
                 }
             }
         }
+
+        Ok(Self {
+            inner,
+            chat_template,
+            special_tokens,
+            special_token_ids,
+        })
+    }
+
+    pub fn from_gguf_file(gguf_path: &str) -> Result<Self> {
+        use candle_core::quantized::{gguf_file, tokenizer::TokenizerFromGguf};
+
+        let mut file = std::fs::File::open(gguf_path)
+            .with_context(|| format!("Failed to open GGUF file: {}", gguf_path))?;
+        let content = gguf_file::Content::read(&mut file)
+            .map_err(|e| anyhow::anyhow!("Failed to parse GGUF: {}", e))?;
+
+        let inner = tokenizers::Tokenizer::from_gguf(&content)
+            .map_err(|e| anyhow::anyhow!("Failed to build tokenizer from GGUF: {}", e))?;
+
+        let chat_template = content
+            .metadata
+            .get("tokenizer.chat_template")
+            .and_then(|v| v.to_string().ok())
+            .map(|s| s.clone());
+
+        let mut special_tokens = HashMap::new();
+        let mut special_token_ids: HashMap<String, u32> = HashMap::new();
+
+        let tokens_arr: Vec<String> = content
+            .metadata
+            .get("tokenizer.ggml.tokens")
+            .and_then(|v| v.to_vec().ok())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.to_string().ok().map(|s| s.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let get_token_str = |id: u32| -> Option<String> {
+            tokens_arr.get(id as usize).cloned()
+        };
+
+        for (gguf_key, name) in [
+            ("tokenizer.ggml.bos_token_id", "bos_token"),
+            ("tokenizer.ggml.eos_token_id", "eos_token"),
+            ("tokenizer.ggml.pad_token_id", "pad_token"),
+            ("tokenizer.ggml.unk_token_id", "unk_token"),
+        ] {
+            if let Some(val) = content.metadata.get(gguf_key) {
+                if let Ok(id) = val.to_u32() {
+                    if let Some(tok_str) = get_token_str(id) {
+                        special_tokens.insert(name.to_string(), tok_str.clone());
+                        special_token_ids.insert(tok_str, id);
+                    }
+                }
+            }
+        }
+
+        if let Some(type_arr) = content.metadata.get("tokenizer.ggml.token_type") {
+            if let Ok(arr) = type_arr.to_vec() {
+                for (idx, v) in arr.iter().enumerate() {
+                    if let Ok(ty) = v.to_u32() {
+                        if matches!(ty, 2..=5) {
+                            if let Some(tok_str) = tokens_arr.get(idx) {
+                                special_token_ids
+                                    .entry(tok_str.clone())
+                                    .or_insert(idx as u32);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        println!(
+            "[gguf] Tokenizer loaded from GGUF ({} tokens, template={})",
+            tokens_arr.len(),
+            if chat_template.is_some() { "yes" } else { "no" },
+        );
 
         Ok(Self {
             inner,

@@ -111,10 +111,6 @@ impl PrefixCache {
         }
     }
 
-    #[allow(dead_code)]
-    pub fn num_entries(&self) -> usize {
-        self.entries.len()
-    }
 }
 
 fn chain_hash(block_tokens: &[u32], prev: u64) -> u64 {

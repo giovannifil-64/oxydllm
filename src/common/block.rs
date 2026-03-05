@@ -1,8 +1,10 @@
-use candle_core::{Result, Tensor};
+use candle_core::Result;
+use candle_core::Tensor;
 use super::{
     attention::{Attention, SegmentInfo},
     config::BlockConfig,
     ffn::FeedForward,
+    gguf_weights::GgufWeights,
     paged::PagedKvCache,
     norm::RMSNorm,
     rope::RotaryEmbedding,
@@ -23,6 +25,28 @@ impl TransformerBlock {
         let post_attn_norm = RMSNorm::load(weights, &format!("{}.post_attention_layernorm", p), cfg.rms_norm_eps)?;
         let attention = Attention::load(cfg, layer_idx, weights)?;
         let ffn = FeedForward::load(layer_idx, weights)?;
+        Ok(Self { input_norm, attention, post_attn_norm, ffn })
+    }
+
+    pub fn load_gguf(
+        cfg: &BlockConfig,
+        layer_idx: usize,
+        gguf: &GgufWeights,
+        device: &candle_core::Device,
+        dtype: candle_core::DType,
+        intermediate_size: usize,
+    ) -> Result<Self> {
+        let prefix = format!("blk.{}", layer_idx);
+
+        let attn_norm_qt = gguf.get(&format!("{prefix}.attn_norm.weight"))?;
+        let input_norm = RMSNorm::from_qtensor(&attn_norm_qt, device, dtype, cfg.rms_norm_eps)?;
+
+        let ffn_norm_qt = gguf.get(&format!("{prefix}.ffn_norm.weight"))?;
+        let post_attn_norm = RMSNorm::from_qtensor(&ffn_norm_qt, device, dtype, cfg.rms_norm_eps)?;
+
+        let attention = Attention::load_gguf(cfg, layer_idx, gguf, device, dtype)?;
+        let ffn = FeedForward::load_gguf(layer_idx, gguf, intermediate_size, device, dtype)?;
+
         Ok(Self { input_norm, attention, post_attn_norm, ffn })
     }
 

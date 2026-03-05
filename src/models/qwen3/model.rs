@@ -5,7 +5,7 @@ use crate::common::{
     attention::SegmentInfo,
     block::TransformerBlock,
     config::BlockConfig,
-    linear::{Embedding, Linear},
+    linear::{AnyLinear, Embedding, Linear},
     mask::causal_mask_cached,
     norm::RMSNorm,
     paged::{BlockAllocator, PagedKvCache, SharedBlockAllocator, DEFAULT_BLOCK_SIZE},
@@ -18,7 +18,7 @@ pub struct Qwen3 {
     embed_tokens: Embedding,
     blocks: Vec<TransformerBlock>,
     norm: RMSNorm,
-    lm_head: Linear,
+    lm_head: AnyLinear,
     rope: RotaryEmbedding,
     allocators: Vec<SharedBlockAllocator>,
     device: Device,
@@ -48,7 +48,7 @@ impl Qwen3 {
             .collect::<Result<Vec<_>>>()?;
 
         let norm = RMSNorm::load(weights, "model.norm", cfg.rms_norm_eps)?;
-        let lm_head = Linear::new(weights.get("lm_head.weight")?.clone(), None);
+        let lm_head = AnyLinear::Float(Linear::new(weights.get("lm_head.weight")?.clone(), None));
         let rope = RotaryEmbedding::new(head_dim, cfg.max_position_embeddings, cfg.rope_theta, device)?;
         let mut allocators = Vec::with_capacity(cfg.num_hidden_layers);
 

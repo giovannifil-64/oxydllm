@@ -1,4 +1,4 @@
-use std::io::{Read, Write};
+use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -10,24 +10,199 @@ pub struct PullConfig {
     pub models_dir: PathBuf,
     pub token: Option<String>,
     pub force: bool,
+    pub variant: Option<String>,
+}
+
+struct GgufVariant {
+    quant_name: String,
+    files: Vec<(String, u64)>,
+}
+
+impl GgufVariant {
+    fn total_size(&self) -> u64 {
+        self.files.iter().map(|(_, s)| s).sum()
+    }
+    fn is_split(&self) -> bool {
+        self.files.len() > 1
+            || self
+                .files
+                .first()
+                .map(|(f, _)| has_split_suffix(f))
+                .unwrap_or(false)
+    }
+}
+
+fn strip_split_suffix(stem: &str) -> &str {
+    let parts: Vec<&str> = stem.split('-').collect();
+    let n = parts.len();
+    if n >= 3
+        && parts[n - 2] == "of"
+        && parts[n - 1].chars().all(|c| c.is_ascii_digit())
+        && parts[n - 3].chars().all(|c| c.is_ascii_digit())
+    {
+        let trim = 1 + parts[n-1].len() + 1 + parts[n-2].len() + 1 + parts[n-3].len();
+        &stem[..stem.len() - trim]
+    } else {
+        stem
+    }
+}
+
+fn has_split_suffix(filename: &str) -> bool {
+    let stem = filename.strip_suffix(".gguf").unwrap_or(filename);
+    stem != strip_split_suffix(stem)
+}
+
+fn group_gguf_variants(gguf_files: &[(String, u64)]) -> Vec<GgufVariant> {
+    let mut groups: Vec<(String, Vec<(String, u64)>)> = Vec::new();
+
+    for (name, size) in gguf_files {
+        let stem = name.strip_suffix(".gguf").unwrap_or(name);
+        let key = strip_split_suffix(stem).to_string();
+        if let Some(g) = groups.iter_mut().find(|(k, _)| k == &key) {
+            g.1.push((name.clone(), *size));
+        } else {
+            groups.push((key, vec![(name.clone(), *size)]));
+        }
+    }
+
+    groups
+        .into_iter()
+        .map(|(key, mut files)| {
+            files.sort_by_key(|(f, _)| f.clone());
+            let quant_name = crate::models::estimate::extract_quant_from_filename(&key)
+                .unwrap_or_else(|| key.clone());
+            GgufVariant { quant_name, files }
+        })
+        .collect()
+}
+
+
+fn select_variant<'a>(
+    variants: &'a [GgufVariant],
+    preferred: Option<&str>,
+) -> anyhow::Result<&'a GgufVariant> {
+    if let Some(pref) = preferred {
+        return variants
+            .iter()
+            .find(|v| v.quant_name.eq_ignore_ascii_case(pref))
+            .ok_or_else(|| {
+                let avail: Vec<&str> = variants.iter().map(|v| v.quant_name.as_str()).collect();
+                anyhow::anyhow!(
+                    "Variant '{}' not found in this repo. Available: {}",
+                    pref,
+                    avail.join(", ")
+                )
+            });
+    }
+
+    if variants.len() == 1 {
+        return Ok(&variants[0]);
+    }
+
+    println!("  Multiple GGUF variants available — choose one to download:\n");
+    println!(
+        "  {:>2}  {:<16}  {:>10}  {:>5}  {}",
+        "#", "Format", "Size", "Files", "Accuracy"
+    );
+    println!("  {}", "─".repeat(56));
+
+    let recommended_idx = best_variant_idx(variants);
+
+    for (i, v) in variants.iter().enumerate() {
+        let star = if Some(i) == recommended_idx { " ★" } else { "" };
+        let files_label = if v.is_split() {
+            format!("{} shards", v.files.len())
+        } else {
+            "1".to_string()
+        };
+        println!(
+            "  {:>2}  {:<16}  {:>10}  {:>5}  {}{}",
+            i + 1,
+            v.quant_name,
+            fmt_size_f(v.total_size()),
+            files_label,
+            crate::models::estimate::quant_accuracy_str(&v.quant_name),
+            star,
+        );
+    }
+    println!();
+
+    let default = recommended_idx.map(|i| i + 1).unwrap_or(1);
+
+    use std::io::IsTerminal;
+    if !std::io::stdin().is_terminal() {
+        println!(
+            "  Non-interactive — selecting {} (#{}).",
+            variants[default - 1].quant_name,
+            default
+        );
+        return Ok(&variants[default - 1]);
+    }
+
+    loop {
+        print!("  Select [1-{}] (default: {}): ", variants.len(), default);
+        std::io::stdout().flush().ok();
+        let mut line = String::new();
+        std::io::stdin().lock().read_line(&mut line)?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            return Ok(&variants[default - 1]);
+        }
+        match trimmed.parse::<usize>() {
+            Ok(n) if n >= 1 && n <= variants.len() => return Ok(&variants[n - 1]),
+            _ => println!("  Please enter a number between 1 and {}.", variants.len()),
+        }
+    }
+}
+
+fn best_variant_idx(variants: &[GgufVariant]) -> Option<usize> {
+    if let Some(i) = variants
+        .iter()
+        .position(|v| v.quant_name.eq_ignore_ascii_case("Q4_K_M"))
+    {
+        return Some(i);
+    }
+    variants.iter().position(|v| {
+        matches!(
+            v.quant_name.to_uppercase().as_str(),
+            "Q4_K_S" | "Q4_K" | "Q4_0" | "Q4_1" | "IQ4_NL" | "IQ4_XS" | "Q5_K_M"
+        )
+    })
+}
+
+fn is_incomplete_download(dir: &Path) -> bool {
+    let index_path = dir.join("gguf.index");
+    if index_path.exists() {
+        if let Ok(content) = std::fs::read_to_string(&index_path) {
+            let all_present = content
+                .lines()
+                .map(|l| l.trim())
+                .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                .all(|fname| dir.join(fname).exists());
+            return !all_present;
+        }
+        return true;
+    }
+
+    if dir.join("config.json").exists() {
+        let has_weights = std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .any(|e| {
+                e.path()
+                    .extension()
+                    .map(|x| x == "safetensors")
+                    .unwrap_or(false)
+            });
+        return !has_weights;
+    }
+
+    true
 }
 
 pub fn pull(config: &PullConfig) -> anyhow::Result<()> {
     let dest = config.models_dir.join(&config.dest_name);
-
-    if dest.exists() {
-        if config.force {
-            println!("Removing existing model at {}...", dest.display());
-            std::fs::remove_dir_all(&dest)?;
-        } else {
-            anyhow::bail!(
-                "A model named '{}' already exists at {}.\n\
-                 Use --force to overwrite, or --name <name> to save under a different name.",
-                config.dest_name,
-                dest.display()
-            );
-        }
-    }
 
     println!("Repository : {}", config.repo_id);
     println!("Destination: {}", dest.display());
@@ -44,13 +219,105 @@ pub fn pull(config: &PullConfig) -> anyhow::Result<()> {
     print!("Fetching file list...");
     std::io::stdout().flush().ok();
     let all_files = list_repo_files(&client, &config.repo_id, config.token.as_deref())?;
-    let to_download = filter_model_files(&all_files);
-    println!(" {} file(s)\n", to_download.len());
+    println!();
+
+    let (gguf_files, metadata_files): (Vec<_>, Vec<_>) = all_files
+        .into_iter()
+        .filter(|(f, _)| is_relevant_file(f))
+        .partition(|(f, _)| f.to_lowercase().ends_with(".gguf"));
+
+    let gguf_to_download: Vec<String> = if gguf_files.is_empty() {
+        Vec::new()
+    } else {
+        let variants = group_gguf_variants(&gguf_files);
+        println!();
+        let chosen = select_variant(&variants, config.variant.as_deref())?;
+        let variant_filenames: Vec<String> =
+            chosen.files.iter().map(|(f, _)| f.clone()).collect();
+
+        if dest.exists() {
+            let all_complete = chosen.files.iter().all(|(fname, expected_size)| {
+                let path = dest.join(fname);
+                if !path.exists() {
+                    return false;
+                }
+                if *expected_size > 0 {
+                    let actual = path.metadata().map(|m| m.len()).unwrap_or(0);
+                    actual + 1024 >= *expected_size
+                } else {
+                    true
+                }
+            });
+            if all_complete && !config.force {
+                anyhow::bail!(
+                    "Variant '{}' is already present in '{}'.\n\
+                     Use --force to re-download it.",
+                    chosen.quant_name,
+                    dest.display()
+                );
+            }
+            for (f, _) in &chosen.files {
+                let _ = std::fs::remove_file(dest.join(f));
+            }
+            let _ = std::fs::remove_file(dest.join("gguf.index"));
+        }
+
+        if variants.len() > 1 {
+            println!(
+                "  Downloading: {} ({}{})\n",
+                chosen.quant_name,
+                fmt_size_f(chosen.total_size()),
+                if chosen.is_split() {
+                    format!(", {} shards", chosen.files.len())
+                } else {
+                    String::new()
+                }
+            );
+        } else {
+            println!(
+                "  Found: {} ({}{})\n",
+                chosen.quant_name,
+                fmt_size_f(chosen.total_size()),
+                if chosen.is_split() {
+                    format!(", {} shards", chosen.files.len())
+                } else {
+                    String::new()
+                }
+            );
+        }
+        variant_filenames
+    };
+
+    if gguf_files.is_empty() && dest.exists() {
+        if config.force || is_incomplete_download(&dest) {
+            if !config.force {
+                println!("Resuming interrupted download — removing partial files...");
+            } else {
+                println!("Removing existing model at {}...", dest.display());
+            }
+            std::fs::remove_dir_all(&dest)?;
+        } else {
+            anyhow::bail!(
+                "A model named '{}' already exists at {}.\n\
+                 Use --force to overwrite, or --name <name> to save under a different name.",
+                config.dest_name,
+                dest.display()
+            );
+        }
+    }
+
+    let mut to_download: Vec<String> = metadata_files
+        .into_iter()
+        .map(|(f, _)| f)
+        .filter(|f| !dest.join(f).exists())
+        .collect();
+    to_download.extend(gguf_to_download.iter().cloned());
+    to_download.sort_by_key(|f| if f.ends_with(".json") { 0u8 } else { 1u8 });
 
     if to_download.is_empty() {
         anyhow::bail!(
             "No compatible model files found in '{}'.\n\
-             The repository may not contain safetensors weights.",
+             The repository may not contain safetensors or GGUF weights.",
             config.repo_id
         );
     }
@@ -58,33 +325,69 @@ pub fn pull(config: &PullConfig) -> anyhow::Result<()> {
     std::fs::create_dir_all(&dest)?;
 
     let mut download_ok = true;
+    let mut downloaded_files: Vec<String> = Vec::new();
     for filename in &to_download {
-        if let Err(e) =
-            download_file(&client, &config.repo_id, filename, &dest, config.token.as_deref())
-        {
-            eprintln!("\nError downloading '{}': {}", filename, e);
-            download_ok = false;
-            break;
+        match download_file(&client, &config.repo_id, filename, &dest, config.token.as_deref()) {
+            Ok(()) => downloaded_files.push(filename.clone()),
+            Err(e) => {
+                eprintln!("\nError downloading '{}': {}", filename, e);
+                download_ok = false;
+                break;
+            }
         }
     }
 
     if !download_ok {
         eprintln!("Cleaning up partial download...");
-        let _ = std::fs::remove_dir_all(&dest);
+        for f in &downloaded_files {
+            let _ = std::fs::remove_file(dest.join(f));
+        }
+        if dest.read_dir().map(|mut d| d.next().is_none()).unwrap_or(true) {
+            let _ = std::fs::remove_dir(&dest);
+        }
         anyhow::bail!("Download incomplete.");
     }
 
-    println!("\nModel '{}' saved to {}", config.dest_name, dest.display());
+    let new_shards: Vec<&str> = gguf_to_download
+        .iter()
+        .filter(|f| f.to_lowercase().ends_with(".gguf"))
+        .map(|f| f.as_str())
+        .collect();
 
+    if !new_shards.is_empty() {
+        let mut existing: Vec<String> = std::fs::read_dir(&dest)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|e| {
+                let p = e.path();
+                if p.extension().and_then(|x| x.to_str()) == Some("gguf") {
+                    p.file_name().map(|n| n.to_string_lossy().to_string())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        existing.sort();
+
+        let index_path = dest.join("gguf.index");
+        let mut index_file = std::fs::File::create(&index_path)?;
+        for shard in &existing {
+            writeln!(index_file, "{}", shard)?;
+        }
+    }
+
+    println!("\nModel '{}' saved to {}", config.dest_name, dest.display());
     Ok(())
 }
+
 
 fn list_repo_files(
     client: &reqwest::blocking::Client,
     repo_id: &str,
     token: Option<&str>,
-) -> anyhow::Result<Vec<String>> {
-    let url = format!("{}/api/models/{}", HF_ENDPOINT, repo_id);
+) -> anyhow::Result<Vec<(String, u64)>> {
+    let url = format!("{}/api/models/{}?blobs=true", HF_ENDPOINT, repo_id);
     let mut builder = client.get(&url);
     if let Some(tok) = token {
         builder = builder.bearer_auth(tok);
@@ -100,28 +403,27 @@ fn list_repo_files(
 
     Ok(siblings
         .iter()
-        .filter_map(|s| s["rfilename"].as_str().map(str::to_string))
+        .filter_map(|s| {
+            let name = s["rfilename"].as_str()?.to_string();
+            let size = s["lfs"]["size"]
+                .as_u64()
+                .or_else(|| s["size"].as_u64())
+                .unwrap_or(0);
+            Some((name, size))
+        })
         .collect())
 }
 
-fn filter_model_files(files: &[String]) -> Vec<String> {
-    let mut result: Vec<String> = files
-        .iter()
-        .filter(|f| {
-            if f.contains('/') || f.starts_with('.') {
-                return false;
-            }
-            let l = f.to_lowercase();
-            l.ends_with(".json")
-                || l.ends_with(".safetensors")
-                || l.ends_with(".model")
-                || l.ends_with(".tiktoken")
-        })
-        .cloned()
-        .collect();
-
-    result.sort_by_key(|f| if f.ends_with(".json") { 0u8 } else { 1u8 });
-    result
+fn is_relevant_file(f: &str) -> bool {
+    if f.contains('/') || f.starts_with('.') {
+        return false;
+    }
+    let l = f.to_lowercase();
+    l.ends_with(".json")
+        || l.ends_with(".safetensors")
+        || l.ends_with(".gguf")
+        || l.ends_with(".model")
+        || l.ends_with(".tiktoken")
 }
 
 fn download_file(
@@ -211,6 +513,16 @@ fn fmt_size(bytes: u64) -> String {
         format!("{:.0}KB", bytes as f64 / KB as f64)
     } else {
         format!("{}B", bytes)
+    }
+}
+
+fn fmt_size_f(bytes: u64) -> String {
+    const MB: u64 = 1024 * 1024;
+    const GB: u64 = MB * 1024;
+    if bytes >= GB {
+        format!("{:.2} GB", bytes as f64 / GB as f64)
+    } else {
+        format!("{:.0} MB", bytes as f64 / MB as f64)
     }
 }
 

@@ -2,6 +2,7 @@ pub mod attention;
 pub mod block;
 pub mod config;
 pub mod ffn;
+pub mod gguf_weights;
 pub mod linear;
 pub mod mask;
 #[cfg(feature = "metal")]

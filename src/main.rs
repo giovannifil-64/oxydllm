@@ -15,12 +15,21 @@ use sampling::SamplingParams;
 use server::ChatMessage;
 use tokenizer::Tokenizer;
 
+struct EstimateArgs {
+    model: String,
+    models_dir: PathBuf,
+    token: Option<String>,
+    context_len: usize,
+    num_sequences: usize,
+}
+
 struct PullArgs {
     repo_id: String,
     models_dir: PathBuf,
     name: Option<String>,
     token: Option<String>,
     force: bool,
+    variant: Option<String>,
 }
 
 struct StartArgs {
@@ -81,14 +90,16 @@ fn print_usage() {
 Usage: rllm <command> [options]
 
 Commands:
-  pull  <user/model>   Download a model from HuggingFace
-  start                Start the HTTP inference server
-  run   <model-name>   Interactive chat in terminal
+  pull     <user/model>   Download a model from HuggingFace
+  start                   Start the HTTP inference server
+  run      <model-name>   Interactive chat in terminal
+  estimate <model>        Estimate memory footprint and accuracy
 
 Download options (pull):
   --models-dir <DIR>        Destination directory (default: ~/.rllm/models/)
   --name <NAME>             Folder name override (default: model name)
   --token <TOKEN>           HuggingFace token for gated models
+  --variant <FORMAT>        GGUF variant to download (e.g. Q4_K_M); skips interactive prompt
   --force                   Overwrite if model already exists
 
 Server options (start):
@@ -108,8 +119,73 @@ Chat options (run):
   --top-k <K>               Top-k filtering (default: 0, disabled)
   --top-p <P>               Nucleus sampling (default: 1.0)
   --min-p <P>               Min-p filtering (default: 0.0)
-  --repeat-penalty <R>      Repetition penalty (default: 1.0)"
+  --repeat-penalty <R>      Repetition penalty (default: 1.0)
+
+Estimate options (estimate):
+  --models-dir <DIR>        Models directory (default: ~/.rllm/models/)
+  --token <TOKEN>           HuggingFace token (for private repos)
+  --context-len <N>         Context length for KV cache estimate (default: 4096)
+  --num-sequences <N>       Concurrent sequences for KV cache estimate (default: 1)"
     );
+}
+
+fn parse_estimate_args(args: &[String]) -> Result<EstimateArgs, String> {
+    let mut model = String::new();
+    let mut models_dir: Option<PathBuf> = None;
+    let mut token: Option<String> = None;
+    let mut context_len: usize = 4096;
+    let mut num_sequences: usize = 1;
+    let mut i = 0;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            "--models-dir" => {
+                i += 1;
+                models_dir = Some(PathBuf::from(
+                    args.get(i).ok_or("--models-dir requires a value")?,
+                ));
+            }
+            "--token" => {
+                i += 1;
+                token = Some(args.get(i).ok_or("--token requires a value")?.clone());
+            }
+            "--context-len" => {
+                i += 1;
+                context_len = args
+                    .get(i)
+                    .ok_or("--context-len requires a value")?
+                    .parse()
+                    .map_err(|_| "Invalid context-len (expected integer)")?;
+            }
+            "--num-sequences" => {
+                i += 1;
+                num_sequences = args
+                    .get(i)
+                    .ok_or("--num-sequences requires a value")?
+                    .parse()
+                    .map_err(|_| "Invalid num-sequences (expected integer)")?;
+            }
+            _ if !args[i].starts_with('-') && model.is_empty() => {
+                model = args[i].clone();
+            }
+            other => return Err(format!("Unknown option: {}", other)),
+        }
+        i += 1;
+    }
+
+    if model.is_empty() {
+        return Err(
+            "Missing <model>: provide a local model name or a HF repo ID (user/model)".to_string(),
+        );
+    }
+
+    Ok(EstimateArgs {
+        model,
+        models_dir: models_dir.unwrap_or_else(default_models_dir),
+        token,
+        context_len,
+        num_sequences,
+    })
 }
 
 fn parse_pull_args(args: &[String]) -> Result<PullArgs, String> {
@@ -118,6 +194,7 @@ fn parse_pull_args(args: &[String]) -> Result<PullArgs, String> {
     let mut name: Option<String> = None;
     let mut token: Option<String> = None;
     let mut force = false;
+    let mut variant: Option<String> = None;
     let mut i = 0;
 
     while i < args.len() {
@@ -135,6 +212,10 @@ fn parse_pull_args(args: &[String]) -> Result<PullArgs, String> {
             "--token" => {
                 i += 1;
                 token = Some(args.get(i).ok_or("--token requires a value")?.clone());
+            }
+            "--variant" => {
+                i += 1;
+                variant = Some(args.get(i).ok_or("--variant requires a value")?.clone());
             }
             "--force" => {
                 force = true;
@@ -163,6 +244,7 @@ fn parse_pull_args(args: &[String]) -> Result<PullArgs, String> {
         name,
         token,
         force,
+        variant,
     })
 }
 
@@ -348,8 +430,13 @@ fn run_interactive(args: &RunArgs) -> anyhow::Result<()> {
     println!("Tokenizer loaded.");
 
     println!("Loading model from '{}'...", args.model_dir);
+    let model_id_infer = std::path::Path::new(&args.model_dir)
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
     let (batch_model, weights_size_bytes) = models::loader::load_batch_model(
-        &args.model_dir, &device, args.max_context_len, 1,
+        &args.model_dir, &model_id_infer, &device, args.max_context_len, 1,
     )?;
     let max_seq_len = batch_model.max_seq_len();
     let kv_cache_bytes = batch_model.kv_cache_bytes();
@@ -481,6 +568,25 @@ fn main() -> anyhow::Result<()> {
                 models_dir: pull_args.models_dir,
                 token,
                 force: pull_args.force,
+                variant: pull_args.variant,
+            })?;
+        }
+        "estimate" => {
+            let est_args = parse_estimate_args(&args[2..]).unwrap_or_else(|e| {
+                eprintln!("Error: {e}");
+                print_usage();
+                std::process::exit(1);
+            });
+            let token = est_args
+                .token
+                .or_else(|| std::env::var("HF_TOKEN").ok())
+                .or_else(|| std::env::var("HUGGING_FACE_HUB_TOKEN").ok());
+            models::estimate::run_estimate(&models::estimate::EstimateArgs {
+                model: est_args.model,
+                models_dir: est_args.models_dir,
+                token,
+                context_len: est_args.context_len,
+                num_sequences: est_args.num_sequences,
             })?;
         }
         "--help" | "-h" | "help" => {

@@ -1,11 +1,12 @@
 use candle_core::{Result, Tensor, D};
-use super::linear::{silu, Linear};
+use super::gguf_weights::GgufWeights;
+use super::linear::{silu, AnyLinear, Linear, QLinear};
 use super::weights::ModelWeights;
 
 pub struct FeedForward {
-    gate_proj: Linear,
-    up_proj: Linear,
-    down_proj: Linear,
+    gate_proj: AnyLinear,
+    up_proj: AnyLinear,
+    down_proj: AnyLinear,
     gate_up_proj: Option<Linear>,
     intermediate_size: usize,
 }
@@ -20,7 +21,35 @@ impl FeedForward {
         let gate_up_w = Tensor::cat(&[gate_proj.weight(), up_proj.weight()], 0)?;
         let gate_up_proj = Some(Linear::new(gate_up_w, None));
 
-        Ok(Self { gate_proj, up_proj, down_proj, gate_up_proj, intermediate_size })
+        Ok(Self {
+            gate_proj: AnyLinear::Float(gate_proj),
+            up_proj: AnyLinear::Float(up_proj),
+            down_proj: AnyLinear::Float(down_proj),
+            gate_up_proj,
+            intermediate_size,
+        })
+    }
+
+    pub fn load_gguf(
+        layer_idx: usize,
+        gguf: &GgufWeights,
+        intermediate_size: usize,
+        _device: &candle_core::Device,
+        dtype: candle_core::DType,
+    ) -> Result<Self> {
+        let prefix = format!("blk.{}", layer_idx);
+
+        let gate_proj = QLinear::from_arc(gguf.get(&format!("{prefix}.ffn_gate.weight"))?, dtype)?;
+        let up_proj   = QLinear::from_arc(gguf.get(&format!("{prefix}.ffn_up.weight"))?,   dtype)?;
+        let down_proj = QLinear::from_arc(gguf.get(&format!("{prefix}.ffn_down.weight"))?, dtype)?;
+
+        Ok(Self {
+            gate_proj: AnyLinear::Quantized(gate_proj),
+            up_proj: AnyLinear::Quantized(up_proj),
+            down_proj: AnyLinear::Quantized(down_proj),
+            gate_up_proj: None,
+            intermediate_size,
+        })
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {

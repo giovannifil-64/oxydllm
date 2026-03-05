@@ -5,7 +5,7 @@ use crate::common::{
     attention::SegmentInfo,
     block::TransformerBlock,
     config::BlockConfig,
-    linear::{Embedding, Linear},
+    linear::{AnyLinear, Embedding, Linear},
     mask::causal_mask_cached,
     norm::RMSNorm,
     paged::{BlockAllocator, PagedKvCache, SharedBlockAllocator, DEFAULT_BLOCK_SIZE},
@@ -18,7 +18,7 @@ pub struct Llama {
     embed_tokens: Embedding,
     blocks: Vec<TransformerBlock>,
     norm: RMSNorm,
-    lm_head: Linear,
+    lm_head: AnyLinear,
     rope: RotaryEmbedding,
     allocators: Vec<SharedBlockAllocator>,
     device: Device,
@@ -48,9 +48,9 @@ impl Llama {
 
         let embed_weight = weights.get("model.embed_tokens.weight")?.clone();
         let lm_head = if cfg.tie_word_embeddings {
-            Linear::new(embed_weight.clone(), None)
+            AnyLinear::Float(Linear::new(embed_weight.clone(), None))
         } else {
-            Linear::new(weights.get("lm_head.weight")?.clone(), None)
+            AnyLinear::Float(Linear::new(weights.get("lm_head.weight")?.clone(), None))
         };
         let embed_tokens = Embedding::new(embed_weight);
 
@@ -104,6 +104,7 @@ impl Llama {
             num_layers: cfg.num_hidden_layers,
         })
     }
+
 }
 
 impl Llama {

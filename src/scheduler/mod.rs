@@ -1,6 +1,6 @@
 pub mod sequence;
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use crate::common::paged::{PagedKvCache, SharedBlockAllocator, DEFAULT_BLOCK_SIZE};
@@ -29,6 +29,7 @@ pub struct Scheduler {
     config: SchedulerConfig,
     waiting: VecDeque<SequenceState>,
     running: Vec<SequenceState>,
+    running_index: HashMap<SequenceId, usize>,
     allocators: Vec<SharedBlockAllocator>,
     next_id: SequenceId,
     num_layers: usize,
@@ -50,11 +51,28 @@ impl Scheduler {
             config,
             waiting: VecDeque::new(),
             running: Vec::new(),
+            running_index: HashMap::new(),
             allocators,
             next_id: 0,
             num_layers,
             block_size,
         }
+    }
+
+    fn push_to_running(&mut self, seq: SequenceState) {
+        let idx = self.running.len();
+        self.running_index.insert(seq.id, idx);
+        self.running.push(seq);
+    }
+
+    fn remove_from_running(&mut self, vec_idx: usize) -> SequenceState {
+        let seq_id = self.running[vec_idx].id;
+        self.running_index.remove(&seq_id);
+        let seq = self.running.swap_remove(vec_idx);
+        if vec_idx < self.running.len() {
+            self.running_index.insert(self.running[vec_idx].id, vec_idx);
+        }
+        seq
     }
 
     pub fn add_request(
@@ -70,11 +88,12 @@ impl Scheduler {
             .map(|i| PagedKvCache::new(Arc::clone(&self.allocators[i])))
             .collect();
 
-        let all_tokens = prompt_tokens.clone();
+        let prompt_len = prompt_tokens.len();
         let seq = SequenceState {
             id,
-            generated_tokens: Vec::new(),
-            all_tokens,
+            prompt_len,
+            num_generated: 0,
+            all_tokens: prompt_tokens,
             sampling_params,
             status: SequenceStatus::Waiting,
             phase: SequencePhase::Prefill,
@@ -97,24 +116,26 @@ impl Scheduler {
 
     fn blocks_needed_for_prefill(&self, seq: &SequenceState) -> usize {
         let total_tokens = seq.all_tokens.len();
-        (total_tokens + self.block_size - 1) / self.block_size
+        total_tokens.div_ceil(self.block_size)
     }
 
     fn decode_needs_new_block(&self, seq: &SequenceState) -> bool {
-        seq.num_processed_tokens % self.block_size == 0 && seq.num_processed_tokens > 0
+        seq.num_processed_tokens.is_multiple_of(self.block_size) && seq.num_processed_tokens > 0
     }
 
     pub fn schedule(&mut self) -> SchedulerOutput {
         let mut scheduled = Vec::new();
         let mut budget = self.config.max_tokens_per_step;
 
-        let mut to_preempt = Vec::new();
-        for (idx, seq) in self.running.iter().enumerate() {
+        let free_blocks = self.num_free_blocks();
+
+        let mut to_preempt: Vec<SequenceId> = Vec::new();
+        for seq in self.running.iter() {
             if budget == 0 {
                 break;
             }
-            if self.decode_needs_new_block(seq) && self.num_free_blocks() == 0 {
-                to_preempt.push(idx);
+            if self.decode_needs_new_block(seq) && free_blocks == 0 {
+                to_preempt.push(seq.id);
                 continue;
             }
             scheduled.push(ScheduledSequence {
@@ -124,8 +145,9 @@ impl Scheduler {
             budget -= 1;
         }
 
-        for &idx in to_preempt.iter().rev() {
-            let mut seq = self.running.remove(idx);
+        for seq_id in &to_preempt {
+            let idx = *self.running_index.get(seq_id).unwrap();
+            let mut seq = self.remove_from_running(idx);
             eprintln!(
                 "[scheduler] seq={} preempted (memory pressure) — KV cache cleared, re-queued for prefill",
                 seq.id
@@ -140,22 +162,17 @@ impl Scheduler {
         }
 
         if !to_preempt.is_empty() {
-            let running_ids: std::collections::HashSet<SequenceId> =
-                self.running.iter().map(|s| s.id).collect();
-            scheduled.retain(|s| running_ids.contains(&s.id));
+            scheduled.retain(|s| self.running_index.contains_key(&s.id));
         }
 
-        let mut newly_admitted = Vec::new();
-        while self.running.len() + newly_admitted.len() < self.config.max_num_sequences
-            && budget > 0
-        {
+        while self.running.len() < self.config.max_num_sequences && budget > 0 {
             let seq = match self.waiting.front() {
                 Some(s) => s,
                 None => break,
             };
 
             let blocks_needed = self.blocks_needed_for_prefill(seq);
-            if blocks_needed > self.num_free_blocks() {
+            if blocks_needed > free_blocks {
                 break;
             }
 
@@ -174,33 +191,32 @@ impl Scheduler {
             });
             budget -= tokens_needed;
 
-            newly_admitted.push(seq);
+            self.push_to_running(seq);
         }
-
-        self.running.extend(newly_admitted);
 
         SchedulerOutput { scheduled }
     }
 
     pub fn get_running_mut(&mut self, seq_id: SequenceId) -> Option<&mut SequenceState> {
-        self.running.iter_mut().find(|s| s.id == seq_id)
+        let idx = *self.running_index.get(&seq_id)?;
+        self.running.get_mut(idx)
     }
 
     pub fn retire_finished(&mut self) -> Vec<CompletedSequence> {
-        let mut completed = Vec::new();
-        let mut i = 0;
-        while i < self.running.len() {
-            if self.running[i].status == SequenceStatus::Finished {
-                let mut seq = self.running.remove(i);
-                for cache in &mut seq.caches {
-                    cache.clear();
-                }
-                completed.push(CompletedSequence {
-                    id: seq.id,
-                });
-            } else {
-                i += 1;
+        let finished: Vec<SequenceId> = self.running
+            .iter()
+            .filter(|s| s.status == SequenceStatus::Finished)
+            .map(|s| s.id)
+            .collect();
+
+        let mut completed = Vec::with_capacity(finished.len());
+        for seq_id in finished {
+            let idx = *self.running_index.get(&seq_id).unwrap();
+            let mut seq = self.remove_from_running(idx);
+            for cache in &mut seq.caches {
+                cache.clear();
             }
+            completed.push(CompletedSequence { id: seq.id });
         }
         completed
     }

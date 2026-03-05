@@ -30,9 +30,9 @@ pub struct SegmentInfo<'a> {
 }
 
 pub struct Attention {
-    q_proj: AnyLinear,
-    k_proj: AnyLinear,
-    v_proj: AnyLinear,
+    q_proj: Option<AnyLinear>,
+    k_proj: Option<AnyLinear>,
+    v_proj: Option<AnyLinear>,
     o_proj: AnyLinear,
     qkv_proj: Option<Linear>,
     q_norm: Option<RMSNorm>,
@@ -50,10 +50,16 @@ impl Attention {
         let p = format!("model.layers.{}.self_attn", layer_idx);
         let hd = cfg.head_dim;
 
-        let q_proj = Linear::new(weights.get(&format!("{}.q_proj.weight", p))?.clone(), None);
-        let k_proj = Linear::new(weights.get(&format!("{}.k_proj.weight", p))?.clone(), None);
-        let v_proj = Linear::new(weights.get(&format!("{}.v_proj.weight", p))?.clone(), None);
-        let o_proj = Linear::new(weights.get(&format!("{}.o_proj.weight", p))?.clone(), None);
+        let q_w = weights.get(&format!("{}.q_proj.weight", p))?;
+        let k_w = weights.get(&format!("{}.k_proj.weight", p))?;
+        let v_w = weights.get(&format!("{}.v_proj.weight", p))?;
+        let qkv_w = Tensor::cat(&[q_w, k_w, v_w], 0)?;
+        let qkv_proj = Some(Linear::new(qkv_w, None));
+
+        let o_proj = AnyLinear::Float(Linear::new(
+            weights.get(&format!("{}.o_proj.weight", p))?.clone(),
+            None,
+        ));
 
         let q_norm = cfg.qk_norm.then(|| {
             RMSNorm::new(
@@ -71,18 +77,11 @@ impl Attention {
         let q_dim = cfg.n_heads * hd;
         let kv_dim = cfg.n_kv_heads * hd;
 
-        let qkv_w = Tensor::cat(&[
-            q_proj.weight(),
-            k_proj.weight(),
-            v_proj.weight(),
-        ], 0)?;
-        let qkv_proj = Some(Linear::new(qkv_w, None));
-
         Ok(Self {
-            q_proj: AnyLinear::Float(q_proj),
-            k_proj: AnyLinear::Float(k_proj),
-            v_proj: AnyLinear::Float(v_proj),
-            o_proj: AnyLinear::Float(o_proj),
+            q_proj: None,
+            k_proj: None,
+            v_proj: None,
+            o_proj,
             qkv_proj,
             q_norm, k_norm,
             n_heads: cfg.n_heads,
@@ -125,9 +124,9 @@ impl Attention {
         let kv_dim = cfg.n_kv_heads * hd;
 
         Ok(Self {
-            q_proj: AnyLinear::Quantized(q_proj),
-            k_proj: AnyLinear::Quantized(k_proj),
-            v_proj: AnyLinear::Quantized(v_proj),
+            q_proj: Some(AnyLinear::Quantized(q_proj)),
+            k_proj: Some(AnyLinear::Quantized(k_proj)),
+            v_proj: Some(AnyLinear::Quantized(v_proj)),
             o_proj: AnyLinear::Quantized(o_proj),
             qkv_proj: None,
             q_norm, k_norm,
@@ -148,7 +147,10 @@ impl Attention {
             let v = out.narrow(D::Minus1, self.q_dim + self.kv_dim, self.kv_dim)?;
             Ok((q, k, v))
         } else {
-            Ok((self.q_proj.forward(x)?, self.k_proj.forward(x)?, self.v_proj.forward(x)?))
+            let q = self.q_proj.as_ref().expect("q_proj missing").forward(x)?;
+            let k = self.k_proj.as_ref().expect("k_proj missing").forward(x)?;
+            let v = self.v_proj.as_ref().expect("v_proj missing").forward(x)?;
+            Ok((q, k, v))
         }
     }
 

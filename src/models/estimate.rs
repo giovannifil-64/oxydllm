@@ -252,8 +252,8 @@ fn estimate_remote(repo_id: &str, token: Option<&str>, ctx_len: usize, num_seqs:
             format!("  {:>9}", "KV cache")
         };
         println!(
-            "  {:<26}  {:>9}{kv_header}  {:>10}  {}",
-            "Format", "Weights", "Total", "Accuracy"
+            "  {:<26}  {:>9}{kv_header}  {:>10}  Accuracy",
+            "Format", "Weights", "Total"
         );
         println!("  {}", "─".repeat(72));
 
@@ -264,8 +264,8 @@ fn estimate_remote(repo_id: &str, token: Option<&str>, ctx_len: usize, num_seqs:
                 .unwrap_or_else(|| "?".to_string());
             let kv_bytes = geometry.as_ref().map(|g| kv_cache_bytes(g, ctx_len, num_seqs));
             let total = kv_bytes.map(|kv| *size as usize + kv);
-            let kv_str = kv_bytes.map(|b| fmt_bytes(b)).unwrap_or_else(|| "?".to_string());
-            let total_str = total.map(|b| fmt_bytes(b)).unwrap_or_else(|| "?".to_string());
+            let kv_str = kv_bytes.map(fmt_bytes).unwrap_or_else(|| "?".to_string());
+            let total_str = total.map(fmt_bytes).unwrap_or_else(|| "?".to_string());
             let acc = quant_accuracy_str(&quant);
             let star = if Some(filename.as_str()) == recommended { " ★" } else { "" };
 
@@ -294,17 +294,16 @@ fn estimate_remote(repo_id: &str, token: Option<&str>, ctx_len: usize, num_seqs:
     if safetensors_bytes > 0 {
         println!();
         let kv_bytes = geometry.as_ref().map(|g| kv_cache_bytes(g, ctx_len, num_seqs));
-        let kv_str = kv_bytes.map(|b| fmt_bytes(b)).unwrap_or_else(|| "?".to_string());
+        let kv_str = kv_bytes.map(fmt_bytes).unwrap_or_else(|| "?".to_string());
         let total = kv_bytes.map(|b| b + safetensors_bytes as usize);
-        let total_str = total.map(|b| fmt_bytes(b)).unwrap_or_else(|| "?".to_string());
+        let total_str = total.map(fmt_bytes).unwrap_or_else(|| "?".to_string());
         println!("  {}", "─".repeat(72));
         println!(
-            "  {:<26}  {:>9}  {:>9}  {:>10}  {}",
+            "  {:<26}  {:>9}  {:>9}  {:>10}  100%",
             "safetensors (F32/BF16)",
             fmt_bytes(safetensors_bytes as usize),
             kv_str,
             total_str,
-            "100%",
         );
     }
 
@@ -507,7 +506,7 @@ pub fn quant_accuracy_str(quant: &str) -> &'static str {
     quant_accuracy(quant).map(|(pct, _)| pct).unwrap_or("?")
 }
 
-fn best_recommendation<'a>(files: &'a [(String, u64)]) -> Option<&'a str> {
+fn best_recommendation(files: &[(String, u64)]) -> Option<&str> {
     if let Some((name, _)) = files.iter().find(|(f, _)| {
         extract_quant_from_filename(f)
             .map(|q| q.eq_ignore_ascii_case("Q4_K_M"))
@@ -530,7 +529,7 @@ fn meta_u32(content: &gguf_file::Content, key: &str) -> Option<u32> {
 }
 
 fn meta_string(content: &gguf_file::Content, key: &str) -> Option<String> {
-    content.metadata.get(key).and_then(|v| v.to_string().ok().map(|s| s.clone()))
+    content.metadata.get(key).and_then(|v| v.to_string().ok().cloned())
 }
 
 fn read_torch_dtype(config_path: &Path) -> Option<String> {

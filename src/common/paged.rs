@@ -99,94 +99,93 @@ pub type SharedBlockAllocator = Arc<Mutex<BlockAllocator>>;
 pub struct BlockTable {
     pub block_ids: Vec<usize>,
     pub num_tokens: usize,
+    cached_slots: Vec<u32>,
 }
 
 impl BlockTable {
     pub fn new() -> Self {
-        Self { block_ids: Vec::new(), num_tokens: 0 }
-    }
-
-    pub fn slot_indices(&self, block_size: usize) -> Vec<u32> {
-        let mut indices = Vec::with_capacity(self.num_tokens);
-        let full_blocks = self.num_tokens / block_size;
-        let remainder = self.num_tokens % block_size;
-
-        for i in 0..full_blocks {
-            let base = self.block_ids[i] * block_size;
-            for off in 0..block_size {
-                indices.push((base + off) as u32);
-            }
-        }
-        if remainder > 0 {
-            let base = self.block_ids[full_blocks] * block_size;
-            for off in 0..remainder {
-                indices.push((base + off) as u32);
-            }
-        }
-        indices
+        Self { block_ids: Vec::new(), num_tokens: 0, cached_slots: Vec::new() }
     }
 }
 
 pub struct PagedKvCache {
     allocator: SharedBlockAllocator,
     table: BlockTable,
+    block_size: usize,
 }
 
 impl PagedKvCache {
     pub fn new(allocator: SharedBlockAllocator) -> Self {
-        Self { allocator, table: BlockTable::new() }
+        let block_size = allocator.lock().unwrap().block_size();
+        Self { allocator, table: BlockTable::new(), block_size }
     }
 
     pub fn append(&mut self, new_k: &Tensor, new_v: &Tensor) -> Result<(Tensor, Tensor)> {
         let (_, _, new_seq, _) = new_k.dims4()?;
         let k_flat = new_k.squeeze(0)?.transpose(0, 1)?;
         let v_flat = new_v.squeeze(0)?.transpose(0, 1)?;
-        let block_size = self.allocator.lock().unwrap().block_size();
+        let block_size = self.block_size;
 
         let mut written = 0;
-        
+
         while written < new_seq {
             let current_offset = self.table.num_tokens % block_size;
-
-            if current_offset == 0 {
-                let block_id = self.allocator.lock().unwrap().allocate()?;
-                self.table.block_ids.push(block_id);
-            }
-
-            let space = block_size - current_offset;
-            let n = (new_seq - written).min(space);
+            let n = (new_seq - written).min(block_size - current_offset);
             let k_chunk = k_flat.narrow(0, written, n)?.contiguous()?;
             let v_chunk = v_flat.narrow(0, written, n)?.contiguous()?;
-            let block_id = *self.table.block_ids.last().unwrap();
 
-            self.allocator
-                .lock().unwrap()
-                .write(block_id, current_offset, &k_chunk, &v_chunk)?;
+            let block_id = {
+                let mut alloc = self.allocator.lock().unwrap();
+                if current_offset == 0 {
+                    let id = alloc.allocate()?;
+                    self.table.block_ids.push(id);
+                }
+                let id = *self.table.block_ids.last().unwrap();
+                alloc.write(id, current_offset, &k_chunk, &v_chunk)?;
+                id
+            };
+
+            let base = (block_id * block_size) as u32;
+            for off in current_offset as u32..(current_offset + n) as u32 {
+                self.table.cached_slots.push(base + off);
+            }
 
             self.table.num_tokens += n;
             written += n;
         }
 
-        let slots = self.table.slot_indices(block_size);
-        let idx = Tensor::from_vec(slots, (self.table.num_tokens,), new_k.device())?;
+        let idx = Tensor::from_slice(
+            &self.table.cached_slots,
+            (self.table.num_tokens,),
+            new_k.device(),
+        )?;
 
         self.allocator.lock().unwrap().gather(&idx)
     }
 
     pub fn clear(&mut self) {
-        for &bid in &self.table.block_ids {
-            self.allocator.lock().unwrap().free(bid);
+        if !self.table.block_ids.is_empty() {
+            let mut alloc = self.allocator.lock().unwrap();
+            for &bid in &self.table.block_ids {
+                alloc.free(bid);
+            }
         }
         self.table.block_ids.clear();
         self.table.num_tokens = 0;
+        self.table.cached_slots.clear();
     }
 
     pub fn prepopulate_block(&mut self, block_id: usize) {
         self.allocator.lock().unwrap().share(block_id);
         self.table.block_ids.push(block_id);
+        let base = (block_id * self.block_size) as u32;
+        for off in 0..self.block_size as u32 {
+            self.table.cached_slots.push(base + off);
+        }
     }
 
     pub fn set_num_tokens(&mut self, n: usize) {
+        self.table.cached_slots.truncate(n);
         self.table.num_tokens = n;
     }
 

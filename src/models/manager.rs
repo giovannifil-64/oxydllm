@@ -205,11 +205,10 @@ impl ModelManager {
     /// The estimate includes both weights and KV cache.
     fn projected_size_bytes(&self, model_id: &str, model_path: &Path) -> usize {
         // Case 1: previously loaded — use the real in-memory footprint (weights + kv).
-        if let Some(entry) = self.registry.get(model_id) {
-            if entry.size_bytes > 0 {
+        if let Some(entry) = self.registry.get(model_id)
+            && entry.size_bytes > 0 {
                 return entry.size_bytes + entry.kv_cache_bytes;
             }
-        }
 
         // Case 2: first-ever load — estimate from disk.
         // On GPU we load BF16 (≈ same size as on-disk BF16 safetensors).

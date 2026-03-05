@@ -23,7 +23,7 @@ impl Default for SamplingParams {
 
 pub fn sample(logits: &Tensor, params: &SamplingParams, prev_tokens: &[u32]) -> Result<u32> {
     if params.temperature == 0.0 {
-        return Ok(logits.argmax(D::Minus1)?.to_scalar::<u32>()?);
+        return logits.argmax(D::Minus1)?.to_scalar::<u32>();
     }
 
     let mut logits = logits.to_dtype(candle_core::DType::F32)?;
@@ -90,13 +90,15 @@ fn apply_top_k(probs: &[f32], k: usize) -> Vec<f32> {
     if k >= probs.len() {
         return probs.to_vec();
     }
-    let mut sorted: Vec<f32> = probs.to_vec();
-    sorted.sort_unstable_by(|a, b| b.partial_cmp(a).unwrap());
-    let threshold = sorted[k];
+    let mut temp: Vec<f32> = probs.to_vec();
+    temp.select_nth_unstable_by(k, |a, b| {
+        b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let threshold = temp[k];
 
     let mut filtered: Vec<f32> = probs.iter().map(|&p| if p > threshold { p } else { 0.0 }).collect();
-
     let mut count = filtered.iter().filter(|&&p| p > 0.0).count();
+
     if count < k {
         for i in 0..filtered.len() {
             if count >= k {

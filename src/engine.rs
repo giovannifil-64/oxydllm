@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use candle_core::{Device, Result, Tensor};
@@ -23,7 +24,7 @@ pub struct Engine {
     model: Box<dyn BatchModel>,
     scheduler: Scheduler,
     device: Device,
-    stop_token_ids: Vec<u32>,
+    stop_token_ids: HashSet<u32>,
     allocators: Vec<SharedBlockAllocator>,
     prefix_cache: PrefixCache,
     block_size: usize,
@@ -36,7 +37,7 @@ impl Engine {
         extra_stop_ids: &[u32],
     ) -> Self {
         let allocators: Vec<SharedBlockAllocator> =
-            model.allocators().iter().map(|a| Arc::clone(a)).collect();
+            model.allocators().iter().map(Arc::clone).collect();
         let num_layers = model.num_layers();
         let device = model.device().clone();
         let block_size = if allocators.is_empty() {
@@ -44,11 +45,10 @@ impl Engine {
         } else {
             allocators[0].lock().unwrap().block_size()
         };
-        let mut stop_token_ids = model.stop_token_ids().to_vec();
+        let mut stop_token_ids: HashSet<u32> =
+            model.stop_token_ids().iter().copied().collect();
         for &id in extra_stop_ids {
-            if !stop_token_ids.contains(&id) {
-                stop_token_ids.push(id);
-            }
+            stop_token_ids.insert(id);
         }
         let scheduler_allocators: Vec<SharedBlockAllocator> =
             allocators.iter().map(Arc::clone).collect();
@@ -141,25 +141,15 @@ impl Engine {
                 sampling::sample(&last_logits, &sampling_params, &all_tokens)?;
             let is_stop = self.stop_token_ids.contains(&next_token);
 
-            {
+            let emit = {
                 let seq = self.scheduler.get_running_mut(seq_id).unwrap();
                 seq.all_tokens.push(next_token);
                 seq.num_processed_tokens = seq.all_tokens.len() - 1;
                 seq.phase = SequencePhase::Decode;
+                seq.apply_token(next_token, is_stop)
+            };
 
-                if is_stop {
-                    seq.status = SequenceStatus::Finished;
-                    seq.finish_reason = Some("stop".to_string());
-                } else {
-                    seq.generated_tokens.push(next_token);
-                    if seq.generated_tokens.len() >= seq.max_tokens {
-                        seq.status = SequenceStatus::Finished;
-                        seq.finish_reason = Some("length".to_string());
-                    }
-                }
-            }
-
-            if !is_stop {
+            if emit {
                 new_tokens.push(NewToken { seq_id, token: next_token });
             }
 
@@ -191,7 +181,7 @@ impl Engine {
             let seq = self.scheduler.get_running_mut(seq_id).unwrap();
             let last_token = *seq.all_tokens.last().unwrap();
             let start_pos = seq.num_processed_tokens;
-            let is_first_decode = seq.generated_tokens.len() == 1;
+            let is_first_decode = seq.num_generated == 1;
 
             let t_decode = std::time::Instant::now();
             let input = Tensor::from_vec(vec![last_token], (1, 1), &self.device)?;
@@ -211,16 +201,8 @@ impl Engine {
             seq.all_tokens.push(next_token);
             seq.num_processed_tokens = seq.all_tokens.len() - 1;
 
-            if is_stop {
-                seq.status = SequenceStatus::Finished;
-                seq.finish_reason = Some("stop".to_string());
-            } else {
-                seq.generated_tokens.push(next_token);
+            if seq.apply_token(next_token, is_stop) {
                 new_tokens.push(NewToken { seq_id: seq.id, token: next_token });
-                if seq.generated_tokens.len() >= seq.max_tokens {
-                    seq.status = SequenceStatus::Finished;
-                    seq.finish_reason = Some("length".to_string());
-                }
             }
         } else if decode_ids.len() > 1 {
             let mut all_token_ids: Vec<u32> = Vec::with_capacity(decode_ids.len());
@@ -274,16 +256,8 @@ impl Engine {
                 seq.all_tokens.push(next_token);
                 seq.num_processed_tokens = seq.all_tokens.len() - 1;
 
-                if is_stop {
-                    seq.status = SequenceStatus::Finished;
-                    seq.finish_reason = Some("stop".to_string());
-                } else {
-                    seq.generated_tokens.push(next_token);
+                if seq.apply_token(next_token, is_stop) {
                     new_tokens.push(NewToken { seq_id: seq.id, token: next_token });
-                    if seq.generated_tokens.len() >= seq.max_tokens {
-                        seq.status = SequenceStatus::Finished;
-                        seq.finish_reason = Some("length".to_string());
-                    }
                 }
             }
         }

@@ -73,14 +73,13 @@ fn resolve_devices(explicit: Option<Vec<usize>>) -> Vec<usize> {
     if let Some(d) = explicit {
         return d;
     }
-    if let Ok(env) = std::env::var("RLLM_DEVICES") {
-        if !env.trim().is_empty() {
+    if let Ok(env) = std::env::var("RLLM_DEVICES")
+        && !env.trim().is_empty() {
             match parse_devices(&env) {
                 Ok(d) => return d,
                 Err(e) => eprintln!("Warning: RLLM_DEVICES ignored — {}", e),
             }
         }
-    }
     vec![]
 }
 
@@ -293,8 +292,7 @@ fn parse_start_args(args: &[String]) -> Result<StartArgs, String> {
             "--devices" => {
                 i += 1;
                 devices_raw = Some(
-                    parse_devices(args.get(i).ok_or("--devices requires a value")?)
-                        .map_err(|e| e)?,
+                    parse_devices(args.get(i).ok_or("--devices requires a value")?)?,
                 );
             }
             "--max-context-len" => {

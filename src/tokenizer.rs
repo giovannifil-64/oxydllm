@@ -72,14 +72,13 @@ impl Tokenizer {
         if let Some(decoder) = cfg.get("added_tokens_decoder").and_then(|v| v.as_object()) {
             for (id_str, info) in decoder {
                 let is_special = info.get("special").and_then(|v| v.as_bool()).unwrap_or(false);
-                if is_special {
-                    if let (Ok(id), Some(content)) = (
+                if is_special
+                    && let (Ok(id), Some(content)) = (
                         id_str.parse::<u32>(),
                         info.get("content").and_then(|c| c.as_str()),
                     ) {
                         special_token_ids.insert(content.to_string(), id);
                     }
-                }
             }
         }
 
@@ -105,8 +104,7 @@ impl Tokenizer {
         let chat_template = content
             .metadata
             .get("tokenizer.chat_template")
-            .and_then(|v| v.to_string().ok())
-            .map(|s| s.clone());
+            .and_then(|v| v.to_string().ok()).cloned();
 
         let mut special_tokens = HashMap::new();
         let mut special_token_ids: HashMap<String, u32> = HashMap::new();
@@ -117,7 +115,7 @@ impl Tokenizer {
             .and_then(|v| v.to_vec().ok())
             .map(|arr| {
                 arr.iter()
-                    .filter_map(|v| v.to_string().ok().map(|s| s.clone()))
+                    .filter_map(|v| v.to_string().ok().cloned())
                     .collect()
             })
             .unwrap_or_default();
@@ -132,31 +130,26 @@ impl Tokenizer {
             ("tokenizer.ggml.pad_token_id", "pad_token"),
             ("tokenizer.ggml.unk_token_id", "unk_token"),
         ] {
-            if let Some(val) = content.metadata.get(gguf_key) {
-                if let Ok(id) = val.to_u32() {
-                    if let Some(tok_str) = get_token_str(id) {
+            if let Some(val) = content.metadata.get(gguf_key)
+                && let Ok(id) = val.to_u32()
+                    && let Some(tok_str) = get_token_str(id) {
                         special_tokens.insert(name.to_string(), tok_str.clone());
                         special_token_ids.insert(tok_str, id);
                     }
-                }
-            }
         }
 
-        if let Some(type_arr) = content.metadata.get("tokenizer.ggml.token_type") {
-            if let Ok(arr) = type_arr.to_vec() {
+        if let Some(type_arr) = content.metadata.get("tokenizer.ggml.token_type")
+            && let Ok(arr) = type_arr.to_vec() {
                 for (idx, v) in arr.iter().enumerate() {
-                    if let Ok(ty) = v.to_u32() {
-                        if matches!(ty, 2..=5) {
-                            if let Some(tok_str) = tokens_arr.get(idx) {
+                    if let Ok(ty) = v.to_u32()
+                        && matches!(ty, 2..=5)
+                            && let Some(tok_str) = tokens_arr.get(idx) {
                                 special_token_ids
                                     .entry(tok_str.clone())
                                     .or_insert(idx as u32);
                             }
-                        }
-                    }
                 }
             }
-        }
 
         println!(
             "[gguf] Tokenizer loaded from GGUF ({} tokens, template={})",
@@ -183,7 +176,7 @@ impl Tokenizer {
     pub fn decode(&self, ids: &[u32]) -> Result<String> {
         self.inner
             .decode(ids, true)
-            .map_err(|e| anyhow::anyhow!("{}", e).into())
+            .map_err(|e| anyhow::anyhow!("{}", e))
     }
 
     pub fn chat_template(&self) -> Option<&str> {
@@ -218,11 +211,10 @@ impl Tokenizer {
             "<|im_end|>",
             "<|endoftext|>",
         ] {
-            if let Some(id) = self.special_token_id(content) {
-                if !ids.contains(&id) {
+            if let Some(id) = self.special_token_id(content)
+                && !ids.contains(&id) {
                     ids.push(id);
                 }
-            }
         }
         ids
     }

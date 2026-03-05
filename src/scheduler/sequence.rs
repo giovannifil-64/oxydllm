@@ -18,7 +18,9 @@ pub enum SequenceStatus {
 
 pub struct SequenceState {
     pub id: SequenceId,
-    pub generated_tokens: Vec<u32>,
+    #[allow(dead_code)]
+    pub prompt_len: usize,
+    pub num_generated: usize,
     pub all_tokens: Vec<u32>,
     pub sampling_params: SamplingParams,
     pub status: SequenceStatus,
@@ -27,4 +29,26 @@ pub struct SequenceState {
     pub num_processed_tokens: usize,
     pub max_tokens: usize,
     pub finish_reason: Option<String>,
+}
+
+impl SequenceState {
+    #[allow(dead_code)]
+    pub fn generated_tokens(&self) -> &[u32] {
+        &self.all_tokens[self.prompt_len..]
+    }
+
+    pub fn apply_token(&mut self, _next_token: u32, is_stop: bool) -> bool {
+        if is_stop {
+            self.status = SequenceStatus::Finished;
+            self.finish_reason = Some("stop".to_string());
+            false
+        } else {
+            self.num_generated += 1;
+            if self.num_generated >= self.max_tokens {
+                self.status = SequenceStatus::Finished;
+                self.finish_reason = Some("length".to_string());
+            }
+            true
+        }
+    }
 }

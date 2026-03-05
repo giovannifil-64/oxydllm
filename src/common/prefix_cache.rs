@@ -100,15 +100,14 @@ impl PrefixCache {
             .min_by_key(|(_, e)| e.last_used)
             .map(|(&h, _)| h);
 
-        if let Some(h) = lru_hash {
-            if let Some(entry) = self.entries.remove(&h) {
+        if let Some(h) = lru_hash
+            && let Some(entry) = self.entries.remove(&h) {
                 for (layer_idx, bid) in entry.block_ids.iter().enumerate() {
                     if layer_idx < allocators.len() {
                         allocators[layer_idx].lock().unwrap().free(*bid);
                     }
                 }
             }
-        }
     }
 
 }

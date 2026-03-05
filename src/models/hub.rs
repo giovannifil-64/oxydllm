@@ -101,8 +101,8 @@ fn select_variant<'a>(
 
     println!("  Multiple GGUF variants available — choose one to download:\n");
     println!(
-        "  {:>2}  {:<16}  {:>10}  {:>5}  {}",
-        "#", "Format", "Size", "Files", "Accuracy"
+        "  {:>2}  {:<16}  {:>10}  {:>5}  Accuracy",
+        "#", "Format", "Size", "Files"
     );
     println!("  {}", "─".repeat(56));
 

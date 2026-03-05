@@ -82,8 +82,7 @@ impl GgufWeights {
             .get(key)
             .ok_or_else(|| anyhow::anyhow!("Missing GGUF metadata key: {}", key))
             .and_then(|v| {
-                v.to_string()
-                    .map(|s| s.clone())
+                v.to_string().cloned()
                     .map_err(|e| anyhow::anyhow!("Bad string for '{}': {}", key, e))
             })
     }
@@ -151,11 +150,10 @@ impl GgufWeights {
             self.metadata.get("tokenizer.ggml.eos_token_ids")
         {
             for v in arr {
-                if let gguf_file::Value::U32(id) = v {
-                    if !ids.contains(id) {
+                if let gguf_file::Value::U32(id) = v
+                    && !ids.contains(id) {
                         ids.push(*id);
                     }
-                }
             }
         }
         ids

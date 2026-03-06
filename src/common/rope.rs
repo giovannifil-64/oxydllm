@@ -38,27 +38,6 @@ impl RotaryEmbedding {
         Ok(Self { cos, sin })
     }
 
-    pub fn apply(&self, x: &Tensor, start_pos: usize) -> Result<Tensor> {
-        let (_b, _h, seq, d) = x.dims4()?;
-        
-        let cos = self.cos.narrow(0, start_pos, seq)?;
-        let sin = self.sin.narrow(0, start_pos, seq)?;
-        
-        let cos = cos.reshape((1, 1, seq, d / 2))?;
-        let sin = sin.reshape((1, 1, seq, d / 2))?;
-        
-        let cos = cos.to_dtype(x.dtype())?;
-        let sin = sin.to_dtype(x.dtype())?;
-
-        let x1 = x.narrow(D::Minus1, 0, d / 2)?;
-        let x2 = x.narrow(D::Minus1, d / 2, d / 2)?;
-        
-        let out1 = (x1.broadcast_mul(&cos)? - x2.broadcast_mul(&sin)?)?;
-        let out2 = (x2.broadcast_mul(&cos)? + x1.broadcast_mul(&sin)?)?;
-        
-        Tensor::cat(&[&out1, &out2], D::Minus1)
-    }
-
     pub fn apply_with_positions(&self, x: &Tensor, position_ids: &Tensor) -> Result<Tensor> {
         let (_b, _h, _seq, d) = x.dims4()?;
 

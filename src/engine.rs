@@ -80,6 +80,19 @@ impl Engine {
             }
         }
 
+        struct PrefillInfo {
+            seq_id: SequenceId,
+            num_cached_tokens: usize,
+            num_cached_blocks: usize,
+            num_full_blocks_total: usize,
+            uncached_len: usize,
+            input_tokens: Vec<u32>,
+            all_tokens: Vec<u32>,
+            sampling_params: SamplingParams,
+        }
+
+        let mut prefill_infos: Vec<PrefillInfo> = Vec::with_capacity(prefill_ids.len());
+
         for &seq_id in &prefill_ids {
             let (all_tokens, sampling_params) = {
                 let seq = self.scheduler.get_running_mut(seq_id).unwrap();
@@ -90,12 +103,10 @@ impl Engine {
 
             let (mut num_cached_blocks, matched_block_ids) =
                 self.prefix_cache.lookup(&all_tokens, block_size);
-
             let max_cacheable = (seq_len.saturating_sub(1)) / block_size;
             if num_cached_blocks > max_cacheable {
                 num_cached_blocks = max_cacheable;
             }
-
             let num_cached_tokens = num_cached_blocks * block_size;
 
             if num_cached_blocks > 0 {
@@ -121,28 +132,97 @@ impl Engine {
 
             let uncached_len = seq_len - num_cached_tokens;
             let input_tokens = all_tokens[num_cached_tokens..].to_vec();
+            let num_full_blocks_total = seq_len / block_size;
 
-            let t_prefill = std::time::Instant::now();
-            let input = Tensor::from_vec(input_tokens, (1, uncached_len), &self.device)?;
-            let logits = {
-                let seq = self.scheduler.get_running_mut(seq_id).unwrap();
-                self.model.forward_with_cache(&input, num_cached_tokens, &mut seq.caches)?
-            };
-            eprintln!(
-                "[timing] prefill forward: {:.1}ms ({}/{} tokens, {} cached)",
-                t_prefill.elapsed().as_secs_f64() * 1000.0,
+            prefill_infos.push(PrefillInfo {
+                seq_id,
+                num_cached_tokens,
+                num_cached_blocks,
+                num_full_blocks_total,
                 uncached_len,
-                seq_len,
-                num_cached_tokens
-            );
+                input_tokens,
+                all_tokens,
+                sampling_params,
+            });
+        }
 
-            let last_logits = logits.squeeze(0)?.get(uncached_len - 1)?;
+        let mut all_token_ids: Vec<u32> = Vec::new();
+        let mut all_positions: Vec<u32> = Vec::new();
+        let mut token_counts: Vec<usize> = Vec::new();
+
+        for info in &prefill_infos {
+            all_token_ids.extend_from_slice(&info.input_tokens);
+            for local_idx in 0..info.uncached_len {
+                all_positions.push((info.num_cached_tokens + local_idx) as u32);
+            }
+            token_counts.push(info.uncached_len);
+        }
+
+        let total_prefill_tokens = all_token_ids.len();
+
+        for &seq_id in &decode_ids {
+            let seq = self.scheduler.get_running_mut(seq_id).unwrap();
+            all_token_ids.push(*seq.all_tokens.last().unwrap());
+            all_positions.push(seq.num_processed_tokens as u32);
+            token_counts.push(1);
+        }
+
+        let total_tokens = all_token_ids.len();
+
+        if total_tokens == 0 {
+            let completed = self.scheduler.retire_finished();
+            return Ok(StepOutput { new_tokens, completed });
+        }
+
+        let num_seqs = prefill_infos.len() + decode_ids.len();
+        let mut cache_vecs: Vec<Vec<_>> = Vec::with_capacity(num_seqs);
+
+        for info in &prefill_infos {
+            let seq = self.scheduler.get_running_mut(info.seq_id).unwrap();
+            cache_vecs.push(std::mem::take(&mut seq.caches));
+        }
+        for &seq_id in &decode_ids {
+            let seq = self.scheduler.get_running_mut(seq_id).unwrap();
+            cache_vecs.push(std::mem::take(&mut seq.caches));
+        }
+
+        let mut cache_slices: Vec<&mut [_]> =
+            cache_vecs.iter_mut().map(|v| v.as_mut_slice()).collect();
+
+
+        let input = Tensor::from_vec(all_token_ids, (1, total_tokens), &self.device)?;
+        let position_ids = Tensor::from_vec(all_positions, (total_tokens,), &self.device)?;
+
+        let logits = self.model.forward_batch(
+            &input,
+            &position_ids,
+            &mut cache_slices,
+            &token_counts,
+        )?;
+
+        for (i, info) in prefill_infos.iter().enumerate() {
+            let seq = self.scheduler.get_running_mut(info.seq_id).unwrap();
+            seq.caches = std::mem::take(&mut cache_vecs[i]);
+        }
+        for (i, &seq_id) in decode_ids.iter().enumerate() {
+            let seq = self.scheduler.get_running_mut(seq_id).unwrap();
+            seq.caches = std::mem::take(&mut cache_vecs[prefill_infos.len() + i]);
+        }
+
+        let batch_logits = logits.squeeze(0)?;
+
+        let mut logit_offset = 0usize;
+        for info in &prefill_infos {
+            let last_idx = logit_offset + info.uncached_len - 1;
+            let seq_logits = batch_logits.get(last_idx)?;
+            logit_offset += info.uncached_len;
+
             let next_token =
-                sampling::sample(&last_logits, &sampling_params, &all_tokens)?;
+                sampling::sample(&seq_logits, &info.sampling_params, &info.all_tokens)?;
             let is_stop = self.stop_token_ids.contains(&next_token);
 
             let emit = {
-                let seq = self.scheduler.get_running_mut(seq_id).unwrap();
+                let seq = self.scheduler.get_running_mut(info.seq_id).unwrap();
                 seq.all_tokens.push(next_token);
                 seq.num_processed_tokens = seq.all_tokens.len() - 1;
                 seq.phase = SequencePhase::Decode;
@@ -150,14 +230,13 @@ impl Engine {
             };
 
             if emit {
-                new_tokens.push(NewToken { seq_id, token: next_token });
+                new_tokens.push(NewToken { seq_id: info.seq_id, token: next_token });
             }
 
-            let num_full_blocks_total = seq_len / block_size;
-            if num_full_blocks_total > num_cached_blocks {
+            if info.num_full_blocks_total > info.num_cached_blocks {
                 let new_block_ids: Vec<Vec<usize>> = {
-                    let seq = self.scheduler.get_running_mut(seq_id).unwrap();
-                    (num_cached_blocks..num_full_blocks_total)
+                    let seq = self.scheduler.get_running_mut(info.seq_id).unwrap();
+                    (info.num_cached_blocks..info.num_full_blocks_total)
                         .map(|block_idx| {
                             seq.caches
                                 .iter()
@@ -167,35 +246,20 @@ impl Engine {
                         .collect()
                 };
                 self.prefix_cache.register(
-                    &all_tokens,
-                    num_cached_blocks,
+                    &info.all_tokens,
+                    info.num_cached_blocks,
                     &new_block_ids,
                     &self.allocators,
-                    block_size,
+                    self.block_size,
                 );
             }
         }
 
-        if decode_ids.len() == 1 {
-            let seq_id = decode_ids[0];
+        for (i, &seq_id) in decode_ids.iter().enumerate() {
+            let seq_logits = batch_logits.get(total_prefill_tokens + i)?;
             let seq = self.scheduler.get_running_mut(seq_id).unwrap();
-            let last_token = *seq.all_tokens.last().unwrap();
-            let start_pos = seq.num_processed_tokens;
-            let is_first_decode = seq.num_generated == 1;
-
-            let t_decode = std::time::Instant::now();
-            let input = Tensor::from_vec(vec![last_token], (1, 1), &self.device)?;
-            let logits = self.model.forward_with_cache(&input, start_pos, &mut seq.caches)?;
-            if is_first_decode {
-                eprintln!(
-                    "[timing] decode step 1: {:.1}ms",
-                    t_decode.elapsed().as_secs_f64() * 1000.0
-                );
-            }
-            let last_logits = logits.squeeze(0)?.get(0)?;
-
             let next_token =
-                sampling::sample(&last_logits, &seq.sampling_params, &seq.all_tokens)?;
+                sampling::sample(&seq_logits, &seq.sampling_params, &seq.all_tokens)?;
             let is_stop = self.stop_token_ids.contains(&next_token);
 
             seq.all_tokens.push(next_token);
@@ -203,62 +267,6 @@ impl Engine {
 
             if seq.apply_token(next_token, is_stop) {
                 new_tokens.push(NewToken { seq_id: seq.id, token: next_token });
-            }
-        } else if decode_ids.len() > 1 {
-            let mut all_token_ids: Vec<u32> = Vec::with_capacity(decode_ids.len());
-            let mut all_positions: Vec<u32> = Vec::with_capacity(decode_ids.len());
-            let mut token_counts: Vec<usize> = Vec::with_capacity(decode_ids.len());
-
-            for &seq_id in &decode_ids {
-                let seq = self.scheduler.get_running_mut(seq_id).unwrap();
-                let last_token = *seq.all_tokens.last().unwrap();
-                let position = seq.num_processed_tokens as u32;
-                all_token_ids.push(last_token);
-                all_positions.push(position);
-                token_counts.push(1);
-            }
-
-            let total_tokens = all_token_ids.len();
-            let input = Tensor::from_vec(all_token_ids, (1, total_tokens), &self.device)?;
-            let position_ids =
-                Tensor::from_vec(all_positions, (total_tokens,), &self.device)?;
-
-            let mut cache_vecs: Vec<Vec<_>> = Vec::with_capacity(decode_ids.len());
-            for &seq_id in &decode_ids {
-                let seq = self.scheduler.get_running_mut(seq_id).unwrap();
-                cache_vecs.push(std::mem::take(&mut seq.caches));
-            }
-
-            let mut cache_slices: Vec<&mut [_]> =
-                cache_vecs.iter_mut().map(|v| v.as_mut_slice()).collect();
-
-            let logits = self.model.forward_batch(
-                &input,
-                &position_ids,
-                &mut cache_slices,
-                &token_counts,
-            )?;
-
-            for (i, &seq_id) in decode_ids.iter().enumerate() {
-                let seq = self.scheduler.get_running_mut(seq_id).unwrap();
-                seq.caches = std::mem::take(&mut cache_vecs[i]);
-            }
-
-            let batch_logits = logits.squeeze(0)?;
-
-            for (i, &seq_id) in decode_ids.iter().enumerate() {
-                let seq_logits = batch_logits.get(i)?;
-                let seq = self.scheduler.get_running_mut(seq_id).unwrap();
-                let next_token =
-                    sampling::sample(&seq_logits, &seq.sampling_params, &seq.all_tokens)?;
-                let is_stop = self.stop_token_ids.contains(&next_token);
-
-                seq.all_tokens.push(next_token);
-                seq.num_processed_tokens = seq.all_tokens.len() - 1;
-
-                if seq.apply_token(next_token, is_stop) {
-                    new_tokens.push(NewToken { seq_id: seq.id, token: next_token });
-                }
             }
         }
 

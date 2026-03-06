@@ -2,13 +2,6 @@ use candle_core::{Device, Result, Tensor};
 use crate::common::paged::{PagedKvCache, SharedBlockAllocator};
 
 pub trait BatchModel {
-    fn forward_with_cache(
-        &self,
-        tokens: &Tensor,
-        start_pos: usize,
-        caches: &mut [PagedKvCache],
-    ) -> Result<Tensor>;
-
     fn forward_batch(
         &self,
         token_ids: &Tensor,

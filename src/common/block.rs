@@ -6,7 +6,6 @@ use super::{
     ffn::FeedForward,
     gguf_weights::GgufWeights,
     linear::{AnyLinear, Embedding},
-    mask::causal_mask_cached,
     norm::RMSNorm,
     paged::PagedKvCache,
     rope::RotaryEmbedding,
@@ -52,21 +51,6 @@ impl TransformerBlock {
         Ok(Self { input_norm, attention, post_attn_norm, ffn })
     }
 
-    pub fn forward(
-        &self,
-        x: &Tensor,
-        rope: &RotaryEmbedding,
-        start_pos: usize,
-        mask: Option<&Tensor>,
-        cache: &mut PagedKvCache,
-    ) -> Result<Tensor> {
-        let residual = x;
-        let x = (residual + self.attention.forward(&self.input_norm.forward(x)?, rope, start_pos, mask, cache)?)?;
-        let residual = &x;
-        let x = (residual + self.ffn.forward(&self.post_attn_norm.forward(&x)?)?)?;
-        Ok(x)
-    }
-
     pub fn forward_batch(
         &self,
         x: &Tensor,
@@ -92,30 +76,6 @@ pub struct TransformerComponents<'a> {
     pub norm: &'a RMSNorm,
     pub lm_head: &'a AnyLinear,
     pub rope: &'a RotaryEmbedding,
-}
-
-/// Shared decode/prefill forward pass for standard transformer models.
-pub fn run_transformer_layers(
-    c: TransformerComponents<'_>,
-    tokens: &Tensor,
-    start_pos: usize,
-    caches: &mut [PagedKvCache],
-) -> Result<Tensor> {
-    let (_b, seq) = tokens.dims2()?;
-    let mut x = c.embed_tokens.forward(tokens)?;
-
-    let mask = if seq > 1 {
-        Some(causal_mask_cached(seq, tokens.device())?)
-    } else {
-        None
-    };
-
-    for (block, cache) in c.blocks.iter().zip(caches.iter_mut()) {
-        x = block.forward(&x, c.rope, start_pos, mask.as_ref(), cache)?;
-    }
-
-    let x = c.norm.forward(&x)?;
-    c.lm_head.forward(&x)
 }
 
 /// Shared batched forward pass for standard transformer models.

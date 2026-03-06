@@ -426,6 +426,9 @@ struct LoadResult {
 /// GPU kernels for **both** prefill (multi-token) and decode (single-token) paths
 /// before the model is marked as Ready.  Without this, the very first real
 /// request pays the compilation cost, causing multi-second TTFT spikes.
+///
+/// Uses `forward_batch` — the same code path the engine uses at runtime — so
+/// Metal specialises kernels for the exact shapes encountered during inference.
 fn warm_up_model(model: &dyn BatchModel) {
     let device = model.device();
     let allocators = model.allocators();
@@ -435,25 +438,26 @@ fn warm_up_model(model: &dyn BatchModel) {
     let lock = crate::gpu_lock::gpu_lock();
     let _gpu = lock.acquire();
 
-    // --- Phase 1: prefill-shaped forward (compile kernels for seq_len > 1) ---
+    // --- Phase 1: prefill-shaped batch (seq_len > 1, causal mask) ---
     {
         let mut caches: Vec<PagedKvCache> = allocators
             .iter()
             .map(|a| PagedKvCache::new(std::sync::Arc::clone(a)))
             .collect();
 
-        // Use 8 dummy tokens – close enough to a short chat-template prompt to
-        // trigger the same Metal/CUDA kernel specialisations that real prefills use.
         let dummy_tokens: Vec<u32> = (1..=8).collect();
+        let positions: Vec<u32> = (0..8).collect();
         let input = match Tensor::from_vec(dummy_tokens, (1, 8), device) {
             Ok(t) => t,
-            Err(e) => {
-                eprintln!("[warmup] failed to create prefill tensor: {e}");
-                return;
-            }
+            Err(e) => { eprintln!("[warmup] failed to create prefill tensor: {e}"); return; }
+        };
+        let position_ids = match Tensor::from_vec(positions, (8,), device) {
+            Ok(t) => t,
+            Err(e) => { eprintln!("[warmup] failed to create position ids: {e}"); return; }
         };
 
-        if let Err(e) = model.forward_with_cache(&input, 0, &mut caches) {
+        let mut cache_slices: Vec<&mut [PagedKvCache]> = vec![caches.as_mut_slice()];
+        if let Err(e) = model.forward_batch(&input, &position_ids, &mut cache_slices, &[8]) {
             eprintln!("[warmup] prefill forward failed (non-fatal): {e}");
         }
 
@@ -462,7 +466,7 @@ fn warm_up_model(model: &dyn BatchModel) {
         }
     }
 
-    // --- Phase 2: decode-shaped forward (compile kernels for seq_len == 1) ---
+    // --- Phase 2: decode-shaped batch (seq_len == 1, no causal mask) ---
     {
         let mut caches: Vec<PagedKvCache> = allocators
             .iter()
@@ -471,13 +475,15 @@ fn warm_up_model(model: &dyn BatchModel) {
 
         let input = match Tensor::from_vec(vec![1u32], (1, 1), device) {
             Ok(t) => t,
-            Err(e) => {
-                eprintln!("[warmup] failed to create decode tensor: {e}");
-                return;
-            }
+            Err(e) => { eprintln!("[warmup] failed to create decode tensor: {e}"); return; }
+        };
+        let position_ids = match Tensor::from_vec(vec![8u32], (1,), device) {
+            Ok(t) => t,
+            Err(e) => { eprintln!("[warmup] failed to create decode position ids: {e}"); return; }
         };
 
-        if let Err(e) = model.forward_with_cache(&input, 0, &mut caches) {
+        let mut cache_slices: Vec<&mut [PagedKvCache]> = vec![caches.as_mut_slice()];
+        if let Err(e) = model.forward_batch(&input, &position_ids, &mut cache_slices, &[1]) {
             eprintln!("[warmup] decode forward failed (non-fatal): {e}");
         }
 

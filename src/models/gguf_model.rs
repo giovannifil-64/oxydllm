@@ -18,7 +18,7 @@ use candle_core::{DType, Device, Result, Tensor};
 use std::sync::{Arc, Mutex};
 
 use crate::common::{
-    block::{TransformerBlock, TransformerComponents, run_transformer_layers, run_transformer_layers_batch},
+    block::{TransformerBlock, TransformerComponents, run_transformer_layers_batch},
     config::BlockConfig,
     gguf_weights::GgufWeights,
     linear::{AnyLinear, Embedding, Linear, QLinear},
@@ -187,15 +187,6 @@ impl StandardTransformer {
 }
 
 impl BatchModel for StandardTransformer {
-    fn forward_with_cache(
-        &self,
-        tokens: &Tensor,
-        start_pos: usize,
-        caches: &mut [PagedKvCache],
-    ) -> Result<Tensor> {
-        run_transformer_layers(self.components(), tokens, start_pos, caches)
-    }
-
     fn forward_batch(
         &self,
         token_ids: &Tensor,

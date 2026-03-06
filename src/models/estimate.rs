@@ -67,7 +67,7 @@ fn resolve_local_path(model: &str, models_dir: &Path) -> Option<PathBuf> {
 }
 
 fn estimate_local(dir: &Path, ctx_len: usize, num_seqs: usize) -> Result<()> {
-    if let Some(gguf_path) = find_gguf_file(dir) {
+    if let Some(gguf_path) = crate::models::loader::find_gguf_file(dir) {
         return estimate_local_gguf(&gguf_path, ctx_len, num_seqs);
     }
     let has_st = std::fs::read_dir(dir)?.any(|e| {
@@ -85,19 +85,6 @@ fn estimate_local(dir: &Path, ctx_len: usize, num_seqs: usize) -> Result<()> {
     }
     anyhow::bail!("No GGUF or safetensors files found in {}", dir.display())
 }
-
-fn find_gguf_file(dir: &Path) -> Option<PathBuf> {
-    std::fs::read_dir(dir).ok()?.find_map(|e| {
-        let e = e.ok()?;
-        let name = e.file_name().to_string_lossy().to_lowercase();
-        if name.ends_with(".gguf") {
-            Some(e.path())
-        } else {
-            None
-        }
-    })
-}
-
 
 fn estimate_local_gguf(gguf_path: &Path, ctx_len: usize, num_seqs: usize) -> Result<()> {
     let model_name = gguf_path
@@ -246,11 +233,7 @@ fn estimate_remote(repo_id: &str, token: Option<&str>, ctx_len: usize, num_seqs:
 
     if !gguf_files.is_empty() {
         println!();
-        let kv_header = if geometry.is_some() {
-            format!("  {:>9}", "KV cache")
-        } else {
-            format!("  {:>9}", "KV cache")
-        };
+        let kv_header = format!("  {:>9}", "KV cache");
         println!(
             "  {:<26}  {:>9}{kv_header}  {:>10}  Accuracy",
             "Format", "Weights", "Total"

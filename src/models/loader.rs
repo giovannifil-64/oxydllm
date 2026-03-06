@@ -1,11 +1,19 @@
+use std::sync::{Arc, Mutex};
 use candle_core::{DType, Device};
-use crate::common::gguf_weights::GgufWeights;
-use crate::common::paged::DEFAULT_BLOCK_SIZE;
-use crate::common::weights::ModelWeights;
+use crate::common::{
+    block::TransformerBlock,
+    config::StandardTransformerConfig,
+    gguf_weights::GgufWeights,
+    linear::{AnyLinear, Embedding, Linear},
+    norm::RMSNorm,
+    paged::{BlockAllocator, DEFAULT_BLOCK_SIZE, SharedBlockAllocator},
+    rope::RotaryEmbedding,
+    weights::ModelWeights,
+};
 use crate::models::traits::BatchModel;
-use crate::models::gguf_model::GgufModel;
-use crate::models::qwen3::{config::Qwen3Config, model::Qwen3};
-use crate::models::llama::{config::LlamaConfig, model::Llama};
+use crate::models::gguf_model::StandardTransformer;
+use crate::models::llama::config::LlamaConfig;
+use crate::models::qwen3::config::Qwen3Config;
 
 use std::path::{Path, PathBuf};
 
@@ -284,43 +292,93 @@ pub fn load_batch_model(
     let value: serde_json::Value = serde_json::from_str(&raw)?;
     let arch = value["architectures"][0].as_str().unwrap_or("Unknown");
 
-    let dtype = if matches!(device, Device::Cpu) {
-        DType::F32
-    } else {
-        DType::BF16
-    };
+    let dtype = if matches!(device, Device::Cpu) { DType::F32 } else { DType::BF16 };
 
+    // All standard pre-norm transformer architectures share the same loading path.
+    // To add a new architecture: implement From<YourConfig> for StandardTransformerConfig
+    // and add one arm here.
     match arch {
         "Qwen3ForCausalLM" => {
-            let cfg = Qwen3Config::from_file(&format!("{}/config.json", model_dir))?;
-            let weight_paths = resolve_weight_paths(model_dir)?;
-            let weight_path_refs: Vec<&str> = weight_paths.iter().map(|s| s.as_str()).collect();
-            let weights = ModelWeights::load(&weight_path_refs, device, dtype)?;
-            let weights_size = weights.total_size_bytes();
-            let ctx = max_context_len.min(cfg.max_position_embeddings);
-            let num_blocks = compute_kv_blocks(
-                cfg.num_hidden_layers, cfg.num_key_value_heads,
-                cfg.head_dim(), ctx, max_num_sequences,
-                dtype, weights_size, device,
-            );
-            Ok((Box::new(Qwen3::load(cfg, &weights, device, dtype, num_blocks)?), weights_size))
+            let cfg: StandardTransformerConfig =
+                Qwen3Config::from_file(&format!("{}/config.json", model_dir))?.into();
+            load_standard_safetensors(cfg, model_dir, device, dtype, max_context_len, max_num_sequences)
         }
         "LlamaForCausalLM" => {
-            let cfg = LlamaConfig::from_file(&format!("{}/config.json", model_dir))?;
-            let weight_paths = resolve_weight_paths(model_dir)?;
-            let weight_path_refs: Vec<&str> = weight_paths.iter().map(|s| s.as_str()).collect();
-            let weights = ModelWeights::load(&weight_path_refs, device, dtype)?;
-            let weights_size = weights.total_size_bytes();
-            let ctx = max_context_len.min(cfg.max_position_embeddings);
-            let num_blocks = compute_kv_blocks(
-                cfg.num_hidden_layers, cfg.num_key_value_heads,
-                cfg.head_dim(), ctx, max_num_sequences,
-                dtype, weights_size, device,
-            );
-            Ok((Box::new(Llama::load(cfg, &weights, device, dtype, num_blocks)?), weights_size))
+            let cfg: StandardTransformerConfig =
+                LlamaConfig::from_file(&format!("{}/config.json", model_dir))?.into();
+            load_standard_safetensors(cfg, model_dir, device, dtype, max_context_len, max_num_sequences)
         }
         other => anyhow::bail!("Architecture not supported: {}", other),
     }
+}
+
+fn load_standard_safetensors(
+    cfg: StandardTransformerConfig,
+    model_dir: &str,
+    device: &Device,
+    dtype: DType,
+    max_context_len: usize,
+    max_num_sequences: usize,
+) -> anyhow::Result<(Box<dyn BatchModel>, usize)> {
+    let weight_paths = resolve_weight_paths(model_dir)?;
+    let weight_path_refs: Vec<&str> = weight_paths.iter().map(|s| s.as_str()).collect();
+    let weights = ModelWeights::load(&weight_path_refs, device, dtype)?;
+    let weights_size = weights.total_size_bytes();
+
+    let ctx = max_context_len.min(cfg.max_position_embeddings);
+    let num_blocks = compute_kv_blocks(
+        &KvBlockParams {
+            num_layers: cfg.num_hidden_layers,
+            n_kv_heads: cfg.num_key_value_heads,
+            head_dim: cfg.head_dim,
+            max_context_len: ctx,
+            max_num_sequences,
+            dtype,
+        },
+        weights_size,
+        device,
+    );
+
+    let embed_weight = weights.get("model.embed_tokens.weight")
+        .map_err(|e| anyhow::anyhow!("{e}"))?.clone();
+    let lm_head = if cfg.tie_word_embeddings {
+        AnyLinear::Float(Linear::new(embed_weight.clone(), None))
+    } else {
+        AnyLinear::Float(Linear::new(
+            weights.get("lm_head.weight").map_err(|e| anyhow::anyhow!("{e}"))?.clone(),
+            None,
+        ))
+    };
+    let embed_tokens = Embedding::new(embed_weight);
+
+    let block_cfg = cfg.block_config();
+    let blocks = (0..cfg.num_hidden_layers)
+        .map(|i| TransformerBlock::load(&block_cfg, i, &weights))
+        .collect::<candle_core::Result<Vec<_>>>()?;
+
+    let norm = RMSNorm::load(&weights, "model.norm", cfg.rms_norm_eps)?;
+    let rope = RotaryEmbedding::new(cfg.head_dim, ctx, cfg.rope_theta, device)?;
+
+    let allocators = (0..cfg.num_hidden_layers)
+        .map(|_| -> candle_core::Result<SharedBlockAllocator> {
+            Ok(Arc::new(Mutex::new(BlockAllocator::new(
+                num_blocks, DEFAULT_BLOCK_SIZE, cfg.num_key_value_heads, cfg.head_dim, dtype, device,
+            )?)))
+        })
+        .collect::<candle_core::Result<Vec<_>>>()?;
+
+    Ok((Box::new(StandardTransformer {
+        embed_tokens,
+        blocks,
+        norm,
+        lm_head,
+        rope,
+        allocators,
+        device: device.clone(),
+        stop_token_ids: cfg.eos_token_ids,
+        vocab_size: cfg.vocab_size,
+        max_seq_len: ctx,
+    }), weights_size))
 }
 
 fn load_batch_model_gguf(
@@ -380,7 +438,6 @@ fn load_batch_model_gguf(
     let num_hidden_layers = gguf.metadata_u32(&format!("{prefix}.block_count"))? as usize;
     let num_attention_heads = gguf.metadata_u32(&format!("{prefix}.attention.head_count"))? as usize;
     let num_key_value_heads = gguf.metadata_u32(&format!("{prefix}.attention.head_count_kv"))? as usize;
-    let _hidden_size = gguf.metadata_u32(&format!("{prefix}.embedding_length"))? as usize;
 
     let head_dim = {
         let meta_key_len = gguf.metadata_u32_or(
@@ -398,17 +455,19 @@ fn load_batch_model_gguf(
 
     let ctx = max_context_len.min(context_length);
     let num_blocks = compute_kv_blocks(
-        num_hidden_layers,
-        num_key_value_heads,
-        head_dim,
-        ctx,
-        max_num_sequences,
-        dtype,
+        &KvBlockParams {
+            num_layers: num_hidden_layers,
+            n_kv_heads: num_key_value_heads,
+            head_dim,
+            max_context_len: ctx,
+            max_num_sequences,
+            dtype,
+        },
         weights_size,
         device,
     );
 
-    let model = GgufModel::load(&gguf, device, dtype, num_blocks)?;
+    let model = StandardTransformer::load_gguf(&gguf, device, dtype, num_blocks)?;
     Ok((Box::new(model), weights_size))
 }
 
@@ -439,23 +498,23 @@ fn detect_system_memory_bytes() -> Option<usize> {
     None
 }
 
-fn compute_kv_blocks(
+struct KvBlockParams {
     num_layers: usize,
     n_kv_heads: usize,
     head_dim: usize,
     max_context_len: usize,
     max_num_sequences: usize,
     dtype: DType,
-    weights_size: usize,
-    device: &Device,
-) -> usize {
+}
+
+fn compute_kv_blocks(p: &KvBlockParams, weights_size: usize, device: &Device) -> usize {
     // Total token slots needed = sequences × context per sequence.
-    let total_slots = max_num_sequences * max_context_len;
+    let total_slots = p.max_num_sequences * p.max_context_len;
     let desired_blocks = total_slots.div_ceil(DEFAULT_BLOCK_SIZE);
 
     // Cost of one KV block summed across all layers (K + V pools).
     let per_block_bytes =
-        DEFAULT_BLOCK_SIZE * n_kv_heads * head_dim * dtype.size_in_bytes() * 2 * num_layers;
+        DEFAULT_BLOCK_SIZE * p.n_kv_heads * p.head_dim * p.dtype.size_in_bytes() * 2 * p.num_layers;
 
     if per_block_bytes == 0 {
         return desired_blocks;

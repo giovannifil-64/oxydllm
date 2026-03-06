@@ -34,10 +34,6 @@ impl Linear {
         Self { weight, bias }
     }
 
-    pub fn weight(&self) -> &Tensor {
-        &self.weight
-    }
-
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let out_features = self.weight.dim(0)?;
         let w_t = self.weight.t()?;

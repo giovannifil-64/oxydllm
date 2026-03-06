@@ -1,49 +1,61 @@
 // ─────────────────────────────────────────────────────────────────────────────
-// gguf_model.rs — Architecture-agnostic GGUF model
+// gguf_model.rs — StandardTransformer: unified model for all standard archs
 // ─────────────────────────────────────────────────────────────────────────────
 //
-// A single generic transformer model that loads from *any* GGUF file.
-// The GGUF format standardises tensor names (blk.{i}.attn_q.weight, etc.) and
-// stores all configuration as typed metadata, so no per-architecture code is
-// needed.
+// `StandardTransformer` is the single concrete model struct used by every
+// standard pre-norm transformer architecture (Llama, Qwen3, GGUF, and any
+// future architecture that fits the same TransformerBlock pattern).
 //
-// When adding a new architecture to rllm, the safetensors path still needs a
-// dedicated model file (because HF models use different tensor naming per
-// architecture), but the GGUF path works out of the box.
+// • GGUF loading:       StandardTransformer::load_gguf(...)
+// • Safetensors loading: loader::load_standard_safetensors(cfg, ...)  ← in loader.rs
+//
+// Adding a new standard architecture requires only:
+//   1. Define its JSON config struct and implement From<Config> for StandardTransformerConfig.
+//   2. Add one arm to the match in loader::load_batch_model.
 // ─────────────────────────────────────────────────────────────────────────────
 
 use candle_core::{DType, Device, Result, Tensor};
 use std::sync::{Arc, Mutex};
 
 use crate::common::{
-    attention::SegmentInfo,
-    block::TransformerBlock,
+    block::{TransformerBlock, TransformerComponents, run_transformer_layers, run_transformer_layers_batch},
     config::BlockConfig,
     gguf_weights::GgufWeights,
     linear::{AnyLinear, Embedding, Linear, QLinear},
-    mask::causal_mask_cached,
     norm::RMSNorm,
     paged::{BlockAllocator, PagedKvCache, SharedBlockAllocator, DEFAULT_BLOCK_SIZE},
     rope::RotaryEmbedding,
 };
 use crate::models::traits::BatchModel;
 
-pub struct GgufModel {
-    embed_tokens: Embedding,
-    blocks: Vec<TransformerBlock>,
-    norm: RMSNorm,
-    lm_head: AnyLinear,
-    rope: RotaryEmbedding,
-    allocators: Vec<SharedBlockAllocator>,
-    device: Device,
-    stop_token_ids: Vec<u32>,
-    vocab_size: usize,
-    max_seq_len: usize,
-    num_layers: usize,
+/// Single generic transformer model used by all standard architectures
+/// (Llama, Qwen3, GGUF, and any future architecture that fits the standard
+/// pre-norm TransformerBlock pattern).
+pub struct StandardTransformer {
+    pub(crate) embed_tokens: Embedding,
+    pub(crate) blocks: Vec<TransformerBlock>,
+    pub(crate) norm: RMSNorm,
+    pub(crate) lm_head: AnyLinear,
+    pub(crate) rope: RotaryEmbedding,
+    pub(crate) allocators: Vec<SharedBlockAllocator>,
+    pub(crate) device: Device,
+    pub(crate) stop_token_ids: Vec<u32>,
+    pub(crate) vocab_size: usize,
+    pub(crate) max_seq_len: usize,
 }
 
-impl GgufModel {
-    pub fn load(
+impl StandardTransformer {
+    fn components(&self) -> TransformerComponents<'_> {
+        TransformerComponents {
+            embed_tokens: &self.embed_tokens,
+            blocks: &self.blocks,
+            norm: &self.norm,
+            lm_head: &self.lm_head,
+            rope: &self.rope,
+        }
+    }
+
+    pub fn load_gguf(
         gguf: &GgufWeights,
         device: &Device,
         dtype: DType,
@@ -170,70 +182,18 @@ impl GgufModel {
             stop_token_ids,
             vocab_size,
             max_seq_len: max_position_embeddings,
-            num_layers: num_hidden_layers,
         })
     }
 }
 
-
-impl GgufModel {
-    fn forward_impl(
-        &self,
-        tokens: &Tensor,
-        start_pos: usize,
-        caches: &mut [PagedKvCache],
-    ) -> Result<Tensor> {
-        let (_b, seq) = tokens.dims2()?;
-        let mut x = self.embed_tokens.forward(tokens)?;
-
-        let mask = if seq > 1 {
-            Some(causal_mask_cached(seq, tokens.device())?)
-        } else {
-            None
-        };
-
-        for (block, cache) in self.blocks.iter().zip(caches.iter_mut()) {
-            x = block.forward(&x, &self.rope, start_pos, mask.as_ref(), cache)?;
-        }
-
-        let x = self.norm.forward(&x)?;
-        self.lm_head.forward(&x)
-    }
-
-    fn forward_batch_impl(
-        &self,
-        token_ids: &Tensor,
-        position_ids: &Tensor,
-        seq_caches: &mut [&mut [PagedKvCache]],
-        token_counts: &[usize],
-    ) -> Result<Tensor> {
-        let mut x = self.embed_tokens.forward(token_ids)?;
-
-        for (layer_idx, block) in self.blocks.iter().enumerate() {
-            let mut segments: Vec<SegmentInfo> = Vec::with_capacity(seq_caches.len());
-            for (seq_idx, seq_cache) in seq_caches.iter_mut().enumerate() {
-                segments.push(SegmentInfo {
-                    num_tokens: token_counts[seq_idx],
-                    cache: &mut seq_cache[layer_idx],
-                });
-            }
-            x = block.forward_batch(&x, &self.rope, position_ids, None, &mut segments)?;
-        }
-
-        let x = self.norm.forward(&x)?;
-        self.lm_head.forward(&x)
-    }
-}
-
-
-impl BatchModel for GgufModel {
+impl BatchModel for StandardTransformer {
     fn forward_with_cache(
         &self,
         tokens: &Tensor,
         start_pos: usize,
         caches: &mut [PagedKvCache],
     ) -> Result<Tensor> {
-        self.forward_impl(tokens, start_pos, caches)
+        run_transformer_layers(self.components(), tokens, start_pos, caches)
     }
 
     fn forward_batch(
@@ -243,13 +203,13 @@ impl BatchModel for GgufModel {
         seq_caches: &mut [&mut [PagedKvCache]],
         token_counts: &[usize],
     ) -> Result<Tensor> {
-        self.forward_batch_impl(token_ids, position_ids, seq_caches, token_counts)
+        run_transformer_layers_batch(self.components(), token_ids, position_ids, seq_caches, token_counts)
     }
 
     fn vocab_size(&self) -> usize { self.vocab_size }
     fn stop_token_ids(&self) -> &[u32] { &self.stop_token_ids }
     fn max_seq_len(&self) -> usize { self.max_seq_len }
     fn device(&self) -> &Device { &self.device }
-    fn num_layers(&self) -> usize { self.num_layers }
+    fn num_layers(&self) -> usize { self.blocks.len() }
     fn allocators(&self) -> &[SharedBlockAllocator] { &self.allocators }
 }

@@ -433,8 +433,14 @@ fn run_interactive(args: &RunArgs) -> anyhow::Result<()> {
         .unwrap_or_default()
         .to_string_lossy()
         .to_string();
+    let is_cpu = matches!(device, candle_core::Device::Cpu);
+    let kv_budget = std::sync::Arc::new(
+        crate::common::paged::GlobalKvBudget::new(
+            crate::common::paged::detect_system_kv_budget(None, is_cpu),
+        )
+    );
     let (batch_model, weights_size_bytes) = models::loader::load_batch_model(
-        &args.model_dir, &model_id_infer, &device, args.max_context_len, 1,
+        &args.model_dir, &model_id_infer, &device, args.max_context_len, 1, &kv_budget,
     )?;
     let max_seq_len = batch_model.max_seq_len();
     let kv_cache_bytes = batch_model.kv_cache_bytes();

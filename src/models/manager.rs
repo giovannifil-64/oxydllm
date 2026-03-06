@@ -7,7 +7,7 @@ use candle_core::Tensor;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc as tokio_mpsc, oneshot};
 
-use crate::common::paged::PagedKvCache;
+use crate::common::paged::{detect_system_kv_budget, GlobalKvBudget, PagedKvCache, SharedGlobalKvBudget};
 use crate::engine::Engine;
 use crate::models::loader;
 use crate::models::traits::BatchModel;
@@ -70,6 +70,7 @@ pub struct ModelManager {
     registry: HashMap<String, RegistryEntry>,
     cuda_devices: Vec<usize>,
     max_context_len: usize,
+    kv_budget: SharedGlobalKvBudget,
 }
 
 pub type SharedModelManager = Arc<tokio::sync::Mutex<ModelManager>>;
@@ -137,6 +138,13 @@ impl ModelManager {
         max_context_len: usize,
     ) -> Self {
         let registry = load_registry(&models_dir);
+        let is_cpu = cuda_devices.is_empty();
+        let kv_total = detect_system_kv_budget(memory_budget_bytes, is_cpu);
+        println!(
+            "[kv-pool] Global KV cache budget: {:.2} GB",
+            kv_total as f64 / 1_073_741_824.0,
+        );
+        let kv_budget = Arc::new(GlobalKvBudget::new(kv_total));
         Self {
             models_dir,
             slots: HashMap::new(),
@@ -145,6 +153,7 @@ impl ModelManager {
             registry,
             cuda_devices,
             max_context_len,
+            kv_budget,
         }
     }
 
@@ -248,11 +257,11 @@ impl ModelManager {
                 .map(|(id, _)| id);
             match lru_id {
                 Some(id) => {
-                    let (freed, shutdown) = match self.slots.get(&id) {
+                    let (freed, kv_bytes, shutdown) = match self.slots.get(&id) {
                         Some(SlotState::Ready { weights_size_bytes, kv_cache_bytes, shutdown, .. }) => {
-                            (*weights_size_bytes + *kv_cache_bytes, Some(Arc::clone(shutdown)))
+                            (*weights_size_bytes + *kv_cache_bytes, *kv_cache_bytes, Some(Arc::clone(shutdown)))
                         }
-                        _ => (0, None),
+                        _ => (0, 0, None),
                     };
                     println!(
                         "[memory pressure] Evicting LRU model '{}' ({:.2} GB) — need {:.2} GB, budget {:.2} GB, used {:.2} GB",
@@ -262,6 +271,7 @@ impl ModelManager {
                         budget as f64 / 1_073_741_824.0,
                         used as f64 / 1_073_741_824.0,
                     );
+                    self.kv_budget.release(kv_bytes);
                     self.slots.remove(&id);
                     if let Some(s) = shutdown {
                         s.store(true, Ordering::Release);
@@ -343,6 +353,7 @@ impl ModelManager {
             effective_keep_alive,
             self.cuda_devices.clone(),
             self.max_context_len,
+            Arc::clone(&self.kv_budget),
         );
 
         GetResult::Wait(rx)
@@ -364,11 +375,14 @@ impl ModelManager {
             .collect();
 
         for id in &expired {
-            let shutdown = match self.slots.get(id) {
-                Some(SlotState::Ready { shutdown, .. }) => Some(Arc::clone(shutdown)),
-                _ => None,
+            let (kv_bytes, shutdown) = match self.slots.get(id) {
+                Some(SlotState::Ready { kv_cache_bytes, shutdown, .. }) => {
+                    (*kv_cache_bytes, Some(Arc::clone(shutdown)))
+                }
+                _ => (0, None),
             };
             println!("Evicting idle model '{}' (keep-alive expired)", id);
+            self.kv_budget.release(kv_bytes);
             self.slots.remove(id);
             if let Some(s) = shutdown {
                 s.store(true, Ordering::Release);
@@ -480,6 +494,7 @@ fn spawn_load(
     effective_keep_alive: Duration,
     cuda_devices: Vec<usize>,
     max_context_len: usize,
+    kv_budget: SharedGlobalKvBudget,
 ) {
     let (result_tx, result_rx) = oneshot::channel::<Result<LoadResult, String>>();
 
@@ -508,7 +523,7 @@ fn spawn_load(
 
         println!("\nLoading model '{}'...", model_id_thread);
         let max_num_sequences: usize = 8;
-        let (batch_model, weights_size_bytes) = match loader::load_batch_model(&model_dir, &model_id_thread, &device, max_context_len, max_num_sequences) {
+        let (batch_model, weights_size_bytes) = match loader::load_batch_model(&model_dir, &model_id_thread, &device, max_context_len, max_num_sequences, &kv_budget) {
             Ok(m) => m,
             Err(e) => {
                 let _ = result_tx.send(Err(format!("Failed to load model: {e}")));
@@ -635,10 +650,13 @@ fn spawn_load(
                             model_id,
                             model_bytes as f64 / 1_073_741_824.0,
                         );
-                        let shutdown = match mgr.slots.get(&model_id) {
-                            Some(SlotState::Ready { shutdown, .. }) => Some(Arc::clone(shutdown)),
-                            _ => None,
+                        let (kv_bytes, shutdown) = match mgr.slots.get(&model_id) {
+                            Some(SlotState::Ready { kv_cache_bytes, shutdown, .. }) => {
+                                (*kv_cache_bytes, Some(Arc::clone(shutdown)))
+                            }
+                            _ => (0, None),
                         };
+                        mgr.kv_budget.release(kv_bytes);
                         mgr.slots.remove(&model_id);
                         drop(mgr);
                         if let Some(s) = shutdown {

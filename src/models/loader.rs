@@ -6,7 +6,7 @@ use crate::common::{
     gguf_weights::GgufWeights,
     linear::{AnyLinear, Embedding, Linear},
     norm::RMSNorm,
-    paged::{BlockAllocator, DEFAULT_BLOCK_SIZE, SharedBlockAllocator},
+    paged::{BlockAllocator, DEFAULT_BLOCK_SIZE, GlobalKvBudget, SharedBlockAllocator, SharedGlobalKvBudget},
     rope::RotaryEmbedding,
     weights::ModelWeights,
 };
@@ -283,9 +283,10 @@ pub fn load_batch_model(
     device: &Device,
     max_context_len: usize,
     max_num_sequences: usize,
+    kv_budget: &SharedGlobalKvBudget,
 ) -> anyhow::Result<(Box<dyn BatchModel>, usize)> {
     if is_gguf_model(model_dir) {
-        return load_batch_model_gguf(model_dir, model_id, device, max_context_len, max_num_sequences);
+        return load_batch_model_gguf(model_dir, model_id, device, max_context_len, max_num_sequences, kv_budget);
     }
 
     let raw = std::fs::read_to_string(format!("{}/config.json", model_dir))?;
@@ -301,12 +302,12 @@ pub fn load_batch_model(
         "Qwen3ForCausalLM" => {
             let cfg: StandardTransformerConfig =
                 Qwen3Config::from_file(&format!("{}/config.json", model_dir))?.into();
-            load_standard_safetensors(cfg, model_dir, device, dtype, max_context_len, max_num_sequences)
+            load_standard_safetensors(cfg, model_dir, device, dtype, max_context_len, max_num_sequences, kv_budget)
         }
         "LlamaForCausalLM" => {
             let cfg: StandardTransformerConfig =
                 LlamaConfig::from_file(&format!("{}/config.json", model_dir))?.into();
-            load_standard_safetensors(cfg, model_dir, device, dtype, max_context_len, max_num_sequences)
+            load_standard_safetensors(cfg, model_dir, device, dtype, max_context_len, max_num_sequences, kv_budget)
         }
         other => anyhow::bail!("Architecture not supported: {}", other),
     }
@@ -319,6 +320,7 @@ fn load_standard_safetensors(
     dtype: DType,
     max_context_len: usize,
     max_num_sequences: usize,
+    kv_budget: &SharedGlobalKvBudget,
 ) -> anyhow::Result<(Box<dyn BatchModel>, usize)> {
     let weight_paths = resolve_weight_paths(model_dir)?;
     let weight_path_refs: Vec<&str> = weight_paths.iter().map(|s| s.as_str()).collect();
@@ -335,8 +337,7 @@ fn load_standard_safetensors(
             max_num_sequences,
             dtype,
         },
-        weights_size,
-        device,
+        kv_budget,
     );
 
     let embed_weight = weights.get("model.embed_tokens.weight")
@@ -387,6 +388,7 @@ fn load_batch_model_gguf(
     device: &Device,
     max_context_len: usize,
     max_num_sequences: usize,
+    kv_budget: &SharedGlobalKvBudget,
 ) -> anyhow::Result<(Box<dyn BatchModel>, usize)> {
     let dir = Path::new(model_dir);
     let all_gguf_paths = find_gguf_files(dir)
@@ -463,39 +465,11 @@ fn load_batch_model_gguf(
             max_num_sequences,
             dtype,
         },
-        weights_size,
-        device,
+        kv_budget,
     );
 
     let model = StandardTransformer::load_gguf(&gguf, device, dtype, num_blocks)?;
     Ok((Box::new(model), weights_size))
-}
-
-fn detect_system_memory_bytes() -> Option<usize> {
-    #[cfg(target_os = "macos")]
-    {
-        let output = std::process::Command::new("sysctl")
-            .arg("-n")
-            .arg("hw.memsize")
-            .output()
-            .ok()?;
-        let s = std::str::from_utf8(&output.stdout).ok()?.trim();
-        return s.parse::<usize>().ok();
-    }
-    #[cfg(target_os = "linux")]
-    {
-        let content = std::fs::read_to_string("/proc/meminfo").ok()?;
-        for line in content.lines() {
-            if line.starts_with("MemTotal:") {
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                let kb: usize = parts.get(1)?.parse().ok()?;
-                return Some(kb * 1024);
-            }
-        }
-        return None;
-    }
-    #[allow(unreachable_code)]
-    None
 }
 
 struct KvBlockParams {
@@ -507,12 +481,12 @@ struct KvBlockParams {
     dtype: DType,
 }
 
-fn compute_kv_blocks(p: &KvBlockParams, weights_size: usize, device: &Device) -> usize {
-    // Total token slots needed = sequences × context per sequence.
+fn compute_kv_blocks(p: &KvBlockParams, kv_budget: &GlobalKvBudget) -> usize {
     let total_slots = p.max_num_sequences * p.max_context_len;
     let desired_blocks = total_slots.div_ceil(DEFAULT_BLOCK_SIZE);
+    let min_blocks: usize = 256; // ~4 096 token minimum context
 
-    // Cost of one KV block summed across all layers (K + V pools).
+    // Bytes for one block summed across all layers (K + V).
     let per_block_bytes =
         DEFAULT_BLOCK_SIZE * p.n_kv_heads * p.head_dim * p.dtype.size_in_bytes() * 2 * p.num_layers;
 
@@ -520,44 +494,21 @@ fn compute_kv_blocks(p: &KvBlockParams, weights_size: usize, device: &Device) ->
         return desired_blocks;
     }
 
-    let total_mem = match detect_system_memory_bytes() {
-        Some(m) => m,
-        None => {
-            println!("[memory] Could not detect system memory — using full KV allocation");
-            return desired_blocks;
-        }
-    };
+    let desired_bytes = desired_blocks.max(min_blocks) * per_block_bytes;
+    let granted_bytes = kv_budget.acquire(desired_bytes);
+    let granted_blocks = (granted_bytes / per_block_bytes).max(min_blocks);
 
-    // On Metal (macOS unified memory) the GPU shares RAM with the OS/apps.
-    // Use 65% as a safe upper bound for the model working set.
-    // On CUDA with dedicated VRAM the system-memory heuristic is conservative
-    // but still prevents obviously absurd allocations.
-    let usable_fraction = if matches!(device, Device::Cpu) { 0.80 } else { 0.65 };
-    let usable = (total_mem as f64 * usable_fraction) as usize;
-    // Reserve 512 MB for activations, intermediates, etc.
-    let headroom: usize = 512 * 1024 * 1024;
-    let available_for_kv = usable.saturating_sub(weights_size).saturating_sub(headroom);
-
-    let max_blocks = available_for_kv / per_block_bytes;
-    let min_blocks: usize = 256; // ~4096 tokens minimum context
-
-    let capped = desired_blocks.min(max_blocks).max(min_blocks);
-
-    if capped < desired_blocks {
-        let desired_kv = desired_blocks as u64 * per_block_bytes as u64;
-        let capped_kv = capped as u64 * per_block_bytes as u64;
-        let capped_ctx = capped * DEFAULT_BLOCK_SIZE;
+    if granted_blocks < desired_blocks {
         println!(
-            "[memory] KV cache capped by available memory: {:.2} GB → {:.2} GB \
-             ({} → {} blocks, ~{} effective token slots, {:.1} GB system RAM detected)",
-            desired_kv as f64 / 1_073_741_824.0,
-            capped_kv as f64 / 1_073_741_824.0,
+            "[kv-pool] KV cache capped: {} → {} blocks ({:.2} → {:.2} GB), \
+             pool remaining: {:.2} GB",
             desired_blocks,
-            capped,
-            capped_ctx,
-            total_mem as f64 / 1_073_741_824.0,
+            granted_blocks,
+            desired_blocks as f64 * per_block_bytes as f64 / 1_073_741_824.0,
+            granted_blocks as f64 * per_block_bytes as f64 / 1_073_741_824.0,
+            kv_budget.available_bytes() as f64 / 1_073_741_824.0,
         );
     }
 
-    capped
+    granted_blocks
 }

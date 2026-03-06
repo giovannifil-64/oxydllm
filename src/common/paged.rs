@@ -1,8 +1,87 @@
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use candle_core::{DType, Device, Result, Tensor};
 
 pub const DEFAULT_BLOCK_SIZE: usize = 16;
+
+pub struct GlobalKvBudget {
+    total_bytes: usize,
+    allocated_bytes: AtomicUsize,
+}
+
+pub type SharedGlobalKvBudget = Arc<GlobalKvBudget>;
+
+impl GlobalKvBudget {
+    pub fn new(total_bytes: usize) -> Self {
+        Self { total_bytes, allocated_bytes: AtomicUsize::new(0) }
+    }
+
+    pub fn acquire(&self, desired_bytes: usize) -> usize {
+        loop {
+            let current = self.allocated_bytes.load(Ordering::Relaxed);
+            let available = self.total_bytes.saturating_sub(current);
+            let granted = desired_bytes.min(available);
+            match self.allocated_bytes.compare_exchange_weak(
+                current,
+                current + granted,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return granted,
+                Err(_) => continue,
+            }
+        }
+    }
+
+    pub fn release(&self, bytes: usize) {
+        self.allocated_bytes
+            .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |cur| {
+                Some(cur.saturating_sub(bytes))
+            })
+            .ok();
+    }
+
+    pub fn available_bytes(&self) -> usize {
+        self.total_bytes
+            .saturating_sub(self.allocated_bytes.load(Ordering::Relaxed))
+    }
+}
+
+pub fn detect_system_kv_budget(memory_budget_bytes: Option<usize>, is_cpu: bool) -> usize {
+    let system_mem = detect_system_memory_bytes().unwrap_or(8 * 1024 * 1024 * 1024);
+    let base = memory_budget_bytes.map_or(system_mem, |b| b.min(system_mem));
+    // Leave ~40-45% for model weights + OS + activations; KV gets the rest.
+    let kv_fraction: f64 = if is_cpu { 0.65 } else { 0.55 };
+    let headroom: usize = 512 * 1024 * 1024; // 512 MB
+    ((base as f64 * kv_fraction) as usize).saturating_sub(headroom)
+}
+
+#[cfg(target_os = "macos")]
+fn detect_system_memory_bytes() -> Option<usize> {
+    let output = std::process::Command::new("sysctl")
+        .arg("-n")
+        .arg("hw.memsize")
+        .output()
+        .ok()?;
+    std::str::from_utf8(&output.stdout).ok()?.trim().parse().ok()
+}
+
+#[cfg(target_os = "linux")]
+fn detect_system_memory_bytes() -> Option<usize> {
+    let content = std::fs::read_to_string("/proc/meminfo").ok()?;
+    content
+        .lines()
+        .find(|l| l.starts_with("MemTotal:"))
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|s| s.parse::<usize>().ok())
+        .map(|kb| kb * 1024)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn detect_system_memory_bytes() -> Option<usize> {
+    None
+}
 
 pub struct BlockAllocator {
     pool_k: Tensor,

@@ -5,8 +5,10 @@ use super::{
     config::BlockConfig,
     ffn::FeedForward,
     gguf_weights::GgufWeights,
-    paged::PagedKvCache,
+    linear::{AnyLinear, Embedding},
+    mask::causal_mask_cached,
     norm::RMSNorm,
+    paged::PagedKvCache,
     rope::RotaryEmbedding,
     weights::ModelWeights,
 };
@@ -81,4 +83,62 @@ impl TransformerBlock {
         let x = (residual + self.ffn.forward(&self.post_attn_norm.forward(&x)?)?)?;
         Ok(x)
     }
+}
+
+/// Static model components shared by standard transformer architectures (Llama, Qwen3, …).
+pub struct TransformerComponents<'a> {
+    pub embed_tokens: &'a Embedding,
+    pub blocks: &'a [TransformerBlock],
+    pub norm: &'a RMSNorm,
+    pub lm_head: &'a AnyLinear,
+    pub rope: &'a RotaryEmbedding,
+}
+
+/// Shared decode/prefill forward pass for standard transformer models.
+pub fn run_transformer_layers(
+    c: TransformerComponents<'_>,
+    tokens: &Tensor,
+    start_pos: usize,
+    caches: &mut [PagedKvCache],
+) -> Result<Tensor> {
+    let (_b, seq) = tokens.dims2()?;
+    let mut x = c.embed_tokens.forward(tokens)?;
+
+    let mask = if seq > 1 {
+        Some(causal_mask_cached(seq, tokens.device())?)
+    } else {
+        None
+    };
+
+    for (block, cache) in c.blocks.iter().zip(caches.iter_mut()) {
+        x = block.forward(&x, c.rope, start_pos, mask.as_ref(), cache)?;
+    }
+
+    let x = c.norm.forward(&x)?;
+    c.lm_head.forward(&x)
+}
+
+/// Shared batched forward pass for standard transformer models.
+pub fn run_transformer_layers_batch(
+    c: TransformerComponents<'_>,
+    token_ids: &Tensor,
+    position_ids: &Tensor,
+    seq_caches: &mut [&mut [PagedKvCache]],
+    token_counts: &[usize],
+) -> Result<Tensor> {
+    let mut x = c.embed_tokens.forward(token_ids)?;
+
+    for (layer_idx, block) in c.blocks.iter().enumerate() {
+        let mut segments: Vec<SegmentInfo> = Vec::with_capacity(seq_caches.len());
+        for (seq_idx, seq_cache) in seq_caches.iter_mut().enumerate() {
+            segments.push(SegmentInfo {
+                num_tokens: token_counts[seq_idx],
+                cache: &mut seq_cache[layer_idx],
+            });
+        }
+        x = block.forward_batch(&x, c.rope, position_ids, None, &mut segments)?;
+    }
+
+    let x = c.norm.forward(&x)?;
+    c.lm_head.forward(&x)
 }

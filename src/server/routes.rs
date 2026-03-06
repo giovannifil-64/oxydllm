@@ -146,6 +146,24 @@ struct SeqTracker {
     token_count: usize,
 }
 
+fn enqueue_request(
+    req: IncomingRequest,
+    engine: &mut Engine,
+    trackers: &mut HashMap<SequenceId, SeqTracker>,
+) {
+    let model_id = req.model_id.clone();
+    let enqueued_at = req.enqueued_at;
+    let seq_id = engine.add_request(req.prompt_tokens, req.sampling_params, req.max_tokens);
+    eprintln!("[req] {} seq={} enqueued", model_id, seq_id);
+    trackers.insert(seq_id, SeqTracker {
+        tx: req.response_tx,
+        model_id,
+        enqueued_at,
+        first_token_at: None,
+        token_count: 0,
+    });
+}
+
 pub fn engine_loop(
     mut engine: Engine,
     tokenizer: Arc<Tokenizer>,
@@ -161,35 +179,11 @@ pub fn engine_loop(
 
         if engine.has_pending_work() {
             while let Ok(req) = request_rx.try_recv() {
-                let model_id = req.model_id.clone();
-                let enqueued_at = req.enqueued_at;
-                let seq_id =
-                    engine.add_request(req.prompt_tokens, req.sampling_params, req.max_tokens);
-                eprintln!("[req] {} seq={} enqueued", model_id, seq_id);
-                trackers.insert(seq_id, SeqTracker {
-                    tx: req.response_tx,
-                    model_id,
-                    enqueued_at,
-                    first_token_at: None,
-                    token_count: 0,
-                });
+                enqueue_request(req, &mut engine, &mut trackers);
             }
         } else {
             match request_rx.blocking_recv() {
-                Some(req) => {
-                    let model_id = req.model_id.clone();
-                    let enqueued_at = req.enqueued_at;
-                    let seq_id =
-                        engine.add_request(req.prompt_tokens, req.sampling_params, req.max_tokens);
-                    eprintln!("[req] {} seq={} enqueued", model_id, seq_id);
-                    trackers.insert(seq_id, SeqTracker {
-                        tx: req.response_tx,
-                        model_id,
-                        enqueued_at,
-                        first_token_at: None,
-                        token_count: 0,
-                    });
-                }
+                Some(req) => enqueue_request(req, &mut engine, &mut trackers),
                 None => break,
             }
         }
@@ -233,7 +227,10 @@ pub fn engine_loop(
                                 tps,
                             );
                             let _ = tracker.tx.send(EngineEvent::Finish {
-                                finish_reason: "stop".to_string(),
+                                finish_reason: completed.finish_reason
+                                    .as_deref()
+                                    .unwrap_or("stop")
+                                    .to_string(),
                             });
                             let _ = tracker.tx.send(EngineEvent::StreamEnd);
                         }

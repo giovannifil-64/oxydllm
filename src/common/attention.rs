@@ -337,11 +337,18 @@ impl Attention {
         let mut padded_k_parts: Vec<Tensor> = Vec::new();
         let mut padded_v_parts: Vec<Tensor> = Vec::new();
 
+        let needs_padding = kv_lengths.iter().any(|&l| l < max_kv);
+        let pad_full = if needs_padding {
+            Some(Tensor::zeros((1, self.n_kv_heads, max_kv, hd), dtype, device)?)
+        } else {
+            None
+        };
+
         for (i, (kp, vp)) in k_parts.iter().zip(v_parts.iter()).enumerate() {
             let kv_len = kv_lengths[i];
             if kv_len < max_kv {
                 let pad_len = max_kv - kv_len;
-                let pad = Tensor::zeros((1, self.n_kv_heads, pad_len, hd), dtype, device)?;
+                let pad = pad_full.as_ref().unwrap().narrow(2, 0, pad_len)?;
                 padded_k_parts.push(Tensor::cat(&[kp, &pad], 2)?);
                 padded_v_parts.push(Tensor::cat(&[vp, &pad], 2)?);
             } else {

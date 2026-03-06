@@ -23,6 +23,7 @@ pub struct SchedulerOutput {
 
 pub struct CompletedSequence {
     pub id: SequenceId,
+    pub finish_reason: Option<String>,
 }
 
 pub struct Scheduler {
@@ -216,7 +217,7 @@ impl Scheduler {
             for cache in &mut seq.caches {
                 cache.clear();
             }
-            completed.push(CompletedSequence { id: seq.id });
+            completed.push(CompletedSequence { id: seq.id, finish_reason: seq.finish_reason.clone() });
         }
         completed
     }

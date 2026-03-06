@@ -25,3 +25,4 @@ minijinja-contrib = { version = "2.16.0", features = ["pycompat"] }
 chrono = "0.4.44"
 rayon = "1.11.0"
 rustc-hash = "2.1.1"
+lru = "0.16.3"

@@ -2,11 +2,9 @@ use candle_core::{DType, Device, Result, Tensor};
 use std::sync::{Arc, Mutex};
 use crate::models::traits::BatchModel;
 use crate::common::{
-    attention::SegmentInfo,
-    block::TransformerBlock,
+    block::{TransformerBlock, TransformerComponents, run_transformer_layers, run_transformer_layers_batch},
     config::BlockConfig,
     linear::{AnyLinear, Embedding, Linear},
-    mask::causal_mask_cached,
     norm::RMSNorm,
     paged::{BlockAllocator, PagedKvCache, SharedBlockAllocator, DEFAULT_BLOCK_SIZE},
     rope::RotaryEmbedding,
@@ -108,27 +106,23 @@ impl Llama {
 }
 
 impl Llama {
+    fn components(&self) -> TransformerComponents<'_> {
+        TransformerComponents {
+            embed_tokens: &self.embed_tokens,
+            blocks: &self.blocks,
+            norm: &self.norm,
+            lm_head: &self.lm_head,
+            rope: &self.rope,
+        }
+    }
+
     fn forward_impl(
         &self,
         tokens: &Tensor,
         start_pos: usize,
         caches: &mut [PagedKvCache],
     ) -> Result<Tensor> {
-        let (_b, seq) = tokens.dims2()?;
-        let mut x = self.embed_tokens.forward(tokens)?;
-
-        let mask = if seq > 1 {
-            Some(causal_mask_cached(seq, tokens.device())?)
-        } else {
-            None
-        };
-
-        for (block, cache) in self.blocks.iter().zip(caches.iter_mut()) {
-            x = block.forward(&x, &self.rope, start_pos, mask.as_ref(), cache)?;
-        }
-
-        let x = self.norm.forward(&x)?;
-        self.lm_head.forward(&x)
+        run_transformer_layers(self.components(), tokens, start_pos, caches)
     }
 
     fn forward_batch_impl(
@@ -138,21 +132,7 @@ impl Llama {
         seq_caches: &mut [&mut [PagedKvCache]],
         token_counts: &[usize],
     ) -> Result<Tensor> {
-        let mut x = self.embed_tokens.forward(token_ids)?;
-
-        for (layer_idx, block) in self.blocks.iter().enumerate() {
-            let mut segments: Vec<SegmentInfo> = Vec::with_capacity(seq_caches.len());
-            for (seq_idx, seq_cache) in seq_caches.iter_mut().enumerate() {
-                segments.push(SegmentInfo {
-                    num_tokens: token_counts[seq_idx],
-                    cache: &mut seq_cache[layer_idx],
-                });
-            }
-            x = block.forward_batch(&x, &self.rope, position_ids, None, &mut segments)?;
-        }
-
-        let x = self.norm.forward(&x)?;
-        self.lm_head.forward(&x)
+        run_transformer_layers_batch(self.components(), token_ids, position_ids, seq_caches, token_counts)
     }
 }
 

@@ -1,23 +1,23 @@
-use std::collections::HashMap;
-use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use std::time::Instant;
+use std::num::NonZeroUsize;
+
+use lru::LruCache;
+use rustc_hash::FxHasher;
 
 use crate::common::paged::SharedBlockAllocator;
 
 struct PrefixEntry {
     block_ids: Vec<usize>,
-    last_used: Instant,
 }
 
 pub struct PrefixCache {
-    entries: HashMap<u64, PrefixEntry>,
-    capacity: usize,
+    entries: LruCache<u64, PrefixEntry>,
 }
 
 impl PrefixCache {
     pub fn new(capacity: usize) -> Self {
-        Self { entries: HashMap::new(), capacity }
+        let cap = NonZeroUsize::new(capacity.max(1)).unwrap();
+        Self { entries: LruCache::new(cap) }
     }
 
     pub fn lookup(&mut self, tokens: &[u32], block_size: usize) -> (usize, Vec<Vec<usize>>) {
@@ -30,9 +30,8 @@ impl PrefixCache {
                 &tokens[block_idx * block_size..(block_idx + 1) * block_size],
                 prev_hash,
             );
-            match self.entries.get_mut(&h) {
+            match self.entries.get(&h) {
                 Some(entry) => {
-                    entry.last_used = Instant::now();
                     matched.push(entry.block_ids.clone());
                     prev_hash = h;
                 }
@@ -74,46 +73,27 @@ impl PrefixCache {
                 prev_hash,
             );
 
-            if !self.entries.contains_key(&h) {
-                if self.entries.len() >= self.capacity {
-                    self.evict_lru(allocators);
-                }
-
+            if !self.entries.contains(&h) {
                 for (layer_idx, &bid) in block_ids.iter().enumerate() {
                     allocators[layer_idx].lock().unwrap().share(bid);
                 }
 
-                self.entries.insert(
-                    h,
-                    PrefixEntry { block_ids: block_ids.clone(), last_used: Instant::now() },
-                );
+                if let Some((_, evicted)) = self.entries.push(h, PrefixEntry { block_ids: block_ids.clone() }) {
+                    for (layer_idx, bid) in evicted.block_ids.iter().enumerate() {
+                        if layer_idx < allocators.len() {
+                            allocators[layer_idx].lock().unwrap().free(*bid);
+                        }
+                    }
+                }
             }
 
             prev_hash = h;
         }
     }
-
-    fn evict_lru(&mut self, allocators: &[SharedBlockAllocator]) {
-        let lru_hash = self
-            .entries
-            .iter()
-            .min_by_key(|(_, e)| e.last_used)
-            .map(|(&h, _)| h);
-
-        if let Some(h) = lru_hash
-            && let Some(entry) = self.entries.remove(&h) {
-                for (layer_idx, bid) in entry.block_ids.iter().enumerate() {
-                    if layer_idx < allocators.len() {
-                        allocators[layer_idx].lock().unwrap().free(*bid);
-                    }
-                }
-            }
-    }
-
 }
 
 fn chain_hash(block_tokens: &[u32], prev: u64) -> u64 {
-    let mut h = DefaultHasher::new();
+    let mut h = FxHasher::default();
     prev.hash(&mut h);
     block_tokens.hash(&mut h);
     h.finish()

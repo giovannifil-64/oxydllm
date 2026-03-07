@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::extract::State;
@@ -450,23 +450,31 @@ async fn chat_completions(
 
     if stream {
         let model_id_clone = model_id.clone();
-        let stream = UnboundedReceiverStream::new(response_rx).map(move |event| {
-            let sse_event = match event {
+        // Thinking-mode filter shared across stream events.
+        let thinking_filter = Arc::new(Mutex::new(chat_template::ThinkingStreamFilter::new()));
+        let stream = UnboundedReceiverStream::new(response_rx).filter_map(move |event| {
+            match event {
                 EngineEvent::Token(text) => {
-                    let chunk = ChatCompletionChunk {
-                        id: chat_id.clone(),
-                        object: "chat.completion.chunk".to_string(),
-                        model: model_id_clone.clone(),
-                        choices: vec![ChunkChoice {
-                            index: 0,
-                            delta: Delta {
-                                role: None,
-                                content: Some(text),
-                            },
-                            finish_reason: None,
-                        }],
-                    };
-                    Event::default().data(serde_json::to_string(&chunk).unwrap())
+                    let filtered = thinking_filter.lock().unwrap().push(&text);
+                    if filtered.is_empty() {
+                        // Token was inside a <think>…</think> block; skip it.
+                        None
+                    } else {
+                        let chunk = ChatCompletionChunk {
+                            id: chat_id.clone(),
+                            object: "chat.completion.chunk".to_string(),
+                            model: model_id_clone.clone(),
+                            choices: vec![ChunkChoice {
+                                index: 0,
+                                delta: Delta {
+                                    role: None,
+                                    content: Some(filtered),
+                                },
+                                finish_reason: None,
+                            }],
+                        };
+                        Some(Ok::<Event, std::convert::Infallible>(Event::default().data(serde_json::to_string(&chunk).unwrap())))
+                    }
                 }
                 EngineEvent::Finish { finish_reason } => {
                     let chunk = ChatCompletionChunk {
@@ -482,14 +490,19 @@ async fn chat_completions(
                             finish_reason: Some(finish_reason),
                         }],
                     };
-                    Event::default().data(serde_json::to_string(&chunk).unwrap())
+                    Some(Ok(Event::default().data(serde_json::to_string(&chunk).unwrap())))
                 }
-                EngineEvent::StreamEnd => Event::default().data("[DONE]"),
+                EngineEvent::StreamEnd => {
+                    // finish() returns any remaining buffered non-thinking text; at stream
+                    // end this is at most a few bytes of a partial "<think>" tag that never
+                    // completed, so it is safe to discard rather than forward to the client.
+                    let _remaining = thinking_filter.lock().unwrap().finish();
+                    Some(Ok(Event::default().data("[DONE]")))
+                }
                 EngineEvent::Error(msg) => {
-                    Event::default().data(format!(r#"{{"error":"{}"}}"#, msg))
+                    Some(Ok(Event::default().data(format!(r#"{{"error":"{}"}}"#, msg))))
                 }
-            };
-            Ok::<_, std::convert::Infallible>(sse_event)
+            }
         });
 
         Ok(Sse::new(stream).into_response())
@@ -517,6 +530,8 @@ async fn chat_completions(
                 }
             }
         }
+
+        let content = chat_template::strip_thinking_content(&content);
 
         let response = ChatCompletionResponse {
             id: chat_id,

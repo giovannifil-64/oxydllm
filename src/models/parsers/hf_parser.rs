@@ -104,6 +104,11 @@ linear/full-attention layers that require a dedicated model implementation."
             has_ffn_norms = true;
             qk_norm = true;
             embed_scale = Some((hidden_size as f64).sqrt());
+            for &e in &[1, 106u32] {
+                if !eos_token_ids.contains(&e) {
+                    eos_token_ids.push(e);
+                }
+            }
             // Only enable softcapping if the fields are actually present and positive.
             if let Some(s) = v["attn_logit_softcapping"].as_f64().filter(|&x| x > 0.0) {
                 attn_softcap = Some(s);

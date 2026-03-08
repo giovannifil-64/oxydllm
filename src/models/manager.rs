@@ -491,6 +491,12 @@ fn warm_up_model(model: &dyn BatchModel) {
             cache.clear();
         }
     }
+
+    // Flush any in-flight GPU commands so the first real request sees clean state.
+    #[cfg(feature = "metal")]
+    if let candle_core::Device::Metal(dev) = device {
+        dev.wait_until_completed().ok();
+    }
 }
 
 fn spawn_load(

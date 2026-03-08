@@ -20,7 +20,8 @@ impl RMSNorm {
     }
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let dtype = x.dtype();
-        let x_f32 = x.to_dtype(candle_core::DType::F32)?;
+        let x_c = x.contiguous()?;
+        let x_f32 = x_c.to_dtype(candle_core::DType::F32)?;
         let variance = x_f32.sqr()?.mean_keepdim(D::Minus1)?;
         let x_normed = x_f32.broadcast_div(&(variance + self.eps)?.sqrt()?)?;
         let x_normed = x_normed.to_dtype(dtype)?;

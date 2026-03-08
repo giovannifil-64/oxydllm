@@ -464,6 +464,7 @@ fn run_interactive(args: &RunArgs) -> anyhow::Result<()> {
     let mut messages: Vec<ChatMessage> = vec![ChatMessage {
         role: "system".to_string(),
         content: "You are a helpful assistant.".to_string(),
+        reasoning_content: None,
     }];
 
     println!("\nType your message (/exit to quit).\n");
@@ -491,9 +492,10 @@ fn run_interactive(args: &RunArgs) -> anyhow::Result<()> {
         messages.push(ChatMessage {
             role: "user".to_string(),
             content: input,
+            reasoning_content: None,
         });
 
-        let prompt = server::apply_chat_template(&tokenizer, &messages);
+        let prompt = server::apply_chat_template(&tokenizer, &messages, false);
         let prompt_tokens = tokenizer.encode(&prompt)?;
         let max_tokens = max_seq_len.saturating_sub(prompt_tokens.len());
 
@@ -514,6 +516,7 @@ fn run_interactive(args: &RunArgs) -> anyhow::Result<()> {
         messages.push(ChatMessage {
             role: "assistant".to_string(),
             content: response_text,
+            reasoning_content: None,
         });
     }
 

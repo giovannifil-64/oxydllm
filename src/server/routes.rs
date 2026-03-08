@@ -43,12 +43,17 @@ pub struct ChatCompletionRequest {
     pub repetition_penalty: Option<f32>,
     #[serde(default)]
     pub keep_alive: Option<u64>,
+    #[serde(default)]
+    pub enable_thinking: Option<bool>,
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug)]
 pub struct ChatMessage {
     pub role: String,
     pub content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    pub reasoning_content: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -68,10 +73,17 @@ struct Choice {
 }
 
 #[derive(Serialize)]
+struct CompletionTokensDetails {
+    reasoning_tokens: usize,
+}
+
+#[derive(Serialize)]
 struct Usage {
     prompt_tokens: usize,
     completion_tokens: usize,
     total_tokens: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    completion_tokens_details: Option<CompletionTokensDetails>,
 }
 
 #[derive(Serialize)]
@@ -95,6 +107,8 @@ struct Delta {
     role: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_content: Option<String>,
 }
 
 pub struct IncomingRequest {
@@ -104,10 +118,12 @@ pub struct IncomingRequest {
     pub response_tx: tokio_mpsc::UnboundedSender<EngineEvent>,
     pub model_id: String,
     pub enqueued_at: std::time::Instant,
+    pub enable_thinking: bool,
 }
 
 pub enum EngineEvent {
     Token(String),
+    ReasoningToken(String),
     Finish { finish_reason: String },
     StreamEnd,
     Error(String),
@@ -117,7 +133,7 @@ struct AppState {
     manager: SharedModelManager,
 }
 
-pub fn apply_chat_template(tokenizer: &Tokenizer, messages: &[ChatMessage]) -> String {
+pub fn apply_chat_template(tokenizer: &Tokenizer, messages: &[ChatMessage], enable_thinking: bool) -> String {
     match tokenizer.chat_template() {
         Some(template) => {
             match chat_template::apply_chat_template(
@@ -126,6 +142,7 @@ pub fn apply_chat_template(tokenizer: &Tokenizer, messages: &[ChatMessage]) -> S
                 tokenizer.bos_token(),
                 tokenizer.eos_token(),
                 true,
+                enable_thinking,
             ) {
                 Ok(prompt) => prompt,
                 Err(e) => {
@@ -144,6 +161,7 @@ struct SeqTracker {
     enqueued_at: std::time::Instant,
     first_token_at: Option<std::time::Instant>,
     token_count: usize,
+    in_thinking: bool,
 }
 
 fn enqueue_request(
@@ -161,6 +179,7 @@ fn enqueue_request(
         enqueued_at,
         first_token_at: None,
         token_count: 0,
+        in_thinking: req.enable_thinking,
     });
 }
 
@@ -171,6 +190,9 @@ pub fn engine_loop(
     shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) {
     let mut trackers: HashMap<SequenceId, SeqTracker> = HashMap::new();
+
+    let think_start_id = tokenizer.special_token_id("<think>");
+    let think_end_id = tokenizer.special_token_id("</think>");
 
     loop {
         if shutdown.load(std::sync::atomic::Ordering::Acquire) {
@@ -207,8 +229,36 @@ pub fn engine_loop(
                                 tracker.first_token_at = Some(std::time::Instant::now());
                             }
                             tracker.token_count += 1;
+
+                            // Detect </think> token to transition from reasoning to content.
+                            if tracker.in_thinking {
+                                let raw = tokenizer
+                                    .decode_with_special(&[tok.token])
+                                    .unwrap_or_default();
+
+                                let is_think_start = think_start_id == Some(tok.token)
+                                    || raw.contains("<think>");
+                                if is_think_start {
+                                    continue;
+                                }
+
+                                let is_think_end = think_end_id == Some(tok.token)
+                                    || raw.contains("</think>");
+                                if is_think_end {
+                                    tracker.in_thinking = false;
+                                    continue;
+                                }
+                            }
+
                             let text = tokenizer.decode(&[tok.token]).unwrap_or_default();
-                            let _ = tracker.tx.send(EngineEvent::Token(text));
+                            if text.is_empty() {
+                                continue;
+                            }
+                            if tracker.in_thinking {
+                                let _ = tracker.tx.send(EngineEvent::ReasoningToken(text));
+                            } else {
+                                let _ = tracker.tx.send(EngineEvent::Token(text));
+                            }
                         }
                     }
                     for completed in &step.completed {
@@ -395,7 +445,9 @@ async fn chat_completions(
     };
 
     let t_template = std::time::Instant::now();
-    let prompt = apply_chat_template(&handle.tokenizer, &body.messages);
+    let enable_thinking = body.enable_thinking.unwrap_or(false)
+        && handle.tokenizer.has_thinking_support();
+    let prompt = apply_chat_template(&handle.tokenizer, &body.messages, enable_thinking);
     let template_ms = t_template.elapsed().as_secs_f64() * 1000.0;
 
     let t_encode = std::time::Instant::now();
@@ -437,6 +489,7 @@ async fn chat_completions(
             response_tx,
             model_id: model_id.clone(),
             enqueued_at: std::time::Instant::now(),
+            enable_thinking,
         })
         .map_err(|_| {
             (
@@ -450,6 +503,7 @@ async fn chat_completions(
 
     if stream {
         let model_id_clone = model_id.clone();
+
         let stream = UnboundedReceiverStream::new(response_rx).map(move |event| {
             let sse_event = match event {
                 EngineEvent::Token(text) => {
@@ -462,6 +516,24 @@ async fn chat_completions(
                             delta: Delta {
                                 role: None,
                                 content: Some(text),
+                                reasoning_content: None,
+                            },
+                            finish_reason: None,
+                        }],
+                    };
+                    Event::default().data(serde_json::to_string(&chunk).unwrap())
+                }
+                EngineEvent::ReasoningToken(text) => {
+                    let chunk = ChatCompletionChunk {
+                        id: chat_id.clone(),
+                        object: "chat.completion.chunk".to_string(),
+                        model: model_id_clone.clone(),
+                        choices: vec![ChunkChoice {
+                            index: 0,
+                            delta: Delta {
+                                role: None,
+                                content: None,
+                                reasoning_content: Some(text),
                             },
                             finish_reason: None,
                         }],
@@ -478,6 +550,7 @@ async fn chat_completions(
                             delta: Delta {
                                 role: None,
                                 content: None,
+                                reasoning_content: None,
                             },
                             finish_reason: Some(finish_reason),
                         }],
@@ -496,14 +569,21 @@ async fn chat_completions(
     } else {
         let mut rx = response_rx;
         let mut content = String::new();
+        let mut reasoning_content = String::new();
         let mut finish_reason = "stop".to_string();
         let mut completion_tokens: usize = 0;
+        let mut reasoning_tokens: usize = 0;
 
         while let Some(event) = rx.recv().await {
             match event {
                 EngineEvent::Token(text) => {
                     content.push_str(&text);
                     completion_tokens += 1;
+                }
+                EngineEvent::ReasoningToken(text) => {
+                    reasoning_content.push_str(&text);
+                    completion_tokens += 1;
+                    reasoning_tokens += 1;
                 }
                 EngineEvent::Finish { finish_reason: fr } => {
                     finish_reason = fr;
@@ -518,6 +598,18 @@ async fn chat_completions(
             }
         }
 
+        let reasoning_opt = if reasoning_content.is_empty() {
+            None
+        } else {
+            Some(reasoning_content.trim().to_string())
+        };
+
+        let completion_tokens_details = if reasoning_tokens > 0 {
+            Some(CompletionTokensDetails { reasoning_tokens })
+        } else {
+            None
+        };
+
         let response = ChatCompletionResponse {
             id: chat_id,
             object: "chat.completion".to_string(),
@@ -526,7 +618,8 @@ async fn chat_completions(
                 index: 0,
                 message: ChatMessage {
                     role: "assistant".to_string(),
-                    content,
+                    content: content.trim().to_string(),
+                    reasoning_content: reasoning_opt,
                 },
                 finish_reason,
             }],
@@ -534,6 +627,7 @@ async fn chat_completions(
                 prompt_tokens: prompt_len,
                 completion_tokens,
                 total_tokens: prompt_len + completion_tokens,
+                completion_tokens_details,
             },
         };
 

@@ -10,6 +10,7 @@ pub fn apply_chat_template(
     bos_token: Option<&str>,
     eos_token: Option<&str>,
     add_generation_prompt: bool,
+    enable_thinking: bool,
 ) -> Result<String> {
     let template = preprocess_template(template);
 
@@ -35,6 +36,7 @@ pub fn apply_chat_template(
         bos_token: bos_token.unwrap_or(""),
         eos_token: eos_token.unwrap_or(""),
         add_generation_prompt,
+        enable_thinking,
     };
 
     let rendered = tmpl
@@ -81,6 +83,7 @@ struct TemplateContext<'a> {
     bos_token: &'a str,
     eos_token: &'a str,
     add_generation_prompt: bool,
+    enable_thinking: bool,
 }
 
 #[derive(Serialize)]

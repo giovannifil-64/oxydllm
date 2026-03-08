@@ -179,6 +179,12 @@ impl Tokenizer {
             .map_err(|e| anyhow::anyhow!("{}", e))
     }
 
+    pub fn decode_with_special(&self, ids: &[u32]) -> Result<String> {
+        self.inner
+            .decode(ids, false)
+            .map_err(|e| anyhow::anyhow!("{}", e))
+    }
+
     pub fn chat_template(&self) -> Option<&str> {
         self.chat_template.as_deref()
     }
@@ -193,6 +199,13 @@ impl Tokenizer {
 
     pub fn special_token_id(&self, content: &str) -> Option<u32> {
         self.special_token_ids.get(content).copied()
+    }
+
+    pub fn has_thinking_support(&self) -> bool {
+        self.chat_template
+            .as_deref()
+            .map(|t| t.contains("enable_thinking"))
+            .unwrap_or(false)
     }
 
     pub fn eos_token_id(&self) -> Option<u32> {

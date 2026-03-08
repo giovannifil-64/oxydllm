@@ -221,74 +221,112 @@ pub fn pull(config: &PullConfig) -> anyhow::Result<()> {
     let all_files = list_repo_files(&client, &config.repo_id, config.token.as_deref())?;
     println!();
 
-    let (gguf_files, metadata_files): (Vec<_>, Vec<_>) = all_files
+    let (gguf_files, mut metadata_files): (Vec<_>, Vec<_>) = all_files
         .into_iter()
         .filter(|(f, _)| is_relevant_file(f))
         .partition(|(f, _)| f.to_lowercase().ends_with(".gguf"));
 
+    let has_safetensors = metadata_files.iter().any(|(f, _)| f.ends_with(".safetensors"));
+    let mut download_safetensors = false;
+
     let gguf_to_download: Vec<String> = if gguf_files.is_empty() {
+        download_safetensors = true;
         Vec::new()
     } else {
-        let variants = group_gguf_variants(&gguf_files);
-        println!();
-        let chosen = select_variant(&variants, config.variant.as_deref())?;
-        let variant_filenames: Vec<String> =
-            chosen.files.iter().map(|(f, _)| f.clone()).collect();
-
-        if dest.exists() {
-            let all_complete = chosen.files.iter().all(|(fname, expected_size)| {
-                let path = dest.join(fname);
-                if !path.exists() {
-                    return false;
-                }
-                if *expected_size > 0 {
-                    let actual = path.metadata().map(|m| m.len()).unwrap_or(0);
-                    actual + 1024 >= *expected_size
-                } else {
-                    true
-                }
+        let mut variants = group_gguf_variants(&gguf_files);
+        if has_safetensors {
+            let st_files: Vec<_> = metadata_files.iter()
+                .filter(|(f, _)| f.ends_with(".safetensors"))
+                .cloned()
+                .collect();
+            variants.insert(0, GgufVariant {
+                quant_name: "Safetensors".to_string(),
+                files: st_files,
             });
-            if all_complete && !config.force {
-                anyhow::bail!(
-                    "Variant '{}' is already present in '{}'.\n\
-                     Use --force to re-download it.",
+        }
+        
+        println!();
+        
+        let target_variant_str = config.variant.as_deref().map(|s| {
+            if s.eq_ignore_ascii_case("safetensors") {
+                "Safetensors"
+            } else {
+                s
+            }
+        });
+
+        let chosen = select_variant(&variants, target_variant_str)?;
+
+        if chosen.quant_name == "Safetensors" {
+            download_safetensors = true;
+            println!(
+                "  Selected: Safetensors ({})\n",
+                fmt_size_f(chosen.total_size())
+            );
+            Vec::new()
+        } else {
+            let variant_filenames: Vec<String> =
+                chosen.files.iter().map(|(f, _)| f.clone()).collect();
+
+            if dest.exists() {
+                let all_complete = chosen.files.iter().all(|(fname, expected_size)| {
+                    let path = dest.join(fname);
+                    if !path.exists() {
+                        return false;
+                    }
+                    if *expected_size > 0 {
+                        let actual = path.metadata().map(|m| m.len()).unwrap_or(0);
+                        actual + 1024 >= *expected_size
+                    } else {
+                        true
+                    }
+                });
+                if all_complete && !config.force {
+                    anyhow::bail!(
+                        "Variant '{}' is already present in '{}'.\n\
+                         Use --force to re-download it.",
+                        chosen.quant_name,
+                        dest.display()
+                    );
+                }
+                for (f, _) in &chosen.files {
+                    let _ = std::fs::remove_file(dest.join(f));
+                }
+                let _ = std::fs::remove_file(dest.join("gguf.index"));
+            }
+
+            if variants.len() > 1 {
+                println!(
+                    "  Downloading: {} ({}{})\n",
                     chosen.quant_name,
-                    dest.display()
+                    fmt_size_f(chosen.total_size()),
+                    if chosen.is_split() {
+                        format!(", {} shards", chosen.files.len())
+                    } else {
+                        String::new()
+                    }
+                );
+            } else {
+                println!(
+                    "  Found: {} ({}{})\n",
+                    chosen.quant_name,
+                    fmt_size_f(chosen.total_size()),
+                    if chosen.is_split() {
+                        format!(", {} shards", chosen.files.len())
+                    } else {
+                        String::new()
+                    }
                 );
             }
-            for (f, _) in &chosen.files {
-                let _ = std::fs::remove_file(dest.join(f));
-            }
-            let _ = std::fs::remove_file(dest.join("gguf.index"));
+            variant_filenames
         }
-
-        if variants.len() > 1 {
-            println!(
-                "  Downloading: {} ({}{})\n",
-                chosen.quant_name,
-                fmt_size_f(chosen.total_size()),
-                if chosen.is_split() {
-                    format!(", {} shards", chosen.files.len())
-                } else {
-                    String::new()
-                }
-            );
-        } else {
-            println!(
-                "  Found: {} ({}{})\n",
-                chosen.quant_name,
-                fmt_size_f(chosen.total_size()),
-                if chosen.is_split() {
-                    format!(", {} shards", chosen.files.len())
-                } else {
-                    String::new()
-                }
-            );
-        }
-        variant_filenames
     };
 
-    if gguf_files.is_empty() && dest.exists() {
+    if !download_safetensors {
+        metadata_files.retain(|(f, _)| !f.ends_with(".safetensors"));
+    }
+
+    if download_safetensors && dest.exists() {
         if config.force || is_incomplete_download(&dest) {
             if !config.force {
                 println!("Resuming interrupted download — removing partial files...");
@@ -419,6 +457,9 @@ fn is_relevant_file(f: &str) -> bool {
         return false;
     }
     let l = f.to_lowercase();
+    if l == "consolidated.safetensors" || l.ends_with(".pth") || l.ends_with(".pt") || l.ends_with(".bin") {
+        return false;
+    }
     l.ends_with(".json")
         || l.ends_with(".safetensors")
         || l.ends_with(".gguf")

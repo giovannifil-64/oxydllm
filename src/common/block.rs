@@ -81,7 +81,7 @@ impl TransformerBlock {
         let mut x = (residual + attn_out)?;
         let residual = x.clone();
         
-        let mut ffn_inp;
+        let ffn_inp;
         if let Some(pre_norm) = &self.pre_ffn_norm {
             // Gemma 3 uses pre_feedforward_layernorm before FFN
             ffn_inp = pre_norm.forward(&x)?;

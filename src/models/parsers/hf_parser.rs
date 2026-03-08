@@ -52,8 +52,9 @@ linear/full-attention layers that require a dedicated model implementation."
 
     match arch {
         // Llama family — add Llama-3 extra EOS tokens
-        "LlamaForCausalLM" | "MistralForCausalLM" | "Mistral3ForCausalLM"
-        | "CodeLlamaForCausalLM" | "YiForCausalLM" => {
+        "LlamaForCausalLM"
+        | "MistralForCausalLM"
+        | "Mistral3ForConditionalGeneration" => {
             default_rope_theta = 500_000.0;
             for &e in &[128009u32, 128008u32] {
                 if !eos_token_ids.contains(&e) {
@@ -118,7 +119,7 @@ linear/full-attention layers that require a dedicated model implementation."
         other => anyhow::bail!(
             "Architecture not supported: '{other}'. \
              Supported: LlamaForCausalLM, MistralForCausalLM, Mistral3ForCausalLM, \
-             CodeLlamaForCausalLM, YiForCausalLM, Qwen2ForCausalLM, Qwen2_5ForCausalLM, \
+             Qwen2ForCausalLM, Qwen2_5ForCausalLM, \
              Qwen3ForCausalLM, GemmaForCausalLM, Gemma2ForCausalLM, Gemma3ForCausalLM."
         ),
     }

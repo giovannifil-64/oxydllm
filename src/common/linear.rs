@@ -62,6 +62,10 @@ pub fn silu(x: &Tensor) -> Result<Tensor> {
     x.div(&x.neg()?.exp()?.affine(1.0, 1.0)?)
 }
 
+pub fn gelu_tanh(x: &Tensor) -> Result<Tensor> {
+    x.gelu()
+}
+
 pub fn softmax_last_dim(x: &Tensor) -> Result<Tensor> {
     let max = x.max_keepdim(candle_core::D::Minus1)?;
     let x = x.broadcast_sub(&max)?;

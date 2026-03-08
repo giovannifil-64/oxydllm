@@ -42,6 +42,8 @@ pub struct StandardTransformer {
     pub(crate) stop_token_ids: Vec<u32>,
     pub(crate) vocab_size: usize,
     pub(crate) max_seq_len: usize,
+    pub(crate) embed_scale: Option<f64>,
+    pub(crate) logit_softcap: Option<f64>,
 }
 
 impl StandardTransformer {
@@ -52,6 +54,8 @@ impl StandardTransformer {
             norm: &self.norm,
             lm_head: &self.lm_head,
             rope: &self.rope,
+            embed_scale: self.embed_scale,
+            logit_softcap: self.logit_softcap,
         }
     }
 
@@ -61,8 +65,25 @@ impl StandardTransformer {
         dtype: DType,
         num_kv_blocks: usize,
     ) -> anyhow::Result<Self> {
+        use crate::common::config::{Activation, NormType};
+
         let arch = gguf.architecture()?;
         let prefix = &arch;
+
+        let mut activation = Activation::SiLU;
+        let mut norm_type = NormType::Standard;
+        let mut logit_softcap = None;
+        let mut attn_softcap = None;
+        let has_ffn_norms = false;
+        
+        if arch == "gemma" || arch == "gemma2" {
+            activation = Activation::GeLUTanh;
+            norm_type = NormType::Gemma;
+        }
+        if arch == "gemma2" {
+            logit_softcap = Some(30.0);
+            attn_softcap = Some(50.0);
+        }
 
         let num_hidden_layers = gguf.metadata_u32(&format!("{prefix}.block_count"))? as usize;
         let num_attention_heads =
@@ -82,6 +103,12 @@ impl StandardTransformer {
                 q0.shape().dims()[0] / num_attention_heads
             }
         };
+
+        let mut embed_scale = None;
+        if arch == "gemma" || arch == "gemma2" {
+            let hidden_size = head_dim * num_attention_heads;
+            embed_scale = Some((hidden_size as f64).sqrt());
+        }
 
         let rms_norm_eps = gguf
             .metadata_f32_or(&format!("{prefix}.attention.layer_norm_rms_epsilon"), 1e-5)
@@ -134,6 +161,10 @@ impl StandardTransformer {
             rms_norm_eps,
             qk_norm: has_qk_norm,
             attention_scale: None,
+            activation,
+            norm_type,
+            attn_softcap,
+            has_ffn_norms,
         };
 
         let blocks = (0..num_hidden_layers)
@@ -146,7 +177,7 @@ impl StandardTransformer {
         let norm_qt = gguf
             .get("output_norm.weight")
             .map_err(|e| anyhow::anyhow!("Missing output_norm.weight: {e}"))?;
-        let norm = RMSNorm::from_qtensor(&norm_qt, device, dtype, rms_norm_eps)
+        let norm = RMSNorm::from_qtensor(&norm_qt, device, dtype, rms_norm_eps, norm_type)
             .map_err(|e| anyhow::anyhow!("Failed to load output_norm: {e}"))?;
 
         let rope =
@@ -182,6 +213,8 @@ impl StandardTransformer {
             stop_token_ids,
             vocab_size,
             max_seq_len: max_position_embeddings,
+            embed_scale,
+            logit_softcap,
         })
     }
 }

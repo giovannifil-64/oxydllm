@@ -1,3 +1,15 @@
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Activation {
+    SiLU,
+    GeLUTanh,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NormType {
+    Standard,
+    Gemma,
+}
+
 pub struct BlockConfig {
     pub n_heads: usize,
     pub n_kv_heads: usize,
@@ -5,6 +17,10 @@ pub struct BlockConfig {
     pub rms_norm_eps: f64,
     pub qk_norm: bool,
     pub attention_scale: Option<f64>,
+    pub activation: Activation,
+    pub norm_type: NormType,
+    pub attn_softcap: Option<f64>,
+    pub has_ffn_norms: bool,
 }
 
 /// Architecture-independent config for standard pre-norm transformer models
@@ -23,6 +39,12 @@ pub struct StandardTransformerConfig {
     pub tie_word_embeddings: bool,
     pub attention_scale: Option<f64>,
     pub eos_token_ids: Vec<u32>,
+    pub activation: Activation,
+    pub norm_type: NormType,
+    pub embed_scale: Option<f64>,
+    pub attn_softcap: Option<f64>,
+    pub logit_softcap: Option<f64>,
+    pub has_ffn_norms: bool,
 }
 
 impl StandardTransformerConfig {
@@ -34,6 +56,10 @@ impl StandardTransformerConfig {
             rms_norm_eps: self.rms_norm_eps,
             qk_norm: self.qk_norm,
             attention_scale: self.attention_scale,
+            activation: self.activation,
+            norm_type: self.norm_type,
+            attn_softcap: self.attn_softcap,
+            has_ffn_norms: self.has_ffn_norms,
         }
     }
 }

@@ -12,8 +12,7 @@ use crate::common::{
 };
 use crate::models::traits::BatchModel;
 use crate::models::gguf_model::StandardTransformer;
-use crate::models::llama::config::LlamaConfig;
-use crate::models::qwen3::config::Qwen3Config;
+use crate::models::parsers::hf_parser;
 
 use std::path::{Path, PathBuf};
 
@@ -289,28 +288,9 @@ pub fn load_batch_model(
         return load_batch_model_gguf(model_dir, model_id, device, max_context_len, max_num_sequences, kv_budget);
     }
 
-    let raw = std::fs::read_to_string(format!("{}/config.json", model_dir))?;
-    let value: serde_json::Value = serde_json::from_str(&raw)?;
-    let arch = value["architectures"][0].as_str().unwrap_or("Unknown");
-
     let dtype = if matches!(device, Device::Cpu) { DType::F32 } else { DType::BF16 };
-
-    // All standard pre-norm transformer architectures share the same loading path.
-    // To add a new architecture: implement From<YourConfig> for StandardTransformerConfig
-    // and add one arm here.
-    match arch {
-        "Qwen3ForCausalLM" => {
-            let cfg: StandardTransformerConfig =
-                Qwen3Config::from_file(&format!("{}/config.json", model_dir))?.into();
-            load_standard_safetensors(cfg, model_dir, device, dtype, max_context_len, max_num_sequences, kv_budget)
-        }
-        "LlamaForCausalLM" => {
-            let cfg: StandardTransformerConfig =
-                LlamaConfig::from_file(&format!("{}/config.json", model_dir))?.into();
-            load_standard_safetensors(cfg, model_dir, device, dtype, max_context_len, max_num_sequences, kv_budget)
-        }
-        other => anyhow::bail!("Architecture not supported: {}", other),
-    }
+    let cfg = hf_parser::parse(&format!("{}/config.json", model_dir))?;
+    load_standard_safetensors(cfg, model_dir, device, dtype, max_context_len, max_num_sequences, kv_budget)
 }
 
 fn load_standard_safetensors(
@@ -357,7 +337,7 @@ fn load_standard_safetensors(
         .map(|i| TransformerBlock::load(&block_cfg, i, &weights))
         .collect::<candle_core::Result<Vec<_>>>()?;
 
-    let norm = RMSNorm::load(&weights, "model.norm", cfg.rms_norm_eps)?;
+    let norm = RMSNorm::load(&weights, "model.norm", cfg.rms_norm_eps, cfg.norm_type)?;
     let rope = RotaryEmbedding::new(cfg.head_dim, ctx, cfg.rope_theta, device)?;
 
     let allocators = (0..cfg.num_hidden_layers)
@@ -379,6 +359,8 @@ fn load_standard_safetensors(
         stop_token_ids: cfg.eos_token_ids,
         vocab_size: cfg.vocab_size,
         max_seq_len: ctx,
+        embed_scale: cfg.embed_scale,
+        logit_softcap: cfg.logit_softcap,
     }), weights_size))
 }
 

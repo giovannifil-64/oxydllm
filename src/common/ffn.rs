@@ -1,7 +1,8 @@
 use candle_core::{Result, Tensor, D};
 use super::gguf_weights::GgufWeights;
-use super::linear::{silu, AnyLinear, Linear, QLinear};
+use super::linear::{gelu_tanh, silu, AnyLinear, Linear, QLinear};
 use super::weights::ModelWeights;
+use super::config::Activation;
 
 pub struct FeedForward {
     /// Fused gate+up projection (safetensors). When Some, gate_proj/up_proj are None.
@@ -11,10 +12,11 @@ pub struct FeedForward {
     up_proj: Option<AnyLinear>,
     down_proj: AnyLinear,
     intermediate_size: usize,
+    activation: Activation,
 }
 
 impl FeedForward {
-    pub fn load(layer_idx: usize, weights: &ModelWeights) -> Result<Self> {
+    pub fn load(layer_idx: usize, weights: &ModelWeights, activation: Activation) -> Result<Self> {
         let p = format!("model.layers.{}.mlp", layer_idx);
         let gate_w = weights.get(&format!("{}.gate_proj.weight", p))?.clone();
         let up_w   = weights.get(&format!("{}.up_proj.weight",   p))?.clone();
@@ -30,6 +32,7 @@ impl FeedForward {
             up_proj: None,
             down_proj: AnyLinear::Float(down_proj),
             intermediate_size,
+            activation,
         })
     }
 
@@ -39,6 +42,7 @@ impl FeedForward {
         intermediate_size: usize,
         _device: &candle_core::Device,
         dtype: candle_core::DType,
+        activation: Activation,
     ) -> Result<Self> {
         let prefix = format!("blk.{}", layer_idx);
 
@@ -52,6 +56,7 @@ impl FeedForward {
             up_proj: Some(AnyLinear::Quantized(up_proj)),
             down_proj: AnyLinear::Quantized(down_proj),
             intermediate_size,
+            activation,
         })
     }
 
@@ -60,9 +65,17 @@ impl FeedForward {
             let out = gu.forward(x)?;
             let gate = out.narrow(D::Minus1, 0, self.intermediate_size)?;
             let up   = out.narrow(D::Minus1, self.intermediate_size, self.intermediate_size)?;
-            return self.down_proj.forward(&(silu(&gate)? * up)?);
+            let activated = match self.activation {
+                Activation::SiLU => silu(&gate)?,
+                Activation::GeLUTanh => gelu_tanh(&gate)?,
+            };
+            return self.down_proj.forward(&(activated * up)?);
         }
-        let gate = silu(&self.gate_proj.as_ref().expect("gate_proj").forward(x)?)?;
+        let raw_gate = self.gate_proj.as_ref().expect("gate_proj").forward(x)?;
+        let gate = match self.activation {
+            Activation::SiLU => silu(&raw_gate)?,
+            Activation::GeLUTanh => gelu_tanh(&raw_gate)?,
+        };
         let up   = self.up_proj.as_ref().expect("up_proj").forward(x)?;
         self.down_proj.forward(&(gate * up)?)
     }

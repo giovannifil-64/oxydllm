@@ -1,3 +1,64 @@
+ kill -9 $$
+ pwd
+ node -e "
+const fs = require('fs');
+let text = fs.readFileSync('src/common/block.rs', 'utf8');
+
+const oldStr = \`    pub fn forward_batch(
+        &self,
+        x: &Tensor,
+        rope: &RotaryEmbedding,
+        position_ids: &Tensor,
+        mask: Option<&Tensor>,
+        segments: &mut [SegmentInfo],
+    ) -> Result<Tensor> {
+        let residual = x;
+        let normed = self.input_norm.forward(x)?;
+        let attn_out = self.attention.forward_batch(&normed, rope, position_ids, mask, segments)?;
+        let x = (residual + attn_out)?;
+        let residual = &x;
+        let x = (residual + self.ffn.forward(&self.post_attn_norm.forward(&x)?)?)?;
+        Ok(x)
+    }\`;
+
+const newStr = \`    pub fn forward_batch(
+        &self,
+        x: &Tensor,
+        rope: &RotaryEmbedding,
+        position_ids: &Tensor,
+        mask: Option<&Tensor>,
+        segments: &mut [SegmentInfo],
+    ) -> Result<Tensor> {
+        let residual = x;
+        let normed = self.input_norm.forward(x)?;
+        let attn_out = self.attention.forward_batch(&normed, rope, position_ids, mask, segments)?;
+        let mut x = (residual + attn_out)?;
+        let residual = x.clone();
+        
+        let mut ffn_inp = self.post_attn_norm.forward(&x)?;
+        if let Some(pre_norm) = &self.pre_ffn_norm {
+            ffn_inp = pre_norm.forward(&ffn_inp)?;
+        }
+        
+        let mut ffn_out = self.ffn.forward(&ffn_inp)?;
+        if let Some(post_norm) = &self.post_ffn_norm {
+            ffn_out = post_norm.forward(&ffn_out)?;
+        }
+        
+        x = (residual + ffn_out)?;
+        Ok(x)
+    }\`;
+
+text = text.replace(oldStr, newStr);
+fs.writeFileSync('src/common/block.rs', text);
+"
+ git branch
+ git checkout -b gemma3-fix
+ ls
+ cat src/common/block.rs
+ cargo check
+ git diff
+ # Reset terminal
 use candle_core::Result;
 use candle_core::Tensor;
 use super::{
@@ -71,31 +132,10 @@ impl TransformerBlock {
     ) -> Result<Tensor> {
         let residual = x;
         let normed = self.input_norm.forward(x)?;
-        let mut attn_out = self.attention.forward_batch(&normed, rope, position_ids, mask, segments)?;
-        
-        if self.pre_ffn_norm.is_some() {
-            // Gemma 3 applies post_attention_layernorm to the attention output
-            attn_out = self.post_attn_norm.forward(&attn_out)?;
-        }
-        
-        let mut x = (residual + attn_out)?;
-        let residual = x.clone();
-        
-        let mut ffn_inp;
-        if let Some(pre_norm) = &self.pre_ffn_norm {
-            // Gemma 3 uses pre_feedforward_layernorm before FFN
-            ffn_inp = pre_norm.forward(&x)?;
-        } else {
-            // Standard transformer uses post_attention_layernorm before FFN
-            ffn_inp = self.post_attn_norm.forward(&x)?;
-        }
-        
-        let mut ffn_out = self.ffn.forward(&ffn_inp)?;
-        if let Some(post_norm) = &self.post_ffn_norm {
-            ffn_out = post_norm.forward(&ffn_out)?;
-        }
-        
-        x = (residual + ffn_out)?;
+        let attn_out = self.attention.forward_batch(&normed, rope, position_ids, mask, segments)?;
+        let x = (residual + attn_out)?;
+        let residual = &x;
+        let x = (residual + self.ffn.forward(&self.post_attn_norm.forward(&x)?)?)?;
         Ok(x)
     }
 }

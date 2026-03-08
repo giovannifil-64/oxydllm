@@ -43,6 +43,7 @@ pub struct Attention {
     q_dim: usize,
     kv_dim: usize,
     scale: f64,
+    attn_softcap: Option<f64>,
 }
 
 impl Attention {
@@ -65,12 +66,14 @@ impl Attention {
             RMSNorm::new(
                 weights.get(&format!("{}.q_norm.weight", p)).expect("q_norm.weight").clone(),
                 cfg.rms_norm_eps,
+                cfg.norm_type,
             )
         });
         let k_norm = cfg.qk_norm.then(|| {
             RMSNorm::new(
                 weights.get(&format!("{}.k_norm.weight", p)).expect("k_norm.weight").clone(),
                 cfg.rms_norm_eps,
+                cfg.norm_type,
             )
         });
 
@@ -90,6 +93,7 @@ impl Attention {
             q_dim,
             kv_dim,
             scale: cfg.attention_scale.unwrap_or(1.0 / (hd as f64).sqrt()),
+            attn_softcap: cfg.attn_softcap,
         })
     }
 
@@ -109,13 +113,13 @@ impl Attention {
 
         let q_norm = if cfg.qk_norm {
             let qt = gguf.get(&format!("{prefix}.attn_q_norm.weight"))?;
-            Some(RMSNorm::from_qtensor(&qt, device, dtype, cfg.rms_norm_eps)?)
+            Some(RMSNorm::from_qtensor(&qt, device, dtype, cfg.rms_norm_eps, cfg.norm_type)?)
         } else {
             None
         };
         let k_norm = if cfg.qk_norm {
             let qt = gguf.get(&format!("{prefix}.attn_k_norm.weight"))?;
-            Some(RMSNorm::from_qtensor(&qt, device, dtype, cfg.rms_norm_eps)?)
+            Some(RMSNorm::from_qtensor(&qt, device, dtype, cfg.rms_norm_eps, cfg.norm_type)?)
         } else {
             None
         };
@@ -136,6 +140,7 @@ impl Attention {
             q_dim,
             kv_dim,
             scale: cfg.attention_scale.unwrap_or(1.0 / (hd as f64).sqrt()),
+            attn_softcap: cfg.attn_softcap,
         })
     }
 
@@ -257,12 +262,12 @@ impl Attention {
 
         // ── Metal SDPA path for batch ────────────────────────────────
         #[cfg(feature = "metal")]
-        let use_sdpa = super::metal_ops::sdpa_available(&q, self.head_dim);
+        let use_sdpa = self.attn_softcap.is_none() && super::metal_ops::sdpa_available(&q, self.head_dim);
         #[cfg(not(feature = "metal"))]
         let use_sdpa = false;
 
         #[cfg(feature = "metal")]
-        if !use_sdpa {
+        if !use_sdpa && self.attn_softcap.is_none() {
             log_sdpa_fallback_once(self.head_dim, q.dtype());
         }
 
@@ -305,7 +310,11 @@ impl Attention {
                 let k_seg = k_seg.narrow(2, 0, kv_len)?;
                 let v_seg = v_seg.narrow(2, 0, kv_len)?;
 
-                let scores = q_seg.matmul(&k_seg.transpose(D::Minus1, D::Minus2)?)?.affine(self.scale, 0.)?;
+                let mut scores = q_seg.matmul(&k_seg.transpose(D::Minus1, D::Minus2)?)?.affine(self.scale, 0.)?;
+
+                if let Some(softcap) = self.attn_softcap {
+                    scores = (scores / softcap)?.tanh()?.affine(softcap, 0.)?;
+                }
 
                 let scores = if let Some(m) = mask {
                     let seg_mask = m.narrow(2, q_offset, seg.num_tokens)?.narrow(3, 0, kv_len)?;

@@ -41,6 +41,13 @@ Here you can find a list of models that have been tested with rLLM, divided by a
 </details>
 
 <details>
+<summary>GemmaForCausalLM</summary>
+
+#### gemma-2b-it
+- Metal: MacBook Pro M5 with 24GB of unified memory.
+</details>
+
+<details>
 <summary>Gemma3ForCausalLM</summary>
 
 #### gemma-3-1b-it

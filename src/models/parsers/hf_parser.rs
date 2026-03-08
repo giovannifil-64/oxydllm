@@ -118,7 +118,7 @@ linear/full-attention layers that require a dedicated model implementation."
 
         other => anyhow::bail!(
             "Architecture not supported: '{other}'. \
-             Supported: LlamaForCausalLM, MistralForCausalLM, Mistral3ForCausalLM, \
+             Supported: LlamaForCausalLM, MistralForCausalLM, Mistral3ForConditionalGeneration, \
              Qwen2ForCausalLM, Qwen2_5ForCausalLM, \
              Qwen3ForCausalLM, GemmaForCausalLM, Gemma2ForCausalLM, Gemma3ForCausalLM."
         ),

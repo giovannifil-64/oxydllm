@@ -338,7 +338,13 @@ fn load_standard_safetensors(
         .collect::<candle_core::Result<Vec<_>>>()?;
 
     let norm = RMSNorm::load(&weights, "model.norm", cfg.rms_norm_eps, cfg.norm_type)?;
-    let rope = RotaryEmbedding::new(cfg.head_dim, ctx, cfg.rope_theta, device)?;
+    let rope = RotaryEmbedding::new_with_scaling(
+        cfg.head_dim, 
+        ctx, 
+        cfg.rope_theta, 
+        cfg.rope_scaling.clone(), 
+        device
+    )?;
 
     let allocators = (0..cfg.num_hidden_layers)
         .map(|_| -> candle_core::Result<SharedBlockAllocator> {

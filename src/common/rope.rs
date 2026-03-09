@@ -1,5 +1,13 @@
 use candle_core::{Tensor, Device, Result, D};
 
+#[derive(Debug, Clone)]
+pub enum RopeScaling {
+    None,
+    Linear { factor: f64 },
+    Llama3 { factor: f64, low_freq_factor: f64, high_freq_factor: f64, original_max_pos: usize },
+    Yarn { factor: f64, original_max_pos: usize },
+}
+
 pub struct RotaryEmbedding {
     cos: Tensor,
     sin: Tensor,
@@ -12,11 +20,49 @@ impl RotaryEmbedding {
         rope_theta: f64,
         device: &Device,
     ) -> Result<Self> {
-        let inv_freq: Vec<f32> = (0..head_dim / 2)
+        Self::new_with_scaling(head_dim, max_seq_len, rope_theta, RopeScaling::None, device)
+    }
+
+    pub fn new_with_scaling(
+        head_dim: usize,
+        max_seq_len: usize,
+        rope_theta: f64,
+        scaling: RopeScaling,
+        device: &Device,
+    ) -> Result<Self> {
+        let mut inv_freq: Vec<f32> = (0..head_dim / 2)
             .map(|i| {
                 1.0 / (rope_theta as f32).powf(2.0 * i as f32 / head_dim as f32)
             })
             .collect();
+            
+        match scaling {
+            RopeScaling::Llama3 { factor, low_freq_factor, high_freq_factor, original_max_pos } => {
+                let low_freq_wavelen = original_max_pos as f32 / low_freq_factor as f32;
+                let high_freq_wavelen = original_max_pos as f32 / high_freq_factor as f32;
+                
+                for i in 0..head_dim / 2 {
+                    let wavelen = 2.0 * std::f32::consts::PI / inv_freq[i];
+                    if wavelen > low_freq_wavelen {
+                        inv_freq[i] /= factor as f32;
+                    } else if wavelen > high_freq_wavelen {
+                        let smooth = (original_max_pos as f32 / wavelen - low_freq_factor as f32) / (high_freq_factor as f32 - low_freq_factor as f32);
+                        inv_freq[i] /= (1.0 - smooth) * factor as f32 + smooth;
+                    }
+                }
+            }
+            RopeScaling::Linear { factor } => {
+                for f in &mut inv_freq {
+                    *f /= factor as f32;
+                }
+            }
+            RopeScaling::Yarn { factor, .. } => {
+                for f in &mut inv_freq {
+                    *f /= factor as f32;
+                }
+            }
+            RopeScaling::None => {}
+        }
         
         let inv_freq = Tensor::from_vec(
             inv_freq, 

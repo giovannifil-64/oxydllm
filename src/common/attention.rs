@@ -1,6 +1,6 @@
 use candle_core::{Result, Tensor, D};
 use std::cell::Cell;
-use super::config::BlockConfig;
+use super::config::{BlockConfig, NormType};
 use super::gguf_weights::GgufWeights;
 use super::paged::PagedKvCache;
 use super::linear::{softmax_last_dim, AnyLinear, Linear, QLinear};
@@ -44,6 +44,7 @@ pub struct Attention {
     kv_dim: usize,
     scale: f64,
     attn_softcap: Option<f64>,
+    sliding_window: Option<usize>,
 }
 
 impl Attention {
@@ -80,6 +81,13 @@ impl Attention {
         let q_dim = cfg.n_heads * hd;
         let kv_dim = cfg.n_kv_heads * hd;
 
+        let mut actual_window = cfg.sliding_window;
+        if let Some(w) = actual_window {
+            if cfg.norm_type == NormType::Gemma && layer_idx % 2 == 1 {
+                actual_window = None; // global layer for Gemma 2
+            }
+        }
+
         Ok(Self {
             q_proj: None,
             k_proj: None,
@@ -94,6 +102,7 @@ impl Attention {
             kv_dim,
             scale: cfg.attention_scale.unwrap_or(1.0 / (hd as f64).sqrt()),
             attn_softcap: cfg.attn_softcap,
+            sliding_window: actual_window,
         })
     }
 
@@ -127,6 +136,13 @@ impl Attention {
         let q_dim = cfg.n_heads * hd;
         let kv_dim = cfg.n_kv_heads * hd;
 
+        let mut actual_window = cfg.sliding_window;
+        if let Some(w) = actual_window {
+            if cfg.norm_type == NormType::Gemma && layer_idx % 2 == 1 {
+                actual_window = None; 
+            }
+        }
+
         Ok(Self {
             q_proj: Some(AnyLinear::Quantized(q_proj)),
             k_proj: Some(AnyLinear::Quantized(k_proj)),
@@ -141,6 +157,7 @@ impl Attention {
             kv_dim,
             scale: cfg.attention_scale.unwrap_or(1.0 / (hd as f64).sqrt()),
             attn_softcap: cfg.attn_softcap,
+            sliding_window: actual_window,
         })
     }
 
@@ -277,9 +294,20 @@ impl Attention {
                 let q_seg = q.narrow(2, q_offset, seg.num_tokens)?;
                 let k_seg = k_cat.narrow(0, i, 1)?;
                 let v_seg = v_cat.narrow(0, i, 1)?;
-                let kv_len = kv_lengths[i];
-                let k_seg = k_seg.narrow(2, 0, kv_len)?;
-                let v_seg = v_seg.narrow(2, 0, kv_len)?;
+                let mut kv_len = kv_lengths[i];
+                
+                let (k_seg, v_seg) = if let Some(w) = self.sliding_window {
+                    if seg.num_tokens == 1 && kv_len > w {
+                        let k = k_seg.narrow(2, kv_len - w, w)?;
+                        let v = v_seg.narrow(2, kv_len - w, w)?;
+                        kv_len = w;
+                        (k, v)
+                    } else {
+                        (k_seg.narrow(2, 0, kv_len)?, v_seg.narrow(2, 0, kv_len)?)
+                    }
+                } else {
+                    (k_seg.narrow(2, 0, kv_len)?, v_seg.narrow(2, 0, kv_len)?)
+                };
 
                 // SDPA handles GQA natively — no repeat_kv needed.
                 let q_c = q_seg.contiguous()?;
@@ -306,9 +334,20 @@ impl Attention {
                 let q_seg = q.narrow(2, q_offset, seg.num_tokens)?;
                 let k_seg = k_cat.narrow(0, i, 1)?;
                 let v_seg = v_cat.narrow(0, i, 1)?;
-                let kv_len = kv_lengths[i];
-                let k_seg = k_seg.narrow(2, 0, kv_len)?;
-                let v_seg = v_seg.narrow(2, 0, kv_len)?;
+                let mut kv_len = kv_lengths[i];
+                
+                let (k_seg, v_seg) = if let Some(w) = self.sliding_window {
+                    if seg.num_tokens == 1 && kv_len > w {
+                        let k = k_seg.narrow(2, kv_len - w, w)?;
+                        let v = v_seg.narrow(2, kv_len - w, w)?;
+                        kv_len = w;
+                        (k, v)
+                    } else {
+                        (k_seg.narrow(2, 0, kv_len)?, v_seg.narrow(2, 0, kv_len)?)
+                    }
+                } else {
+                    (k_seg.narrow(2, 0, kv_len)?, v_seg.narrow(2, 0, kv_len)?)
+                };
 
                 let mut scores = q_seg.matmul(&k_seg.transpose(D::Minus1, D::Minus2)?)?.affine(self.scale, 0.)?;
 

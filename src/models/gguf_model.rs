@@ -65,26 +65,19 @@ impl StandardTransformer {
         dtype: DType,
         num_kv_blocks: usize,
     ) -> anyhow::Result<Self> {
-        use crate::common::config::{Activation, NormType};
-
         let arch = gguf.architecture()?;
         let prefix = &arch;
 
-        let mut activation = Activation::SiLU;
-        let mut norm_type = NormType::Standard;
-        let mut logit_softcap = None;
-        let mut attn_softcap = None;
-        let has_ffn_norms = false;
+        let arch_def = crate::models::arch_defaults::arch_defaults(&arch)
+            .ok_or_else(|| anyhow::anyhow!("Architecture not supported: '{arch}'"))?;
+            
+        let mut activation = arch_def.activation;
+        let mut norm_type = arch_def.norm_type;
+        let mut logit_softcap = arch_def.logit_softcap;
+        let mut attn_softcap = arch_def.attn_softcap;
+        let has_ffn_norms = arch_def.has_ffn_norms;
+        let has_qk_norm = arch_def.qk_norm;
         
-        if arch == "gemma" || arch == "gemma2" {
-            activation = Activation::GeLUTanh;
-            norm_type = NormType::Gemma;
-        }
-        if arch == "gemma2" {
-            logit_softcap = Some(30.0);
-            attn_softcap = Some(50.0);
-        }
-
         let num_hidden_layers = gguf.metadata_u32(&format!("{prefix}.block_count"))? as usize;
         let num_attention_heads =
             gguf.metadata_u32(&format!("{prefix}.attention.head_count"))? as usize;
@@ -104,9 +97,10 @@ impl StandardTransformer {
             }
         };
 
+        let hidden_size = gguf.metadata_u32_or(&format!("{prefix}.embedding_length"), (head_dim * num_attention_heads) as u32) as usize;
+
         let mut embed_scale = None;
-        if arch == "gemma" || arch == "gemma2" {
-            let hidden_size = head_dim * num_attention_heads;
+        if arch_def.embed_scale_from_hidden {
             embed_scale = Some((hidden_size as f64).sqrt());
         }
 
@@ -114,7 +108,7 @@ impl StandardTransformer {
             .metadata_f32_or(&format!("{prefix}.attention.layer_norm_rms_epsilon"), 1e-5)
             as f64;
         let rope_theta =
-            gguf.metadata_f32_or(&format!("{prefix}.rope.freq_base"), 500_000.0) as f64;
+            gguf.metadata_f32_or(&format!("{prefix}.rope.freq_base"), arch_def.default_rope_theta as f32) as f64;
         let max_position_embeddings =
             gguf.metadata_u32_or(&format!("{prefix}.context_length"), 131072) as usize;
 
@@ -131,7 +125,15 @@ impl StandardTransformer {
             }
         };
 
-        let has_qk_norm = gguf.try_get("blk.0.attn_q_norm.weight").is_some();
+        let attention_scale_meta = gguf.metadata_f32_or(&format!("{prefix}.attention.key_length"), 0.0);
+        let mut attention_scale = None;
+        if arch == "gemma2" || arch == "gemma3" {
+             // If there's a specific GGUF field for query_pre_attn_scalar, we could read it. 
+             // Normally GGUF Gemma2 sets attention scale directly or we can use default heuristics.
+             // We can read `gemma2.attention.key_length` which is usually 256
+             let qk_dim = head_dim as f64;
+             attention_scale = Some(1.0 / qk_dim.sqrt());
+        }
 
         let embed_qt = gguf
             .get("token_embd.weight")
@@ -154,17 +156,29 @@ impl StandardTransformer {
             }
         };
 
+        let sliding_window_meta = gguf.metadata_u32_or(&format!("{prefix}.attention.sliding_window"), 0) as usize;
+        let sliding_window = if sliding_window_meta > 0 {
+            Some(sliding_window_meta)
+        } else if arch == "gemma2" {
+            Some(4096)
+        } else {
+            None
+        };
+
         let block_cfg = BlockConfig {
             n_heads: num_attention_heads,
             n_kv_heads: num_key_value_heads,
             head_dim,
+            hidden_size,
+            intermediate_size,
             rms_norm_eps,
             qk_norm: has_qk_norm,
-            attention_scale: None,
+            attention_scale,
             activation,
             norm_type,
             attn_softcap,
             has_ffn_norms,
+            sliding_window,
         };
 
         let blocks = (0..num_hidden_layers)

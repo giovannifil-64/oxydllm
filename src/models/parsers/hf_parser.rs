@@ -2,6 +2,8 @@ use anyhow::{Context, Result};
 use serde_json::Value;
 use crate::common::config::{Activation, NormType, StandardTransformerConfig};
 
+use crate::common::rope::RopeScaling;
+
 /// Parse a HuggingFace `config.json` into a `StandardTransformerConfig`.
 ///
 /// Uses `serde_json::Value` instead of per-architecture serde structs so that
@@ -38,120 +40,67 @@ linear/full-attention layers that require a dedicated model implementation."
 
     let mut eos_token_ids = parse_eos(&v["eos_token_id"]);
 
-    // --- architecture-specific defaults & overrides ---
-    let mut activation       = Activation::SiLU;
-    let mut norm_type        = NormType::Standard;
-    let mut qk_norm          = false;
-    let mut tie_word_embeddings = false;
-    let mut embed_scale: Option<f64>   = None;
-    let mut attn_softcap: Option<f64>  = None;
-    let mut logit_softcap: Option<f64> = None;
-    let mut attention_scale: Option<f64> = None;
-    let mut has_ffn_norms = false;
-    let mut default_rope_theta: f64 = 10_000.0;
+    let arch_def = crate::models::arch_defaults::arch_defaults(arch)
+        .with_context(|| format!("Architecture not supported: '{arch}'"))?;
 
-    match arch {
-        // Llama family — add Llama-3 extra EOS tokens
-        "LlamaForCausalLM"
-        | "MistralForCausalLM"
-        | "Mistral3ForConditionalGeneration" => {
-            default_rope_theta = 500_000.0;
-            for &e in &[128009u32, 128008u32] {
-                if !eos_token_ids.contains(&e) {
-                    eos_token_ids.push(e);
-                }
-            }
+    for &e in arch_def.extra_eos_ids {
+        if !eos_token_ids.contains(&e) {
+            eos_token_ids.push(e);
         }
-
-        // Qwen2 (full attention, no qk_norm)
-        "Qwen2ForCausalLM" | "Qwen2_5ForCausalLM" => {
-            default_rope_theta = 1_000_000.0;
-        }
-
-        // Qwen3 — only difference from Qwen2 is qk_norm
-        "Qwen3ForCausalLM" => {
-            qk_norm = true;
-            default_rope_theta = 1_000_000.0;
-        }
-
-        // Gemma 1 — GeLU-tanh, (1+w)*rms_norm, embed scaling, always ties embeddings
-        "GemmaForCausalLM" => {
-            activation = Activation::GeLUTanh;
-            norm_type  = NormType::Gemma;
-            tie_word_embeddings = true;
-            embed_scale = Some((hidden_size as f64).sqrt());
-        }
-
-        // Gemma 2 — same as Gemma 1 + softcapping (always present in config) + query_pre_attn_scalar
-        "Gemma2ForCausalLM" => {
-            activation = Activation::GeLUTanh;
-            norm_type  = NormType::Gemma;
-            tie_word_embeddings = true;
-            embed_scale = Some((hidden_size as f64).sqrt());
-            // Gemma 2 always has these fields; fall back to canonical values if missing.
-            attn_softcap  = Some(v["attn_logit_softcapping"].as_f64().unwrap_or(50.0));
-            logit_softcap = Some(v["final_logit_softcapping"].as_f64().unwrap_or(30.0));
-            if let Some(scalar) = v["query_pre_attn_scalar"].as_f64() {
-                attention_scale = Some(1.0 / scalar.sqrt());
-            }
-        }
-
-        // Gemma 3 — like Gemma 1 but NO softcapping; only apply if explicitly set in config.
-        "Gemma3ForCausalLM" => {
-            activation = Activation::GeLUTanh;
-            norm_type  = NormType::Gemma;
-            tie_word_embeddings = true;
-            has_ffn_norms = true;
-            qk_norm = true;
-            embed_scale = Some((hidden_size as f64).sqrt());
-            for &e in &[1, 106u32] {
-                if !eos_token_ids.contains(&e) {
-                    eos_token_ids.push(e);
-                }
-            }
-            // Only enable softcapping if the fields are actually present and positive.
-            if let Some(s) = v["attn_logit_softcapping"].as_f64().filter(|&x| x > 0.0) {
-                attn_softcap = Some(s);
-            }
-            if let Some(s) = v["final_logit_softcapping"].as_f64().filter(|&x| x > 0.0) {
-                logit_softcap = Some(s);
-            }
-            if let Some(scalar) = v["query_pre_attn_scalar"].as_f64() {
-                attention_scale = Some(1.0 / scalar.sqrt());
-            }
-        }
-
-        other => anyhow::bail!(
-            "Architecture not supported: '{other}'. \
-             Supported: LlamaForCausalLM, MistralForCausalLM, Mistral3ForConditionalGeneration, \
-             Qwen2ForCausalLM, Qwen2_5ForCausalLM, \
-             Qwen3ForCausalLM, GemmaForCausalLM, Gemma2ForCausalLM, Gemma3ForCausalLM."
-        ),
     }
-
     if eos_token_ids.is_empty() {
         eos_token_ids = vec![2]; // generic <eos>
     }
 
+    let mut embed_scale = if arch_def.embed_scale_from_hidden {
+        Some((hidden_size as f64).sqrt())
+    } else {
+        None
+    };
+
+    let mut attn_softcap = arch_def.attn_softcap;
+    let mut logit_softcap = arch_def.logit_softcap;
+    let mut attention_scale = None;
+
+    if let Some(s) = v["attn_logit_softcapping"].as_f64().filter(|&x| x > 0.0) {
+        attn_softcap = Some(s);
+    }
+    if let Some(s) = v["final_logit_softcapping"].as_f64().filter(|&x| x > 0.0) {
+        logit_softcap = Some(s);
+    }
+    if let Some(scalar) = v["query_pre_attn_scalar"].as_f64() {
+        attention_scale = Some(1.0 / scalar.sqrt());
+    }
+
+    let tie_word_embeddings = v["tie_word_embeddings"].as_bool()
+        .unwrap_or(arch == "GemmaForCausalLM" || arch == "Gemma2ForCausalLM" || arch == "Gemma3ForCausalLM"); // Temporary fallback logic for tying
+
+    let rope_scaling = parse_rope_scaling(&v["rope_scaling"]);
+    let sliding_window = v["sliding_window"].as_u64().map(|x| x as usize);
+
     Ok(StandardTransformerConfig {
         vocab_size:               req_usize(&v, "vocab_size")?,
+        hidden_size,
+        intermediate_size:        req_usize(&v, "intermediate_size")?,
         num_hidden_layers:        req_usize(&v, "num_hidden_layers")?,
         num_attention_heads,
         num_key_value_heads,
         head_dim,
         rms_norm_eps:             v["rms_norm_eps"].as_f64().unwrap_or(1e-5),
-        rope_theta:               v["rope_theta"].as_f64().unwrap_or(default_rope_theta),
+        rope_theta:               v["rope_theta"].as_f64().unwrap_or(arch_def.default_rope_theta),
+        rope_scaling,
         max_position_embeddings:  v["max_position_embeddings"].as_u64().unwrap_or(131_072) as usize,
-        qk_norm,
-        tie_word_embeddings:      v["tie_word_embeddings"].as_bool().unwrap_or(tie_word_embeddings),
+        qk_norm:                  arch_def.qk_norm,
+        tie_word_embeddings,
         attention_scale,
         eos_token_ids,
-        activation,
-        norm_type,
+        activation:               arch_def.activation,
+        norm_type:                arch_def.norm_type,
         embed_scale,
         attn_softcap,
         logit_softcap,
-        has_ffn_norms,
+        has_ffn_norms:            arch_def.has_ffn_norms,
+        sliding_window,
     })
 }
 
@@ -167,5 +116,29 @@ fn parse_eos(v: &Value) -> Vec<u32> {
         Value::Number(n) => n.as_u64().map(|x| vec![x as u32]).unwrap_or_default(),
         Value::Array(arr) => arr.iter().filter_map(|x| x.as_u64()).map(|x| x as u32).collect(),
         _ => vec![],
+    }
+}
+
+fn parse_rope_scaling(v: &Value) -> RopeScaling {
+    if v.is_null() {
+        return RopeScaling::None;
+    }
+    
+    let rope_type = v["rope_type"].as_str().or_else(|| v["type"].as_str()).unwrap_or("");
+    let factor = v["factor"].as_f64().unwrap_or(1.0);
+    
+    match rope_type {
+        "linear" => RopeScaling::Linear { factor },
+        "llama3" => {
+            let low_freq_factor = v["low_freq_factor"].as_f64().unwrap_or(1.0);
+            let high_freq_factor = v["high_freq_factor"].as_f64().unwrap_or(1.0);
+            let original_max_pos = v["original_max_position_embeddings"].as_u64().unwrap_or(8192) as usize;
+            RopeScaling::Llama3 { factor, low_freq_factor, high_freq_factor, original_max_pos }
+        }
+        "yarn" => {
+            let original_max_pos = v["original_max_position_embeddings"].as_u64().unwrap_or(8192) as usize;
+            RopeScaling::Yarn { factor, original_max_pos }
+        }
+        _ => RopeScaling::None,
     }
 }

@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use serde_json::Value;
-use crate::common::config::{Activation, NormType, StandardTransformerConfig};
+use crate::common::config::StandardTransformerConfig;
 
 use crate::common::rope::RopeScaling;
 
@@ -17,17 +17,8 @@ pub fn parse(config_path: &str) -> Result<StandardTransformerConfig> {
 
     let arch = v["architectures"][0].as_str().unwrap_or("Unknown");
 
-    // Bail early for architectures that need special handling before touching
-    // common fields (e.g. nested text_config).
-    match arch {
-        "Qwen3_5ForConditionalGeneration" => {
-            anyhow::bail!(
-                "Qwen3_5ForConditionalGeneration is not yet supported: it uses hybrid \
-linear/full-attention layers that require a dedicated model implementation."
-            );
-        }
-        _ => {}
-    }
+    let arch_def = crate::models::arch_defaults::arch_defaults(arch)
+        .with_context(|| format!("Architecture '{arch}' not supported"))?;
 
     let hidden_size          = req_usize(&v, "hidden_size")?;
     let num_attention_heads  = req_usize(&v, "num_attention_heads")?;
@@ -40,9 +31,6 @@ linear/full-attention layers that require a dedicated model implementation."
 
     let mut eos_token_ids = parse_eos(&v["eos_token_id"]);
 
-    let arch_def = crate::models::arch_defaults::arch_defaults(arch)
-        .with_context(|| format!("Architecture not supported: '{arch}'"))?;
-
     for &e in arch_def.extra_eos_ids {
         if !eos_token_ids.contains(&e) {
             eos_token_ids.push(e);
@@ -52,7 +40,7 @@ linear/full-attention layers that require a dedicated model implementation."
         eos_token_ids = vec![2]; // generic <eos>
     }
 
-    let mut embed_scale = if arch_def.embed_scale_from_hidden {
+    let embed_scale = if arch_def.embed_scale_from_hidden {
         Some((hidden_size as f64).sqrt())
     } else {
         None
@@ -80,8 +68,6 @@ linear/full-attention layers that require a dedicated model implementation."
 
     Ok(StandardTransformerConfig {
         vocab_size:               req_usize(&v, "vocab_size")?,
-        hidden_size,
-        intermediate_size:        req_usize(&v, "intermediate_size")?,
         num_hidden_layers:        req_usize(&v, "num_hidden_layers")?,
         num_attention_heads,
         num_key_value_heads,
@@ -135,10 +121,7 @@ fn parse_rope_scaling(v: &Value) -> RopeScaling {
             let original_max_pos = v["original_max_position_embeddings"].as_u64().unwrap_or(8192) as usize;
             RopeScaling::Llama3 { factor, low_freq_factor, high_freq_factor, original_max_pos }
         }
-        "yarn" => {
-            let original_max_pos = v["original_max_position_embeddings"].as_u64().unwrap_or(8192) as usize;
-            RopeScaling::Yarn { factor, original_max_pos }
-        }
+        "yarn" => RopeScaling::Yarn { factor },
         _ => RopeScaling::None,
     }
 }

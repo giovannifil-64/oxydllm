@@ -16,8 +16,6 @@ pub struct BlockConfig {
     pub n_heads: usize,
     pub n_kv_heads: usize,
     pub head_dim: usize,
-    pub hidden_size: usize,
-    pub intermediate_size: usize,
     pub rms_norm_eps: f64,
     pub qk_norm: bool,
     pub attention_scale: Option<f64>,
@@ -33,8 +31,6 @@ pub struct BlockConfig {
 /// their JSON config into this struct; the loader then uses it uniformly.
 pub struct StandardTransformerConfig {
     pub vocab_size: usize,
-    pub hidden_size: usize,
-    pub intermediate_size: usize,
     pub num_hidden_layers: usize,
     pub num_attention_heads: usize,
     pub num_key_value_heads: usize,
@@ -62,8 +58,6 @@ impl StandardTransformerConfig {
             n_heads: self.num_attention_heads,
             n_kv_heads: self.num_key_value_heads,
             head_dim: self.head_dim,
-            hidden_size: self.hidden_size,
-            intermediate_size: self.intermediate_size,
             rms_norm_eps: self.rms_norm_eps,
             qk_norm: self.qk_norm,
             attention_scale: self.attention_scale,

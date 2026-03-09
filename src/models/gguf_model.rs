@@ -69,12 +69,12 @@ impl StandardTransformer {
         let prefix = &arch;
 
         let arch_def = crate::models::arch_defaults::arch_defaults(&arch)
-            .ok_or_else(|| anyhow::anyhow!("Architecture not supported: '{arch}'"))?;
+            .ok_or_else(|| anyhow::anyhow!("Architecture '{arch}' not supported"))?;
             
-        let mut activation = arch_def.activation;
-        let mut norm_type = arch_def.norm_type;
-        let mut logit_softcap = arch_def.logit_softcap;
-        let mut attn_softcap = arch_def.attn_softcap;
+        let activation = arch_def.activation;
+        let norm_type = arch_def.norm_type;
+        let logit_softcap = arch_def.logit_softcap;
+        let attn_softcap = arch_def.attn_softcap;
         let has_ffn_norms = arch_def.has_ffn_norms;
         let has_qk_norm = arch_def.qk_norm;
         
@@ -125,7 +125,6 @@ impl StandardTransformer {
             }
         };
 
-        let attention_scale_meta = gguf.metadata_f32_or(&format!("{prefix}.attention.key_length"), 0.0);
         let mut attention_scale = None;
         if arch == "gemma2" || arch == "gemma3" {
              // If there's a specific GGUF field for query_pre_attn_scalar, we could read it. 
@@ -169,8 +168,6 @@ impl StandardTransformer {
             n_heads: num_attention_heads,
             n_kv_heads: num_key_value_heads,
             head_dim,
-            hidden_size,
-            intermediate_size,
             rms_norm_eps,
             qk_norm: has_qk_norm,
             attention_scale,

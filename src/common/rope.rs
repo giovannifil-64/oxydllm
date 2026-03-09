@@ -5,7 +5,7 @@ pub enum RopeScaling {
     None,
     Linear { factor: f64 },
     Llama3 { factor: f64, low_freq_factor: f64, high_freq_factor: f64, original_max_pos: usize },
-    Yarn { factor: f64, original_max_pos: usize },
+    Yarn { factor: f64 },
 }
 
 pub struct RotaryEmbedding {

@@ -47,6 +47,24 @@ pub struct Attention {
     sliding_window: Option<usize>,
 }
 
+fn truncate_kv_window(
+    k: candle_core::Tensor,
+    v: candle_core::Tensor,
+    kv_len: usize,
+    window: Option<usize>,
+    num_tokens: usize,
+) -> Result<(candle_core::Tensor, candle_core::Tensor, usize)> {
+    if let Some(w) = window {
+        if num_tokens == 1 && kv_len > w {
+            Ok((k.narrow(2, kv_len - w, w)?, v.narrow(2, kv_len - w, w)?, w))
+        } else {
+            Ok((k.narrow(2, 0, kv_len)?, v.narrow(2, 0, kv_len)?, kv_len))
+        }
+    } else {
+        Ok((k.narrow(2, 0, kv_len)?, v.narrow(2, 0, kv_len)?, kv_len))
+    }
+}
+
 impl Attention {
     pub fn load(cfg: &BlockConfig, layer_idx: usize, weights: &ModelWeights) -> Result<Self> {
         let p = format!("model.layers.{}.self_attn", layer_idx);
@@ -81,12 +99,11 @@ impl Attention {
         let q_dim = cfg.n_heads * hd;
         let kv_dim = cfg.n_kv_heads * hd;
 
-        let mut actual_window = cfg.sliding_window;
-        if let Some(w) = actual_window {
-            if cfg.norm_type == NormType::Gemma && layer_idx % 2 == 1 {
-                actual_window = None; // global layer for Gemma 2
-            }
-        }
+        let actual_window = if cfg.norm_type == NormType::Gemma && layer_idx % 2 == 1 {
+            None // global layer for Gemma 2
+        } else {
+            cfg.sliding_window
+        };
 
         Ok(Self {
             q_proj: None,
@@ -136,12 +153,11 @@ impl Attention {
         let q_dim = cfg.n_heads * hd;
         let kv_dim = cfg.n_kv_heads * hd;
 
-        let mut actual_window = cfg.sliding_window;
-        if let Some(w) = actual_window {
-            if cfg.norm_type == NormType::Gemma && layer_idx % 2 == 1 {
-                actual_window = None; 
-            }
-        }
+        let actual_window = if cfg.norm_type == NormType::Gemma && layer_idx % 2 == 1 {
+            None // global layer for Gemma 2
+        } else {
+            cfg.sliding_window
+        };
 
         Ok(Self {
             q_proj: Some(AnyLinear::Quantized(q_proj)),
@@ -294,20 +310,8 @@ impl Attention {
                 let q_seg = q.narrow(2, q_offset, seg.num_tokens)?;
                 let k_seg = k_cat.narrow(0, i, 1)?;
                 let v_seg = v_cat.narrow(0, i, 1)?;
-                let mut kv_len = kv_lengths[i];
-                
-                let (k_seg, v_seg) = if let Some(w) = self.sliding_window {
-                    if seg.num_tokens == 1 && kv_len > w {
-                        let k = k_seg.narrow(2, kv_len - w, w)?;
-                        let v = v_seg.narrow(2, kv_len - w, w)?;
-                        kv_len = w;
-                        (k, v)
-                    } else {
-                        (k_seg.narrow(2, 0, kv_len)?, v_seg.narrow(2, 0, kv_len)?)
-                    }
-                } else {
-                    (k_seg.narrow(2, 0, kv_len)?, v_seg.narrow(2, 0, kv_len)?)
-                };
+                let kv_len = kv_lengths[i];
+                let (k_seg, v_seg, _) = truncate_kv_window(k_seg, v_seg, kv_len, self.sliding_window, seg.num_tokens)?;
 
                 // SDPA handles GQA natively — no repeat_kv needed.
                 let q_c = q_seg.contiguous()?;
@@ -334,20 +338,7 @@ impl Attention {
                 let q_seg = q.narrow(2, q_offset, seg.num_tokens)?;
                 let k_seg = k_cat.narrow(0, i, 1)?;
                 let v_seg = v_cat.narrow(0, i, 1)?;
-                let mut kv_len = kv_lengths[i];
-                
-                let (k_seg, v_seg) = if let Some(w) = self.sliding_window {
-                    if seg.num_tokens == 1 && kv_len > w {
-                        let k = k_seg.narrow(2, kv_len - w, w)?;
-                        let v = v_seg.narrow(2, kv_len - w, w)?;
-                        kv_len = w;
-                        (k, v)
-                    } else {
-                        (k_seg.narrow(2, 0, kv_len)?, v_seg.narrow(2, 0, kv_len)?)
-                    }
-                } else {
-                    (k_seg.narrow(2, 0, kv_len)?, v_seg.narrow(2, 0, kv_len)?)
-                };
+                let (k_seg, v_seg, kv_len) = truncate_kv_window(k_seg, v_seg, kv_lengths[i], self.sliding_window, seg.num_tokens)?;
 
                 let mut scores = q_seg.matmul(&k_seg.transpose(D::Minus1, D::Minus2)?)?.affine(self.scale, 0.)?;
 

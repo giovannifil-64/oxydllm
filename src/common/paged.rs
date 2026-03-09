@@ -179,11 +179,12 @@ pub struct BlockTable {
     pub block_ids: Vec<usize>,
     pub num_tokens: usize,
     cached_slots: Vec<u32>,
+    device_idx: Option<Tensor>,
 }
 
 impl BlockTable {
     pub fn new() -> Self {
-        Self { block_ids: Vec::new(), num_tokens: 0, cached_slots: Vec::new() }
+        Self { block_ids: Vec::new(), num_tokens: 0, cached_slots: Vec::new(), device_idx: None }
     }
 }
 
@@ -233,13 +234,20 @@ impl PagedKvCache {
             written += n;
         }
 
-        let idx = Tensor::from_slice(
-            &self.table.cached_slots,
-            (self.table.num_tokens,),
-            new_k.device(),
-        )?;
+        // Extend device_idx incrementally — only transfer the newly appended slots
+        let prev_len = self.table.device_idx.as_ref().map(|t| t.elem_count()).unwrap_or(0);
+        if prev_len < self.table.num_tokens {
+            let new_slots = &self.table.cached_slots[prev_len..self.table.num_tokens];
+            let delta = Tensor::from_slice(new_slots, (new_slots.len(),), new_k.device())?;
+            let updated = match self.table.device_idx.take() {
+                None => delta,
+                Some(existing) => Tensor::cat(&[&existing, &delta], 0)?,
+            };
+            self.table.device_idx = Some(updated);
+        }
 
-        self.allocator.lock().unwrap().gather(&idx)
+        let idx = self.table.device_idx.as_ref().unwrap();
+        self.allocator.lock().unwrap().gather(idx)
     }
 
     pub fn clear(&mut self) {
@@ -252,6 +260,7 @@ impl PagedKvCache {
         self.table.block_ids.clear();
         self.table.num_tokens = 0;
         self.table.cached_slots.clear();
+        self.table.device_idx = None;
     }
 
     pub fn prepopulate_block(&mut self, block_id: usize) {
@@ -266,6 +275,11 @@ impl PagedKvCache {
     pub fn set_num_tokens(&mut self, n: usize) {
         self.table.cached_slots.truncate(n);
         self.table.num_tokens = n;
+        if let Some(ref t) = self.table.device_idx {
+            if t.elem_count() > n {
+                self.table.device_idx = t.narrow(0, 0, n).ok();
+            }
+        }
     }
 
     pub fn block_id_at(&self, idx: usize) -> Option<usize> {

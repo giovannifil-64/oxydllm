@@ -342,8 +342,9 @@ fn load_standard_safetensors(
         cfg.head_dim, 
         ctx, 
         cfg.rope_theta, 
-        cfg.rope_scaling.clone(), 
-        device
+        cfg.rope_scaling.clone(),
+        dtype,
+        device,
     )?;
 
     let allocators = (0..cfg.num_hidden_layers)
@@ -424,31 +425,13 @@ fn load_batch_model_gguf(
 
     let weights_size = gguf.total_size_bytes();
 
-    let prefix = &arch;
-    let num_hidden_layers = gguf.metadata_u32(&format!("{prefix}.block_count"))? as usize;
-    let num_attention_heads = gguf.metadata_u32(&format!("{prefix}.attention.head_count"))? as usize;
-    let num_key_value_heads = gguf.metadata_u32(&format!("{prefix}.attention.head_count_kv"))? as usize;
-
-    let head_dim = {
-        let meta_key_len = gguf.metadata_u32_or(
-            &format!("{prefix}.attention.key_length"), 0,
-        ) as usize;
-        if meta_key_len > 0 {
-            meta_key_len
-        } else {
-            let q0 = gguf.get("blk.0.attn_q.weight")
-                .map_err(|e| anyhow::anyhow!("Cannot determine head_dim: {}", e))?;
-            q0.shape().dims()[0] / num_attention_heads
-        }
-    };
-    let context_length = gguf.metadata_u32_or(&format!("{prefix}.context_length"), 131072) as usize;
-
-    let ctx = max_context_len.min(context_length);
+    let topo = crate::models::gguf_model::parse_gguf_topology(&gguf)?;
+    let ctx = max_context_len.min(topo.context_length);
     let num_blocks = compute_kv_blocks(
         &KvBlockParams {
-            num_layers: num_hidden_layers,
-            n_kv_heads: num_key_value_heads,
-            head_dim,
+            num_layers: topo.num_hidden_layers,
+            n_kv_heads: topo.num_key_value_heads,
+            head_dim: topo.head_dim,
             max_context_len: ctx,
             max_num_sequences,
             dtype,

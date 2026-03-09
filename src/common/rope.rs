@@ -1,4 +1,4 @@
-use candle_core::{Tensor, Device, Result, D};
+use candle_core::{DType, Tensor, Device, Result, D};
 
 #[derive(Debug, Clone)]
 pub enum RopeScaling {
@@ -18,9 +18,10 @@ impl RotaryEmbedding {
         head_dim: usize,
         max_seq_len: usize,
         rope_theta: f64,
+        dtype: DType,
         device: &Device,
     ) -> Result<Self> {
-        Self::new_with_scaling(head_dim, max_seq_len, rope_theta, RopeScaling::None, device)
+        Self::new_with_scaling(head_dim, max_seq_len, rope_theta, RopeScaling::None, dtype, device)
     }
 
     pub fn new_with_scaling(
@@ -28,6 +29,7 @@ impl RotaryEmbedding {
         max_seq_len: usize,
         rope_theta: f64,
         scaling: RopeScaling,
+        dtype: DType,
         device: &Device,
     ) -> Result<Self> {
         let mut inv_freq: Vec<f32> = (0..head_dim / 2)
@@ -78,9 +80,8 @@ impl RotaryEmbedding {
         )?;
         
         let freqs = positions.matmul(&inv_freq)?;
-        let cos = freqs.cos()?;
-        let sin = freqs.sin()?;
-        
+        let cos = freqs.cos()?.to_dtype(dtype)?;
+        let sin = freqs.sin()?.to_dtype(dtype)?;
         Ok(Self { cos, sin })
     }
 
@@ -89,9 +90,8 @@ impl RotaryEmbedding {
 
         let cos = self.cos.index_select(position_ids, 0)?;
         let sin = self.sin.index_select(position_ids, 0)?;
-
-        let cos = cos.unsqueeze(0)?.unsqueeze(0)?.to_dtype(x.dtype())?;
-        let sin = sin.unsqueeze(0)?.unsqueeze(0)?.to_dtype(x.dtype())?;
+        let cos = cos.unsqueeze(0)?.unsqueeze(0)?;
+        let sin = sin.unsqueeze(0)?.unsqueeze(0)?;
 
         let x1 = x.narrow(D::Minus1, 0, d / 2)?;
         let x2 = x.narrow(D::Minus1, d / 2, d / 2)?;

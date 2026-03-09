@@ -10,6 +10,7 @@ pub struct ArchDefaults {
     pub logit_softcap: Option<f64>,
     pub default_rope_theta: f64,
     pub extra_eos_ids: &'static [u32],
+    pub default_sliding_window: Option<usize>,
 }
 
 impl Default for ArchDefaults {
@@ -24,6 +25,7 @@ impl Default for ArchDefaults {
             logit_softcap: None,
             default_rope_theta: 10_000.0,
             extra_eos_ids: &[],
+            default_sliding_window: None,
         }
     }
 }
@@ -39,6 +41,7 @@ pub fn llama_defaults() -> ArchDefaults {
         logit_softcap: None,
         default_rope_theta: 500_000.0,
         extra_eos_ids: &[128009, 128008],
+        default_sliding_window: None,
     }
 }
 
@@ -66,6 +69,7 @@ pub fn arch_defaults(arch: &str) -> Option<ArchDefaults> {
             embed_scale_from_hidden: true,
             attn_softcap: Some(50.0),
             logit_softcap: Some(30.0),
+            default_sliding_window: Some(4096),
             ..Default::default()
         }),
         "gemma3" | "gemma-3" | "Gemma3ForCausalLM" => Some(ArchDefaults {

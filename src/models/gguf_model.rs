@@ -46,6 +46,39 @@ pub struct StandardTransformer {
     pub(crate) logit_softcap: Option<f64>,
 }
 
+pub(crate) struct GgufTopology {
+    pub num_hidden_layers: usize,
+    pub num_attention_heads: usize,
+    pub num_key_value_heads: usize,
+    pub head_dim: usize,
+    pub context_length: usize,
+}
+
+pub(crate) fn parse_gguf_topology(gguf: &GgufWeights) -> anyhow::Result<GgufTopology> {
+    let arch = gguf.architecture()?;
+    let prefix = &arch;
+    let num_hidden_layers = gguf.metadata_u32(&format!("{prefix}.block_count"))? as usize;
+    let num_attention_heads =
+        gguf.metadata_u32(&format!("{prefix}.attention.head_count"))? as usize;
+    let num_key_value_heads =
+        gguf.metadata_u32(&format!("{prefix}.attention.head_count_kv"))? as usize;
+    let head_dim = {
+        let from_meta =
+            gguf.metadata_u32_or(&format!("{prefix}.attention.key_length"), 0) as usize;
+        if from_meta > 0 {
+            from_meta
+        } else {
+            let q0 = gguf
+                .get("blk.0.attn_q.weight")
+                .map_err(|e| anyhow::anyhow!("Cannot determine head_dim: {e}"))?;
+            q0.shape().dims()[0] / num_attention_heads
+        }
+    };
+    let context_length =
+        gguf.metadata_u32_or(&format!("{prefix}.context_length"), 131072) as usize;
+    Ok(GgufTopology { num_hidden_layers, num_attention_heads, num_key_value_heads, head_dim, context_length })
+}
+
 impl StandardTransformer {
     fn components(&self) -> TransformerComponents<'_> {
         TransformerComponents {
@@ -78,24 +111,11 @@ impl StandardTransformer {
         let has_ffn_norms = arch_def.has_ffn_norms;
         let has_qk_norm = arch_def.qk_norm;
         
-        let num_hidden_layers = gguf.metadata_u32(&format!("{prefix}.block_count"))? as usize;
-        let num_attention_heads =
-            gguf.metadata_u32(&format!("{prefix}.attention.head_count"))? as usize;
-        let num_key_value_heads =
-            gguf.metadata_u32(&format!("{prefix}.attention.head_count_kv"))? as usize;
-
-        let head_dim = {
-            let from_meta =
-                gguf.metadata_u32_or(&format!("{prefix}.attention.key_length"), 0) as usize;
-            if from_meta > 0 {
-                from_meta
-            } else {
-                let q0 = gguf
-                    .get("blk.0.attn_q.weight")
-                    .map_err(|e| anyhow::anyhow!("Cannot determine head_dim: {e}"))?;
-                q0.shape().dims()[0] / num_attention_heads
-            }
-        };
+        let topo = parse_gguf_topology(gguf)?;
+        let num_hidden_layers = topo.num_hidden_layers;
+        let num_attention_heads = topo.num_attention_heads;
+        let num_key_value_heads = topo.num_key_value_heads;
+        let head_dim = topo.head_dim;
 
         let hidden_size = gguf.metadata_u32_or(&format!("{prefix}.embedding_length"), (head_dim * num_attention_heads) as u32) as usize;
 
@@ -125,14 +145,13 @@ impl StandardTransformer {
             }
         };
 
-        let mut attention_scale = None;
-        if arch == "gemma2" || arch == "gemma3" {
-             // If there's a specific GGUF field for query_pre_attn_scalar, we could read it. 
-             // Normally GGUF Gemma2 sets attention scale directly or we can use default heuristics.
-             // We can read `gemma2.attention.key_length` which is usually 256
-             let qk_dim = head_dim as f64;
-             attention_scale = Some(1.0 / qk_dim.sqrt());
-        }
+        // Read query_pre_attn_scalar from GGUF if present (e.g. Gemma2 27B uses 224, not head_dim)
+        let attention_scale = {
+            let scalar = gguf.metadata_f32_or(
+                &format!("{prefix}.attention.query_pre_attn_scalar"), 0.0,
+            ) as f64;
+            if scalar > 0.0 { Some(1.0 / scalar.sqrt()) } else { None }
+        };
 
         let embed_qt = gguf
             .get("token_embd.weight")
@@ -158,10 +177,8 @@ impl StandardTransformer {
         let sliding_window_meta = gguf.metadata_u32_or(&format!("{prefix}.attention.sliding_window"), 0) as usize;
         let sliding_window = if sliding_window_meta > 0 {
             Some(sliding_window_meta)
-        } else if arch == "gemma2" {
-            Some(4096)
         } else {
-            None
+            arch_def.default_sliding_window
         };
 
         let block_cfg = BlockConfig {
@@ -192,7 +209,7 @@ impl StandardTransformer {
             .map_err(|e| anyhow::anyhow!("Failed to load output_norm: {e}"))?;
 
         let rope =
-            RotaryEmbedding::new(head_dim, max_position_embeddings, rope_theta, device)
+            RotaryEmbedding::new(head_dim, max_position_embeddings, rope_theta, dtype, device)
                 .map_err(|e| anyhow::anyhow!("Failed to create RoPE: {e}"))?;
 
         let mut allocators = Vec::with_capacity(num_hidden_layers);

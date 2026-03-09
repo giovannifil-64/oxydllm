@@ -65,6 +65,14 @@ fn truncate_kv_window(
     }
 }
 
+fn compute_sliding_window(cfg: &BlockConfig, layer_idx: usize) -> Option<usize> {
+    if cfg.norm_type == NormType::Gemma && layer_idx % 2 == 1 {
+        None
+    } else {
+        cfg.sliding_window
+    }
+}
+
 impl Attention {
     pub fn load(cfg: &BlockConfig, layer_idx: usize, weights: &ModelWeights) -> Result<Self> {
         let p = format!("model.layers.{}.self_attn", layer_idx);
@@ -99,11 +107,7 @@ impl Attention {
         let q_dim = cfg.n_heads * hd;
         let kv_dim = cfg.n_kv_heads * hd;
 
-        let actual_window = if cfg.norm_type == NormType::Gemma && layer_idx % 2 == 1 {
-            None // global layer for Gemma 2
-        } else {
-            cfg.sliding_window
-        };
+        let actual_window = compute_sliding_window(cfg, layer_idx);
 
         Ok(Self {
             q_proj: None,
@@ -153,11 +157,7 @@ impl Attention {
         let q_dim = cfg.n_heads * hd;
         let kv_dim = cfg.n_kv_heads * hd;
 
-        let actual_window = if cfg.norm_type == NormType::Gemma && layer_idx % 2 == 1 {
-            None // global layer for Gemma 2
-        } else {
-            cfg.sliding_window
-        };
+        let actual_window = compute_sliding_window(cfg, layer_idx);
 
         Ok(Self {
             q_proj: Some(AnyLinear::Quantized(q_proj)),

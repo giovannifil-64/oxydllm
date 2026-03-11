@@ -294,13 +294,21 @@ impl Attention {
         let mut q_offset = 0usize;
 
         // ── Metal SDPA path for batch ────────────────────────────────
+        // Disable SDPA when any prefill segment has prefix-cached tokens: the
+        // Metal do_causal flag assumes query position 0 == context position 0,
+        // which is wrong when cached tokens already occupy slots 0..N.  The
+        // standard fallback builds an explicit "visible_prefix + causal" mask.
         #[cfg(feature = "metal")]
-        let use_sdpa = self.attn_softcap.is_none() && super::metal_ops::sdpa_available(&q, self.head_dim);
+        let use_sdpa = self.attn_softcap.is_none()
+            && super::metal_ops::sdpa_available(&q, self.head_dim)
+            && !kv_lengths.iter().zip(segments.iter()).any(|(&kv_len, seg)| {
+                seg.num_tokens > 1 && kv_len > seg.num_tokens
+            });
         #[cfg(not(feature = "metal"))]
         let use_sdpa = false;
 
         #[cfg(feature = "metal")]
-        if !use_sdpa && self.attn_softcap.is_none() {
+        if !use_sdpa && self.attn_softcap.is_none() && !super::metal_ops::sdpa_available(&q, self.head_dim) {
             log_sdpa_fallback_once(self.head_dim, q.dtype());
         }
 

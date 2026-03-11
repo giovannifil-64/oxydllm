@@ -15,6 +15,19 @@ pub fn parse(config_path: &str) -> Result<StandardTransformerConfig> {
     let v: Value = serde_json::from_str(&raw)
         .with_context(|| format!("Cannot parse JSON from {config_path}"))?;
 
+    // For multimodal models the LLM parameters are nested under "text_config".
+    // Merge those fields into the root so the rest of the parser is uniform.
+    let v = if let Some(text_cfg) = v.get("text_config").and_then(|tc| tc.as_object()) {
+        let mut merged = v.clone();
+        let root = merged.as_object_mut().unwrap();
+        for (k, val) in text_cfg {
+            root.entry(k.clone()).or_insert_with(|| val.clone());
+        }
+        merged
+    } else {
+        v
+    };
+
     let arch = v["architectures"][0].as_str().unwrap_or("Unknown");
 
     let arch_def = crate::models::arch_defaults::arch_defaults(arch)

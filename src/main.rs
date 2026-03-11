@@ -43,9 +43,16 @@ struct StartArgs {
 
 struct RunArgs {
     model_dir: String,
+    model_id: String,
     sampling_params: SamplingParams,
     cuda_device: Option<usize>,
     max_context_len: usize,
+}
+
+struct RmArgs {
+    model_name: String,
+    models_dir: PathBuf,
+    force: bool,
 }
 
 fn default_models_dir() -> PathBuf {
@@ -90,6 +97,7 @@ Usage: rllm <command> [options]
 
 Commands:
   pull     <user/model>   Download a model from HuggingFace
+  rm       <model-name>   Remove a model and its files from disk
   start                   Start the HTTP inference server
   run      <model-name>   Interactive chat in terminal
   estimate <model>        Estimate memory footprint and accuracy
@@ -119,6 +127,10 @@ Chat options (run):
   --top-p <P>               Nucleus sampling (default: 1.0)
   --min-p <P>               Min-p filtering (default: 0.0)
   --repeat-penalty <R>      Repetition penalty (default: 1.0)
+
+Remove options (rm):
+  --models-dir <DIR>        Models directory (default: ~/.rllm/models/)
+  --force / -f              Skip confirmation prompt
 
 Estimate options (estimate):
   --models-dir <DIR>        Models directory (default: ~/.rllm/models/)
@@ -245,6 +257,82 @@ fn parse_pull_args(args: &[String]) -> Result<PullArgs, String> {
         force,
         variant,
     })
+}
+
+fn parse_rm_args(args: &[String]) -> Result<RmArgs, String> {
+    let mut model_name = String::new();
+    let mut models_dir: Option<PathBuf> = None;
+    let mut force = false;
+    let mut i = 0;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            "--models-dir" => {
+                i += 1;
+                models_dir = Some(PathBuf::from(
+                    args.get(i).ok_or("--models-dir requires a value")?,
+                ));
+            }
+            "--force" | "-f" => {
+                force = true;
+            }
+            _ if !args[i].starts_with('-') && model_name.is_empty() => {
+                model_name = args[i].clone();
+            }
+            other => return Err(format!("Unknown option: {}", other)),
+        }
+        i += 1;
+    }
+
+    if model_name.is_empty() {
+        return Err("Missing <model-name>".to_string());
+    }
+
+    Ok(RmArgs {
+        model_name,
+        models_dir: models_dir.unwrap_or_else(default_models_dir),
+        force,
+    })
+}
+
+fn run_rm(args: &RmArgs) -> anyhow::Result<()> {
+    use std::io::{Write, BufRead};
+
+    let model_path = models::loader::resolve_model_path(&args.models_dir, &args.model_name)
+        .ok_or_else(|| anyhow::anyhow!(
+            "Model '{}' not found in '{}'",
+            args.model_name,
+            args.models_dir.display()
+        ))?;
+
+    println!("Model:     {}", args.model_name);
+    println!("Directory: {}", model_path.display());
+
+    if !args.force {
+        print!("Remove model '{}' and all its files? [y/N] ", args.model_name);
+        std::io::stdout().flush()?;
+        let mut answer = String::new();
+        std::io::stdin().lock().read_line(&mut answer)?;
+        if !matches!(answer.trim().to_lowercase().as_str(), "y" | "yes") {
+            println!("Aborted.");
+            return Ok(());
+        }
+    }
+
+    std::fs::remove_dir_all(&model_path)?;
+    println!("Removed '{}'.", model_path.display());
+
+    // Clean the registry entry if present.
+    let registry_path = models::manager::registry_path(&args.models_dir);
+    if registry_path.exists() {
+        let mut registry = models::manager::load_registry(&args.models_dir);
+        if registry.remove(&args.model_name).is_some() {
+            models::manager::save_registry(&args.models_dir, &registry);
+            println!("Removed '{}' from registry.", args.model_name);
+        }
+    }
+
+    Ok(())
 }
 
 fn parse_start_args(args: &[String]) -> Result<StartArgs, String> {
@@ -404,14 +492,18 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
     }
 
     let model_dir = if model_name.contains('/') || model_name.contains('\\') {
-        model_name
+        model_name.clone()
     } else {
         let base = models_dir.unwrap_or_else(default_models_dir);
-        base.join(&model_name).to_string_lossy().to_string()
+        models::loader::resolve_model_path(&base, &model_name)
+            .unwrap_or_else(|| base.join(&model_name))
+            .to_string_lossy()
+            .to_string()
     };
 
     Ok(RunArgs {
         model_dir,
+        model_id: model_name,
         sampling_params: params,
         cuda_device: resolve_devices(devices_raw).into_iter().next(),
         max_context_len,
@@ -428,11 +520,6 @@ fn run_interactive(args: &RunArgs) -> anyhow::Result<()> {
     println!("Tokenizer loaded.");
 
     println!("Loading model from '{}'...", args.model_dir);
-    let model_id_infer = std::path::Path::new(&args.model_dir)
-        .file_name()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .to_string();
     let is_cpu = matches!(device, candle_core::Device::Cpu);
     let kv_budget = std::sync::Arc::new(
         crate::common::paged::GlobalKvBudget::new(
@@ -440,7 +527,7 @@ fn run_interactive(args: &RunArgs) -> anyhow::Result<()> {
         )
     );
     let (batch_model, weights_size_bytes) = models::loader::load_batch_model(
-        &args.model_dir, &model_id_infer, &device, args.max_context_len, 1, &kv_budget,
+        &args.model_dir, &args.model_id, &device, args.max_context_len, 1, &kv_budget,
     )?;
     let max_seq_len = batch_model.max_seq_len();
     let kv_cache_bytes = batch_model.kv_cache_bytes();
@@ -595,6 +682,14 @@ fn main() -> anyhow::Result<()> {
                 context_len: est_args.context_len,
                 num_sequences: est_args.num_sequences,
             })?;
+        }
+        "rm" | "remove" => {
+            let rm_args = parse_rm_args(&args[2..]).unwrap_or_else(|e| {
+                eprintln!("Error: {e}");
+                print_usage();
+                std::process::exit(1);
+            });
+            run_rm(&rm_args)?;
         }
         "--help" | "-h" | "help" => {
             print_usage();

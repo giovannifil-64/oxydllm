@@ -81,11 +81,11 @@ pub enum GetResult {
 }
 
 
-fn registry_path(models_dir: &Path) -> PathBuf {
+pub fn registry_path(models_dir: &Path) -> PathBuf {
     models_dir.join(".rllm_registry.json")
 }
 
-fn load_registry(models_dir: &Path) -> HashMap<String, RegistryEntry> {
+pub fn load_registry(models_dir: &Path) -> HashMap<String, RegistryEntry> {
     let path = registry_path(models_dir);
     let raw = match std::fs::read_to_string(&path) {
         Ok(r) => r,
@@ -94,7 +94,7 @@ fn load_registry(models_dir: &Path) -> HashMap<String, RegistryEntry> {
     serde_json::from_str(&raw).unwrap_or_default()
 }
 
-fn save_registry(models_dir: &Path, registry: &HashMap<String, RegistryEntry>) {
+pub fn save_registry(models_dir: &Path, registry: &HashMap<String, RegistryEntry>) {
     let path = registry_path(models_dir);
     if let Ok(json) = serde_json::to_string_pretty(registry) {
         let _ = std::fs::write(path, json);
@@ -137,7 +137,21 @@ impl ModelManager {
         cuda_devices: Vec<usize>,
         max_context_len: usize,
     ) -> Self {
-        let registry = load_registry(&models_dir);
+        let mut registry = load_registry(&models_dir);
+        // Remove registry entries whose model directory no longer exists.
+        let valid_ids: std::collections::HashSet<String> = loader::discover_models(&models_dir)
+            .into_iter()
+            .map(|m| m.id)
+            .collect();
+        let before = registry.len();
+        registry.retain(|id, _| valid_ids.contains(id));
+        if registry.len() < before {
+            println!(
+                "[registry] Removed {} stale entries (models no longer on disk).",
+                before - registry.len()
+            );
+            save_registry(&models_dir, &registry);
+        }
         let is_cpu = cuda_devices.is_empty();
         let kv_total = detect_system_kv_budget(memory_budget_bytes, is_cpu);
         println!(

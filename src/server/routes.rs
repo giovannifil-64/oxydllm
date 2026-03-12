@@ -134,24 +134,38 @@ struct AppState {
 }
 
 pub fn apply_chat_template(tokenizer: &Tokenizer, messages: &[ChatMessage], enable_thinking: bool) -> String {
-    match tokenizer.chat_template() {
-        Some(template) => {
-            match chat_template::apply_chat_template(
-                template,
-                messages,
-                tokenizer.bos_token(),
-                tokenizer.eos_token(),
-                true,
-                enable_thinking,
-            ) {
-                Ok(prompt) => prompt,
-                Err(e) => {
-                    eprintln!("Warning: chat template rendering failed: {e:#}. Falling back to plain text.");
-                    chat_template::format_plain_chat(messages)
+    let Some(template) = tokenizer.chat_template() else {
+        return chat_template::format_plain_chat(messages);
+    };
+
+    let try_render = |msgs: &[ChatMessage]| {
+        chat_template::apply_chat_template(
+            template,
+            msgs,
+            tokenizer.bos_token(),
+            tokenizer.eos_token(),
+            true,
+            enable_thinking,
+        )
+    };
+
+    match try_render(messages) {
+        Ok(prompt) => prompt,
+        Err(e) => {
+            let without_system: Vec<&ChatMessage> =
+                messages.iter().filter(|m| m.role != "system").collect();
+
+            if without_system.len() < messages.len() {
+                let msgs_ref: Vec<ChatMessage> = without_system.into_iter().cloned().collect();
+                if let Ok(prompt) = try_render(&msgs_ref) {
+                    eprintln!("Warning: system role not supported by this model's template — retrying without system message.");
+                    return prompt;
                 }
             }
+
+            eprintln!("Warning: chat template rendering failed: {e:#}. Falling back to plain text.");
+            chat_template::format_plain_chat(messages)
         }
-        None => chat_template::format_plain_chat(messages),
     }
 }
 

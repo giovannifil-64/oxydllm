@@ -90,6 +90,16 @@ impl RotaryEmbedding {
 
         let cos = self.cos.index_select(position_ids, 0)?;
         let sin = self.sin.index_select(position_ids, 0)?;
+
+        #[cfg(feature = "metal")]
+        if x.device().is_metal() {
+            let x_c   = if x.is_contiguous()   { x.clone()   } else { x.contiguous()?   };
+            let cos_c = if cos.is_contiguous() { cos.clone() } else { cos.contiguous()? };
+            let sin_c = if sin.is_contiguous() { sin.clone() } else { sin.contiguous()? };
+            return super::metal_ops::rope_fused(&x_c, &cos_c, &sin_c);
+        }
+
+        // CPU / non-Metal fallback
         let cos = cos.unsqueeze(0)?.unsqueeze(0)?;
         let sin = sin.unsqueeze(0)?.unsqueeze(0)?;
 

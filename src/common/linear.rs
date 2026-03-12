@@ -59,7 +59,7 @@ impl Linear {
 
 
 pub fn silu(x: &Tensor) -> Result<Tensor> {
-    x.div(&x.neg()?.exp()?.affine(1.0, 1.0)?)
+    x.silu()
 }
 
 pub fn gelu_tanh(x: &Tensor) -> Result<Tensor> {
@@ -67,6 +67,11 @@ pub fn gelu_tanh(x: &Tensor) -> Result<Tensor> {
 }
 
 pub fn softmax_last_dim(x: &Tensor) -> Result<Tensor> {
+    #[cfg(feature = "metal")]
+    if x.device().is_metal() {
+        let x_c = if x.is_contiguous() { x.clone() } else { x.contiguous()? };
+        return super::metal_ops::softmax_fused(&x_c);
+    }
     let max = x.max_keepdim(candle_core::D::Minus1)?;
     let x = x.broadcast_sub(&max)?;
     let exp_x = x.exp()?;

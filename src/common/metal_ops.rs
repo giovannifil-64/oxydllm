@@ -1,34 +1,24 @@
 // ─────────────────────────────────────────────────────────────────────────────
-// metal_ops.rs  — Metal-accelerated SDPA for rLLM
+// metal_ops.rs  — Metal-accelerated kernels for rLLM
 // ─────────────────────────────────────────────────────────────────────────────
 //
-// Wraps candle-metal-kernels' built-in Scaled Dot Product Attention (SDPA)
-// shaders — derived from MLX — via candle's `CustomOp3` trait so rLLM can
-// call fused Flash-Attention-like kernels on Apple Silicon without custom
-// .metal files.
+// All ops wrap candle-metal-kernels (already a project dependency) via
+// candle's `CustomOp` traits, matching the same pattern used for SDPA.
 //
-// Approach inspired by Crane (https://github.com/lucasjinreal/Crane), which
-// also leverages candle's built-in Metal SDPA kernels for fast inference on
-// Apple Silicon.
-//
-// The SDPA kernel has two paths:
-//   • **vector** (seq_q ≤ 8, used in decode):
-//       – `call_sdpa_vector` for short KV, or
-//       – `call_sdpa_vector_2pass` when KV length ≥ 1024
-//   • **full** (seq_q > 8, used in prefill):
-//       – `call_sdpa_full` with optional mask and causal flag
-//
-// Both support GQA natively (n_heads can be a multiple of n_kv_heads),
-// so `repeat_kv` is NOT needed when using SDPA.
+// Kernels provided:
+//   • SDPA  — fused Flash-Attention (vector + full paths, GQA-native)
+//   • RMSNorm  — single-pass fused normalisation + scale
+//   • Softmax  — fused softmax over last dimension
+//   • RoPE     — fused rotary embedding (standard non-interleaved layout)
 // ─────────────────────────────────────────────────────────────────────────────
 
 use candle_core::{
-    backend::BackendStorage, CpuStorage, CustomOp3, DType, Layout,
+    backend::BackendStorage, CpuStorage, CustomOp1, CustomOp2, CustomOp3, DType, Layout,
     MetalStorage, Result, Shape, Tensor, D,
 };
 use candle_metal_kernels::SdpaDType;
 
-// ─── Sdpa CustomOp3 ──────────────────────────────────────────────────────────
+// ─── SDPA ────────────────────────────────────────────────────────────────────
 
 struct Sdpa {
     scale: f32,
@@ -72,7 +62,6 @@ impl CustomOp3 for Sdpa {
 
         let output = device.new_buffer(elem_count, q.dtype(), "sdpa_o")?;
 
-        // ── Validate shapes ──────────────────────────────────────────
         if q_l.dim(D::Minus1)? != k_l.dim(D::Minus1)? {
             candle_core::bail!("`q` and `k` last dims must match");
         }
@@ -91,7 +80,7 @@ impl CustomOp3 for Sdpa {
 
         let supports_sdpa_full_mask = self.mask.is_none() || q_seq <= k_seq;
         let supports_sdpa_full =
-            q_seq > 8 && supported_head_dim && supports_sdpa_full_mask;
+            q_seq > 8 && supported_head_dim && supports_sdpa_full_mask && self.softcapping == 1.0;
         let supports_sdpa_vector =
             q_seq <= 8 && supported_head_dim && q_seq <= k_seq;
 
@@ -115,7 +104,6 @@ impl CustomOp3 for Sdpa {
             other => candle_core::bail!("unsupported SDPA dtype {other:?}"),
         };
 
-        // ── Dispatch ─────────────────────────────────────────────────
         let encoder = device.command_encoder()?;
 
         if supports_sdpa_vector {
@@ -190,11 +178,8 @@ impl CustomOp3 for Sdpa {
                 )
                 .map_err(candle_core::Error::wrap)?;
             }
-        } else if supports_sdpa_full {
-            if self.softcapping != 1.0 {
-                candle_core::bail!("SDPA full requires softcapping to be 1.0");
-            }
-
+        } else {
+            // supports_sdpa_full (softcapping already checked == 1.0 above)
             let mask_s_l = self.mask.as_ref().map(|m| m.storage_and_layout());
 
             let (mask_type, mask_buffer, mask_strides) = if let Some(mask) = &self.mask {
@@ -257,8 +242,6 @@ impl CustomOp3 for Sdpa {
                 itype,
             )
             .map_err(candle_core::Error::wrap)?;
-        } else {
-            candle_core::bail!("must be vector or full SDPA path");
         }
 
         Ok((
@@ -268,22 +251,221 @@ impl CustomOp3 for Sdpa {
     }
 }
 
+// ─── RMSNorm ─────────────────────────────────────────────────────────────────
+
+struct RmsNormOp {
+    eps: f32,
+}
+
+impl CustomOp2 for RmsNormOp {
+    fn name(&self) -> &'static str {
+        "metal-rms-norm"
+    }
+
+    fn cpu_fwd(
+        &self,
+        _s1: &CpuStorage,
+        _l1: &Layout,
+        _s2: &CpuStorage,
+        _l2: &Layout,
+    ) -> Result<(CpuStorage, Shape)> {
+        candle_core::bail!("RmsNormOp: Metal-only")
+    }
+
+    fn metal_fwd(
+        &self,
+        x: &MetalStorage,
+        l_x: &Layout,
+        w: &MetalStorage,
+        l_w: &Layout,
+    ) -> Result<(MetalStorage, Shape)> {
+        let device = x.device();
+
+        let name = match (x.dtype(), w.dtype()) {
+            (DType::F32, DType::F32) => "rmsnorm_f32",
+            (DType::F16, DType::F16) => "rmsnorm_f16",
+            (DType::BF16, DType::BF16) => "rmsnorm_bf16",
+            (dt1, dt2) => candle_core::bail!("rms_norm dtype mismatch: x={dt1:?} w={dt2:?}"),
+        };
+
+        if !(l_x.is_contiguous() && l_w.is_contiguous()) {
+            candle_core::bail!("RmsNormOp: both input and weight must be contiguous");
+        }
+
+        let last_dim = l_x.dims()[l_x.shape().rank() - 1];
+        let elem_count = l_x.shape().elem_count();
+        let output = device.new_buffer(elem_count, x.dtype(), "rms_norm_out")?;
+        let encoder = device.command_encoder()?;
+
+        candle_metal_kernels::call_rms_norm(
+            device.device(),
+            &encoder,
+            device.kernels(),
+            name,
+            elem_count,
+            last_dim,
+            self.eps,
+            x.buffer(),
+            l_x.start_offset() * x.dtype().size_in_bytes(),
+            w.buffer(),
+            l_w.start_offset() * w.dtype().size_in_bytes(),
+            &output,
+        )
+        .map_err(candle_core::Error::wrap)?;
+
+        Ok((
+            MetalStorage::new(output, device.clone(), elem_count, x.dtype()),
+            l_x.shape().clone(),
+        ))
+    }
+}
+
+// ─── Softmax ─────────────────────────────────────────────────────────────────
+
+struct SoftmaxOp;
+
+impl CustomOp1 for SoftmaxOp {
+    fn name(&self) -> &'static str {
+        "metal-softmax"
+    }
+
+    fn cpu_fwd(&self, _s: &CpuStorage, _l: &Layout) -> Result<(CpuStorage, Shape)> {
+        candle_core::bail!("SoftmaxOp: Metal-only")
+    }
+
+    fn metal_fwd(&self, x: &MetalStorage, l: &Layout) -> Result<(MetalStorage, Shape)> {
+        let device = x.device();
+
+        let name = match x.dtype() {
+            DType::F32 => "softmax_f32",
+            DType::F16 => "softmax_f16",
+            DType::BF16 => "softmax_bf16",
+            other => candle_core::bail!("softmax not implemented for {other:?}"),
+        };
+
+        if !l.is_contiguous() {
+            candle_core::bail!("SoftmaxOp: input must be contiguous");
+        }
+
+        let last_dim = l.dims()[l.shape().rank() - 1];
+        let elem_count = l.shape().elem_count();
+        let output = device.new_buffer(elem_count, x.dtype(), "softmax_out")?;
+        let encoder = device.command_encoder()?;
+
+        candle_metal_kernels::call_last_softmax(
+            device.device(),
+            &encoder,
+            device.kernels(),
+            name,
+            elem_count,
+            last_dim,
+            x.buffer(),
+            l.start_offset() * x.dtype().size_in_bytes(),
+            &output,
+        )
+        .map_err(candle_core::Error::wrap)?;
+
+        Ok((
+            MetalStorage::new(output, device.clone(), elem_count, x.dtype()),
+            l.shape().clone(),
+        ))
+    }
+}
+
+// ─── RoPE ────────────────────────────────────────────────────────────────────
+//
+// Uses the standard (non-interleaved) layout: [x_first_half | x_second_half].
+// Input  x:   [b, h, seq, d]          (contiguous)
+// Input  cos: [seq, d/2]              (contiguous, pre-gathered for positions)
+// Input  sin: [seq, d/2]              (contiguous, pre-gathered for positions)
+// Output:     [b, h, seq, d]
+
+struct RopeOp;
+
+impl CustomOp3 for RopeOp {
+    fn name(&self) -> &'static str {
+        "metal-rope"
+    }
+
+    fn cpu_fwd(
+        &self,
+        _s1: &CpuStorage,
+        _l1: &Layout,
+        _s2: &CpuStorage,
+        _l2: &Layout,
+        _s3: &CpuStorage,
+        _l3: &Layout,
+    ) -> Result<(CpuStorage, Shape)> {
+        candle_core::bail!("RopeOp: Metal-only")
+    }
+
+    fn metal_fwd(
+        &self,
+        src: &MetalStorage,
+        l_src: &Layout,
+        cos: &MetalStorage,
+        l_cos: &Layout,
+        sin: &MetalStorage,
+        l_sin: &Layout,
+    ) -> Result<(MetalStorage, Shape)> {
+        let device = src.device();
+
+        if cos.dtype() != src.dtype() || sin.dtype() != src.dtype() {
+            candle_core::bail!(
+                "RopeOp dtype mismatch: src={:?} cos={:?} sin={:?}",
+                src.dtype(), cos.dtype(), sin.dtype()
+            );
+        }
+
+        let name = match src.dtype() {
+            DType::F32 => "rope_f32",
+            DType::F16 => "rope_f16",
+            DType::BF16 => "rope_bf16",
+            other => candle_core::bail!("RopeOp not implemented for {other:?}"),
+        };
+
+        if !(l_src.is_contiguous() && l_cos.is_contiguous() && l_sin.is_contiguous()) {
+            candle_core::bail!("RopeOp: all inputs must be contiguous");
+        }
+
+        let (b, h, t, d) = l_src.shape().dims4()?;
+        let el = b * h * t * d;
+        let output = device.new_buffer(el, src.dtype(), "rope_out")?;
+        let encoder = device.command_encoder()?;
+
+        // stride_b = 0: cos/sin are [seq, d/2] shared across all batch/head dims
+        candle_metal_kernels::call_rope(
+            device.device(),
+            &encoder,
+            device.kernels(),
+            name,
+            b * h,   // bh
+            t * d,   // td
+            d,       // full head_dim
+            0,       // stride_b = 0 (2D cos/sin, no per-batch offset)
+            src.buffer(),
+            l_src.start_offset() * src.dtype().size_in_bytes(),
+            cos.buffer(),
+            l_cos.start_offset() * cos.dtype().size_in_bytes(),
+            sin.buffer(),
+            l_sin.start_offset() * sin.dtype().size_in_bytes(),
+            &output,
+        )
+        .map_err(candle_core::Error::wrap)?;
+
+        Ok((
+            MetalStorage::new(output, device.clone(), el, src.dtype()),
+            l_src.shape().clone(),
+        ))
+    }
+}
+
 // ─── Public API ──────────────────────────────────────────────────────────────
 
 /// Scaled Dot Product Attention via Metal fused kernels.
 ///
-/// Computes `softmax(Q·Kᵀ × scale) · V` on-GPU without materialising the
-/// full (seq_q × seq_kv) attention matrix.
-///
-/// **Input shapes** (all `[B, H, seq, head_dim]`):
-/// - `q`: `(bs, n_heads, seq_q, head_dim)`
-/// - `k`: `(bs, n_kv_heads, seq_kv, head_dim)`
-/// - `v`: `(bs, n_kv_heads, seq_kv, head_dim)`
-///
-/// GQA is supported natively: `n_heads` must be a multiple of `n_kv_heads`.
-/// `repeat_kv` is NOT needed — the kernel handles head expansion internally.
-///
-/// Returns `(bs, n_heads, seq_q, head_dim)`.
+/// - Vector path (seq_q ≤ 8): supports `softcapping`
+/// - Full path   (seq_q > 8): requires `softcapping == 1.0`
 pub fn sdpa(
     q: &Tensor,
     k: &Tensor,
@@ -291,17 +473,42 @@ pub fn sdpa(
     mask: Option<&Tensor>,
     do_causal: bool,
     scale: f32,
+    softcapping: f32,
 ) -> Result<Tensor> {
     q.apply_op3_no_bwd(
         k,
         v,
         &Sdpa {
             scale,
-            softcapping: 1.0,
+            softcapping,
             mask: mask.cloned(),
             do_causal,
         },
     )
+}
+
+/// Fused RMSNorm via Metal kernel.
+///
+/// Equivalent to `x / rms(x) * weight` in a single GPU pass.
+/// Both `x` and `weight` must be contiguous and have the same dtype.
+pub fn rms_norm_fused(x: &Tensor, weight: &Tensor, eps: f32) -> Result<Tensor> {
+    x.apply_op2_no_bwd(weight, &RmsNormOp { eps })
+}
+
+/// Fused softmax over the last dimension via Metal kernel.
+///
+/// Input must be contiguous.
+pub fn softmax_fused(x: &Tensor) -> Result<Tensor> {
+    x.apply_op1_no_bwd(&SoftmaxOp)
+}
+
+/// Fused RoPE (standard non-interleaved layout) via Metal kernel.
+///
+/// - `x`:   `[b, h, seq, d]`      — contiguous
+/// - `cos`: `[seq, d/2]`          — pre-gathered for the active positions
+/// - `sin`: `[seq, d/2]`          — pre-gathered for the active positions
+pub fn rope_fused(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
+    x.apply_op3_no_bwd(cos, sin, &RopeOp)
 }
 
 /// Check whether SDPA is usable for the given configuration.

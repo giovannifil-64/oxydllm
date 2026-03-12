@@ -25,6 +25,12 @@ impl RMSNorm {
         Ok(Self::new(weight, eps, variant))
     }
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        #[cfg(feature = "metal")]
+        if x.device().is_metal() {
+            let x_c = if x.is_contiguous() { x.clone() } else { x.contiguous()? };
+            let w_c = if self.weight.is_contiguous() { self.weight.clone() } else { self.weight.contiguous()? };
+            return super::metal_ops::rms_norm_fused(&x_c, &w_c, self.eps as f32);
+        }
         let dtype = x.dtype();
         let x_f32 = x.contiguous()?.to_dtype(DType::F32)?;
         let variance = x_f32.sqr()?.mean_keepdim(D::Minus1)?;

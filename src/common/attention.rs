@@ -294,12 +294,10 @@ impl Attention {
         let mut q_offset = 0usize;
 
         // ── Metal SDPA path for batch ────────────────────────────────
-        // Disable SDPA when any prefill segment has prefix-cached tokens: the
-        // Metal do_causal flag assumes query position 0 == context position 0,
-        // which is wrong when cached tokens already occupy slots 0..N.  The
-        // standard fallback builds an explicit "visible_prefix + causal" mask.
         #[cfg(feature = "metal")]
-        let use_sdpa = self.attn_softcap.is_none()
+        let all_vector = segments.iter().all(|seg| seg.num_tokens <= 8);
+        #[cfg(feature = "metal")]
+        let use_sdpa = (self.attn_softcap.is_none() || all_vector)
             && super::metal_ops::sdpa_available(&q, self.head_dim)
             && !kv_lengths.iter().zip(segments.iter()).any(|(&kv_len, seg)| {
                 seg.num_tokens > 1 && kv_len > seg.num_tokens
@@ -333,6 +331,7 @@ impl Attention {
                     None,
                     seg.num_tokens > 1, // causal for prefill segments
                     self.scale as f32,
+                    self.attn_softcap.map(|s| s as f32).unwrap_or(1.0),
                 )?;
                 out_parts.push(seg_out);
                 q_offset += seg.num_tokens;

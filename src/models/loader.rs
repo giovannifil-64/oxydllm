@@ -308,7 +308,7 @@ fn load_standard_safetensors(
     let weights_size = weights.total_size_bytes();
 
     let ctx = max_context_len.min(cfg.max_position_embeddings);
-    let num_blocks = compute_kv_blocks(
+    let (num_blocks, acquired_kv_bytes) = compute_kv_blocks(
         &KvBlockParams {
             num_layers: cfg.num_hidden_layers,
             n_kv_heads: cfg.num_key_value_heads,
@@ -318,57 +318,64 @@ fn load_standard_safetensors(
             dtype,
         },
         kv_budget,
-    );
-
-    let embed_weight = weights.get("model.embed_tokens.weight")
-        .map_err(|e| anyhow::anyhow!("{e}"))?.clone();
-    let lm_head = if cfg.tie_word_embeddings {
-        AnyLinear::Float(Linear::new(embed_weight.clone(), None))
-    } else {
-        AnyLinear::Float(Linear::new(
-            weights.get("lm_head.weight").map_err(|e| anyhow::anyhow!("{e}"))?.clone(),
-            None,
-        ))
-    };
-    let embed_tokens = Embedding::new(embed_weight);
-
-    let block_cfg = cfg.block_config();
-    let blocks = (0..cfg.num_hidden_layers)
-        .map(|i| TransformerBlock::load(&block_cfg, i, &weights))
-        .collect::<candle_core::Result<Vec<_>>>()?;
-
-    let norm = RMSNorm::load(&weights, "model.norm", cfg.rms_norm_eps, cfg.norm_type)?;
-    let rope = RotaryEmbedding::new_with_scaling(
-        cfg.head_dim, 
-        ctx, 
-        cfg.rope_theta, 
-        cfg.rope_scaling.clone(),
-        dtype,
-        device,
     )?;
 
-    let allocators = (0..cfg.num_hidden_layers)
-        .map(|_| -> candle_core::Result<SharedBlockAllocator> {
-            Ok(Arc::new(Mutex::new(BlockAllocator::new(
-                num_blocks, DEFAULT_BLOCK_SIZE, cfg.num_key_value_heads, cfg.head_dim, dtype, device,
-            )?)))
-        })
-        .collect::<candle_core::Result<Vec<_>>>()?;
+    let result = (|| -> anyhow::Result<(Box<dyn BatchModel>, usize)> {
+        let embed_weight = weights.get("model.embed_tokens.weight")
+            .map_err(|e| anyhow::anyhow!("{e}"))?.clone();
+        let lm_head = if cfg.tie_word_embeddings {
+            AnyLinear::Float(Linear::new(embed_weight.clone(), None))
+        } else {
+            AnyLinear::Float(Linear::new(
+                weights.get("lm_head.weight").map_err(|e| anyhow::anyhow!("{e}"))?.clone(),
+                None,
+            ))
+        };
+        let embed_tokens = Embedding::new(embed_weight);
 
-    Ok((Box::new(StandardTransformer {
-        embed_tokens,
-        blocks,
-        norm,
-        lm_head,
-        rope,
-        allocators,
-        device: device.clone(),
-        stop_token_ids: cfg.eos_token_ids,
-        vocab_size: cfg.vocab_size,
-        max_seq_len: ctx,
-        embed_scale: cfg.embed_scale,
-        logit_softcap: cfg.logit_softcap,
-    }), weights_size))
+        let block_cfg = cfg.block_config();
+        let blocks = (0..cfg.num_hidden_layers)
+            .map(|i| TransformerBlock::load(&block_cfg, i, &weights))
+            .collect::<candle_core::Result<Vec<_>>>()?;
+
+        let norm = RMSNorm::load(&weights, "model.norm", cfg.rms_norm_eps, cfg.norm_type)?;
+        let rope = RotaryEmbedding::new_with_scaling(
+            cfg.head_dim,
+            ctx,
+            cfg.rope_theta,
+            cfg.rope_scaling.clone(),
+            dtype,
+            device,
+        )?;
+
+        let allocators = (0..cfg.num_hidden_layers)
+            .map(|_| -> candle_core::Result<SharedBlockAllocator> {
+                Ok(Arc::new(Mutex::new(BlockAllocator::new(
+                    num_blocks, DEFAULT_BLOCK_SIZE, cfg.num_key_value_heads, cfg.head_dim, dtype, device,
+                )?)))
+            })
+            .collect::<candle_core::Result<Vec<_>>>()?;
+
+        Ok((Box::new(StandardTransformer {
+            embed_tokens,
+            blocks,
+            norm,
+            lm_head,
+            rope,
+            allocators,
+            device: device.clone(),
+            stop_token_ids: cfg.eos_token_ids,
+            vocab_size: cfg.vocab_size,
+            max_seq_len: ctx,
+            embed_scale: cfg.embed_scale,
+            logit_softcap: cfg.logit_softcap,
+        }), weights_size))
+    })();
+
+    if result.is_err() {
+        kv_budget.release(acquired_kv_bytes);
+    }
+    result
 }
 
 fn load_batch_model_gguf(
@@ -427,7 +434,7 @@ fn load_batch_model_gguf(
 
     let topo = crate::models::gguf_model::parse_gguf_topology(&gguf)?;
     let ctx = max_context_len.min(topo.context_length);
-    let num_blocks = compute_kv_blocks(
+    let (num_blocks, acquired_kv_bytes) = compute_kv_blocks(
         &KvBlockParams {
             num_layers: topo.num_hidden_layers,
             n_kv_heads: topo.num_key_value_heads,
@@ -437,9 +444,15 @@ fn load_batch_model_gguf(
             dtype,
         },
         kv_budget,
-    );
+    )?;
 
-    let model = StandardTransformer::load_gguf(&gguf, device, dtype, num_blocks)?;
+    let model = match StandardTransformer::load_gguf(&gguf, device, dtype, num_blocks) {
+        Ok(m) => m,
+        Err(e) => {
+            kv_budget.release(acquired_kv_bytes);
+            return Err(e.into());
+        }
+    };
     Ok((Box::new(model), weights_size))
 }
 
@@ -452,7 +465,7 @@ struct KvBlockParams {
     dtype: DType,
 }
 
-fn compute_kv_blocks(p: &KvBlockParams, kv_budget: &GlobalKvBudget) -> usize {
+fn compute_kv_blocks(p: &KvBlockParams, kv_budget: &GlobalKvBudget) -> anyhow::Result<(usize, usize)> {
     let total_slots = p.max_num_sequences * p.max_context_len;
     let desired_blocks = total_slots.div_ceil(DEFAULT_BLOCK_SIZE);
     let min_blocks: usize = 256; // ~4 096 token minimum context
@@ -462,12 +475,24 @@ fn compute_kv_blocks(p: &KvBlockParams, kv_budget: &GlobalKvBudget) -> usize {
         DEFAULT_BLOCK_SIZE * p.n_kv_heads * p.head_dim * p.dtype.size_in_bytes() * 2 * p.num_layers;
 
     if per_block_bytes == 0 {
-        return desired_blocks;
+        return Ok((desired_blocks, 0));
     }
 
     let desired_bytes = desired_blocks.max(min_blocks) * per_block_bytes;
     let granted_bytes = kv_budget.acquire(desired_bytes);
-    let granted_blocks = (granted_bytes / per_block_bytes).max(min_blocks);
+    let granted_blocks = granted_bytes / per_block_bytes;
+
+    if granted_blocks < min_blocks {
+        kv_budget.release(granted_bytes);
+        anyhow::bail!(
+            "KV cache budget exhausted: requested {} blocks ({:.2} GB minimum) \
+             but only {} blocks ({:.2} GB) available",
+            min_blocks,
+            min_blocks as f64 * per_block_bytes as f64 / 1_073_741_824.0,
+            granted_blocks,
+            granted_blocks as f64 * per_block_bytes as f64 / 1_073_741_824.0,
+        );
+    }
 
     if granted_blocks < desired_blocks {
         println!(
@@ -481,5 +506,5 @@ fn compute_kv_blocks(p: &KvBlockParams, kv_budget: &GlobalKvBudget) -> usize {
         );
     }
 
-    granted_blocks
+    Ok((granted_blocks, granted_bytes))
 }

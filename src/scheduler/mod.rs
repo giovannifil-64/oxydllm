@@ -166,6 +166,8 @@ impl Scheduler {
             scheduled.retain(|s| self.running_index.contains_key(&s.id));
         }
 
+        let free_blocks = self.num_free_blocks();
+
         while self.running.len() < self.config.max_num_sequences && budget > 0 {
             let seq = match self.waiting.front() {
                 Some(s) => s,

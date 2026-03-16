@@ -193,12 +193,12 @@ impl Engine {
         let input = Tensor::from_vec(all_token_ids, (1, total_tokens), &self.device)?;
         let position_ids = Tensor::from_vec(all_positions, (total_tokens,), &self.device)?;
 
-        let logits = self.model.forward_batch(
+        let logits_result = self.model.forward_batch(
             &input,
             &position_ids,
             &mut cache_slices,
             &token_counts,
-        )?;
+        );
 
         for (i, info) in prefill_infos.iter().enumerate() {
             let seq = self.scheduler.get_running_mut(info.seq_id).unwrap();
@@ -208,6 +208,8 @@ impl Engine {
             let seq = self.scheduler.get_running_mut(seq_id).unwrap();
             seq.caches = std::mem::take(&mut cache_vecs[prefill_infos.len() + i]);
         }
+
+        let logits = logits_result?;
 
         let batch_logits = logits.squeeze(0)?;
 

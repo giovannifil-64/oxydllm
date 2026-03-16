@@ -5,7 +5,7 @@ pub enum RopeScaling {
     None,
     Linear { factor: f64 },
     Llama3 { factor: f64, low_freq_factor: f64, high_freq_factor: f64, original_max_pos: usize },
-    Yarn { factor: f64 },
+    Yarn { factor: f64, original_max_pos: usize, beta_fast: f64, beta_slow: f64 },
 }
 
 pub struct RotaryEmbedding {
@@ -58,9 +58,30 @@ impl RotaryEmbedding {
                     *f /= factor as f32;
                 }
             }
-            RopeScaling::Yarn { factor, .. } => {
-                for f in &mut inv_freq {
-                    *f /= factor as f32;
+            RopeScaling::Yarn { factor, original_max_pos, beta_fast, beta_slow } => {
+                let dim = head_dim;
+                let base = rope_theta;
+
+                let find_correction_dim = |num_rotations: f64| -> f64 {
+                    (dim as f64 * (original_max_pos as f64 / (num_rotations * 2.0 * std::f64::consts::PI)).ln())
+                        / (2.0 * base.ln())
+                };
+                let low = (find_correction_dim(beta_fast).floor().max(0.0)) as usize;
+                let high = (find_correction_dim(beta_slow).ceil().min((dim / 2 - 1) as f64)) as usize;
+
+                for i in 0..dim / 2 {
+                    let freq_extra = inv_freq[i];
+                    let freq_inter = inv_freq[i] / factor as f32;
+
+                    let ramp = if high <= low {
+                        if i < low { 0.0f32 } else { 1.0 }
+                    } else {
+                        ((i as f32 - low as f32) / (high as f32 - low as f32)).clamp(0.0, 1.0)
+                    };
+
+                    // ramp=0 → keep original freq (high-freq dims, small index)
+                    // ramp=1 → scale by factor  (low-freq dims, large index)
+                    inv_freq[i] = freq_inter * ramp + freq_extra * (1.0 - ramp);
                 }
             }
             RopeScaling::None => {}

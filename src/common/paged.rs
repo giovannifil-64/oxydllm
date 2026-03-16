@@ -246,7 +246,12 @@ impl PagedKvCache {
             self.table.device_idx = Some(updated);
         }
 
-        let idx = self.table.device_idx.as_ref().unwrap();
+        let idx = self.table.device_idx.as_ref().ok_or_else(|| {
+            candle_core::Error::Msg(
+                "PagedKvCache::append bug: device_idx is None after writing tokens — \
+                 this should never happen (append must write ≥1 token)".to_string(),
+            )
+        })?;
         self.allocator.lock().unwrap().gather(idx)
     }
 

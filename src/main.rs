@@ -584,8 +584,19 @@ fn run_interactive(args: &RunArgs) -> anyhow::Result<()> {
 
         let prompt = server::apply_chat_template(&tokenizer, &messages, false);
         let prompt_tokens = tokenizer.encode(&prompt)?;
-        let max_tokens = max_seq_len.saturating_sub(prompt_tokens.len());
 
+        if prompt_tokens.len() >= max_seq_len {
+            eprintln!(
+                "[warning] Context full ({} tokens >= {} max) — cannot generate. \
+                 Start a new conversation with /exit.",
+                prompt_tokens.len(),
+                max_seq_len,
+            );
+            messages.pop();
+            continue;
+        }
+
+        let max_tokens = max_seq_len - prompt_tokens.len();
         engine.add_request(prompt_tokens, args.sampling_params.clone(), max_tokens);
 
         let mut response_text = String::new();

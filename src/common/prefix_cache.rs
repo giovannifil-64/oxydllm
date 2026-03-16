@@ -8,6 +8,7 @@ use crate::common::paged::SharedBlockAllocator;
 
 struct PrefixEntry {
     block_ids: Vec<usize>,
+    block_tokens: Vec<u32>,
 }
 
 pub struct PrefixCache {
@@ -30,12 +31,13 @@ impl PrefixCache {
                 &tokens[block_idx * block_size..(block_idx + 1) * block_size],
                 prev_hash,
             );
+            let block_tokens = &tokens[block_idx * block_size..(block_idx + 1) * block_size];
             match self.entries.get(&h) {
-                Some(entry) => {
+                Some(entry) if entry.block_tokens == block_tokens => {
                     matched.push(entry.block_ids.clone());
                     prev_hash = h;
                 }
-                None => break,
+                _ => break,
             }
         }
 
@@ -73,12 +75,13 @@ impl PrefixCache {
                 prev_hash,
             );
 
+            let block_tokens = tokens[block_idx * block_size..(block_idx + 1) * block_size].to_vec();
             if !self.entries.contains(&h) {
                 for (layer_idx, &bid) in block_ids.iter().enumerate() {
                     allocators[layer_idx].lock().unwrap().share(bid);
                 }
 
-                if let Some((_, evicted)) = self.entries.push(h, PrefixEntry { block_ids: block_ids.clone() }) {
+                if let Some((_, evicted)) = self.entries.push(h, PrefixEntry { block_ids: block_ids.clone(), block_tokens }) {
                     for (layer_idx, bid) in evicted.block_ids.iter().enumerate() {
                         if layer_idx < allocators.len() {
                             allocators[layer_idx].lock().unwrap().free(*bid);

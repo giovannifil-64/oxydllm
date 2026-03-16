@@ -134,7 +134,12 @@ fn parse_rope_scaling(v: &Value) -> RopeScaling {
             let original_max_pos = v["original_max_position_embeddings"].as_u64().unwrap_or(8192) as usize;
             RopeScaling::Llama3 { factor, low_freq_factor, high_freq_factor, original_max_pos }
         }
-        "yarn" => RopeScaling::Yarn { factor },
+        "yarn" => {
+            let original_max_pos = v["original_max_position_embeddings"].as_u64().unwrap_or(8192) as usize;
+            let beta_fast = v["beta_fast"].as_f64().unwrap_or(32.0);
+            let beta_slow = v["beta_slow"].as_f64().unwrap_or(1.0);
+            RopeScaling::Yarn { factor, original_max_pos, beta_fast, beta_slow }
+        }
         _ => RopeScaling::None,
     }
 }

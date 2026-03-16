@@ -257,7 +257,7 @@ pub fn select_device_at(_cuda_idx: usize) -> anyhow::Result<Device> {
     #[cfg(feature = "cuda")]
     match Device::new_cuda(_cuda_idx) {
         Ok(d) => {
-            println!("Device: CUDA:{}", cuda_idx);
+            println!("Device: CUDA:{}", _cuda_idx);
             return Ok(d);
         }
         Err(e) => eprintln!("CUDA:{} not available: {e}", _cuda_idx),

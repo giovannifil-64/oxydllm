@@ -582,8 +582,24 @@ fn run_interactive(args: &RunArgs) -> anyhow::Result<()> {
             reasoning_content: None,
         });
 
-        let prompt = server::apply_chat_template(&tokenizer, &messages, false);
-        let prompt_tokens = tokenizer.encode(&prompt)?;
+        let mut prompt = server::apply_chat_template(&tokenizer, &messages, false);
+        let mut prompt_tokens = tokenizer.encode(&prompt)?;
+
+        while prompt_tokens.len() >= max_seq_len && messages.len() > 2 {
+            let prev_len = prompt_tokens.len();
+            messages.remove(1);
+            if messages.len() > 1 && messages[1].role == "assistant" {
+                messages.remove(1);
+            }
+            prompt = server::apply_chat_template(&tokenizer, &messages, false);
+            prompt_tokens = tokenizer.encode(&prompt)?;
+            eprintln!(
+                "[context] Truncated oldest messages ({} → {} tokens, max {})",
+                prev_len,
+                prompt_tokens.len(),
+                max_seq_len,
+            );
+        }
 
         if prompt_tokens.len() >= max_seq_len {
             eprintln!(

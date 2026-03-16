@@ -120,7 +120,7 @@ pub fn estimate_model_size(model_dir: &Path) -> usize {
         .filter(|e| {
             e.path()
                 .extension()
-                .map(|x| x == "safetensors")
+                .map(|x| x == "safetensors" || x == "gguf")
                 .unwrap_or(false)
         })
         .filter_map(|e| std::fs::metadata(e.path()).ok())

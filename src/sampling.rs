@@ -26,20 +26,29 @@ pub fn sample(logits: &Tensor, params: &SamplingParams, prev_tokens: &[u32]) -> 
         return logits.argmax(D::Minus1)?.to_scalar::<u32>();
     }
 
-    let mut logits = logits.to_dtype(candle_core::DType::F32)?;
+    let mut logits_vec: Vec<f32> = logits.to_dtype(candle_core::DType::F32)?.to_vec1()?;
 
     if params.repetition_penalty != 1.0 {
-        logits = apply_repetition_penalty(&logits, prev_tokens, params.repetition_penalty)?;
+        apply_repetition_penalty_cpu(&mut logits_vec, prev_tokens, params.repetition_penalty);
     }
 
-    logits = (&logits / params.temperature as f64)?;
+    let inv_temp = 1.0 / params.temperature;
+    for l in logits_vec.iter_mut() {
+        *l *= inv_temp;
+    }
 
-    let max_logit = logits.max(D::Minus1)?.to_scalar::<f32>()?;
-    let logits = (&logits - max_logit as f64)?;
-    let exp = logits.exp()?;
-    let sum_exp = exp.sum(D::Minus1)?.to_scalar::<f32>()?;
-    let probs = (&exp / sum_exp as f64)?;
-    let probs_vec: Vec<f32> = probs.to_vec1()?;
+    let max_logit = logits_vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let mut sum = 0.0f32;
+    for l in logits_vec.iter_mut() {
+        *l = (*l - max_logit).exp();
+        sum += *l;
+    }
+    let inv_sum = 1.0 / sum;
+    for p in logits_vec.iter_mut() {
+        *p *= inv_sum;
+    }
+
+    let probs_vec = logits_vec;
 
     let probs_vec = if params.min_p > 0.0 {
         apply_min_p(&probs_vec, params.min_p)
@@ -62,20 +71,14 @@ pub fn sample(logits: &Tensor, params: &SamplingParams, prev_tokens: &[u32]) -> 
     categorical_sample(&probs_vec)
 }
 
-fn apply_repetition_penalty(
-    logits: &Tensor,
-    prev_tokens: &[u32],
-    penalty: f32,
-) -> Result<Tensor> {
-    let mut logits_vec: Vec<f32> = logits.to_vec1()?;
+fn apply_repetition_penalty_cpu(logits: &mut [f32], prev_tokens: &[u32], penalty: f32) {
     for &tok in prev_tokens {
         let idx = tok as usize;
-        if idx < logits_vec.len() {
-            let l = logits_vec[idx];
-            logits_vec[idx] = if l > 0.0 { l / penalty } else { l * penalty };
+        if idx < logits.len() {
+            let l = logits[idx];
+            logits[idx] = if l > 0.0 { l / penalty } else { l * penalty };
         }
     }
-    Tensor::from_vec(logits_vec, logits.shape(), logits.device())
 }
 
 fn apply_min_p(probs: &[f32], min_p: f32) -> Vec<f32> {
@@ -220,12 +223,10 @@ mod tests {
 
     #[test]
     fn repetition_penalty_reduces_repeated_logits() {
-        let device = candle_core::Device::Cpu;
-        let logits = Tensor::from_vec(vec![2.0_f32, 3.0, 1.0], (3,), &device).unwrap();
-        let penalized = apply_repetition_penalty(&logits, &[1], 2.0).unwrap();
-        let vals: Vec<f32> = penalized.to_vec1().unwrap();
-        assert!(vals[1] < 3.0);
-        assert_eq!(vals[0], 2.0);
+        let mut logits = vec![2.0_f32, 3.0, 1.0];
+        apply_repetition_penalty_cpu(&mut logits, &[1], 2.0);
+        assert!(logits[1] < 3.0);
+        assert_eq!(logits[0], 2.0);
     }
 
     #[test]

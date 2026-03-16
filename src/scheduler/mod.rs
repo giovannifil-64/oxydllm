@@ -200,6 +200,11 @@ impl Scheduler {
         SchedulerOutput { scheduled }
     }
 
+    pub fn get_running(&self, seq_id: SequenceId) -> Option<&SequenceState> {
+        let idx = *self.running_index.get(&seq_id)?;
+        self.running.get(idx)
+    }
+
     pub fn get_running_mut(&mut self, seq_id: SequenceId) -> Option<&mut SequenceState> {
         let idx = *self.running_index.get(&seq_id)?;
         self.running.get_mut(idx)

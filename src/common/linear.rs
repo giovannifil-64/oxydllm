@@ -25,29 +25,28 @@ impl Embedding {
     }
 }
 pub struct Linear {
-    weight: Tensor,
+    weight_t: Tensor,
     bias: Option<Tensor>,
 }
 
 impl Linear {
     pub fn new(weight: Tensor, bias: Option<Tensor>) -> Self {
-        Self { weight, bias }
+        let weight_t = weight.t().expect("Linear weight must be 2D");
+        Self { weight_t, bias }
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let out_features = self.weight.dim(0)?;
-        let w_t = self.weight.t()?;
-
         let out = if x.rank() > 2 {
             let original_dims = x.dims().to_vec();
             let in_features = *original_dims.last().unwrap();
             let batch_flat: usize = original_dims[..original_dims.len() - 1].iter().product();
-            let o = x.reshape((batch_flat, in_features))?.matmul(&w_t)?;
+            let o = x.reshape((batch_flat, in_features))?.matmul(&self.weight_t)?;
+            let out_features = o.dim(1)?;
             let mut new_dims = original_dims;
             *new_dims.last_mut().unwrap() = out_features;
             o.reshape(new_dims)?
         } else {
-            x.matmul(&w_t)?
+            x.matmul(&self.weight_t)?
         };
 
         match &self.bias {
@@ -92,6 +91,9 @@ impl QLinear {
         })
     }
 
+    /// Note: candle's QMatMul operates in F32 only, so on BF16/GPU this performs
+    /// BF16→F32 (input) then F32→BF16 (output) — two dtype casts per call.
+    /// This is an inherent candle limitation, not something we can avoid here.
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let original_dims = x.dims().to_vec();
 

@@ -56,12 +56,13 @@ fn truncate_kv_window(
 ) -> Result<(candle_core::Tensor, candle_core::Tensor, usize)> {
     if let Some(w) = window {
         if num_tokens == 1 && kv_len > w {
-            Ok((k.narrow(2, kv_len - w, w)?, v.narrow(2, kv_len - w, w)?, w))
-        } else {
-            Ok((k.narrow(2, 0, kv_len)?, v.narrow(2, 0, kv_len)?, kv_len))
+            return Ok((k.narrow(2, kv_len - w, w)?, v.narrow(2, kv_len - w, w)?, w));
         }
-    } else {
+    }
+    if kv_len < k.dim(2)? {
         Ok((k.narrow(2, 0, kv_len)?, v.narrow(2, 0, kv_len)?, kv_len))
+    } else {
+        Ok((k, v, kv_len))
     }
 }
 
@@ -246,7 +247,6 @@ impl Attention {
 
         let mut k_parts: Vec<Tensor> = Vec::with_capacity(segments.len());
         let mut v_parts: Vec<Tensor> = Vec::with_capacity(segments.len());
-        let mut max_kv = 0usize;
         let mut kv_lengths: Vec<usize> = Vec::with_capacity(segments.len());
         let mut offset = 0usize;
 
@@ -255,7 +255,6 @@ impl Attention {
             let seg_v = v.narrow(2, offset, seg.num_tokens)?;
             let (full_k, full_v) = seg.cache.append(&seg_k, &seg_v)?;
             let kv_len = full_k.dim(2)?;
-            max_kv = max_kv.max(kv_len);
             kv_lengths.push(kv_len);
             k_parts.push(full_k);
             v_parts.push(full_v);
@@ -263,34 +262,7 @@ impl Attention {
         }
 
         let device = x.device();
-        let dtype = x.dtype();
-        let mut padded_k_parts: Vec<Tensor> = Vec::new();
-        let mut padded_v_parts: Vec<Tensor> = Vec::new();
-
-        let needs_padding = kv_lengths.iter().any(|&l| l < max_kv);
-        let pad_full = if needs_padding {
-            Some(Tensor::zeros((1, self.n_kv_heads, max_kv, hd), dtype, device)?)
-        } else {
-            None
-        };
-
-        for (i, (kp, vp)) in k_parts.iter().zip(v_parts.iter()).enumerate() {
-            let kv_len = kv_lengths[i];
-            if kv_len < max_kv {
-                let pad_len = max_kv - kv_len;
-                let pad = pad_full.as_ref().unwrap().narrow(2, 0, pad_len)?;
-                padded_k_parts.push(Tensor::cat(&[kp, &pad], 2)?);
-                padded_v_parts.push(Tensor::cat(&[vp, &pad], 2)?);
-            } else {
-                padded_k_parts.push(kp.clone());
-                padded_v_parts.push(vp.clone());
-            }
-        }
-
-        let k_cat = Tensor::cat(&padded_k_parts, 0)?;
-        let v_cat = Tensor::cat(&padded_v_parts, 0)?;
-
-        let mut out_parts: Vec<Tensor> = Vec::new();
+        let mut out_parts: Vec<Tensor> = Vec::with_capacity(segments.len());
         let mut q_offset = 0usize;
 
         // ── Metal SDPA path for batch ────────────────────────────────
@@ -314,10 +286,10 @@ impl Attention {
             #[cfg(feature = "metal")]
             for (i, seg) in segments.iter().enumerate() {
                 let q_seg = q.narrow(2, q_offset, seg.num_tokens)?;
-                let k_seg = k_cat.narrow(0, i, 1)?;
-                let v_seg = v_cat.narrow(0, i, 1)?;
-                let kv_len = kv_lengths[i];
-                let (k_seg, v_seg, _) = truncate_kv_window(k_seg, v_seg, kv_len, self.sliding_window, seg.num_tokens)?;
+                let (k_seg, v_seg, _) = truncate_kv_window(
+                    k_parts[i].clone(), v_parts[i].clone(),
+                    kv_lengths[i], self.sliding_window, seg.num_tokens,
+                )?;
 
                 // SDPA handles GQA natively — no repeat_kv needed.
                 let q_c = q_seg.contiguous()?;
@@ -338,14 +310,14 @@ impl Attention {
             }
         } else {
             // ── Fallback: standard attention ─────────────────────────
-            let k_cat = self.repeat_kv(k_cat)?;
-            let v_cat = self.repeat_kv(v_cat)?;
-
             for (i, seg) in segments.iter().enumerate() {
                 let q_seg = q.narrow(2, q_offset, seg.num_tokens)?;
-                let k_seg = k_cat.narrow(0, i, 1)?;
-                let v_seg = v_cat.narrow(0, i, 1)?;
-                let (k_seg, v_seg, kv_len) = truncate_kv_window(k_seg, v_seg, kv_lengths[i], self.sliding_window, seg.num_tokens)?;
+                let (k_seg, v_seg, kv_len) = truncate_kv_window(
+                    k_parts[i].clone(), v_parts[i].clone(),
+                    kv_lengths[i], self.sliding_window, seg.num_tokens,
+                )?;
+                let k_seg = self.repeat_kv(k_seg)?;
+                let v_seg = self.repeat_kv(v_seg)?;
 
                 let mut scores = q_seg.matmul(&k_seg.transpose(D::Minus1, D::Minus2)?)?.affine(self.scale, 0.)?;
 

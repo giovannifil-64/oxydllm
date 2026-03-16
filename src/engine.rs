@@ -67,7 +67,13 @@ impl Engine {
     }
 
     pub fn step(&mut self) -> Result<StepOutput> {
-        let output = self.scheduler.schedule();
+        let Engine {
+            model, scheduler, device, stop_token_ids,
+            allocators, prefix_cache, block_size, ..
+        } = self;
+        let block_size = *block_size;
+
+        let output = scheduler.schedule();
         let mut new_tokens = Vec::new();
 
         let mut prefill_ids: Vec<SequenceId> = Vec::new();
@@ -87,22 +93,17 @@ impl Engine {
             num_full_blocks_total: usize,
             uncached_len: usize,
             input_tokens: Vec<u32>,
-            all_tokens: Vec<u32>,
-            sampling_params: SamplingParams,
         }
 
         let mut prefill_infos: Vec<PrefillInfo> = Vec::with_capacity(prefill_ids.len());
 
         for &seq_id in &prefill_ids {
-            let (all_tokens, sampling_params) = {
-                let seq = self.scheduler.get_running_mut(seq_id).unwrap();
-                (seq.all_tokens.clone(), seq.sampling_params.clone())
-            };
+            let seq = scheduler.get_running_mut(seq_id).unwrap();
+            let (all_tokens, _, caches) = seq.tokens_and_caches();
             let seq_len = all_tokens.len();
-            let block_size = self.block_size;
 
             let (mut num_cached_blocks, matched_block_ids) =
-                self.prefix_cache.lookup(&all_tokens, block_size);
+                prefix_cache.lookup(all_tokens, block_size);
             let max_cacheable = (seq_len.saturating_sub(1)) / block_size;
             if num_cached_blocks > max_cacheable {
                 num_cached_blocks = max_cacheable;
@@ -110,15 +111,14 @@ impl Engine {
             let num_cached_tokens = num_cached_blocks * block_size;
 
             if num_cached_blocks > 0 {
-                let seq = self.scheduler.get_running_mut(seq_id).unwrap();
-                for (layer_idx, cache) in seq.caches.iter_mut().enumerate() {
+                for (layer_idx, cache) in caches.iter_mut().enumerate() {
                     for layer_block_ids in matched_block_ids[..num_cached_blocks].iter() {
                         if let Some(&bid) = layer_block_ids.get(layer_idx) {
                             cache.prepopulate_block(bid);
                         }
                     }
                 }
-                for cache in seq.caches.iter_mut() {
+                for cache in caches.iter_mut() {
                     cache.set_num_tokens(num_cached_tokens);
                 }
                 eprintln!(
@@ -141,8 +141,6 @@ impl Engine {
                 num_full_blocks_total,
                 uncached_len,
                 input_tokens,
-                all_tokens,
-                sampling_params,
             });
         }
 
@@ -161,7 +159,7 @@ impl Engine {
         let total_prefill_tokens = all_token_ids.len();
 
         for &seq_id in &decode_ids {
-            let seq = self.scheduler.get_running_mut(seq_id).unwrap();
+            let seq = scheduler.get_running_mut(seq_id).unwrap();
             all_token_ids.push(*seq.all_tokens.last().unwrap());
             all_positions.push(seq.num_processed_tokens as u32);
             token_counts.push(1);
@@ -170,7 +168,7 @@ impl Engine {
         let total_tokens = all_token_ids.len();
 
         if total_tokens == 0 {
-            let completed = self.scheduler.retire_finished();
+            let completed = scheduler.retire_finished();
             return Ok(StepOutput { new_tokens, completed });
         }
 
@@ -178,22 +176,21 @@ impl Engine {
         let mut cache_vecs: Vec<Vec<_>> = Vec::with_capacity(num_seqs);
 
         for info in &prefill_infos {
-            let seq = self.scheduler.get_running_mut(info.seq_id).unwrap();
+            let seq = scheduler.get_running_mut(info.seq_id).unwrap();
             cache_vecs.push(std::mem::take(&mut seq.caches));
         }
         for &seq_id in &decode_ids {
-            let seq = self.scheduler.get_running_mut(seq_id).unwrap();
+            let seq = scheduler.get_running_mut(seq_id).unwrap();
             cache_vecs.push(std::mem::take(&mut seq.caches));
         }
 
         let mut cache_slices: Vec<&mut [_]> =
             cache_vecs.iter_mut().map(|v| v.as_mut_slice()).collect();
 
+        let input = Tensor::from_vec(all_token_ids, (1, total_tokens), device)?;
+        let position_ids = Tensor::from_vec(all_positions, (total_tokens,), device)?;
 
-        let input = Tensor::from_vec(all_token_ids, (1, total_tokens), &self.device)?;
-        let position_ids = Tensor::from_vec(all_positions, (total_tokens,), &self.device)?;
-
-        let logits_result = self.model.forward_batch(
+        let logits_result = model.forward_batch(
             &input,
             &position_ids,
             &mut cache_slices,
@@ -201,11 +198,11 @@ impl Engine {
         );
 
         for (i, info) in prefill_infos.iter().enumerate() {
-            let seq = self.scheduler.get_running_mut(info.seq_id).unwrap();
+            let seq = scheduler.get_running_mut(info.seq_id).unwrap();
             seq.caches = std::mem::take(&mut cache_vecs[i]);
         }
         for (i, &seq_id) in decode_ids.iter().enumerate() {
-            let seq = self.scheduler.get_running_mut(seq_id).unwrap();
+            let seq = scheduler.get_running_mut(seq_id).unwrap();
             seq.caches = std::mem::take(&mut cache_vecs[prefill_infos.len() + i]);
         }
 
@@ -219,12 +216,14 @@ impl Engine {
             let seq_logits = batch_logits.get(last_idx)?;
             logit_offset += info.uncached_len;
 
-            let next_token =
-                sampling::sample(&seq_logits, &info.sampling_params, &info.all_tokens)?;
-            let is_stop = self.stop_token_ids.contains(&next_token);
+            let next_token = {
+                let seq = scheduler.get_running(info.seq_id).unwrap();
+                sampling::sample(&seq_logits, &seq.sampling_params, &seq.all_tokens)?
+            };
+            let is_stop = stop_token_ids.contains(&next_token);
 
             let emit = {
-                let seq = self.scheduler.get_running_mut(info.seq_id).unwrap();
+                let seq = scheduler.get_running_mut(info.seq_id).unwrap();
                 seq.all_tokens.push(next_token);
                 seq.num_processed_tokens = seq.all_tokens.len() - 1;
                 seq.phase = SequencePhase::Decode;
@@ -237,7 +236,7 @@ impl Engine {
 
             if info.num_full_blocks_total > info.num_cached_blocks {
                 let new_block_ids: Vec<Vec<usize>> = {
-                    let seq = self.scheduler.get_running_mut(info.seq_id).unwrap();
+                    let seq = scheduler.get_running_mut(info.seq_id).unwrap();
                     (info.num_cached_blocks..info.num_full_blocks_total)
                         .map(|block_idx| {
                             seq.caches
@@ -247,22 +246,23 @@ impl Engine {
                         })
                         .collect()
                 };
-                self.prefix_cache.register(
-                    &info.all_tokens,
+                let seq = scheduler.get_running(info.seq_id).unwrap();
+                prefix_cache.register(
+                    &seq.all_tokens,
                     info.num_cached_blocks,
                     &new_block_ids,
-                    &self.allocators,
-                    self.block_size,
+                    allocators,
+                    block_size,
                 );
             }
         }
 
         for (i, &seq_id) in decode_ids.iter().enumerate() {
             let seq_logits = batch_logits.get(total_prefill_tokens + i)?;
-            let seq = self.scheduler.get_running_mut(seq_id).unwrap();
+            let seq = scheduler.get_running_mut(seq_id).unwrap();
             let next_token =
                 sampling::sample(&seq_logits, &seq.sampling_params, &seq.all_tokens)?;
-            let is_stop = self.stop_token_ids.contains(&next_token);
+            let is_stop = stop_token_ids.contains(&next_token);
 
             seq.all_tokens.push(next_token);
             seq.num_processed_tokens = seq.all_tokens.len() - 1;
@@ -272,7 +272,7 @@ impl Engine {
             }
         }
 
-        let completed = self.scheduler.retire_finished();
+        let completed = scheduler.retire_finished();
         Ok(StepOutput { new_tokens, completed })
     }
 

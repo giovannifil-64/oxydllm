@@ -37,6 +37,10 @@ impl SequenceState {
         &self.all_tokens[self.prompt_len..]
     }
 
+    pub fn tokens_and_caches(&mut self) -> (&[u32], &SamplingParams, &mut Vec<PagedKvCache>) {
+        (&self.all_tokens, &self.sampling_params, &mut self.caches)
+    }
+
     pub fn apply_token(&mut self, _next_token: u32, is_stop: bool) -> bool {
         if is_stop {
             self.status = SequenceStatus::Finished;

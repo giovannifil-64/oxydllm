@@ -66,6 +66,10 @@ impl PrefixCache {
 
         for (i, block_ids) in new_block_ids.iter().enumerate() {
             if block_ids.len() != allocators.len() {
+                eprintln!(
+                    "[prefix_cache] register: block_ids.len()={} != allocators.len()={} at block {}, skipping remaining",
+                    block_ids.len(), allocators.len(), start_block + i,
+                );
                 break;
             }
 

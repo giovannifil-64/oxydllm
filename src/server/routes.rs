@@ -45,6 +45,8 @@ pub struct ChatCompletionRequest {
     pub keep_alive: Option<u64>,
     #[serde(default)]
     pub enable_thinking: Option<bool>,
+    #[serde(default)]
+    pub seed: Option<u64>,
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug)]
@@ -485,6 +487,7 @@ async fn chat_completions(
         top_p: body.top_p.unwrap_or(1.0),
         min_p: body.min_p.unwrap_or(0.0),
         repetition_penalty: body.repetition_penalty.unwrap_or(1.0),
+        seed: body.seed,
     };
 
     let remaining = handle.max_seq_len.saturating_sub(prompt_len);
@@ -650,11 +653,14 @@ async fn chat_completions(
 }
 
 fn make_chat_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
     let t = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
-    format!("chatcmpl-{:x}{:x}", t.as_secs(), t.subsec_nanos())
+    format!("chatcmpl-{:x}{:x}-{}", t.as_secs(), t.subsec_nanos(), seq)
 }
 
 pub fn start_server(

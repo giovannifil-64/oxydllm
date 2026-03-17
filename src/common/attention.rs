@@ -29,12 +29,14 @@ pub struct SegmentInfo<'a> {
     pub cache: &'a mut PagedKvCache,
 }
 
+enum QkvProjection {
+    Fused(Linear),
+    Separate { q: AnyLinear, k: AnyLinear, v: AnyLinear },
+}
+
 pub struct Attention {
-    q_proj: Option<AnyLinear>,
-    k_proj: Option<AnyLinear>,
-    v_proj: Option<AnyLinear>,
+    qkv: QkvProjection,
     o_proj: AnyLinear,
-    qkv_proj: Option<Linear>,
     q_norm: Option<RMSNorm>,
     k_norm: Option<RMSNorm>,
     n_heads: usize,
@@ -83,7 +85,7 @@ impl Attention {
         let k_w = weights.get(&format!("{}.k_proj.weight", p))?;
         let v_w = weights.get(&format!("{}.v_proj.weight", p))?;
         let qkv_w = Tensor::cat(&[q_w, k_w, v_w], 0)?;
-        let qkv_proj = Some(Linear::new(qkv_w, None));
+        let qkv_proj = Linear::new(qkv_w, None);
 
         let o_proj = AnyLinear::Float(Linear::new(
             weights.get(&format!("{}.o_proj.weight", p))?.clone(),
@@ -111,11 +113,8 @@ impl Attention {
         let actual_window = compute_sliding_window(cfg, layer_idx);
 
         Ok(Self {
-            q_proj: None,
-            k_proj: None,
-            v_proj: None,
+            qkv: QkvProjection::Fused(qkv_proj),
             o_proj,
-            qkv_proj,
             q_norm, k_norm,
             n_heads: cfg.n_heads,
             n_kv_heads: cfg.n_kv_heads,
@@ -161,11 +160,12 @@ impl Attention {
         let actual_window = compute_sliding_window(cfg, layer_idx);
 
         Ok(Self {
-            q_proj: Some(AnyLinear::Quantized(q_proj)),
-            k_proj: Some(AnyLinear::Quantized(k_proj)),
-            v_proj: Some(AnyLinear::Quantized(v_proj)),
+            qkv: QkvProjection::Separate {
+                q: AnyLinear::Quantized(q_proj),
+                k: AnyLinear::Quantized(k_proj),
+                v: AnyLinear::Quantized(v_proj),
+            },
             o_proj: AnyLinear::Quantized(o_proj),
-            qkv_proj: None,
             q_norm, k_norm,
             n_heads: cfg.n_heads,
             n_kv_heads: cfg.n_kv_heads,
@@ -179,17 +179,17 @@ impl Attention {
     }
 
     fn qkv_split(&self, x: &Tensor) -> Result<(Tensor, Tensor, Tensor)> {
-        if let Some(ref qkv) = self.qkv_proj {
-            let out = qkv.forward(x)?; // [..., q_dim + 2*kv_dim]
-            let q = out.narrow(D::Minus1, 0, self.q_dim)?;
-            let k = out.narrow(D::Minus1, self.q_dim, self.kv_dim)?;
-            let v = out.narrow(D::Minus1, self.q_dim + self.kv_dim, self.kv_dim)?;
-            Ok((q, k, v))
-        } else {
-            let q = self.q_proj.as_ref().expect("q_proj missing").forward(x)?;
-            let k = self.k_proj.as_ref().expect("k_proj missing").forward(x)?;
-            let v = self.v_proj.as_ref().expect("v_proj missing").forward(x)?;
-            Ok((q, k, v))
+        match &self.qkv {
+            QkvProjection::Fused(qkv) => {
+                let out = qkv.forward(x)?;
+                let q = out.narrow(D::Minus1, 0, self.q_dim)?;
+                let k = out.narrow(D::Minus1, self.q_dim, self.kv_dim)?;
+                let v = out.narrow(D::Minus1, self.q_dim + self.kv_dim, self.kv_dim)?;
+                Ok((q, k, v))
+            }
+            QkvProjection::Separate { q, k, v } => {
+                Ok((q.forward(x)?, k.forward(x)?, v.forward(x)?))
+            }
         }
     }
 

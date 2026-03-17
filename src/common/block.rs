@@ -15,7 +15,7 @@ use super::{
 pub struct TransformerBlock {
     input_norm: RMSNorm,
     attention: Attention,
-    post_attn_norm: RMSNorm,
+    ffn_norm: RMSNorm,
     ffn: FeedForward,
     pre_ffn_norm: Option<RMSNorm>,
     post_ffn_norm: Option<RMSNorm>,
@@ -25,7 +25,7 @@ impl TransformerBlock {
     pub fn load(cfg: &BlockConfig, layer_idx: usize, weights: &ModelWeights) -> Result<Self> {
         let p = format!("model.layers.{}", layer_idx);
         let input_norm = RMSNorm::load(weights, &format!("{}.input_layernorm", p), cfg.rms_norm_eps, cfg.norm_type)?;
-        let post_attn_norm = RMSNorm::load(weights, &format!("{}.post_attention_layernorm", p), cfg.rms_norm_eps, cfg.norm_type)?;
+        let ffn_norm = RMSNorm::load(weights, &format!("{}.post_attention_layernorm", p), cfg.rms_norm_eps, cfg.norm_type)?;
         let attention = Attention::load(cfg, layer_idx, weights)?;
         let ffn = FeedForward::load(layer_idx, weights, cfg.activation)?;
         
@@ -36,7 +36,7 @@ impl TransformerBlock {
             post_ffn_norm = Some(RMSNorm::load(weights, &format!("{}.post_feedforward_layernorm", p), cfg.rms_norm_eps, cfg.norm_type)?);
         }
         
-        Ok(Self { input_norm, attention, post_attn_norm, ffn, pre_ffn_norm, post_ffn_norm })
+        Ok(Self { input_norm, attention, ffn_norm, ffn, pre_ffn_norm, post_ffn_norm })
     }
 
     pub fn load_gguf(
@@ -53,12 +53,12 @@ impl TransformerBlock {
         let input_norm = RMSNorm::from_qtensor(&attn_norm_qt, device, dtype, cfg.rms_norm_eps, cfg.norm_type)?;
 
         let ffn_norm_qt = gguf.get(&format!("{prefix}.ffn_norm.weight"))?;
-        let post_attn_norm = RMSNorm::from_qtensor(&ffn_norm_qt, device, dtype, cfg.rms_norm_eps, cfg.norm_type)?;
+        let ffn_norm = RMSNorm::from_qtensor(&ffn_norm_qt, device, dtype, cfg.rms_norm_eps, cfg.norm_type)?;
 
         let attention = Attention::load_gguf(cfg, layer_idx, gguf, device, dtype)?;
         let ffn = FeedForward::load_gguf(layer_idx, gguf, intermediate_size, device, dtype, cfg.activation)?;
 
-        Ok(Self { input_norm, attention, post_attn_norm, ffn, pre_ffn_norm: None, post_ffn_norm: None })
+        Ok(Self { input_norm, attention, ffn_norm, ffn, pre_ffn_norm: None, post_ffn_norm: None })
     }
 
     pub fn forward_batch(
@@ -74,20 +74,17 @@ impl TransformerBlock {
         let mut attn_out = self.attention.forward_batch(&normed, rope, position_ids, mask, segments)?;
         
         if self.pre_ffn_norm.is_some() {
-            // Gemma 3 applies post_attention_layernorm to the attention output
-            attn_out = self.post_attn_norm.forward(&attn_out)?;
+            attn_out = self.ffn_norm.forward(&attn_out)?;
         }
-        
+
         let mut x = (residual + attn_out)?;
         let residual = x.clone();
-        
+
         let ffn_inp;
         if let Some(pre_norm) = &self.pre_ffn_norm {
-            // Gemma 3 uses pre_feedforward_layernorm before FFN
             ffn_inp = pre_norm.forward(&x)?;
         } else {
-            // Standard transformer uses post_attention_layernorm before FFN
-            ffn_inp = self.post_attn_norm.forward(&x)?;
+            ffn_inp = self.ffn_norm.forward(&x)?;
         }
         
         let mut ffn_out = self.ffn.forward(&ffn_inp)?;

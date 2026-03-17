@@ -7,6 +7,7 @@ pub struct SamplingParams {
     pub top_p: f32,
     pub min_p: f32,
     pub repetition_penalty: f32,
+    pub seed: Option<u64>,
 }
 
 impl Default for SamplingParams {
@@ -17,6 +18,7 @@ impl Default for SamplingParams {
             top_p: 1.0,
             min_p: 0.0,
             repetition_penalty: 1.0,
+            seed: None,
         }
     }
 }
@@ -68,7 +70,7 @@ pub fn sample(logits: &Tensor, params: &SamplingParams, prev_tokens: &[u32]) -> 
         probs_vec
     };
 
-    categorical_sample(&probs_vec)
+    categorical_sample(&probs_vec, params.seed)
 }
 
 fn apply_repetition_penalty_cpu(logits: &mut [f32], prev_tokens: &[u32], penalty: f32) {
@@ -103,12 +105,12 @@ fn apply_top_k(probs: &[f32], k: usize) -> Vec<f32> {
     let mut count = filtered.iter().filter(|&&p| p > 0.0).count();
 
     if count < k {
-        for i in 0..filtered.len() {
+        for (i, &p) in probs.iter().enumerate() {
             if count >= k {
                 break;
             }
-            if filtered[i] == 0.0 && probs[i] == threshold {
-                filtered[i] = probs[i];
+            if filtered[i] == 0.0 && p == threshold && p > 0.0 {
+                filtered[i] = p;
                 count += 1;
             }
         }
@@ -146,8 +148,11 @@ fn renormalize(probs: &mut [f32]) {
     }
 }
 
-fn categorical_sample(probs: &[f32]) -> Result<u32> {
-    let r: f32 = fastrand_f32();
+fn categorical_sample(probs: &[f32], seed: Option<u64>) -> Result<u32> {
+    let r: f32 = match seed {
+        Some(s) => seeded_rand_f32(s),
+        None => thread_rand_f32(),
+    };
     let mut cumulative = 0.0;
     for (i, &p) in probs.iter().enumerate() {
         cumulative += p;
@@ -163,28 +168,35 @@ fn categorical_sample(probs: &[f32]) -> Result<u32> {
     Ok(0)
 }
 
-fn fastrand_f32() -> f32 {
+fn seeded_rand_f32(seed: u64) -> f32 {
+    let mut z = seed.wrapping_add(0x9e3779b97f4a7c15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
+    z = z ^ (z >> 31);
+    (z >> 40) as f32 / ((1u64 << 24) as f32)
+}
+
+fn thread_rand_f32() -> f32 {
     use std::hash::{Hash, Hasher};
     use std::collections::hash_map::DefaultHasher;
     use std::time::SystemTime;
 
     thread_local! {
-        static STATE: std::cell::Cell<u32> = std::cell::Cell::new({
+        static STATE: std::cell::Cell<u64> = std::cell::Cell::new({
             let mut hasher = DefaultHasher::new();
             SystemTime::now().hash(&mut hasher);
             std::thread::current().id().hash(&mut hasher);
-            let h = hasher.finish();
-            let s = (h ^ (h >> 32)) as u32;
+            let s = hasher.finish();
             if s == 0 { 1 } else { s }
         });
     }
     STATE.with(|s| {
         let mut x = s.get();
         x ^= x << 13;
-        x ^= x >> 17;
-        x ^= x << 5;
+        x ^= x >> 7;
+        x ^= x << 17;
         s.set(x);
-        (x as f32) / (u32::MAX as f32)
+        (x >> 40) as f32 / ((1u64 << 24) as f32)
     })
 }
 

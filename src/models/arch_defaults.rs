@@ -45,18 +45,43 @@ pub fn llama_defaults() -> ArchDefaults {
     }
 }
 
+pub fn known_unsupported_reason(arch: &str) -> Option<&'static str> {
+    match arch {
+        // Mixture-of-Experts models — MoE routing not yet implemented.
+        "Qwen3MoeForCausalLM"
+        | "MixtralForCausalLM"
+        | "DeepseekV2ForCausalLM"
+        | "DeepseekV3ForCausalLM" => Some("Mixture-of-Experts (MoE) architectures are not yet supported"),
+        _ => None,
+    }
+}
+
 pub fn arch_defaults(arch: &str) -> Option<ArchDefaults> {
     match arch {
-        "llama" | "LlamaForCausalLM" | "mistral" | "MistralForCausalLM" | "Mistral3ForConditionalGeneration" => Some(llama_defaults()),
+        "llama" | "LlamaForCausalLM" => Some(llama_defaults()),
+
+        "mistral" | "MistralForCausalLM" | "Mistral3ForConditionalGeneration" => Some(ArchDefaults {
+            extra_eos_ids: &[],
+            ..llama_defaults()
+        }),
+        "phi3" | "Phi3ForCausalLM" => Some(ArchDefaults {
+            default_rope_theta: 10_000.0,
+            extra_eos_ids: &[],
+            ..llama_defaults()
+        }),
+
         "qwen2" | "Qwen2ForCausalLM" => Some(ArchDefaults {
             default_rope_theta: 1_000_000.0,
+            extra_eos_ids: &[],
             ..llama_defaults()
         }),
         "qwen3" | "Qwen3ForCausalLM" => Some(ArchDefaults {
             qk_norm: true,
             default_rope_theta: 1_000_000.0,
+            extra_eos_ids: &[],
             ..llama_defaults()
         }),
+
         "gemma" | "GemmaForCausalLM" => Some(ArchDefaults {
             activation: Activation::GeLUTanh,
             norm_type: NormType::Gemma,
@@ -80,10 +105,6 @@ pub fn arch_defaults(arch: &str) -> Option<ArchDefaults> {
             embed_scale_from_hidden: true,
             extra_eos_ids: &[1, 106],
             ..Default::default()
-        }),
-        "phi3" | "Phi3ForCausalLM" => Some(ArchDefaults {
-            default_rope_theta: 10_000.0, // Usually default, can be overridden by config
-            ..llama_defaults()
         }),
         _ => None,
     }

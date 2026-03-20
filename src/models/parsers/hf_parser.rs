@@ -30,6 +30,10 @@ pub fn parse(config_path: &str) -> Result<StandardTransformerConfig> {
 
     let arch = v["architectures"][0].as_str().unwrap_or("Unknown");
 
+    if let Some(reason) = crate::models::arch_defaults::known_unsupported_reason(arch) {
+        anyhow::bail!("Architecture '{arch}' is not supported: {reason}");
+    }
+
     let arch_def = crate::models::arch_defaults::arch_defaults(arch)
         .with_context(|| format!("Architecture '{arch}' not supported"))?;
 

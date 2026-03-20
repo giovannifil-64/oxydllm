@@ -128,7 +128,7 @@ fn apply_top_p(probs: &[f32], top_p: f32) -> Vec<f32> {
     let mut filtered = vec![0.0_f32; probs.len()];
 
     for (idx, prob) in indexed {
-        if cumulative >= top_p {
+        if cumulative >= top_p && cumulative > 0.0 {
             break;
         }
         filtered[idx] = prob;

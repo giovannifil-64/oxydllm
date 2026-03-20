@@ -97,10 +97,12 @@ impl QLinear {
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let original_dims = x.dims().to_vec();
 
-        let x_f32 = if x.dtype() != DType::F32 {
-            x.to_dtype(DType::F32)?
+        let x_f32_owned;
+        let x_f32: &Tensor = if x.dtype() != DType::F32 {
+            x_f32_owned = x.to_dtype(DType::F32)?;
+            &x_f32_owned
         } else {
-            x.clone()
+            x
         };
 
         let x_2d = if x_f32.rank() > 2 {
@@ -108,7 +110,7 @@ impl QLinear {
             let batch_flat: usize = original_dims[..original_dims.len() - 1].iter().product();
             x_f32.reshape((batch_flat, in_features))?
         } else {
-            x_f32
+            x_f32.clone()
         };
 
         let out = candle_core::Module::forward(&self.inner, &x_2d)?;

@@ -16,19 +16,26 @@ pub fn causal_mask(seq_len: usize, device: &Device) -> Result<Tensor> {
     upper.affine(-1e30, 0.0)?.reshape((1, 1, seq_len, seq_len))
 }
 
+fn device_discriminant(device: &Device) -> u8 {
+    if device.is_cpu() { 0 }
+    else if device.is_metal() { 1 }
+    else { 2 }
+}
+
 thread_local! {
-    static MASK_CACHE: RefCell<LruCache<usize, Tensor>> =
+    static MASK_CACHE: RefCell<LruCache<(usize, u8), Tensor>> =
         RefCell::new(LruCache::new(NonZeroUsize::new(MASK_CACHE_CAP).unwrap()));
 }
 
 pub fn causal_mask_cached(seq_len: usize, device: &Device) -> Result<Tensor> {
+    let key = (seq_len, device_discriminant(device));
     MASK_CACHE.with(|cache| {
         let mut map = cache.borrow_mut();
-        if let Some(t) = map.get(&seq_len) {
+        if let Some(t) = map.get(&key) {
             return Ok(t.clone());
         }
         let mask = causal_mask(seq_len, device)?;
-        map.push(seq_len, mask.clone());
+        map.push(key, mask.clone());
         Ok(mask)
     })
 }

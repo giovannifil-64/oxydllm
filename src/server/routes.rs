@@ -315,6 +315,7 @@ pub fn engine_loop(
                     // Do not break, the engine remains alive for subsequent requests.
                 }
             }
+            std::thread::yield_now();
         }
     }
 

@@ -4,12 +4,13 @@ use super::linear::{gelu_tanh, silu, AnyLinear, Linear, QLinear};
 use super::weights::ModelWeights;
 use super::config::Activation;
 
+enum GateUpProjection {
+    Fused(Linear),
+    Separate { gate: AnyLinear, up: AnyLinear },
+}
+
 pub struct FeedForward {
-    /// Fused gate+up projection (safetensors). When Some, gate_proj/up_proj are None.
-    gate_up_proj: Option<Linear>,
-    /// Separate projections (GGUF). When Some, gate_up_proj is None.
-    gate_proj: Option<AnyLinear>,
-    up_proj: Option<AnyLinear>,
+    gate_up: GateUpProjection,
     down_proj: AnyLinear,
     intermediate_size: usize,
     activation: Activation,
@@ -27,9 +28,7 @@ impl FeedForward {
         let gate_up_w = Tensor::cat(&[&gate_w, &up_w], 0)?;
 
         Ok(Self {
-            gate_up_proj: Some(Linear::new(gate_up_w, None)),
-            gate_proj: None,
-            up_proj: None,
+            gate_up: GateUpProjection::Fused(Linear::new(gate_up_w, None)),
             down_proj: AnyLinear::Float(down_proj),
             intermediate_size,
             activation,
@@ -46,14 +45,15 @@ impl FeedForward {
     ) -> Result<Self> {
         let prefix = format!("blk.{}", layer_idx);
 
-        let gate_proj = QLinear::from_arc(gguf.get(&format!("{prefix}.ffn_gate.weight"))?, dtype)?;
-        let up_proj   = QLinear::from_arc(gguf.get(&format!("{prefix}.ffn_up.weight"))?,   dtype)?;
+        let gate = QLinear::from_arc(gguf.get(&format!("{prefix}.ffn_gate.weight"))?, dtype)?;
+        let up   = QLinear::from_arc(gguf.get(&format!("{prefix}.ffn_up.weight"))?,   dtype)?;
         let down_proj = QLinear::from_arc(gguf.get(&format!("{prefix}.ffn_down.weight"))?, dtype)?;
 
         Ok(Self {
-            gate_up_proj: None,
-            gate_proj: Some(AnyLinear::Quantized(gate_proj)),
-            up_proj: Some(AnyLinear::Quantized(up_proj)),
+            gate_up: GateUpProjection::Separate {
+                gate: AnyLinear::Quantized(gate),
+                up:   AnyLinear::Quantized(up),
+            },
             down_proj: AnyLinear::Quantized(down_proj),
             intermediate_size,
             activation,
@@ -61,22 +61,21 @@ impl FeedForward {
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        if let Some(ref gu) = self.gate_up_proj {
-            let out = gu.forward(x)?;
-            let gate = out.narrow(D::Minus1, 0, self.intermediate_size)?;
-            let up   = out.narrow(D::Minus1, self.intermediate_size, self.intermediate_size)?;
-            let activated = match self.activation {
-                Activation::SiLU => silu(&gate)?,
-                Activation::GeLUTanh => gelu_tanh(&gate)?,
-            };
-            return self.down_proj.forward(&(activated * up)?);
-        }
-        let raw_gate = self.gate_proj.as_ref().expect("gate_proj").forward(x)?;
-        let gate = match self.activation {
-            Activation::SiLU => silu(&raw_gate)?,
-            Activation::GeLUTanh => gelu_tanh(&raw_gate)?,
+        let (gate, up) = match &self.gate_up {
+            GateUpProjection::Fused(gu) => {
+                let out = gu.forward(x)?;
+                let gate = out.narrow(D::Minus1, 0, self.intermediate_size)?;
+                let up   = out.narrow(D::Minus1, self.intermediate_size, self.intermediate_size)?;
+                (gate, up)
+            }
+            GateUpProjection::Separate { gate: gp, up: up_p } => {
+                (gp.forward(x)?, up_p.forward(x)?)
+            }
         };
-        let up   = self.up_proj.as_ref().expect("up_proj").forward(x)?;
-        self.down_proj.forward(&(gate * up)?)
+        let activated = match self.activation {
+            Activation::SiLU => silu(&gate)?,
+            Activation::GeLUTanh => gelu_tanh(&gate)?,
+        };
+        self.down_proj.forward(&(activated * up)?)
     }
 }

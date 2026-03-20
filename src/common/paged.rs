@@ -49,8 +49,13 @@ impl GlobalKvBudget {
 }
 
 pub fn detect_system_kv_budget(memory_budget_bytes: Option<usize>, is_cpu: bool) -> usize {
-    let system_mem = detect_system_memory_bytes().unwrap_or(8 * 1024 * 1024 * 1024);
-    let base = memory_budget_bytes.map_or(system_mem, |b| b.min(system_mem));
+    let base = if let Some(b) = memory_budget_bytes {
+        let total = detect_system_memory_bytes().unwrap_or(usize::MAX);
+        b.min(total)
+    } else {
+        detect_available_memory_bytes()
+            .unwrap_or_else(|| detect_system_memory_bytes().unwrap_or(8 * 1024 * 1024 * 1024))
+    };
     // Leave ~40-45% for model weights + OS + activations; KV gets the rest.
     let kv_fraction: f64 = if is_cpu { 0.65 } else { 0.55 };
     let headroom: usize = 512 * 1024 * 1024; // 512 MB
@@ -60,26 +65,69 @@ pub fn detect_system_kv_budget(memory_budget_bytes: Option<usize>, is_cpu: bool)
 #[cfg(target_os = "macos")]
 fn detect_system_memory_bytes() -> Option<usize> {
     let output = std::process::Command::new("sysctl")
-        .arg("-n")
-        .arg("hw.memsize")
+        .args(["-n", "hw.memsize"])
         .output()
         .ok()?;
     std::str::from_utf8(&output.stdout).ok()?.trim().parse().ok()
 }
 
+#[cfg(target_os = "macos")]
+fn detect_available_memory_bytes() -> Option<usize> {
+    let ps = std::process::Command::new("sysctl")
+        .args(["-n", "hw.pagesize"])
+        .output()
+        .ok()?;
+    let page_size: usize = std::str::from_utf8(&ps.stdout).ok()?.trim().parse().ok()?;
+
+    let vm = std::process::Command::new("vm_stat").output().ok()?;
+    let text = std::str::from_utf8(&vm.stdout).ok()?;
+
+    let mut pages: usize = 0;
+    for line in text.lines() {
+        let reclaimable = line.starts_with("Pages free:")
+            || line.starts_with("Pages inactive:")
+            || line.starts_with("Pages speculative:");
+        if reclaimable {
+            // Lines look like: "Pages free:      174978."
+            if let Some(n) = line
+                .split_whitespace()
+                .last()
+                .and_then(|s| s.trim_end_matches('.').parse::<usize>().ok())
+            {
+                pages += n;
+            }
+        }
+    }
+    Some(pages * page_size)
+}
+
 #[cfg(target_os = "linux")]
-fn detect_system_memory_bytes() -> Option<usize> {
-    let content = std::fs::read_to_string("/proc/meminfo").ok()?;
-    content
+fn parse_meminfo_kb(key: &str) -> Option<usize> {
+    std::fs::read_to_string("/proc/meminfo").ok()?
         .lines()
-        .find(|l| l.starts_with("MemTotal:"))
+        .find(|l| l.starts_with(key))
         .and_then(|l| l.split_whitespace().nth(1))
         .and_then(|s| s.parse::<usize>().ok())
         .map(|kb| kb * 1024)
 }
 
+#[cfg(target_os = "linux")]
+fn detect_system_memory_bytes() -> Option<usize> {
+    parse_meminfo_kb("MemTotal:")
+}
+
+#[cfg(target_os = "linux")]
+fn detect_available_memory_bytes() -> Option<usize> {
+    parse_meminfo_kb("MemAvailable:")
+}
+
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn detect_system_memory_bytes() -> Option<usize> {
+    None
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn detect_available_memory_bytes() -> Option<usize> {
     None
 }
 

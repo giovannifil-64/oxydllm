@@ -304,11 +304,14 @@ pub fn engine_loop(
                 }
                 Err(e) => {
                     eprintln!("Engine error: {e}");
-                    for (_, tracker) in trackers.drain() {
-                        let _ = tracker.tx.send(EngineEvent::Error(e.to_string()));
-                        let _ = tracker.tx.send(EngineEvent::StreamEnd);
+                    let aborted_ids = engine.abort_running();
+                    for id in aborted_ids {
+                        if let Some(tracker) = trackers.remove(&id) {
+                            let _ = tracker.tx.send(EngineEvent::Error(e.to_string()));
+                            let _ = tracker.tx.send(EngineEvent::StreamEnd);
+                        }
                     }
-                    break;
+                    // Do not break, the engine remains alive for subsequent requests.
                 }
             }
         }

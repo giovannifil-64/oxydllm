@@ -276,6 +276,10 @@ impl Engine {
         Ok(StepOutput { new_tokens, completed })
     }
 
+    pub fn abort_running(&mut self) -> Vec<SequenceId> {
+        self.scheduler.abort_all_running()
+    }
+
     pub fn has_pending_work(&self) -> bool {
         self.scheduler.has_pending_work()
     }

@@ -1,18 +1,19 @@
 use std::cell::RefCell;
 use std::num::NonZeroUsize;
-use candle_core::{DType, Device, Result, Tensor};
+use candle_core::{Device, Result, Tensor};
 use lru::LruCache;
 
 const MASK_CACHE_CAP: usize = 32;
 
 pub fn causal_mask(seq_len: usize, device: &Device) -> Result<Tensor> {
-    let mask: Vec<f32> = (0..seq_len * seq_len)
-        .map(|i| {
-            let (row, col) = (i / seq_len, i % seq_len);
-            if col > row { f32::NEG_INFINITY } else { 0.0f32 }
-        })
-        .collect();
-    Tensor::from_vec(mask, (1, 1, seq_len, seq_len), device)?.to_dtype(DType::F32)
+    let row: Vec<f32> = (0..seq_len).map(|i| i as f32).collect();
+    let col: Vec<f32> = (0..seq_len).map(|i| i as f32).collect();
+    let rows = Tensor::from_vec(row, (seq_len, 1), device)?;
+    let cols = Tensor::from_vec(col, (1, seq_len), device)?;
+    let diff  = cols.broadcast_sub(&rows)?;
+    let step  = diff.affine(1000.0, -500.0)?.tanh()?;
+    let upper = step.affine(0.5, 0.5)?;
+    upper.affine(-1e30, 0.0)?.reshape((1, 1, seq_len, seq_len))
 }
 
 thread_local! {

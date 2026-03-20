@@ -128,42 +128,37 @@ impl Scheduler {
         let mut scheduled = Vec::new();
         let mut budget = self.config.max_tokens_per_step;
 
-        let free_blocks = self.num_free_blocks();
-
-        let mut to_preempt: Vec<SequenceId> = Vec::new();
+        let mut seqs_needing_block: Vec<SequenceId> = Vec::new();
         for seq in self.running.iter() {
-            if budget == 0 {
-                break;
+            if self.decode_needs_new_block(seq) {
+                seqs_needing_block.push(seq.id);
+            } else if budget > 0 {
+                scheduled.push(ScheduledSequence { id: seq.id, phase: SequencePhase::Decode });
+                budget -= 1;
             }
-            if self.decode_needs_new_block(seq) && free_blocks == 0 {
-                to_preempt.push(seq.id);
-                continue;
-            }
-            scheduled.push(ScheduledSequence {
-                id: seq.id,
-                phase: SequencePhase::Decode,
-            });
-            budget -= 1;
         }
 
-        for seq_id in &to_preempt {
-            let idx = *self.running_index.get(seq_id).unwrap();
-            let mut seq = self.remove_from_running(idx);
-            eprintln!(
-                "[scheduler] seq={} preempted (memory pressure) — KV cache cleared, re-queued for prefill",
-                seq.id
-            );
-            for cache in &mut seq.caches {
-                cache.clear();
+        for &seq_id in &seqs_needing_block {
+            if self.num_free_blocks() > 0 {
+                if budget > 0 {
+                    scheduled.push(ScheduledSequence { id: seq_id, phase: SequencePhase::Decode });
+                    budget -= 1;
+                }
+            } else {
+                let idx = *self.running_index.get(&seq_id).unwrap();
+                let mut seq = self.remove_from_running(idx);
+                eprintln!(
+                    "[scheduler] seq={} preempted (memory pressure) — KV cache cleared, re-queued for prefill",
+                    seq.id
+                );
+                for cache in &mut seq.caches {
+                    cache.clear();
+                }
+                seq.num_processed_tokens = 0;
+                seq.phase = SequencePhase::Prefill;
+                seq.status = SequenceStatus::Waiting;
+                self.waiting.push_front(seq);
             }
-            seq.num_processed_tokens = 0;
-            seq.phase = SequencePhase::Prefill;
-            seq.status = SequenceStatus::Waiting;
-            self.waiting.push_front(seq);
-        }
-
-        if !to_preempt.is_empty() {
-            scheduled.retain(|s| self.running_index.contains_key(&s.id));
         }
 
         let free_blocks = self.num_free_blocks();
@@ -227,6 +222,17 @@ impl Scheduler {
             completed.push(CompletedSequence { id: seq.id, finish_reason: seq.finish_reason.clone() });
         }
         completed
+    }
+
+    pub fn abort_all_running(&mut self) -> Vec<SequenceId> {
+        let ids: Vec<SequenceId> = self.running.iter().map(|s| s.id).collect();
+        for mut seq in self.running.drain(..) {
+            for cache in &mut seq.caches {
+                cache.clear();
+            }
+        }
+        self.running_index.clear();
+        ids
     }
 
     pub fn has_pending_work(&self) -> bool {

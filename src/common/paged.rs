@@ -179,12 +179,11 @@ pub struct BlockTable {
     pub block_ids: Vec<usize>,
     pub num_tokens: usize,
     cached_slots: Vec<u32>,
-    device_idx: Option<Tensor>,
 }
 
 impl BlockTable {
     pub fn new() -> Self {
-        Self { block_ids: Vec::new(), num_tokens: 0, cached_slots: Vec::new(), device_idx: None }
+        Self { block_ids: Vec::new(), num_tokens: 0, cached_slots: Vec::new() }
     }
 }
 
@@ -192,12 +191,14 @@ pub struct PagedKvCache {
     allocator: SharedBlockAllocator,
     table: BlockTable,
     block_size: usize,
+    contig_k: Option<Tensor>,
+    contig_v: Option<Tensor>,
 }
 
 impl PagedKvCache {
     pub fn new(allocator: SharedBlockAllocator) -> Self {
         let block_size = allocator.lock().unwrap().block_size();
-        Self { allocator, table: BlockTable::new(), block_size }
+        Self { allocator, table: BlockTable::new(), block_size, contig_k: None, contig_v: None }
     }
 
     pub fn append(&mut self, new_k: &Tensor, new_v: &Tensor) -> Result<(Tensor, Tensor)> {
@@ -206,6 +207,7 @@ impl PagedKvCache {
         let v_flat = new_v.squeeze(0)?.transpose(0, 1)?;
         let block_size = self.block_size;
 
+        let prev_tokens = self.table.num_tokens;
         let mut written = 0;
 
         while written < new_seq {
@@ -234,25 +236,30 @@ impl PagedKvCache {
             written += n;
         }
 
-        // Extend device_idx incrementally — only transfer the newly appended slots
-        let prev_len = self.table.device_idx.as_ref().map(|t| t.elem_count()).unwrap_or(0);
-        if prev_len < self.table.num_tokens {
-            let new_slots = &self.table.cached_slots[prev_len..self.table.num_tokens];
-            let delta = Tensor::from_slice(new_slots, (new_slots.len(),), new_k.device())?;
-            let updated = match self.table.device_idx.take() {
-                None => delta,
-                Some(existing) => Tensor::cat(&[&existing, &delta], 0)?,
-            };
-            self.table.device_idx = Some(updated);
-        }
+        let (ck, cv) = match (self.contig_k.take(), self.contig_v.take()) {
+            (Some(k), Some(v)) => {
+                // Fast decode path: cat only the new token(s) onto the existing buffer.
+                (Tensor::cat(&[&k, new_k], 2)?, Tensor::cat(&[&v, new_v], 2)?)
+            }
+            (None, None) => {
+                if prev_tokens > 0 {
+                    let prefix_slots = &self.table.cached_slots[..prev_tokens];
+                    let idx = Tensor::from_slice(prefix_slots, (prev_tokens,), new_k.device())?;
+                    let (pk, pv) = self.allocator.lock().unwrap().gather(&idx)?;
+                    (Tensor::cat(&[&pk, new_k], 2)?, Tensor::cat(&[&pv, new_v], 2)?)
+                } else {
+                    (new_k.clone(), new_v.clone())
+                }
+            }
+            _ => unreachable!("contig_k and contig_v must always be in sync"),
+        };
+        self.contig_k = Some(ck);
+        self.contig_v = Some(cv);
 
-        let idx = self.table.device_idx.as_ref().ok_or_else(|| {
-            candle_core::Error::Msg(
-                "PagedKvCache::append bug: device_idx is None after writing tokens — \
-                 this should never happen (append must write ≥1 token)".to_string(),
-            )
-        })?;
-        self.allocator.lock().unwrap().gather(idx)
+        Ok((
+            self.contig_k.as_ref().unwrap().clone(),
+            self.contig_v.as_ref().unwrap().clone(),
+        ))
     }
 
     pub fn clear(&mut self) {
@@ -265,7 +272,8 @@ impl PagedKvCache {
         self.table.block_ids.clear();
         self.table.num_tokens = 0;
         self.table.cached_slots.clear();
-        self.table.device_idx = None;
+        self.contig_k = None;
+        self.contig_v = None;
     }
 
     pub fn prepopulate_block(&mut self, block_id: usize) {
@@ -280,10 +288,13 @@ impl PagedKvCache {
     pub fn set_num_tokens(&mut self, n: usize) {
         self.table.cached_slots.truncate(n);
         self.table.num_tokens = n;
-        if let Some(ref t) = self.table.device_idx {
-            if t.elem_count() > n {
-                self.table.device_idx = t.narrow(0, 0, n).ok();
-            }
+        if let Some(ck) = self.contig_k.take() {
+            let len = ck.dim(2).unwrap_or(0);
+            self.contig_k = if len > n { ck.narrow(2, 0, n).ok() } else { Some(ck) };
+        }
+        if let Some(cv) = self.contig_v.take() {
+            let len = cv.dim(2).unwrap_or(0);
+            self.contig_v = if len > n { cv.narrow(2, 0, n).ok() } else { Some(cv) };
         }
     }
 

@@ -1,6 +1,5 @@
 use anyhow::{Context, Result};
 use candle_core::{safetensors::MmapedSafetensors, DType, Device, Tensor};
-use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 
 pub struct ModelWeights {
@@ -17,7 +16,7 @@ impl ModelWeights {
         let names: Vec<String> = mmap.tensors().into_iter().map(|(n, _)| n).collect();
 
         let tensors: FxHashMap<String, Tensor> = names
-            .par_iter()
+            .iter()
             .map(|name| {
                 let t = mmap
                     .load(name, device)

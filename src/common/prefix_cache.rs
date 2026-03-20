@@ -21,6 +21,26 @@ impl PrefixCache {
         Self { entries: LruCache::new(cap) }
     }
 
+    pub fn count_cached_blocks(&self, tokens: &[u32], block_size: usize) -> usize {
+        let num_full_blocks = tokens.len() / block_size;
+        let mut prev_hash: u64 = 0;
+        let mut count = 0;
+
+        for block_idx in 0..num_full_blocks {
+            let block_tokens = &tokens[block_idx * block_size..(block_idx + 1) * block_size];
+            let h = chain_hash(block_tokens, prev_hash);
+            match self.entries.peek(&h) {
+                Some(entry) if entry.block_tokens == block_tokens => {
+                    count += 1;
+                    prev_hash = h;
+                }
+                _ => break,
+            }
+        }
+        
+        count
+    }
+
     pub fn lookup(&mut self, tokens: &[u32], block_size: usize) -> (usize, Vec<Vec<usize>>) {
         let num_full_blocks = tokens.len() / block_size;
         let mut prev_hash: u64 = 0;

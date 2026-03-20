@@ -452,13 +452,12 @@ fn warm_up_model(model: &dyn BatchModel) {
     let lock = crate::gpu_lock::gpu_lock();
     let _gpu = lock.acquire();
 
-    // --- Phase 1: prefill-shaped batch (seq_len > 1, causal mask) ---
-    {
-        let mut caches: Vec<PagedKvCache> = allocators
-            .iter()
-            .map(|a| PagedKvCache::new(std::sync::Arc::clone(a)))
-            .collect();
+    let mut caches: Vec<PagedKvCache> = allocators
+        .iter()
+        .map(|a| PagedKvCache::new(std::sync::Arc::clone(a)))
+        .collect();
 
+    {
         let dummy_tokens: Vec<u32> = (1..=8).collect();
         let positions: Vec<u32> = (0..8).collect();
         let input = match Tensor::from_vec(dummy_tokens, (1, 8), device) {
@@ -474,19 +473,9 @@ fn warm_up_model(model: &dyn BatchModel) {
         if let Err(e) = model.forward_batch(&input, &position_ids, &mut cache_slices, &[8]) {
             eprintln!("[warmup] prefill forward failed (non-fatal): {e}");
         }
-
-        for cache in &mut caches {
-            cache.clear();
-        }
     }
 
-    // --- Phase 2: decode-shaped batch (seq_len == 1, no causal mask) ---
     {
-        let mut caches: Vec<PagedKvCache> = allocators
-            .iter()
-            .map(|a| PagedKvCache::new(std::sync::Arc::clone(a)))
-            .collect();
-
         let input = match Tensor::from_vec(vec![1u32], (1, 1), device) {
             Ok(t) => t,
             Err(e) => { eprintln!("[warmup] failed to create decode tensor: {e}"); return; }
@@ -500,10 +489,10 @@ fn warm_up_model(model: &dyn BatchModel) {
         if let Err(e) = model.forward_batch(&input, &position_ids, &mut cache_slices, &[1]) {
             eprintln!("[warmup] decode forward failed (non-fatal): {e}");
         }
+    }
 
-        for cache in &mut caches {
-            cache.clear();
-        }
+    for cache in &mut caches {
+        cache.clear();
     }
 
     // Flush any in-flight GPU commands so the first real request sees clean state.

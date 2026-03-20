@@ -4,6 +4,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use crate::common::paged::{PagedKvCache, SharedBlockAllocator, DEFAULT_BLOCK_SIZE};
+use crate::common::prefix_cache::PrefixCache;
 use crate::sampling::SamplingParams;
 use sequence::*;
 
@@ -115,16 +116,21 @@ impl Scheduler {
         self.allocators[0].lock().unwrap().num_free()
     }
 
-    fn blocks_needed_for_prefill(&self, seq: &SequenceState) -> usize {
+    fn blocks_needed_for_prefill(&self, seq: &SequenceState, prefix_cache: Option<&PrefixCache>) -> usize {
         let total_tokens = seq.all_tokens.len();
-        total_tokens.div_ceil(self.block_size)
+        let total_blocks = total_tokens.div_ceil(self.block_size);
+        let cached = prefix_cache.map_or(0, |pc| {
+            let max_cacheable = total_tokens.saturating_sub(1) / self.block_size;
+            pc.count_cached_blocks(&seq.all_tokens, self.block_size).min(max_cacheable)
+        });
+        total_blocks.saturating_sub(cached)
     }
 
     fn decode_needs_new_block(&self, seq: &SequenceState) -> bool {
         seq.num_processed_tokens.is_multiple_of(self.block_size) && seq.num_processed_tokens > 0
     }
 
-    pub fn schedule(&mut self) -> SchedulerOutput {
+    pub fn schedule(&mut self, prefix_cache: Option<&PrefixCache>) -> SchedulerOutput {
         let mut scheduled = Vec::new();
         let mut budget = self.config.max_tokens_per_step;
 
@@ -169,7 +175,7 @@ impl Scheduler {
                 None => break,
             };
 
-            let blocks_needed = self.blocks_needed_for_prefill(seq);
+            let blocks_needed = self.blocks_needed_for_prefill(seq, prefix_cache);
             if blocks_needed > free_blocks {
                 break;
             }
@@ -281,7 +287,7 @@ mod tests {
         let id1 = sched.add_request(vec![4, 5], SamplingParams::default(), 10);
         assert_eq!(sched.num_waiting(), 2);
 
-        let output = sched.schedule();
+        let output = sched.schedule(None);
         assert_eq!(output.scheduled.len(), 2);
         assert_eq!(output.scheduled[0].id, id0);
         assert_eq!(output.scheduled[0].phase, SequencePhase::Prefill);
@@ -310,7 +316,7 @@ mod tests {
         sched.add_request(vec![3, 4], SamplingParams::default(), 10);
         sched.add_request(vec![5, 6], SamplingParams::default(), 10);
 
-        let output = sched.schedule();
+        let output = sched.schedule(None);
         // Only 2 should be admitted
         assert_eq!(output.scheduled.len(), 2);
         assert_eq!(sched.num_running(), 2);
@@ -332,7 +338,7 @@ mod tests {
         let id0 = sched.add_request(tokens.clone(), SamplingParams::default(), 100);
 
         // Admit and "prefill" it
-        let output = sched.schedule();
+        let output = sched.schedule(None);
         assert_eq!(output.scheduled.len(), 1);
         assert_eq!(output.scheduled[0].id, id0);
 
@@ -343,7 +349,7 @@ mod tests {
 
         // Add a second request that needs 1 block
         let id1 = sched.add_request(tokens, SamplingParams::default(), 100);
-        let output = sched.schedule();
+        let output = sched.schedule(None);
 
         assert!(sched.has_pending_work());
         let _ = (id1, output);
@@ -361,7 +367,7 @@ mod tests {
         let initial_free = allocators[0].lock().unwrap().num_free();
 
         let id0 = sched.add_request(vec![1, 2, 3], SamplingParams::default(), 10);
-        sched.schedule();
+        sched.schedule(None);
 
 
         sched.get_running_mut(id0).unwrap().status = SequenceStatus::Finished;

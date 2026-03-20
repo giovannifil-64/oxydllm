@@ -116,6 +116,22 @@ pub fn run_transformer_layers_batch(
     seq_caches: &mut [&mut [PagedKvCache]],
     token_counts: &[usize],
 ) -> Result<Tensor> {
+    debug_assert_eq!(
+        token_counts.len(), seq_caches.len(),
+        "token_counts.len() must equal seq_caches.len()"
+    );
+    debug_assert_eq!(
+        token_counts.iter().sum::<usize>(),
+        token_ids.dim(candle_core::D::Minus1).unwrap_or(0),
+        "sum(token_counts) must equal token_ids sequence length"
+    );
+    for (i, seq_cache) in seq_caches.iter().enumerate() {
+        debug_assert_eq!(
+            seq_cache.len(), c.blocks.len(),
+            "seq_caches[{i}].len() must equal number of transformer blocks"
+        );
+    }
+
     let mut x = c.embed_tokens.forward(token_ids)?;
     if let Some(scale) = c.embed_scale {
         x = (x * scale)?;

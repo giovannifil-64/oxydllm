@@ -126,7 +126,7 @@ pub struct IncomingRequest {
 pub enum EngineEvent {
     Token(String),
     ReasoningToken(String),
-    Finish { finish_reason: String },
+    Finish { finish_reason: String, completion_tokens: usize },
     StreamEnd,
     Error(String),
 }
@@ -297,6 +297,7 @@ pub fn engine_loop(
                                     .as_deref()
                                     .unwrap_or("stop")
                                     .to_string(),
+                                completion_tokens: tracker.token_count,
                             });
                             let _ = tracker.tx.send(EngineEvent::StreamEnd);
                         }
@@ -560,7 +561,7 @@ async fn chat_completions(
                     };
                     Event::default().data(serde_json::to_string(&chunk).unwrap())
                 }
-                EngineEvent::Finish { finish_reason } => {
+                EngineEvent::Finish { finish_reason, .. } => {
                     let chunk = ChatCompletionChunk {
                         id: chat_id.clone(),
                         object: "chat.completion.chunk".to_string(),
@@ -598,15 +599,14 @@ async fn chat_completions(
             match event {
                 EngineEvent::Token(text) => {
                     content.push_str(&text);
-                    completion_tokens += 1;
                 }
                 EngineEvent::ReasoningToken(text) => {
                     reasoning_content.push_str(&text);
-                    completion_tokens += 1;
                     reasoning_tokens += 1;
                 }
-                EngineEvent::Finish { finish_reason: fr } => {
+                EngineEvent::Finish { finish_reason: fr, completion_tokens: ct } => {
                     finish_reason = fr;
+                    completion_tokens = ct;
                 }
                 EngineEvent::StreamEnd => break,
                 EngineEvent::Error(msg) => {

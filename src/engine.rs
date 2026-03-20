@@ -73,7 +73,7 @@ impl Engine {
         } = self;
         let block_size = *block_size;
 
-        let output = scheduler.schedule();
+        let output = scheduler.schedule(Some(prefix_cache));
         let mut new_tokens = Vec::new();
 
         let mut prefill_ids: Vec<SequenceId> = Vec::new();

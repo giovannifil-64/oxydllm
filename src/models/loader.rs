@@ -160,6 +160,15 @@ fn resolve_weight_paths(model_dir: &str) -> anyhow::Result<Vec<String>> {
         println!("Total shared weight files: {}", files.len());
         Ok(files)
     } else {
+        // No index file: try the standard single-file names in order.
+        // Some repos (e.g. Mistral-7B-Instruct-v0.3) ship a `consolidated.safetensors`
+        // as an alternative to the sharded layout.
+        for name in &["model.safetensors", "consolidated.safetensors"] {
+            let path = format!("{}/{}", model_dir, name);
+            if std::path::Path::new(&path).exists() {
+                return Ok(vec![path]);
+            }
+        }
         Ok(vec![format!("{}/model.safetensors", model_dir)])
     }
 }

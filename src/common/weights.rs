@@ -35,6 +35,10 @@ impl ModelWeights {
             .ok_or_else(|| candle_core::Error::Msg(format!("Tensor not found: {}", name)))
     }
 
+    pub fn try_get(&self, name: &str) -> Option<&Tensor> {
+        self.tensors.get(name)
+    }
+
     /// Returns the actual memory footprint of all loaded tensors in bytes.
     /// This reflects the dtype used at load time (BF16 on GPU, F32 on CPU),
     /// which may differ from the on-disk size of the safetensors files.

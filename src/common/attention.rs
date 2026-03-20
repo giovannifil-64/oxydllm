@@ -85,7 +85,15 @@ impl Attention {
         let k_w = weights.get(&format!("{}.k_proj.weight", p))?;
         let v_w = weights.get(&format!("{}.v_proj.weight", p))?;
         let qkv_w = Tensor::cat(&[q_w, k_w, v_w], 0)?;
-        let qkv_proj = Linear::new(qkv_w, None);
+        let qkv_bias = match (
+            weights.try_get(&format!("{}.q_proj.bias", p)),
+            weights.try_get(&format!("{}.k_proj.bias", p)),
+            weights.try_get(&format!("{}.v_proj.bias", p)),
+        ) {
+            (Some(qb), Some(kb), Some(vb)) => Some(Tensor::cat(&[qb, kb, vb], 0)?),
+            _ => None,
+        };
+        let qkv_proj = Linear::new(qkv_w, qkv_bias);
 
         let o_proj = AnyLinear::Float(Linear::new(
             weights.get(&format!("{}.o_proj.weight", p))?.clone(),

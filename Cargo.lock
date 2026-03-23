@@ -2209,7 +2209,6 @@ dependencies = [
  "minijinja",
  "minijinja-contrib",
  "objc2-metal",
- "rayon",
  "reqwest",
  "rustc-hash",
  "serde",

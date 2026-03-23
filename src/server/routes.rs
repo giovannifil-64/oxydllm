@@ -278,23 +278,44 @@ pub fn engine_loop(
                                 tracker.thinking_ids.push(tok.token);
                                 let full = tokenizer.decode(&tracker.thinking_ids).unwrap_or_default();
                                 let new_text = &full[tracker.thinking_decoded_len..];
-                                if !new_text.is_empty() {
-                                    tracker.thinking_decoded_len = full.len();
-                                    let _ = tracker.tx.send(EngineEvent::ReasoningToken(new_text.to_string()));
+                                let emit = new_text.trim_end_matches('\u{FFFD}');
+                                if !emit.is_empty() {
+                                    tracker.thinking_decoded_len += emit.len();
+                                    let _ = tracker.tx.send(EngineEvent::ReasoningToken(emit.to_string()));
                                 }
                             } else {
                                 tracker.output_ids.push(tok.token);
                                 let full = tokenizer.decode(&tracker.output_ids).unwrap_or_default();
                                 let new_text = &full[tracker.decoded_len..];
-                                if !new_text.is_empty() {
-                                    tracker.decoded_len = full.len();
-                                    let _ = tracker.tx.send(EngineEvent::Token(new_text.to_string()));
+                                let emit = new_text.trim_end_matches('\u{FFFD}');
+                                if !emit.is_empty() {
+                                    tracker.decoded_len += emit.len();
+                                    let _ = tracker.tx.send(EngineEvent::Token(emit.to_string()));
                                 }
                             }
                         }
                     }
                     for completed in &step.completed {
-                        if let Some(tracker) = trackers.remove(&completed.id) {
+                        if let Some(mut tracker) = trackers.remove(&completed.id) {
+                            if !tracker.output_ids.is_empty() {
+                                let full = tokenizer.decode(&tracker.output_ids).unwrap_or_default();
+                                if tracker.decoded_len < full.len() {
+                                    let rest = &full[tracker.decoded_len..];
+                                    if !rest.is_empty() {
+                                        tracker.decoded_len = full.len();
+                                        let _ = tracker.tx.send(EngineEvent::Token(rest.to_string()));
+                                    }
+                                }
+                            }
+                            if !tracker.thinking_ids.is_empty() {
+                                let full = tokenizer.decode(&tracker.thinking_ids).unwrap_or_default();
+                                if tracker.thinking_decoded_len < full.len() {
+                                    let rest = &full[tracker.thinking_decoded_len..];
+                                    if !rest.is_empty() {
+                                        let _ = tracker.tx.send(EngineEvent::ReasoningToken(rest.to_string()));
+                                    }
+                                }
+                            }
                             let total_ms = tracker.enqueued_at.elapsed().as_secs_f64() * 1000.0;
                             let decode_s = tracker.first_token_at
                                 .map(|t| t.elapsed().as_secs_f64())

@@ -317,6 +317,7 @@ impl Attention {
                     self.scale as f32,
                     self.attn_softcap.map(|s| s as f32).unwrap_or(1.0),
                 )?;
+                let seg_out = seg_out.contiguous()?;
                 out_buf.slice_set(&seg_out, 2, q_offset)?;
                 q_offset += seg.num_tokens;
             }
@@ -358,7 +359,7 @@ impl Attention {
                 };
 
                 let attn = softmax_last_dim(&scores)?;
-                let seg_out = attn.matmul(&v_seg)?;
+                let seg_out = attn.matmul(&v_seg)?.contiguous()?;
                 out_buf.slice_set(&seg_out, 2, q_offset)?;
                 q_offset += seg.num_tokens;
             }

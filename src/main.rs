@@ -624,12 +624,21 @@ fn run_interactive(args: &RunArgs) -> anyhow::Result<()> {
                 output_ids.push(tok.token);
                 let full = tokenizer.decode(&output_ids)?;
                 let new_text = &full[decoded_len..];
-                if !new_text.is_empty() {
-                    print!("{}", new_text);
+                let emit = new_text.trim_end_matches('\u{FFFD}');
+                if !emit.is_empty() {
+                    print!("{}", emit);
                     std::io::stdout().flush()?;
-                    response_text.push_str(new_text);
-                    decoded_len = full.len();
+                    response_text.push_str(emit);
+                    decoded_len += emit.len();
                 }
+            }
+        }
+        if !output_ids.is_empty() {
+            let full = tokenizer.decode(&output_ids)?;
+            if decoded_len < full.len() {
+                let rest = &full[decoded_len..];
+                print!("{}", rest);
+                response_text.push_str(rest);
             }
         }
         println!("\n");

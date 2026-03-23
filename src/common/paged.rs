@@ -255,6 +255,8 @@ impl PagedKvCache {
 
     pub fn append(&mut self, new_k: &Tensor, new_v: &Tensor) -> Result<(Tensor, Tensor)> {
         let (_, _, new_seq, _) = new_k.dims4()?;
+        let new_k = &new_k.contiguous()?;
+        let new_v = &new_v.contiguous()?;
         let k_flat = new_k.squeeze(0)?.transpose(0, 1)?;
         let v_flat = new_v.squeeze(0)?.transpose(0, 1)?;
         let block_size = self.block_size;
@@ -306,8 +308,8 @@ impl PagedKvCache {
                     let new_k_buf = Tensor::zeros((1, n_kv, new_cap, hd), dtype, &device)?;
                     let new_v_buf = Tensor::zeros((1, n_kv, new_cap, hd), dtype, &device)?;
                     if self.contig_len > 0 {
-                        let old_k = k_buf.narrow(2, 0, self.contig_len)?;
-                        let old_v = v_buf.narrow(2, 0, self.contig_len)?;
+                        let old_k = k_buf.narrow(2, 0, self.contig_len)?.contiguous()?;
+                        let old_v = v_buf.narrow(2, 0, self.contig_len)?.contiguous()?;
                         new_k_buf.slice_set(&old_k, 2, 0)?;
                         new_v_buf.slice_set(&old_v, 2, 0)?;
                     }
@@ -330,8 +332,8 @@ impl PagedKvCache {
                     let prefix_slots = &self.table.cached_slots[..prev_tokens];
                     let idx = Tensor::from_slice(prefix_slots, (prev_tokens,), &device)?;
                     let (pk, pv) = self.allocator.lock().unwrap().gather(&idx)?;
-                    k_buf.slice_set(&pk, 2, 0)?;
-                    v_buf.slice_set(&pv, 2, 0)?;
+                    k_buf.slice_set(&pk.contiguous()?, 2, 0)?;
+                    v_buf.slice_set(&pv.contiguous()?, 2, 0)?;
                 }
                 k_buf.slice_set(new_k, 2, self.contig_len)?;
                 v_buf.slice_set(new_v, 2, self.contig_len)?;

@@ -622,15 +622,23 @@ fn run_interactive(args: &RunArgs) -> anyhow::Result<()> {
             let step = engine.step().map_err(|e| anyhow::anyhow!("{}", e))?;
             for tok in &step.new_tokens {
                 output_ids.push(tok.token);
-                let full = tokenizer.decode(&output_ids)?;
-                let new_text = &full[decoded_len..];
-                let emit = new_text.trim_end_matches('\u{FFFD}');
-                if !emit.is_empty() {
-                    print!("{}", emit);
-                    std::io::stdout().flush()?;
-                    response_text.push_str(emit);
-                    decoded_len += emit.len();
-                }
+                let single = tokenizer.decode(&[tok.token])?;
+                let emit = if !single.is_empty() && !single.contains('\u{FFFD}') {
+                    decoded_len += single.len();
+                    single
+                } else {
+                    let full = tokenizer.decode(&output_ids)?;
+                    let new_text = &full[decoded_len..];
+                    let trimmed = new_text.trim_end_matches('\u{FFFD}');
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    decoded_len += trimmed.len();
+                    trimmed.to_string()
+                };
+                print!("{}", emit);
+                std::io::stdout().flush()?;
+                response_text.push_str(&emit);
             }
         }
         if !output_ids.is_empty() {

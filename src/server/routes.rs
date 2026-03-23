@@ -207,6 +207,28 @@ fn enqueue_request(
     });
 }
 
+fn prefix_decode_token(
+    tokenizer: &Tokenizer,
+    all_ids: &[u32],
+    decoded_len: &mut usize,
+    token: u32,
+) -> Option<String> {
+    let single = tokenizer.decode(&[token]).unwrap_or_default();
+    if !single.is_empty() && !single.contains('\u{FFFD}') {
+        *decoded_len += single.len();
+        return Some(single);
+    }
+    let full = tokenizer.decode(all_ids).unwrap_or_default();
+    let new_text = &full[*decoded_len..];
+    let emit = new_text.trim_end_matches('\u{FFFD}');
+    if !emit.is_empty() {
+        *decoded_len += emit.len();
+        Some(emit.to_string())
+    } else {
+        None
+    }
+}
+
 pub fn engine_loop(
     mut engine: Engine,
     tokenizer: Arc<Tokenizer>,
@@ -276,21 +298,17 @@ pub fn engine_loop(
 
                             if tracker.in_thinking {
                                 tracker.thinking_ids.push(tok.token);
-                                let full = tokenizer.decode(&tracker.thinking_ids).unwrap_or_default();
-                                let new_text = &full[tracker.thinking_decoded_len..];
-                                let emit = new_text.trim_end_matches('\u{FFFD}');
-                                if !emit.is_empty() {
-                                    tracker.thinking_decoded_len += emit.len();
-                                    let _ = tracker.tx.send(EngineEvent::ReasoningToken(emit.to_string()));
+                                if let Some(text) = prefix_decode_token(
+                                    &tokenizer, &tracker.thinking_ids, &mut tracker.thinking_decoded_len, tok.token,
+                                ) {
+                                    let _ = tracker.tx.send(EngineEvent::ReasoningToken(text));
                                 }
                             } else {
                                 tracker.output_ids.push(tok.token);
-                                let full = tokenizer.decode(&tracker.output_ids).unwrap_or_default();
-                                let new_text = &full[tracker.decoded_len..];
-                                let emit = new_text.trim_end_matches('\u{FFFD}');
-                                if !emit.is_empty() {
-                                    tracker.decoded_len += emit.len();
-                                    let _ = tracker.tx.send(EngineEvent::Token(emit.to_string()));
+                                if let Some(text) = prefix_decode_token(
+                                    &tokenizer, &tracker.output_ids, &mut tracker.decoded_len, tok.token,
+                                ) {
+                                    let _ = tracker.tx.send(EngineEvent::Token(text));
                                 }
                             }
                         }

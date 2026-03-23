@@ -241,12 +241,16 @@ pub struct PagedKvCache {
     block_size: usize,
     contig_k: Option<Tensor>,
     contig_v: Option<Tensor>,
+    contig_len: usize,
 }
 
 impl PagedKvCache {
     pub fn new(allocator: SharedBlockAllocator) -> Self {
         let block_size = allocator.lock().unwrap().block_size();
-        Self { allocator, table: BlockTable::new(), block_size, contig_k: None, contig_v: None }
+        Self {
+            allocator, table: BlockTable::new(), block_size,
+            contig_k: None, contig_v: None, contig_len: 0,
+        }
     }
 
     pub fn append(&mut self, new_k: &Tensor, new_v: &Tensor) -> Result<(Tensor, Tensor)> {
@@ -284,29 +288,64 @@ impl PagedKvCache {
             written += n;
         }
 
-        let (ck, cv) = match (self.contig_k.take(), self.contig_v.take()) {
-            (Some(k), Some(v)) => {
-                // Fast decode path: cat only the new token(s) onto the existing buffer.
-                (Tensor::cat(&[&k, new_k], 2)?, Tensor::cat(&[&v, new_v], 2)?)
+        let total_needed = self.contig_len + new_seq;
+
+        match (self.contig_k.take(), self.contig_v.take()) {
+            (Some(k_buf), Some(v_buf)) => {
+                let cap = k_buf.dim(2)?;
+                if total_needed <= cap {
+                    k_buf.slice_set(new_k, 2, self.contig_len)?;
+                    v_buf.slice_set(new_v, 2, self.contig_len)?;
+                    self.contig_k = Some(k_buf);
+                    self.contig_v = Some(v_buf);
+                } else {
+                    let new_cap = (total_needed * 2).max(64);
+                    let (_, n_kv, _, hd) = k_buf.dims4()?;
+                    let device = k_buf.device().clone();
+                    let dtype = k_buf.dtype();
+                    let new_k_buf = Tensor::zeros((1, n_kv, new_cap, hd), dtype, &device)?;
+                    let new_v_buf = Tensor::zeros((1, n_kv, new_cap, hd), dtype, &device)?;
+                    if self.contig_len > 0 {
+                        let old_k = k_buf.narrow(2, 0, self.contig_len)?;
+                        let old_v = v_buf.narrow(2, 0, self.contig_len)?;
+                        new_k_buf.slice_set(&old_k, 2, 0)?;
+                        new_v_buf.slice_set(&old_v, 2, 0)?;
+                    }
+                    new_k_buf.slice_set(new_k, 2, self.contig_len)?;
+                    new_v_buf.slice_set(new_v, 2, self.contig_len)?;
+                    self.contig_k = Some(new_k_buf);
+                    self.contig_v = Some(new_v_buf);
+                }
             }
             (None, None) => {
+                let init_cap = (total_needed * 2).max(64);
+                let (_, n_kv, _, hd) = new_k.dims4()?;
+                let device = new_k.device().clone();
+                let dtype = new_k.dtype();
+                let k_buf = Tensor::zeros((1, n_kv, init_cap, hd), dtype, &device)?;
+                let v_buf = Tensor::zeros((1, n_kv, init_cap, hd), dtype, &device)?;
+
                 if prev_tokens > 0 {
+                    // Cold start with prefix cache: gather once, write into buffer.
                     let prefix_slots = &self.table.cached_slots[..prev_tokens];
-                    let idx = Tensor::from_slice(prefix_slots, (prev_tokens,), new_k.device())?;
+                    let idx = Tensor::from_slice(prefix_slots, (prev_tokens,), &device)?;
                     let (pk, pv) = self.allocator.lock().unwrap().gather(&idx)?;
-                    (Tensor::cat(&[&pk, new_k], 2)?, Tensor::cat(&[&pv, new_v], 2)?)
-                } else {
-                    (new_k.clone(), new_v.clone())
+                    k_buf.slice_set(&pk, 2, 0)?;
+                    v_buf.slice_set(&pv, 2, 0)?;
                 }
+                k_buf.slice_set(new_k, 2, self.contig_len)?;
+                v_buf.slice_set(new_v, 2, self.contig_len)?;
+                self.contig_k = Some(k_buf);
+                self.contig_v = Some(v_buf);
             }
             _ => unreachable!("contig_k and contig_v must always be in sync"),
         };
-        self.contig_k = Some(ck);
-        self.contig_v = Some(cv);
+        self.contig_len = total_needed;
 
+        // Return narrow views over the valid region — zero-copy.
         Ok((
-            self.contig_k.as_ref().unwrap().clone(),
-            self.contig_v.as_ref().unwrap().clone(),
+            self.contig_k.as_ref().unwrap().narrow(2, 0, self.contig_len)?,
+            self.contig_v.as_ref().unwrap().narrow(2, 0, self.contig_len)?,
         ))
     }
 
@@ -322,6 +361,7 @@ impl PagedKvCache {
         self.table.cached_slots.clear();
         self.contig_k = None;
         self.contig_v = None;
+        self.contig_len = 0;
     }
 
     pub fn prepopulate_block(&mut self, block_id: usize) {
@@ -336,13 +376,8 @@ impl PagedKvCache {
     pub fn set_num_tokens(&mut self, n: usize) {
         self.table.cached_slots.truncate(n);
         self.table.num_tokens = n;
-        if let Some(ck) = self.contig_k.take() {
-            let len = ck.dim(2).unwrap_or(0);
-            self.contig_k = if len > n { ck.narrow(2, 0, n).ok() } else { Some(ck) };
-        }
-        if let Some(cv) = self.contig_v.take() {
-            let len = cv.dim(2).unwrap_or(0);
-            self.contig_v = if len > n { cv.narrow(2, 0, n).ok() } else { Some(cv) };
+        if n < self.contig_len {
+            self.contig_len = n;
         }
     }
 

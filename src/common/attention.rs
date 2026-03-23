@@ -270,7 +270,7 @@ impl Attention {
         }
 
         let device = x.device();
-        let mut out_parts: Vec<Tensor> = Vec::with_capacity(segments.len());
+        let out_buf = Tensor::zeros((b, self.n_heads, total_seq, hd), q.dtype(), device)?;
         let mut q_offset = 0usize;
 
         // ── Metal SDPA path for batch ────────────────────────────────
@@ -313,7 +313,7 @@ impl Attention {
                     self.scale as f32,
                     self.attn_softcap.map(|s| s as f32).unwrap_or(1.0),
                 )?;
-                out_parts.push(seg_out);
+                out_buf.slice_set(&seg_out, 2, q_offset)?;
                 q_offset += seg.num_tokens;
             }
         } else {
@@ -355,13 +355,12 @@ impl Attention {
 
                 let attn = softmax_last_dim(&scores)?;
                 let seg_out = attn.matmul(&v_seg)?;
-                out_parts.push(seg_out);
+                out_buf.slice_set(&seg_out, 2, q_offset)?;
                 q_offset += seg.num_tokens;
             }
         }
 
-        let out = Tensor::cat(&out_parts, 2)?;
-        let out = out.transpose(1, 2)?.reshape((b, total_seq, self.n_heads * hd))?;
+        let out = out_buf.transpose(1, 2)?.reshape((b, total_seq, self.n_heads * hd))?;
         self.o_proj.forward(&out)
     }
 }

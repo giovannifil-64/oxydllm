@@ -178,6 +178,10 @@ struct SeqTracker {
     first_token_at: Option<std::time::Instant>,
     token_count: usize,
     in_thinking: bool,
+    output_ids: Vec<u32>,
+    thinking_ids: Vec<u32>,
+    decoded_len: usize,
+    thinking_decoded_len: usize,
 }
 
 fn enqueue_request(
@@ -196,6 +200,10 @@ fn enqueue_request(
         first_token_at: None,
         token_count: 0,
         in_thinking: req.enable_thinking,
+        output_ids: Vec::new(),
+        thinking_ids: Vec::new(),
+        decoded_len: 0,
+        thinking_decoded_len: 0,
     });
 }
 
@@ -266,14 +274,22 @@ pub fn engine_loop(
                                 }
                             }
 
-                            let text = tokenizer.decode(&[tok.token]).unwrap_or_default();
-                            if text.is_empty() {
-                                continue;
-                            }
                             if tracker.in_thinking {
-                                let _ = tracker.tx.send(EngineEvent::ReasoningToken(text));
+                                tracker.thinking_ids.push(tok.token);
+                                let full = tokenizer.decode(&tracker.thinking_ids).unwrap_or_default();
+                                let new_text = &full[tracker.thinking_decoded_len..];
+                                if !new_text.is_empty() {
+                                    tracker.thinking_decoded_len = full.len();
+                                    let _ = tracker.tx.send(EngineEvent::ReasoningToken(new_text.to_string()));
+                                }
                             } else {
-                                let _ = tracker.tx.send(EngineEvent::Token(text));
+                                tracker.output_ids.push(tok.token);
+                                let full = tokenizer.decode(&tracker.output_ids).unwrap_or_default();
+                                let new_text = &full[tracker.decoded_len..];
+                                if !new_text.is_empty() {
+                                    tracker.decoded_len = full.len();
+                                    let _ = tracker.tx.send(EngineEvent::Token(new_text.to_string()));
+                                }
                             }
                         }
                     }

@@ -70,7 +70,7 @@ pub fn sample(logits: &Tensor, params: &SamplingParams, prev_tokens: &[u32]) -> 
         probs_vec
     };
 
-    categorical_sample(&probs_vec, params.seed)
+    categorical_sample(&probs_vec, params.seed, prev_tokens.len() as u64)
 }
 
 fn apply_repetition_penalty_cpu(logits: &mut [f32], prev_tokens: &[u32], penalty: f32) {
@@ -148,9 +148,9 @@ fn renormalize(probs: &mut [f32]) {
     }
 }
 
-fn categorical_sample(probs: &[f32], seed: Option<u64>) -> Result<u32> {
+fn categorical_sample(probs: &[f32], seed: Option<u64>, step: u64) -> Result<u32> {
     let r: f32 = match seed {
-        Some(s) => seeded_rand_f32(s),
+        Some(s) => splitmix64_f32(s.wrapping_add(step)),
         None => thread_rand_f32(),
     };
     let mut cumulative = 0.0;
@@ -168,8 +168,8 @@ fn categorical_sample(probs: &[f32], seed: Option<u64>) -> Result<u32> {
     Ok(0)
 }
 
-fn seeded_rand_f32(seed: u64) -> f32 {
-    let mut z = seed.wrapping_add(0x9e3779b97f4a7c15);
+fn splitmix64_f32(x: u64) -> f32 {
+    let mut z = x.wrapping_add(0x9e3779b97f4a7c15);
     z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
     z = z ^ (z >> 31);
@@ -239,6 +239,26 @@ mod tests {
         apply_repetition_penalty_cpu(&mut logits, &[1], 2.0);
         assert!(logits[1] < 3.0);
         assert_eq!(logits[0], 2.0);
+    }
+
+    #[test]
+    fn seeded_sampling_varies_across_steps() {
+        let probs = vec![0.25_f32, 0.25, 0.25, 0.25];
+        let seed = Some(42u64);
+        let r0 = categorical_sample(&probs, seed, 0).unwrap();
+        let r1 = categorical_sample(&probs, seed, 1).unwrap();
+        let r2 = categorical_sample(&probs, seed, 2).unwrap();
+
+        assert!(!(r0 == r1 && r1 == r2), "seeded sampling returned same token for 3 consecutive steps");
+    }
+
+    #[test]
+    fn seeded_sampling_is_reproducible() {
+        let probs = vec![0.1_f32, 0.5, 0.3, 0.1];
+        let seed = Some(123u64);
+        let a = categorical_sample(&probs, seed, 7).unwrap();
+        let b = categorical_sample(&probs, seed, 7).unwrap();
+        assert_eq!(a, b, "same seed+step must produce same result");
     }
 
     #[test]

@@ -616,13 +616,20 @@ fn run_interactive(args: &RunArgs) -> anyhow::Result<()> {
         engine.add_request(prompt_tokens, args.sampling_params.clone(), max_tokens);
 
         let mut response_text = String::new();
+        let mut output_ids: Vec<u32> = Vec::new();
+        let mut decoded_len: usize = 0;
         while engine.has_pending_work() {
             let step = engine.step().map_err(|e| anyhow::anyhow!("{}", e))?;
             for tok in &step.new_tokens {
-                let text = tokenizer.decode(&[tok.token])?;
-                print!("{}", text);
-                std::io::stdout().flush()?;
-                response_text.push_str(&text);
+                output_ids.push(tok.token);
+                let full = tokenizer.decode(&output_ids)?;
+                let new_text = &full[decoded_len..];
+                if !new_text.is_empty() {
+                    print!("{}", new_text);
+                    std::io::stdout().flush()?;
+                    response_text.push_str(new_text);
+                    decoded_len = full.len();
+                }
             }
         }
         println!("\n");

@@ -514,7 +514,8 @@ async fn chat_completions(
     let remaining = handle.max_seq_len.saturating_sub(prompt_len);
     let max_tokens = body
         .max_tokens
-        .unwrap_or(remaining);
+        .unwrap_or(remaining)
+        .min(remaining);
 
     let (response_tx, response_rx) = tokio_mpsc::unbounded_channel();
 

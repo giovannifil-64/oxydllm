@@ -100,20 +100,24 @@ impl Attention {
             None,
         ));
 
-        let q_norm = cfg.qk_norm.then(|| {
-            RMSNorm::new(
-                weights.get(&format!("{}.q_norm.weight", p)).expect("q_norm.weight").clone(),
+        let q_norm = if cfg.qk_norm {
+            Some(RMSNorm::new(
+                weights.get(&format!("{}.q_norm.weight", p))?.clone(),
                 cfg.rms_norm_eps,
                 cfg.norm_type,
-            )
-        });
-        let k_norm = cfg.qk_norm.then(|| {
-            RMSNorm::new(
-                weights.get(&format!("{}.k_norm.weight", p)).expect("k_norm.weight").clone(),
+            ))
+        } else {
+            None
+        };
+        let k_norm = if cfg.qk_norm {
+            Some(RMSNorm::new(
+                weights.get(&format!("{}.k_norm.weight", p))?.clone(),
                 cfg.rms_norm_eps,
                 cfg.norm_type,
-            )
-        });
+            ))
+        } else {
+            None
+        };
 
         let q_dim = cfg.n_heads * hd;
         let kv_dim = cfg.n_kv_heads * hd;

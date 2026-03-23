@@ -97,7 +97,9 @@ pub fn load_registry(models_dir: &Path) -> HashMap<String, RegistryEntry> {
 pub fn save_registry(models_dir: &Path, registry: &HashMap<String, RegistryEntry>) {
     let path = registry_path(models_dir);
     if let Ok(json) = serde_json::to_string_pretty(registry) {
-        let _ = std::fs::write(path, json);
+        if let Err(e) = std::fs::write(&path, &json) {
+            eprintln!("[registry] Failed to save {}: {e}", path.display());
+        }
     }
 }
 

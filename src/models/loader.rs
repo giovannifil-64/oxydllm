@@ -242,7 +242,8 @@ fn discover_gguf_model(id: &str, gguf_path: &Path) -> Option<DiscoveredModel> {
 
     let arch_display = match arch.as_str() {
         "llama" => "LlamaForCausalLM (GGUF)".to_string(),
-        "qwen2" | "qwen3" => "Qwen3ForCausalLM (GGUF)".to_string(),
+        "qwen2" => "Qwen2ForCausalLM (GGUF)".to_string(),
+        "qwen3" => "Qwen3ForCausalLM (GGUF)".to_string(),
         other => format!("{} (GGUF)", other),
     };
 

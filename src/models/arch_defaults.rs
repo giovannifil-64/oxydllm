@@ -52,6 +52,7 @@ pub fn known_unsupported_reason(arch: &str) -> Option<&'static str> {
         | "MixtralForCausalLM"
         | "DeepseekV2ForCausalLM"
         | "DeepseekV3ForCausalLM" => Some("Mixture-of-Experts (MoE) architectures are not yet supported"),
+        "Qwen3_5ForConditionalGeneration" => Some("Hybrid linear+full attention models are not yet supported"),
         _ => None,
     }
 }

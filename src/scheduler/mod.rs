@@ -167,7 +167,7 @@ impl Scheduler {
             }
         }
 
-        let free_blocks = self.num_free_blocks();
+        let mut free_blocks = self.num_free_blocks();
 
         while self.running.len() < self.config.max_num_sequences && budget > 0 {
             let seq = match self.waiting.front() {
@@ -194,6 +194,7 @@ impl Scheduler {
                 phase: SequencePhase::Prefill,
             });
             budget -= tokens_needed;
+            free_blocks = free_blocks.saturating_sub(blocks_needed);
 
             self.push_to_running(seq);
         }
@@ -238,6 +239,17 @@ impl Scheduler {
             }
         }
         self.running_index.clear();
+        ids
+    }
+
+    pub fn abort_all(&mut self) -> Vec<SequenceId> {
+        let mut ids = self.abort_all_running();
+        for mut seq in self.waiting.drain(..) {
+            ids.push(seq.id);
+            for cache in &mut seq.caches {
+                cache.clear();
+            }
+        }
         ids
     }
 

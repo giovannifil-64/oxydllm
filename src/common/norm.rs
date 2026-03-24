@@ -9,20 +9,20 @@ pub struct RMSNorm {
 }
 
 impl RMSNorm {
-    pub fn new(weight: Tensor, eps: f64, variant: NormType) -> Self {
+    pub fn new(weight: Tensor, eps: f64, variant: NormType) -> Result<Self> {
         let weight = match variant {
-            NormType::Gemma => weight.affine(1.0, 1.0).expect("RMSNorm Gemma weight+1 failed"),
+            NormType::Gemma => weight.affine(1.0, 1.0)?,
             NormType::Standard => weight,
         };
-        Self { weight, eps }
+        Ok(Self { weight, eps })
     }
     pub fn load(weights: &ModelWeights, name: &str, eps: f64, variant: NormType) -> Result<Self> {
         let weight = weights.get(&format!("{}.weight", name))?.clone();
-        Ok(Self::new(weight, eps, variant))
+        Self::new(weight, eps, variant)
     }
     pub fn from_qtensor(qtensor: &QTensor, device: &Device, dtype: DType, eps: f64, variant: NormType) -> Result<Self> {
         let weight = qtensor.dequantize(device)?.to_dtype(dtype)?;
-        Ok(Self::new(weight, eps, variant))
+        Self::new(weight, eps, variant)
     }
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         #[cfg(feature = "metal")]

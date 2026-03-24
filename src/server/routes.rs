@@ -236,6 +236,8 @@ pub fn engine_loop(
     shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) {
     let mut trackers: HashMap<SequenceId, SeqTracker> = HashMap::new();
+    let mut consecutive_errors: u32 = 0;
+    const MAX_CONSECUTIVE_ERRORS: u32 = 3;
 
     let think_start_id = tokenizer.special_token_id("<think>");
     let think_end_id = tokenizer.special_token_id("</think>");
@@ -267,6 +269,7 @@ pub fn engine_loop(
             };
             match step_result {
                 Ok(step) => {
+                    consecutive_errors = 0;
                     for tok in &step.new_tokens {
                         if let Some(tracker) = trackers.get_mut(&tok.seq_id) {
                             if tracker.first_token_at.is_none() {
@@ -359,15 +362,27 @@ pub fn engine_loop(
                     }
                 }
                 Err(e) => {
-                    eprintln!("Engine error: {e}");
-                    let aborted_ids = engine.abort_running();
-                    for id in aborted_ids {
-                        if let Some(tracker) = trackers.remove(&id) {
-                            let _ = tracker.tx.send(EngineEvent::Error(e.to_string()));
-                            let _ = tracker.tx.send(EngineEvent::StreamEnd);
+                    consecutive_errors += 1;
+                    eprintln!("Engine error ({consecutive_errors}/{MAX_CONSECUTIVE_ERRORS}): {e}");
+
+                    if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
+                        eprintln!("[CRITICAL] {consecutive_errors} consecutive engine errors — aborting all sequences");
+                        let aborted_ids = engine.abort_all();
+                        for id in aborted_ids {
+                            if let Some(tracker) = trackers.remove(&id) {
+                                let _ = tracker.tx.send(EngineEvent::Error(e.to_string()));
+                                let _ = tracker.tx.send(EngineEvent::StreamEnd);
+                            }
+                        }
+                    } else {
+                        let aborted_ids = engine.abort_running();
+                        for id in aborted_ids {
+                            if let Some(tracker) = trackers.remove(&id) {
+                                let _ = tracker.tx.send(EngineEvent::Error(e.to_string()));
+                                let _ = tracker.tx.send(EngineEvent::StreamEnd);
+                            }
                         }
                     }
-                    // Do not break, the engine remains alive for subsequent requests.
                 }
             }
             std::thread::yield_now();

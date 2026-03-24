@@ -105,7 +105,7 @@ impl Attention {
                 weights.get(&format!("{}.q_norm.weight", p))?.clone(),
                 cfg.rms_norm_eps,
                 cfg.norm_type,
-            ))
+            )?)
         } else {
             None
         };
@@ -114,7 +114,7 @@ impl Attention {
                 weights.get(&format!("{}.k_norm.weight", p))?.clone(),
                 cfg.rms_norm_eps,
                 cfg.norm_type,
-            ))
+            )?)
         } else {
             None
         };

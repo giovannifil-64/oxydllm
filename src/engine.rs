@@ -280,6 +280,10 @@ impl Engine {
         self.scheduler.abort_all_running()
     }
 
+    pub fn abort_all(&mut self) -> Vec<SequenceId> {
+        self.scheduler.abort_all()
+    }
+
     pub fn has_pending_work(&self) -> bool {
         self.scheduler.has_pending_work()
     }

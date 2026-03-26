@@ -7,6 +7,8 @@ pub struct SamplingParams {
     pub top_p: f32,
     pub min_p: f32,
     pub repetition_penalty: f32,
+    pub frequency_penalty: f32,
+    pub presence_penalty: f32,
     pub seed: Option<u64>,
 }
 
@@ -18,6 +20,8 @@ impl Default for SamplingParams {
             top_p: 1.0,
             min_p: 0.0,
             repetition_penalty: 1.0,
+            frequency_penalty: 0.0,
+            presence_penalty: 0.0,
             seed: None,
         }
     }
@@ -32,6 +36,15 @@ pub fn sample(logits: &Tensor, params: &SamplingParams, prev_tokens: &[u32]) -> 
 
     if params.repetition_penalty != 1.0 {
         apply_repetition_penalty_cpu(&mut logits_vec, prev_tokens, params.repetition_penalty);
+    }
+
+    if params.frequency_penalty != 0.0 || params.presence_penalty != 0.0 {
+        apply_frequency_presence_penalty(
+            &mut logits_vec,
+            prev_tokens,
+            params.frequency_penalty,
+            params.presence_penalty,
+        );
     }
 
     let inv_temp = 1.0 / params.temperature;
@@ -79,6 +92,24 @@ fn apply_repetition_penalty_cpu(logits: &mut [f32], prev_tokens: &[u32], penalty
         if idx < logits.len() {
             let l = logits[idx];
             logits[idx] = if l > 0.0 { l / penalty } else { l * penalty };
+        }
+    }
+}
+
+fn apply_frequency_presence_penalty(
+    logits: &mut [f32],
+    prev_tokens: &[u32],
+    frequency_penalty: f32,
+    presence_penalty: f32,
+) {
+    let mut counts = std::collections::HashMap::<u32, u32>::new();
+    for &tok in prev_tokens {
+        *counts.entry(tok).or_insert(0) += 1;
+    }
+    for (&tok, &count) in &counts {
+        let idx = tok as usize;
+        if idx < logits.len() {
+            logits[idx] -= frequency_penalty * count as f32 + presence_penalty;
         }
     }
 }

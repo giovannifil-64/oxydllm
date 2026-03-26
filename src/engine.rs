@@ -66,6 +66,16 @@ impl Engine {
         self.scheduler.add_request(prompt_tokens, sampling_params, max_tokens)
     }
 
+    pub fn add_request_with_stop(
+        &mut self,
+        prompt_tokens: Vec<u32>,
+        sampling_params: SamplingParams,
+        max_tokens: usize,
+        extra_stop_token_ids: Vec<u32>,
+    ) -> SequenceId {
+        self.scheduler.add_request_with_stop(prompt_tokens, sampling_params, max_tokens, extra_stop_token_ids)
+    }
+
     pub fn step(&mut self) -> Result<StepOutput> {
         let Engine {
             model, scheduler, device, stop_token_ids,
@@ -220,7 +230,10 @@ impl Engine {
                 let seq = scheduler.get_running(info.seq_id).unwrap();
                 sampling::sample(&seq_logits, &seq.sampling_params, &seq.all_tokens)?
             };
-            let is_stop = stop_token_ids.contains(&next_token);
+            let is_stop = stop_token_ids.contains(&next_token) || {
+                let seq = scheduler.get_running(info.seq_id).unwrap();
+                seq.extra_stop_token_ids.contains(&next_token)
+            };
 
             let emit = {
                 let seq = scheduler.get_running_mut(info.seq_id).unwrap();
@@ -262,7 +275,8 @@ impl Engine {
             let seq = scheduler.get_running_mut(seq_id).unwrap();
             let next_token =
                 sampling::sample(&seq_logits, &seq.sampling_params, &seq.all_tokens)?;
-            let is_stop = stop_token_ids.contains(&next_token);
+            let is_stop = stop_token_ids.contains(&next_token)
+                || seq.extra_stop_token_ids.contains(&next_token);
 
             seq.all_tokens.push(next_token);
             seq.num_processed_tokens = seq.all_tokens.len() - 1;

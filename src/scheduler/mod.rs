@@ -83,6 +83,16 @@ impl Scheduler {
         sampling_params: SamplingParams,
         max_tokens: usize,
     ) -> SequenceId {
+        self.add_request_with_stop(prompt_tokens, sampling_params, max_tokens, Vec::new())
+    }
+
+    pub fn add_request_with_stop(
+        &mut self,
+        prompt_tokens: Vec<u32>,
+        sampling_params: SamplingParams,
+        max_tokens: usize,
+        extra_stop_token_ids: Vec<u32>,
+    ) -> SequenceId {
         let id = self.next_id;
         self.next_id += 1;
 
@@ -103,6 +113,7 @@ impl Scheduler {
             num_processed_tokens: 0,
             max_tokens,
             finish_reason: None,
+            extra_stop_token_ids,
         };
 
         self.waiting.push_back(seq);

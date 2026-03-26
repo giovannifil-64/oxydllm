@@ -29,6 +29,7 @@ pub struct SequenceState {
     pub num_processed_tokens: usize,
     pub max_tokens: usize,
     pub finish_reason: Option<String>,
+    pub extra_stop_token_ids: Vec<u32>,
 }
 
 impl SequenceState {

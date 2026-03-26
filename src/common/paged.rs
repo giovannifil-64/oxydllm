@@ -2,6 +2,7 @@ use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use candle_core::{DType, Device, Result, Tensor};
+use super::kv_quant::KvQuantizer;
 
 pub const DEFAULT_BLOCK_SIZE: usize = 16;
 
@@ -88,7 +89,6 @@ fn detect_available_memory_bytes() -> Option<usize> {
             || line.starts_with("Pages inactive:")
             || line.starts_with("Pages speculative:");
         if reclaimable {
-            // Lines look like: "Pages free:      174978."
             if let Some(n) = line
                 .split_whitespace()
                 .last()
@@ -131,13 +131,30 @@ fn detect_available_memory_bytes() -> Option<usize> {
     None
 }
 
+enum KvPool {
+    Full {
+        pool_k: Tensor,
+        pool_v: Tensor,
+    },
+    Quantized {
+        packed_k: Vec<u8>,
+        packed_v: Vec<u8>,
+        norms_k: Vec<f32>,
+        norms_v: Vec<f32>,
+        quantizer: Arc<KvQuantizer>,
+    },
+}
+
 pub struct BlockAllocator {
-    pool_k: Tensor,
-    pool_v: Tensor,
+    pool: KvPool,
     free_list: Vec<usize>,
     ref_counts: Vec<u32>,
     num_blocks: usize,
     block_size: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    dtype: DType,
+    device: Device,
 }
 
 impl BlockAllocator {
@@ -148,13 +165,32 @@ impl BlockAllocator {
         head_dim: usize,
         dtype: DType,
         device: &Device,
+        quantizer: Option<Arc<KvQuantizer>>,
     ) -> Result<Self> {
         let total_slots = num_blocks * block_size;
-        let pool_k = Tensor::zeros((total_slots, n_kv_heads, head_dim), dtype, device)?;
-        let pool_v = Tensor::zeros((total_slots, n_kv_heads, head_dim), dtype, device)?;
         let free_list = (0..num_blocks).rev().collect();
         let ref_counts = vec![0u32; num_blocks];
-        Ok(Self { pool_k, pool_v, free_list, ref_counts, num_blocks, block_size })
+
+        let pool = if let Some(q) = quantizer {
+            let bph = q.packed_index_bytes();
+            KvPool::Quantized {
+                packed_k: vec![0u8; total_slots * n_kv_heads * bph],
+                packed_v: vec![0u8; total_slots * n_kv_heads * bph],
+                norms_k: vec![0f32; total_slots * n_kv_heads],
+                norms_v: vec![0f32; total_slots * n_kv_heads],
+                quantizer: q,
+            }
+        } else {
+            KvPool::Full {
+                pool_k: Tensor::zeros((total_slots, n_kv_heads, head_dim), dtype, device)?,
+                pool_v: Tensor::zeros((total_slots, n_kv_heads, head_dim), dtype, device)?,
+            }
+        };
+
+        Ok(Self {
+            pool, free_list, ref_counts, num_blocks, block_size,
+            n_kv_heads, head_dim, dtype, device: device.clone(),
+        })
     }
 
     pub fn allocate(&mut self) -> Result<usize> {
@@ -191,32 +227,173 @@ impl BlockAllocator {
         self.block_size
     }
 
-    /// Total bytes occupied by the K and V pool tensors.
-    pub fn pool_bytes(&self) -> usize {
-        let k_bytes = self.pool_k.elem_count() * self.pool_k.dtype().size_in_bytes();
-        let v_bytes = self.pool_v.elem_count() * self.pool_v.dtype().size_in_bytes();
-        k_bytes + v_bytes
+    pub fn is_quantized(&self) -> bool {
+        matches!(self.pool, KvPool::Quantized { .. })
     }
 
+    pub fn dims(&self) -> (usize, usize) {
+        (self.n_kv_heads, self.head_dim)
+    }
+
+    /// Returns a clone of the quantizer Arc if the pool is quantized.
+    pub fn get_quantizer(&self) -> Option<Arc<KvQuantizer>> {
+        match &self.pool {
+            KvPool::Quantized { quantizer, .. } => Some(Arc::clone(quantizer)),
+            _ => None,
+        }
+    }
+
+    /// Copy pre-quantized CPU-staged data into the block pool.
+    /// All slices are indexed as flat `[n_tokens * n_kv_heads * bph]` (packed)
+    /// or `[n_tokens * n_kv_heads]` (norms).
+    /// Holds the lock for microseconds (pure memcpy — no quantization).
+    pub fn write_staged(
+        &mut self,
+        block_id: usize,
+        offset: usize,
+        n_tokens: usize,
+        pk_staged: &[u8],
+        nk_staged: &[f32],
+        pv_staged: &[u8],
+        nv_staged: &[f32],
+    ) {
+        let KvPool::Quantized { packed_k, norms_k, packed_v, norms_v, quantizer } = &mut self.pool
+        else {
+            return;
+        };
+        let bph = quantizer.packed_index_bytes();
+        let nkv = self.n_kv_heads;
+        let start = block_id * self.block_size + offset;
+        for t in 0..n_tokens {
+            let slot = start + t;
+            let sb = t * nkv * bph;
+            let sn = t * nkv;
+            let db = slot * nkv * bph;
+            let dn = slot * nkv;
+            packed_k[db..db + nkv * bph].copy_from_slice(&pk_staged[sb..sb + nkv * bph]);
+            norms_k[dn..dn + nkv].copy_from_slice(&nk_staged[sn..sn + nkv]);
+            packed_v[db..db + nkv * bph].copy_from_slice(&pv_staged[sb..sb + nkv * bph]);
+            norms_v[dn..dn + nkv].copy_from_slice(&nv_staged[sn..sn + nkv]);
+        }
+    }
+
+    pub fn pool_bytes(&self) -> usize {
+        match &self.pool {
+            KvPool::Full { pool_k, pool_v } => {
+                pool_k.elem_count() * pool_k.dtype().size_in_bytes()
+                    + pool_v.elem_count() * pool_v.dtype().size_in_bytes()
+            }
+            KvPool::Quantized { packed_k, packed_v, norms_k, norms_v, .. } => {
+                packed_k.len() + packed_v.len()
+                    + (norms_k.len() + norms_v.len()) * std::mem::size_of::<f32>()
+            }
+        }
+    }
+
+    /// Write KV data for a chunk of tokens into the block pool.
+    /// data_k, data_v shape: [n_tokens, n_kv_heads, head_dim]
     pub fn write(
-        &self,
+        &mut self,
         block_id: usize,
         offset: usize,
         data_k: &Tensor,
         data_v: &Tensor,
     ) -> Result<()> {
         let start = block_id * self.block_size + offset;
-        self.pool_k.slice_set(data_k, 0, start)?;
-        self.pool_v.slice_set(data_v, 0, start)?;
+        match &mut self.pool {
+            KvPool::Full { pool_k, pool_v } => {
+                pool_k.slice_set(data_k, 0, start)?;
+                pool_v.slice_set(data_v, 0, start)?;
+            }
+            KvPool::Quantized { packed_k, packed_v, norms_k, norms_v, quantizer } => {
+                let n_tokens = data_k.dim(0)?;
+                let k_f32 = data_k.to_dtype(DType::F32)?.to_device(&Device::Cpu)?;
+                let v_f32 = data_v.to_dtype(DType::F32)?.to_device(&Device::Cpu)?;
+                let k_vec: Vec<f32> = k_f32.flatten_all()?.to_vec1()?;
+                let v_vec: Vec<f32> = v_f32.flatten_all()?.to_vec1()?;
+
+                let bph = quantizer.packed_index_bytes();
+                let hd = self.head_dim;
+                let nkv = self.n_kv_heads;
+
+                for t in 0..n_tokens {
+                    let slot = start + t;
+                    for h in 0..nkv {
+                        let src = (t * nkv + h) * hd;
+                        let byte_dst = slot * nkv * bph + h * bph;
+                        let norm_dst = slot * nkv + h;
+
+                        let (pk, nk) = quantizer.quantize(&k_vec[src..src + hd]);
+                        packed_k[byte_dst..byte_dst + bph].copy_from_slice(&pk);
+                        norms_k[norm_dst] = nk;
+
+                        let (pv, nv) = quantizer.quantize(&v_vec[src..src + hd]);
+                        packed_v[byte_dst..byte_dst + bph].copy_from_slice(&pv);
+                        norms_v[norm_dst] = nv;
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
+    /// Gather KV data for given slot indices.
+    /// Returns (K, V) with shape [1, n_kv_heads, num_tokens, head_dim].
     pub fn gather(&self, slot_indices: &Tensor) -> Result<(Tensor, Tensor)> {
-        let k = self.pool_k.index_select(slot_indices, 0)?;
-        let v = self.pool_v.index_select(slot_indices, 0)?;
-        let k = k.transpose(0, 1)?.unsqueeze(0)?;
-        let v = v.transpose(0, 1)?.unsqueeze(0)?;
-        Ok((k, v))
+        match &self.pool {
+            KvPool::Full { pool_k, pool_v } => {
+                let k = pool_k.index_select(slot_indices, 0)?;
+                let v = pool_v.index_select(slot_indices, 0)?;
+                let k = k.transpose(0, 1)?.unsqueeze(0)?;
+                let v = v.transpose(0, 1)?.unsqueeze(0)?;
+                Ok((k, v))
+            }
+            KvPool::Quantized { packed_k, packed_v, norms_k, norms_v, quantizer } => {
+                let indices: Vec<u32> = slot_indices
+                    .to_device(&Device::Cpu)?
+                    .to_vec1()?;
+                let num_tokens = indices.len();
+                let bph = quantizer.packed_index_bytes();
+                let hd = self.head_dim;
+                let nkv = self.n_kv_heads;
+
+                let mut k_data = vec![0f32; num_tokens * nkv * hd];
+                let mut v_data = vec![0f32; num_tokens * nkv * hd];
+
+                for (t, &slot) in indices.iter().enumerate() {
+                    let slot = slot as usize;
+                    for h in 0..nkv {
+                        let byte_src = slot * nkv * bph + h * bph;
+                        let norm_src = slot * nkv + h;
+                        let dst = (t * nkv + h) * hd;
+
+                        let dk = quantizer.dequantize(
+                            &packed_k[byte_src..byte_src + bph],
+                            norms_k[norm_src],
+                        );
+                        k_data[dst..dst + hd].copy_from_slice(&dk);
+
+                        let dv = quantizer.dequantize(
+                            &packed_v[byte_src..byte_src + bph],
+                            norms_v[norm_src],
+                        );
+                        v_data[dst..dst + hd].copy_from_slice(&dv);
+                    }
+                }
+
+                let k = Tensor::from_vec(k_data, (num_tokens, nkv, hd), &Device::Cpu)?
+                    .to_dtype(self.dtype)?
+                    .to_device(&self.device)?
+                    .transpose(0, 1)?
+                    .unsqueeze(0)?;
+                let v = Tensor::from_vec(v_data, (num_tokens, nkv, hd), &Device::Cpu)?
+                    .to_dtype(self.dtype)?
+                    .to_device(&self.device)?
+                    .transpose(0, 1)?
+                    .unsqueeze(0)?;
+                Ok((k, v))
+            }
+        }
     }
 }
 
@@ -235,21 +412,51 @@ impl BlockTable {
     }
 }
 
+/// Deferred block pool write (avoids GPU→CPU sync during forward pass).
+struct PendingWrite {
+    block_id: usize,
+    offset: usize,
+    k_chunk: Tensor,
+    v_chunk: Tensor,
+}
+
+/// Metadata for one block-pool write, sent to the background quantization thread.
+struct BgFlushItem {
+    block_id: usize,
+    offset: usize,
+    n_tokens: usize,
+}
+
 pub struct PagedKvCache {
     allocator: SharedBlockAllocator,
+    /// Cached quantizer reference — avoids locking the allocator in the hot path.
+    quantizer: Option<Arc<KvQuantizer>>,
     table: BlockTable,
     block_size: usize,
     contig_k: Option<Tensor>,
     contig_v: Option<Tensor>,
     contig_len: usize,
+    pending_writes: Vec<PendingWrite>,
+    /// Option 2: handle for the background quantization thread spawned by flush_pending().
+    bg_flush: Option<std::thread::JoinHandle<()>>,
 }
 
 impl PagedKvCache {
     pub fn new(allocator: SharedBlockAllocator) -> Self {
-        let block_size = allocator.lock().unwrap().block_size();
+        let alloc = allocator.lock().unwrap();
+        let block_size = alloc.block_size();
+        let quantizer = alloc.get_quantizer();
+        drop(alloc);
         Self {
-            allocator, table: BlockTable::new(), block_size,
-            contig_k: None, contig_v: None, contig_len: 0,
+            allocator,
+            quantizer,
+            table: BlockTable::new(),
+            block_size,
+            contig_k: None,
+            contig_v: None,
+            contig_len: 0,
+            pending_writes: Vec::new(),
+            bg_flush: None,
         }
     }
 
@@ -260,6 +467,12 @@ impl PagedKvCache {
         let k_flat = new_k.squeeze(0)?.transpose(0, 1)?;
         let v_flat = new_v.squeeze(0)?.transpose(0, 1)?;
         let block_size = self.block_size;
+
+        // Option 3: Skip block-pool writes for single-token decode steps.
+        // The contiguous buffer is always present during decode and serves all
+        // attention.  Pool writes are only needed for prefix-cache reuse, and
+        // the prefix cache only uses full blocks filled during prefill.
+        let skip_pool_write = self.contig_len > 0 && new_seq == 1;
 
         let prev_tokens = self.table.num_tokens;
         let mut written = 0;
@@ -277,7 +490,18 @@ impl PagedKvCache {
                     self.table.block_ids.push(id);
                 }
                 let id = *self.table.block_ids.last().unwrap();
-                alloc.write(id, current_offset, &k_chunk, &v_chunk)?;
+                if !skip_pool_write {
+                    if alloc.is_quantized() {
+                        self.pending_writes.push(PendingWrite {
+                            block_id: id,
+                            offset: current_offset,
+                            k_chunk: k_chunk.clone(),
+                            v_chunk: v_chunk.clone(),
+                        });
+                    } else {
+                        alloc.write(id, current_offset, &k_chunk, &v_chunk)?;
+                    }
+                }
                 id
             };
 
@@ -328,7 +552,6 @@ impl PagedKvCache {
                 let v_buf = Tensor::zeros((1, n_kv, init_cap, hd), dtype, &device)?;
 
                 if prev_tokens > 0 {
-                    // Cold start with prefix cache: gather once, write into buffer.
                     let prefix_slots = &self.table.cached_slots[..prev_tokens];
                     let idx = Tensor::from_slice(prefix_slots, (prev_tokens,), &device)?;
                     let (pk, pv) = self.allocator.lock().unwrap().gather(&idx)?;
@@ -344,14 +567,152 @@ impl PagedKvCache {
         };
         self.contig_len = total_needed;
 
-        // Return narrow views over the valid region — zero-copy.
         Ok((
             self.contig_k.as_ref().unwrap().narrow(2, 0, self.contig_len)?,
             self.contig_v.as_ref().unwrap().narrow(2, 0, self.contig_len)?,
         ))
     }
 
+    /// Flush deferred quantized writes to the block pool.
+    ///
+    /// Three optimizations applied here:
+    /// - Option 3: decode steps never populate `pending_writes`, so this is a
+    ///   no-op for every decode token (see `append`).
+    /// - Option 1: all pending K chunks and all pending V chunks are concatenated
+    ///   into one tensor each before the GPU→CPU transfer, reducing 28 Metal
+    ///   command-buffer syncs to 2.
+    /// - Option 2: after the (cheap) batched transfer the CPU quantization is
+    ///   dispatched to a background thread so the GPU can start the next forward
+    ///   pass immediately.  The join happens at the start of the *next* call, by
+    ///   which time the GPU decode step (≥21 ms) has given the CPU thread
+    ///   (≈15 ms) ample time to finish.
+    pub fn flush_pending(&mut self) -> Result<()> {
+        // Always join a previous background flush before touching pending_writes.
+        if let Some(handle) = self.bg_flush.take() {
+            handle.join().map_err(|_| {
+                candle_core::Error::Msg("bg flush thread panicked".to_string())
+            })?;
+        }
+
+        if self.pending_writes.is_empty() {
+            return Ok(());
+        }
+
+        // Non-quantized path: write directly (full-precision pool).
+        if self.quantizer.is_none() {
+            let mut alloc = self.allocator.lock().unwrap();
+            for pw in self.pending_writes.drain(..) {
+                alloc.write(pw.block_id, pw.offset, &pw.k_chunk, &pw.v_chunk)?;
+            }
+            return Ok(());
+        }
+
+        // ── Option 1: single batched GPU→CPU transfer ─────────────────────────
+        let token_counts: Vec<usize> = self.pending_writes.iter()
+            .map(|pw| pw.k_chunk.dim(0).unwrap_or(1))
+            .collect();
+
+        let k_cat = if self.pending_writes.len() == 1 {
+            self.pending_writes[0].k_chunk.clone()
+        } else {
+            Tensor::cat(
+                &self.pending_writes.iter().map(|pw| &pw.k_chunk).collect::<Vec<_>>(),
+                0,
+            )?
+        };
+        let v_cat = if self.pending_writes.len() == 1 {
+            self.pending_writes[0].v_chunk.clone()
+        } else {
+            Tensor::cat(
+                &self.pending_writes.iter().map(|pw| &pw.v_chunk).collect::<Vec<_>>(),
+                0,
+            )?
+        };
+
+        // Two GPU→CPU syncs total (one for K, one for V) regardless of layer count.
+        let k_vec: Vec<f32> = k_cat
+            .to_dtype(DType::F32)?
+            .to_device(&Device::Cpu)?
+            .flatten_all()?
+            .to_vec1()?;
+        let v_vec: Vec<f32> = v_cat
+            .to_dtype(DType::F32)?
+            .to_device(&Device::Cpu)?
+            .flatten_all()?
+            .to_vec1()?;
+
+        // Build a lightweight write plan (no Tensor references — safe to send).
+        let items: Vec<BgFlushItem> = self.pending_writes
+            .drain(..)
+            .zip(token_counts.iter())
+            .map(|(pw, &n)| BgFlushItem {
+                block_id: pw.block_id,
+                offset: pw.offset,
+                n_tokens: n,
+            })
+            .collect();
+
+        // Capture owned values for the background thread.
+        let allocator = Arc::clone(&self.allocator);
+        let quantizer = Arc::clone(self.quantizer.as_ref().unwrap());
+        let (nkv, hd) = allocator.lock().unwrap().dims();
+
+        // ── Option 2: async CPU quantization ──────────────────────────────────
+        // The GPU→CPU data is already on the CPU.  Quantization is pure CPU math
+        // and can overlap with the GPU's next forward pass.  We hold the
+        // allocator lock only for the final bulk memcpy, not during quantization.
+        self.bg_flush = Some(std::thread::spawn(move || {
+            let bph = quantizer.packed_index_bytes();
+            let total_tokens: usize = items.iter().map(|it| it.n_tokens).sum();
+
+            // Pre-quantize into staging buffers — no lock needed.
+            let mut pk_staged = vec![0u8; total_tokens * nkv * bph];
+            let mut nk_staged = vec![0f32; total_tokens * nkv];
+            let mut pv_staged = vec![0u8; total_tokens * nkv * bph];
+            let mut nv_staged = vec![0f32; total_tokens * nkv];
+
+            for t in 0..total_tokens {
+                for h in 0..nkv {
+                    let src = (t * nkv + h) * hd;
+                    let db = (t * nkv + h) * bph;
+                    let dn = t * nkv + h;
+
+                    let (pk, nk) = quantizer.quantize(&k_vec[src..src + hd]);
+                    pk_staged[db..db + bph].copy_from_slice(&pk);
+                    nk_staged[dn] = nk;
+
+                    let (pv, nv) = quantizer.quantize(&v_vec[src..src + hd]);
+                    pv_staged[db..db + bph].copy_from_slice(&pv);
+                    nv_staged[dn] = nv;
+                }
+            }
+
+            // Acquire lock once for a fast bulk memcpy.
+            let mut alloc = allocator.lock().unwrap();
+            let mut t_off = 0usize;
+            for item in &items {
+                let t_end = t_off + item.n_tokens;
+                alloc.write_staged(
+                    item.block_id,
+                    item.offset,
+                    item.n_tokens,
+                    &pk_staged[t_off * nkv * bph..t_end * nkv * bph],
+                    &nk_staged[t_off * nkv..t_end * nkv],
+                    &pv_staged[t_off * nkv * bph..t_end * nkv * bph],
+                    &nv_staged[t_off * nkv..t_end * nkv],
+                );
+                t_off += item.n_tokens;
+            }
+        }));
+
+        Ok(())
+    }
+
     pub fn clear(&mut self) {
+        if let Some(handle) = self.bg_flush.take() {
+            handle.join().ok();
+        }
+        self.pending_writes.clear();
         if !self.table.block_ids.is_empty() {
             let mut alloc = self.allocator.lock().unwrap();
             for &bid in &self.table.block_ids {
@@ -395,7 +756,7 @@ mod tests {
 
     fn make_allocator(num_blocks: usize, block_size: usize) -> SharedBlockAllocator {
         Arc::new(Mutex::new(
-            BlockAllocator::new(num_blocks, block_size, 2, 4, DType::F32, &Device::Cpu)
+            BlockAllocator::new(num_blocks, block_size, 2, 4, DType::F32, &Device::Cpu, None)
                 .unwrap(),
         ))
     }
@@ -426,25 +787,21 @@ mod tests {
 
     #[test]
     fn paged_cache_matches_naive_cat() {
-        // Use tiny dimensions: n_kv_heads=2, head_dim=4, block_size=2
         let alloc = make_allocator(8, 2);
         let mut cache = PagedKvCache::new(alloc);
         let dev = Device::Cpu;
 
-        // Simulate prefill: 5 tokens
         let k1 = Tensor::randn(0f32, 1., (1, 2, 5, 4), &dev).unwrap();
         let v1 = Tensor::randn(0f32, 1., (1, 2, 5, 4), &dev).unwrap();
         let (k_out, v_out) = cache.append(&k1, &v1).unwrap();
         assert_eq!(k_out.dims(), &[1, 2, 5, 4]);
         assert_eq!(v_out.dims(), &[1, 2, 5, 4]);
 
-        // Verify data matches: gather should reproduce the original
-        let k1_gathered = k_out.squeeze(0).unwrap().transpose(0, 1).unwrap(); // (5,2,4)
-        let k1_flat = k1.squeeze(0).unwrap().transpose(0, 1).unwrap(); // (5,2,4)
+        let k1_gathered = k_out.squeeze(0).unwrap().transpose(0, 1).unwrap();
+        let k1_flat = k1.squeeze(0).unwrap().transpose(0, 1).unwrap();
         let diff = (k1_gathered - k1_flat).unwrap().abs().unwrap().sum_all().unwrap().to_scalar::<f32>().unwrap();
         assert!(diff < 1e-6, "prefill K mismatch: diff={diff}");
 
-        // Simulate decode: 3 single-token appends
         let mut naive_k = k1.clone();
         let mut naive_v = v1.clone();
         for _ in 0..3 {
@@ -460,7 +817,6 @@ mod tests {
             assert!(dk < 1e-6, "decode K mismatch: diff={dk}");
             assert!(dv < 1e-6, "decode V mismatch: diff={dv}");
         }
-        // After prefill(5) + decode(3) = 8 tokens, 4 blocks of size 2
         assert_eq!(k_out.device().location(), dev.location());
     }
 
@@ -470,30 +826,41 @@ mod tests {
         let mut cache = PagedKvCache::new(Arc::clone(&alloc));
         let dev = Device::Cpu;
 
-        // Fill 4 tokens → 2 blocks
         let k = Tensor::zeros((1, 2, 4, 4), DType::F32, &dev).unwrap();
         let v = Tensor::zeros((1, 2, 4, 4), DType::F32, &dev).unwrap();
         cache.append(&k, &v).unwrap();
-        assert_eq!(alloc.lock().unwrap().num_free(), 2); // 4 total - 2 used
+        assert_eq!(alloc.lock().unwrap().num_free(), 2);
 
         cache.clear();
-        assert_eq!(alloc.lock().unwrap().num_free(), 4); // all returned
+        assert_eq!(alloc.lock().unwrap().num_free(), 4);
     }
 
     #[test]
     fn exhaustion_error() {
-        // Only 2 blocks of size 2 → max 4 tokens
         let alloc = make_allocator(2, 2);
         let mut cache = PagedKvCache::new(alloc);
         let dev = Device::Cpu;
 
         let k = Tensor::zeros((1, 2, 4, 4), DType::F32, &dev).unwrap();
         let v = Tensor::zeros((1, 2, 4, 4), DType::F32, &dev).unwrap();
-        cache.append(&k, &v).unwrap(); // fills both blocks
+        cache.append(&k, &v).unwrap();
 
-        // Next token should fail
         let k1 = Tensor::zeros((1, 2, 1, 4), DType::F32, &dev).unwrap();
         let v1 = Tensor::zeros((1, 2, 1, 4), DType::F32, &dev).unwrap();
         assert!(cache.append(&k1, &v1).is_err());
+    }
+
+    #[test]
+    fn quantized_pool_reduces_memory() {
+        let q = Arc::new(super::super::kv_quant::KvQuantizer::new(4, 64));
+        let alloc_q = Arc::new(Mutex::new(
+            BlockAllocator::new(4, 2, 2, 64, DType::F32, &Device::Cpu, Some(q)).unwrap(),
+        ));
+        let alloc_f = Arc::new(Mutex::new(
+            BlockAllocator::new(4, 2, 2, 64, DType::F32, &Device::Cpu, None).unwrap(),
+        ));
+        let q_bytes = alloc_q.lock().unwrap().pool_bytes();
+        let f_bytes = alloc_f.lock().unwrap().pool_bytes();
+        assert!(q_bytes < f_bytes / 3, "quantized pool not smaller: q={q_bytes} f={f_bytes}");
     }
 }

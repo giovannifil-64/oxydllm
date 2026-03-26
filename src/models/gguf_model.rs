@@ -21,6 +21,7 @@ use crate::common::{
     block::{TransformerBlock, TransformerComponents, run_transformer_layers_batch},
     config::BlockConfig,
     gguf_weights::GgufWeights,
+    kv_quant::KvQuantizer,
     linear::{AnyLinear, Embedding, Linear, QLinear},
     norm::RMSNorm,
     paged::{BlockAllocator, PagedKvCache, SharedBlockAllocator, DEFAULT_BLOCK_SIZE},
@@ -97,6 +98,7 @@ impl StandardTransformer {
         device: &Device,
         dtype: DType,
         num_kv_blocks: usize,
+        kv_quantizer: Option<Arc<KvQuantizer>>,
     ) -> anyhow::Result<Self> {
         let arch = gguf.architecture()?;
         let prefix = &arch;
@@ -222,6 +224,7 @@ impl StandardTransformer {
                     head_dim,
                     dtype,
                     device,
+                    kv_quantizer.clone(),
                 )
                 .map_err(|e| anyhow::anyhow!("Failed to create block allocator: {e}"))?,
             ));

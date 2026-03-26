@@ -279,7 +279,7 @@ mod tests {
         (0..num_layers)
             .map(|_| {
                 Arc::new(Mutex::new(
-                    BlockAllocator::new(num_blocks, DEFAULT_BLOCK_SIZE, 2, 4, DType::F32, &Device::Cpu)
+                    BlockAllocator::new(num_blocks, DEFAULT_BLOCK_SIZE, 2, 4, DType::F32, &Device::Cpu, None)
                         .unwrap(),
                 ))
             })

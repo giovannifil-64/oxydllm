@@ -745,6 +745,7 @@ pub fn start_server(
     memory_budget_bytes: Option<usize>,
     cuda_devices: Vec<usize>,
     max_context_len: usize,
+    kv_quant: crate::common::kv_quant::KvQuantMode,
 ) -> anyhow::Result<()> {
     if !models_dir.exists() {
         std::fs::create_dir_all(&models_dir)?;
@@ -763,6 +764,7 @@ pub fn start_server(
         memory_budget_bytes,
         cuda_devices,
         max_context_len,
+        kv_quant,
     )));
 
     let state = Arc::new(AppState {

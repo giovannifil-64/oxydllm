@@ -4,6 +4,7 @@ use crate::common::{
     block::TransformerBlock,
     config::StandardTransformerConfig,
     gguf_weights::GgufWeights,
+    kv_quant::{self, KvQuantMode, KvQuantizer},
     linear::{AnyLinear, Embedding, Linear},
     norm::RMSNorm,
     paged::{BlockAllocator, DEFAULT_BLOCK_SIZE, GlobalKvBudget, SharedBlockAllocator, SharedGlobalKvBudget},
@@ -293,14 +294,15 @@ pub fn load_batch_model(
     max_context_len: usize,
     max_num_sequences: usize,
     kv_budget: &SharedGlobalKvBudget,
+    kv_quant: KvQuantMode,
 ) -> anyhow::Result<(Box<dyn BatchModel>, usize)> {
     if is_gguf_model(model_dir) {
-        return load_batch_model_gguf(model_dir, model_id, device, max_context_len, max_num_sequences, kv_budget);
+        return load_batch_model_gguf(model_dir, model_id, device, max_context_len, max_num_sequences, kv_budget, kv_quant);
     }
 
     let dtype = if matches!(device, Device::Cpu) { DType::F32 } else { DType::BF16 };
     let cfg = hf_parser::parse(&format!("{}/config.json", model_dir))?;
-    load_standard_safetensors(cfg, model_dir, device, dtype, max_context_len, max_num_sequences, kv_budget)
+    load_standard_safetensors(cfg, model_dir, device, dtype, max_context_len, max_num_sequences, kv_budget, kv_quant)
 }
 
 fn load_standard_safetensors(
@@ -311,6 +313,7 @@ fn load_standard_safetensors(
     max_context_len: usize,
     max_num_sequences: usize,
     kv_budget: &SharedGlobalKvBudget,
+    kv_quant: KvQuantMode,
 ) -> anyhow::Result<(Box<dyn BatchModel>, usize)> {
     let weight_paths = resolve_weight_paths(model_dir)?;
     let weight_path_refs: Vec<&str> = weight_paths.iter().map(|s| s.as_str()).collect();
@@ -326,9 +329,15 @@ fn load_standard_safetensors(
             max_context_len: ctx,
             max_num_sequences,
             dtype,
+            kv_quant,
         },
         kv_budget,
     )?;
+
+    let quantizer: Option<Arc<KvQuantizer>> = match kv_quant {
+        KvQuantMode::Off => None,
+        mode => Some(Arc::new(KvQuantizer::new(mode.bit_width(), cfg.head_dim))),
+    };
 
     let result = (|| -> anyhow::Result<(Box<dyn BatchModel>, usize)> {
         let embed_weight = weights.get("model.embed_tokens.weight")
@@ -362,6 +371,7 @@ fn load_standard_safetensors(
             .map(|_| -> candle_core::Result<SharedBlockAllocator> {
                 Ok(Arc::new(Mutex::new(BlockAllocator::new(
                     num_blocks, DEFAULT_BLOCK_SIZE, cfg.num_key_value_heads, cfg.head_dim, dtype, device,
+                    quantizer.clone(),
                 )?)))
             })
             .collect::<candle_core::Result<Vec<_>>>()?;
@@ -395,6 +405,7 @@ fn load_batch_model_gguf(
     max_context_len: usize,
     max_num_sequences: usize,
     kv_budget: &SharedGlobalKvBudget,
+    kv_quant: KvQuantMode,
 ) -> anyhow::Result<(Box<dyn BatchModel>, usize)> {
     let dir = Path::new(model_dir);
     let all_gguf_paths = find_gguf_files(dir)
@@ -452,11 +463,17 @@ fn load_batch_model_gguf(
             max_context_len: ctx,
             max_num_sequences,
             dtype,
+            kv_quant,
         },
         kv_budget,
     )?;
 
-    let model = match StandardTransformer::load_gguf(&gguf, device, dtype, num_blocks) {
+    let quantizer: Option<Arc<KvQuantizer>> = match kv_quant {
+        KvQuantMode::Off => None,
+        mode => Some(Arc::new(KvQuantizer::new(mode.bit_width(), topo.head_dim))),
+    };
+
+    let model = match StandardTransformer::load_gguf(&gguf, device, dtype, num_blocks, quantizer) {
         Ok(m) => m,
         Err(e) => {
             kv_budget.release(acquired_kv_bytes);
@@ -473,6 +490,7 @@ struct KvBlockParams {
     max_context_len: usize,
     max_num_sequences: usize,
     dtype: DType,
+    kv_quant: KvQuantMode,
 }
 
 fn compute_kv_blocks(p: &KvBlockParams, kv_budget: &GlobalKvBudget) -> anyhow::Result<(usize, usize)> {
@@ -481,8 +499,15 @@ fn compute_kv_blocks(p: &KvBlockParams, kv_budget: &GlobalKvBudget) -> anyhow::R
     let min_blocks: usize = 256; // ~4 096 token minimum context
 
     // Bytes for one block summed across all layers (K + V).
-    let per_block_bytes =
-        DEFAULT_BLOCK_SIZE * p.n_kv_heads * p.head_dim * p.dtype.size_in_bytes() * 2 * p.num_layers;
+    let per_block_bytes = match p.kv_quant {
+        KvQuantMode::Off => {
+            DEFAULT_BLOCK_SIZE * p.n_kv_heads * p.head_dim * p.dtype.size_in_bytes() * 2 * p.num_layers
+        }
+        mode => {
+            let bph = kv_quant::quantized_bytes_per_head(p.head_dim, mode.bit_width());
+            DEFAULT_BLOCK_SIZE * p.n_kv_heads * bph * 2 * p.num_layers
+        }
+    };
 
     if per_block_bytes == 0 {
         return Ok((desired_blocks, 0));

@@ -148,6 +148,12 @@ pub fn run_transformer_layers_batch(
         x = block.forward_batch(&x, c.rope, position_ids, None, &mut segments)?;
     }
 
+    for seq_cache in seq_caches.iter_mut() {
+        for cache in seq_cache.iter_mut() {
+            cache.flush_pending()?;
+        }
+    }
+
     let x = c.norm.forward(&x)?;
     let logits = c.lm_head.forward(&x)?;
     

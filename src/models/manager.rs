@@ -7,6 +7,7 @@ use candle_core::Tensor;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc as tokio_mpsc, oneshot};
 
+use crate::common::kv_quant::KvQuantMode;
 use crate::common::paged::{detect_system_kv_budget, GlobalKvBudget, PagedKvCache, SharedGlobalKvBudget};
 use crate::engine::Engine;
 use crate::models::loader;
@@ -71,6 +72,7 @@ pub struct ModelManager {
     cuda_devices: Vec<usize>,
     max_context_len: usize,
     kv_budget: SharedGlobalKvBudget,
+    kv_quant: KvQuantMode,
 }
 
 pub type SharedModelManager = Arc<tokio::sync::Mutex<ModelManager>>;
@@ -138,6 +140,7 @@ impl ModelManager {
         memory_budget_bytes: Option<usize>,
         cuda_devices: Vec<usize>,
         max_context_len: usize,
+        kv_quant: KvQuantMode,
     ) -> Self {
         let mut registry = load_registry(&models_dir);
         // Remove registry entries whose model directory no longer exists.
@@ -161,6 +164,10 @@ impl ModelManager {
             kv_total as f64 / 1_073_741_824.0,
         );
         let kv_budget = Arc::new(GlobalKvBudget::new(kv_total));
+        if kv_quant != KvQuantMode::Off {
+            println!("[kv-pool] KV cache quantization: {}", kv_quant.label());
+        }
+
         Self {
             models_dir,
             slots: HashMap::new(),
@@ -170,6 +177,7 @@ impl ModelManager {
             cuda_devices,
             max_context_len,
             kv_budget,
+            kv_quant,
         }
     }
 
@@ -370,6 +378,7 @@ impl ModelManager {
             self.cuda_devices.clone(),
             self.max_context_len,
             Arc::clone(&self.kv_budget),
+            self.kv_quant,
         );
 
         GetResult::Wait(rx)
@@ -512,6 +521,7 @@ fn spawn_load(
     cuda_devices: Vec<usize>,
     max_context_len: usize,
     kv_budget: SharedGlobalKvBudget,
+    kv_quant: KvQuantMode,
 ) {
     let (result_tx, result_rx) = oneshot::channel::<Result<LoadResult, String>>();
 
@@ -540,7 +550,7 @@ fn spawn_load(
 
         println!("\nLoading model '{}'...", model_id_thread);
         let max_num_sequences: usize = 8;
-        let (batch_model, weights_size_bytes) = match loader::load_batch_model(&model_dir, &model_id_thread, &device, max_context_len, max_num_sequences, &kv_budget) {
+        let (batch_model, weights_size_bytes) = match loader::load_batch_model(&model_dir, &model_id_thread, &device, max_context_len, max_num_sequences, &kv_budget, kv_quant) {
             Ok(m) => m,
             Err(e) => {
                 let _ = result_tx.send(Err(format!("Failed to load model: {e}")));

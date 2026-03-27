@@ -214,6 +214,15 @@ fn unix_timestamp() -> u64 {
         .as_secs()
 }
 
+fn system_fingerprint(model_id: &str) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    model_id.hash(&mut h);
+    env!("CARGO_PKG_VERSION").hash(&mut h);
+    format!("fp_{:012x}", h.finish() & 0xFFFF_FFFF_FFFF)
+}
+
 pub fn apply_chat_template(tokenizer: &Tokenizer, messages: &[ChatMessage], enable_thinking: bool) -> String {
     let Some(template) = tokenizer.chat_template() else {
         return chat_template::format_plain_chat(messages);
@@ -750,6 +759,7 @@ async fn chat_completions(
 
     let chat_id = make_chat_id();
     let created = unix_timestamp();
+    let fp = system_fingerprint(&model_id);
     let stream = body.stream.unwrap_or(false);
     let include_usage = body
         .stream_options
@@ -781,7 +791,7 @@ async fn chat_completions(
                     finish_reason: None,
                 }],
                 usage: None,
-                system_fingerprint: None,
+                system_fingerprint: Some(fp.clone()),
             };
             let _ = sse_tx_clone.send(Ok(Event::default()
                 .data(serde_json::to_string(&role_chunk).unwrap())));
@@ -805,7 +815,7 @@ async fn chat_completions(
                                 finish_reason: None,
                             }],
                             usage: None,
-                            system_fingerprint: None,
+                            system_fingerprint: Some(fp.clone()),
                         };
                         let _ = sse_tx_clone.send(Ok(Event::default()
                             .data(serde_json::to_string(&chunk).unwrap())));
@@ -826,7 +836,7 @@ async fn chat_completions(
                                 finish_reason: None,
                             }],
                             usage: None,
-                            system_fingerprint: None,
+                            system_fingerprint: Some(fp.clone()),
                         };
                         let _ = sse_tx_clone.send(Ok(Event::default()
                             .data(serde_json::to_string(&chunk).unwrap())));
@@ -847,7 +857,7 @@ async fn chat_completions(
                                 finish_reason: Some(finish_reason),
                             }],
                             usage: None,
-                            system_fingerprint: None,
+                            system_fingerprint: Some(fp.clone()),
                         };
                         let _ = sse_tx_clone.send(Ok(Event::default()
                             .data(serde_json::to_string(&chunk).unwrap())));
@@ -865,7 +875,7 @@ async fn chat_completions(
                                     total_tokens: prompt_len + completion_tokens,
                                     completion_tokens_details: None,
                                 }),
-                                system_fingerprint: None,
+                                system_fingerprint: Some(fp.clone()),
                             };
                             let _ = sse_tx_clone.send(Ok(Event::default()
                                 .data(serde_json::to_string(&usage_chunk).unwrap())));
@@ -957,7 +967,7 @@ async fn chat_completions(
                 total_tokens: prompt_len + completion_tokens,
                 completion_tokens_details,
             },
-            system_fingerprint: None,
+            system_fingerprint: Some(fp.clone()),
         };
 
         Ok(Json(response).into_response())

@@ -139,11 +139,6 @@ impl KvQuantizer {
         (self.head_dim * self.bit_width as usize + 7) / 8
     }
 
-    /// Total bytes per head per token (indices + f32 norm).
-    pub fn bytes_per_head(&self) -> usize {
-        self.packed_index_bytes() + 4
-    }
-
     /// Quantize a single f32 vector of length head_dim.
     pub fn quantize(&self, x: &[f32]) -> (Vec<u8>, f32) {
         debug_assert_eq!(x.len(), self.head_dim);

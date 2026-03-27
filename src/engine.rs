@@ -13,6 +13,8 @@ use crate::scheduler::*;
 pub struct NewToken {
     pub seq_id: SequenceId,
     pub token: u32,
+    pub logprob: Option<f32>,
+    pub top_logprobs: Vec<(u32, f32)>,
 }
 
 pub struct StepOutput {
@@ -226,10 +228,11 @@ impl Engine {
             let seq_logits = batch_logits.get(last_idx)?;
             logit_offset += info.uncached_len;
 
-            let next_token = {
+            let sample_out = {
                 let seq = scheduler.get_running(info.seq_id).unwrap();
                 sampling::sample(&seq_logits, &seq.sampling_params, &seq.all_tokens)?
             };
+            let next_token = sample_out.token;
             let is_stop = stop_token_ids.contains(&next_token) || {
                 let seq = scheduler.get_running(info.seq_id).unwrap();
                 seq.extra_stop_token_ids.contains(&next_token)
@@ -244,7 +247,12 @@ impl Engine {
             };
 
             if emit {
-                new_tokens.push(NewToken { seq_id: info.seq_id, token: next_token });
+                new_tokens.push(NewToken {
+                    seq_id: info.seq_id,
+                    token: next_token,
+                    logprob: sample_out.logprob,
+                    top_logprobs: sample_out.top_logprobs,
+                });
             }
 
             if info.num_full_blocks_total > info.num_cached_blocks {
@@ -272,9 +280,12 @@ impl Engine {
 
         for (i, &seq_id) in decode_ids.iter().enumerate() {
             let seq_logits = batch_logits.get(total_prefill_tokens + i)?;
+            let sample_out = {
+                let seq = scheduler.get_running(seq_id).unwrap();
+                sampling::sample(&seq_logits, &seq.sampling_params, &seq.all_tokens)?
+            };
+            let next_token = sample_out.token;
             let seq = scheduler.get_running_mut(seq_id).unwrap();
-            let next_token =
-                sampling::sample(&seq_logits, &seq.sampling_params, &seq.all_tokens)?;
             let is_stop = stop_token_ids.contains(&next_token)
                 || seq.extra_stop_token_ids.contains(&next_token);
 
@@ -282,7 +293,12 @@ impl Engine {
             seq.num_processed_tokens = seq.all_tokens.len() - 1;
 
             if seq.apply_token(next_token, is_stop) {
-                new_tokens.push(NewToken { seq_id: seq.id, token: next_token });
+                new_tokens.push(NewToken {
+                    seq_id: seq.id,
+                    token: next_token,
+                    logprob: sample_out.logprob,
+                    top_logprobs: sample_out.top_logprobs,
+                });
             }
         }
 

@@ -54,6 +54,12 @@ pub struct ChatCompletionRequest {
     pub stream_options: Option<StreamOptions>,
     #[serde(default)]
     pub seed: Option<u64>,
+    #[serde(default)]
+    pub logprobs: Option<bool>,
+    #[serde(default)]
+    pub top_logprobs: Option<usize>,
+    #[serde(default)]
+    pub logit_bias: Option<serde_json::Value>,
     // Extensions (non-OpenAI)
     #[serde(default)]
     pub top_k: Option<usize>,
@@ -66,15 +72,6 @@ pub struct ChatCompletionRequest {
     #[serde(default)]
     pub enable_thinking: Option<bool>,
     // Accepted but ignored (allows OpenAI SDK clients to pass these without errors)
-    #[serde(default)]
-    #[allow(dead_code)]
-    pub logprobs: Option<bool>,
-    #[serde(default)]
-    #[allow(dead_code)]
-    pub top_logprobs: Option<usize>,
-    #[serde(default)]
-    #[allow(dead_code)]
-    pub logit_bias: Option<serde_json::Value>,
     #[serde(default)]
     #[allow(dead_code)]
     pub response_format: Option<serde_json::Value>,
@@ -105,6 +102,35 @@ pub struct ChatMessage {
     pub reasoning_content: Option<String>,
 }
 
+// ---------------------------------------------------------------------------
+// Logprob response structs
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize, Clone)]
+struct TopLogprobItem {
+    token: String,
+    logprob: f32,
+    bytes: Option<Vec<u8>>,
+}
+
+#[derive(Serialize, Clone)]
+struct TokenLogprob {
+    token: String,
+    logprob: f32,
+    bytes: Option<Vec<u8>>,
+    top_logprobs: Vec<TopLogprobItem>,
+}
+
+#[derive(Serialize, Clone)]
+struct Logprobs {
+    content: Vec<TokenLogprob>,
+    refusal: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Completion response structs
+// ---------------------------------------------------------------------------
+
 #[derive(Serialize)]
 struct ChatCompletionResponse {
     id: String,
@@ -121,6 +147,7 @@ struct Choice {
     index: usize,
     message: ChatMessage,
     finish_reason: String,
+    logprobs: Option<Logprobs>,
 }
 
 #[derive(Serialize)]
@@ -154,6 +181,7 @@ struct ChunkChoice {
     index: usize,
     delta: Delta,
     finish_reason: Option<String>,
+    logprobs: Option<Logprobs>,
 }
 
 #[derive(Serialize)]
@@ -164,6 +192,19 @@ struct Delta {
     content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_content: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Engine communication types
+// ---------------------------------------------------------------------------
+
+/// Pre-decoded logprob entry for a single generated token.
+pub struct EngineLogprobEntry {
+    pub token_str: String,
+    pub logprob: f32,
+    pub bytes: Vec<u8>,
+    /// Top-k alternatives: (token_str, logprob, bytes).
+    pub top_logprobs: Vec<(String, f32, Vec<u8>)>,
 }
 
 pub struct IncomingRequest {
@@ -178,7 +219,7 @@ pub struct IncomingRequest {
 }
 
 pub enum EngineEvent {
-    Token(String),
+    Token { text: String, logprob_entries: Vec<EngineLogprobEntry> },
     ReasoningToken(String),
     Finish { finish_reason: String, completion_tokens: usize },
     StreamEnd,
@@ -188,6 +229,10 @@ pub enum EngineEvent {
 struct AppState {
     manager: SharedModelManager,
 }
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
 
 fn error_response(
     status: StatusCode,
@@ -221,6 +266,51 @@ fn system_fingerprint(model_id: &str) -> String {
     model_id.hash(&mut h);
     env!("CARGO_PKG_VERSION").hash(&mut h);
     format!("fp_{:012x}", h.finish() & 0xFFFF_FFFF_FFFF)
+}
+
+/// Convert engine logprob entries into the serializable `Logprobs` response struct.
+fn build_logprobs_content(entries: &[EngineLogprobEntry], req_top_n: usize) -> Logprobs {
+    Logprobs {
+        content: entries
+            .iter()
+            .map(|e| TokenLogprob {
+                token: e.token_str.clone(),
+                logprob: e.logprob,
+                bytes: Some(e.bytes.clone()),
+                top_logprobs: e
+                    .top_logprobs
+                    .iter()
+                    .take(req_top_n)
+                    .map(|(ts, lp, tb)| TopLogprobItem {
+                        token: ts.clone(),
+                        logprob: *lp,
+                        bytes: Some(tb.clone()),
+                    })
+                    .collect(),
+            })
+            .collect(),
+        refusal: None,
+    }
+}
+
+/// Build an `EngineLogprobEntry` by decoding token IDs to strings.
+fn build_logprob_entry(
+    tokenizer: &Tokenizer,
+    token_id: u32,
+    logprob: f32,
+    top_lps: Vec<(u32, f32)>,
+) -> EngineLogprobEntry {
+    let token_str = tokenizer.decode(&[token_id]).unwrap_or_default();
+    let bytes = token_str.as_bytes().to_vec();
+    let top_logprobs = top_lps
+        .into_iter()
+        .map(|(tid, lp)| {
+            let ts = tokenizer.decode(&[tid]).unwrap_or_default();
+            let tb = ts.as_bytes().to_vec();
+            (ts, lp, tb)
+        })
+        .collect();
+    EngineLogprobEntry { token_str, logprob, bytes, top_logprobs }
 }
 
 pub fn apply_chat_template(tokenizer: &Tokenizer, messages: &[ChatMessage], enable_thinking: bool) -> String {
@@ -259,6 +349,10 @@ pub fn apply_chat_template(tokenizer: &Tokenizer, messages: &[ChatMessage], enab
     }
 }
 
+// ---------------------------------------------------------------------------
+// Engine loop and per-sequence tracking
+// ---------------------------------------------------------------------------
+
 struct SeqTracker {
     tx: tokio_mpsc::UnboundedSender<EngineEvent>,
     model_id: String,
@@ -270,6 +364,8 @@ struct SeqTracker {
     thinking_ids: Vec<u32>,
     decoded_len: usize,
     thinking_decoded_len: usize,
+    /// Raw logprob data buffered for output tokens not yet emitted as text.
+    pending_raw_lps: Vec<(u32, f32, Vec<(u32, f32)>)>,
 }
 
 fn enqueue_request(
@@ -297,6 +393,7 @@ fn enqueue_request(
         thinking_ids: Vec::new(),
         decoded_len: 0,
         thinking_decoded_len: 0,
+        pending_raw_lps: Vec::new(),
     });
 }
 
@@ -352,9 +449,6 @@ pub fn engine_loop(
         }
 
         if engine.has_pending_work() {
-            // Acquire the global GPU lock so that only one model
-            // does a forward pass at a time (prevents Metal/CUDA contention
-            // when multiple models are loaded simultaneously).
             let step_result = {
                 let lock = crate::gpu_lock::gpu_lock();
                 let _gpu = lock.acquire();
@@ -372,7 +466,7 @@ pub fn engine_loop(
                             }
                             tracker.token_count += 1;
 
-                            // Detect </think> token to transition from reasoning to content.
+                            // Handle thinking tokens.
                             if tracker.in_thinking {
                                 let raw = tokenizer
                                     .decode_with_special(&[tok.token])
@@ -400,27 +494,59 @@ pub fn engine_loop(
                                     let _ = tracker.tx.send(EngineEvent::ReasoningToken(text));
                                 }
                             } else {
+                                // Buffer logprob raw data (if logprobs were requested).
+                                if tok.logprob.is_some() {
+                                    tracker.pending_raw_lps.push((
+                                        tok.token,
+                                        tok.logprob.unwrap(),
+                                        tok.top_logprobs.clone(),
+                                    ));
+                                }
                                 tracker.output_ids.push(tok.token);
                                 if let Some(text) = prefix_decode_token(
                                     &tokenizer, &tracker.output_ids, &mut tracker.decoded_len, tok.token,
                                 ) {
-                                    let _ = tracker.tx.send(EngineEvent::Token(text));
+                                    let logprob_entries: Vec<EngineLogprobEntry> =
+                                        std::mem::take(&mut tracker.pending_raw_lps)
+                                            .into_iter()
+                                            .map(|(tid, lp, top)| build_logprob_entry(&tokenizer, tid, lp, top))
+                                            .collect();
+                                    let _ = tracker.tx.send(EngineEvent::Token { text, logprob_entries });
                                 }
                             }
                         }
                     }
                     for completed in &step.completed {
                         if let Some(mut tracker) = trackers.remove(&completed.id) {
-                            if !tracker.output_ids.is_empty() {
+                            // Flush any remaining buffered text.
+                            let remaining_text = if !tracker.output_ids.is_empty() {
                                 let full = tokenizer.decode(&tracker.output_ids).unwrap_or_default();
                                 if tracker.decoded_len < full.len() {
-                                    let rest = &full[tracker.decoded_len..];
-                                    if !rest.is_empty() {
-                                        tracker.decoded_len = full.len();
-                                        let _ = tracker.tx.send(EngineEvent::Token(rest.to_string()));
-                                    }
+                                    let rest = full[tracker.decoded_len..].to_string();
+                                    tracker.decoded_len = full.len();
+                                    rest
+                                } else {
+                                    String::new()
                                 }
+                            } else {
+                                String::new()
+                            };
+
+                            // Drain any buffered logprob entries (tokens whose text was still in the buffer).
+                            let remaining_lp_entries: Vec<EngineLogprobEntry> =
+                                std::mem::take(&mut tracker.pending_raw_lps)
+                                    .into_iter()
+                                    .map(|(tid, lp, top)| build_logprob_entry(&tokenizer, tid, lp, top))
+                                    .collect();
+
+                            if !remaining_text.is_empty() || !remaining_lp_entries.is_empty() {
+                                let _ = tracker.tx.send(EngineEvent::Token {
+                                    text: remaining_text,
+                                    logprob_entries: remaining_lp_entries,
+                                });
                             }
+
+                            // Flush remaining thinking text.
                             if !tracker.thinking_ids.is_empty() {
                                 let full = tokenizer.decode(&tracker.thinking_ids).unwrap_or_default();
                                 if tracker.thinking_decoded_len < full.len() {
@@ -430,6 +556,7 @@ pub fn engine_loop(
                                     }
                                 }
                             }
+
                             let total_ms = tracker.enqueued_at.elapsed().as_secs_f64() * 1000.0;
                             let decode_s = tracker.first_token_at
                                 .map(|t| t.elapsed().as_secs_f64())
@@ -487,6 +614,10 @@ pub fn engine_loop(
         let _ = tracker.tx.send(EngineEvent::StreamEnd);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Route handlers
+// ---------------------------------------------------------------------------
 
 async fn health() -> impl IntoResponse {
     Json(serde_json::json!({"status": "ok"}))
@@ -611,6 +742,63 @@ async fn list_running_models(State(state): State<Arc<AppState>>) -> impl IntoRes
     Json(resp)
 }
 
+// ---------------------------------------------------------------------------
+// chat/completions — helpers
+// ---------------------------------------------------------------------------
+
+/// Accumulated result for a single completion (used for n>1).
+struct CompletionData {
+    content: String,
+    reasoning_content: String,
+    reasoning_tokens: usize,
+    finish_reason: String,
+    completion_tokens: usize,
+    logprob_entries: Vec<EngineLogprobEntry>,
+}
+
+/// Drain one completion channel into a `CompletionData`.
+async fn collect_one_completion(
+    mut rx: tokio_mpsc::UnboundedReceiver<EngineEvent>,
+) -> Result<CompletionData, (StatusCode, Json<serde_json::Value>)> {
+    let mut data = CompletionData {
+        content: String::new(),
+        reasoning_content: String::new(),
+        reasoning_tokens: 0,
+        finish_reason: "stop".to_string(),
+        completion_tokens: 0,
+        logprob_entries: Vec::new(),
+    };
+    while let Some(event) = rx.recv().await {
+        match event {
+            EngineEvent::Token { text, logprob_entries } => {
+                data.content.push_str(&text);
+                data.logprob_entries.extend(logprob_entries);
+            }
+            EngineEvent::ReasoningToken(text) => {
+                data.reasoning_content.push_str(&text);
+                data.reasoning_tokens += 1;
+            }
+            EngineEvent::Finish { finish_reason, completion_tokens } => {
+                data.finish_reason = finish_reason;
+                data.completion_tokens = completion_tokens;
+            }
+            EngineEvent::StreamEnd => break,
+            EngineEvent::Error(msg) => {
+                return Err(error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    msg,
+                    "server_error",
+                ));
+            }
+        }
+    }
+    Ok(data)
+}
+
+// ---------------------------------------------------------------------------
+// chat/completions — main handler
+// ---------------------------------------------------------------------------
+
 async fn chat_completions(
     State(state): State<Arc<AppState>>,
     Json(body): Json<ChatCompletionRequest>,
@@ -632,11 +820,21 @@ async fn chat_completions(
         ));
     }
 
-    if let Some(n) = body.n {
-        if n > 1 {
+    let n = body.n.unwrap_or(1);
+    if n == 0 {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "n must be at least 1",
+            "invalid_request_error",
+        ));
+    }
+
+    // Validate logit_bias shape early.
+    if let Some(ref lb) = body.logit_bias {
+        if !lb.is_null() && !lb.is_object() {
             return Err(error_response(
                 StatusCode::BAD_REQUEST,
-                "n > 1 is not supported",
+                "logit_bias must be a JSON object mapping token IDs to biases",
                 "invalid_request_error",
             ));
         }
@@ -686,11 +884,7 @@ async fn chat_completions(
 
     let t_encode = std::time::Instant::now();
     let prompt_tokens = handle.tokenizer.encode(&prompt).map_err(|e| {
-        error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            e.to_string(),
-            "server_error",
-        )
+        error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string(), "server_error")
     })?;
     let encode_ms = t_encode.elapsed().as_secs_f64() * 1000.0;
     let prompt_len = prompt_tokens.len();
@@ -700,24 +894,48 @@ async fn chat_completions(
         model_id, template_ms, encode_ms, prompt_len, t_request.elapsed().as_secs_f64() * 1000.0
     );
 
-    let extra_stop_token_ids = match &body.stop {
+    // Parse stop strings into token IDs (single-token stops only).
+    let extra_stop_token_ids: Vec<u32> = match &body.stop {
         Some(StopParam::Single(s)) => {
             let ids = handle.tokenizer.encode(s).unwrap_or_default();
             if ids.len() == 1 { ids } else { Vec::new() }
         }
-        Some(StopParam::Multiple(strings)) => {
-            strings
-                .iter()
-                .filter_map(|s| {
-                    let ids = handle.tokenizer.encode(s).unwrap_or_default();
-                    if ids.len() == 1 { Some(ids[0]) } else { None }
-                })
-                .collect()
-        }
+        Some(StopParam::Multiple(strings)) => strings
+            .iter()
+            .filter_map(|s| {
+                let ids = handle.tokenizer.encode(s).unwrap_or_default();
+                if ids.len() == 1 { Some(ids[0]) } else { None }
+            })
+            .collect(),
         None => Vec::new(),
     };
 
-    let sampling_params = SamplingParams {
+    // Parse logit_bias.
+    let logit_bias: Option<Vec<(u32, f32)>> = match &body.logit_bias {
+        Some(serde_json::Value::Object(map)) if !map.is_empty() => {
+            let pairs: Vec<(u32, f32)> = map
+                .iter()
+                .filter_map(|(k, v)| {
+                    let token_id: u32 = k.parse().ok()?;
+                    let bias: f32 = v.as_f64()? as f32;
+                    Some((token_id, bias.clamp(-100.0, 100.0)))
+                })
+                .collect();
+            if pairs.is_empty() { None } else { Some(pairs) }
+        }
+        _ => None,
+    };
+
+    // Compute top_logprobs_k for sampling.
+    let wants_logprobs = body.logprobs.unwrap_or(false);
+    let req_top_n = body.top_logprobs.unwrap_or(0);
+    let top_logprobs_k: usize = if wants_logprobs {
+        req_top_n.max(1) // at least 1 so we always get the chosen token's logprob
+    } else {
+        0
+    };
+
+    let base_sampling_params = SamplingParams {
         temperature: body.temperature.unwrap_or(0.7),
         top_k: body.top_k.unwrap_or(0),
         top_p: body.top_p.unwrap_or(1.0),
@@ -726,6 +944,8 @@ async fn chat_completions(
         frequency_penalty: body.frequency_penalty.unwrap_or(0.0),
         presence_penalty: body.presence_penalty.unwrap_or(0.0),
         seed: body.seed,
+        logit_bias,
+        top_logprobs_k,
     };
 
     let remaining = handle.max_seq_len.saturating_sub(prompt_len);
@@ -735,27 +955,37 @@ async fn chat_completions(
         .unwrap_or(remaining)
         .min(remaining);
 
-    let (response_tx, response_rx) = tokio_mpsc::unbounded_channel();
+    // Spawn N requests (one per completion).
+    let mut completion_rxs: Vec<tokio_mpsc::UnboundedReceiver<EngineEvent>> =
+        Vec::with_capacity(n);
 
-    handle
-        .request_tx
-        .send(IncomingRequest {
-            prompt_tokens,
-            sampling_params,
-            max_tokens,
-            response_tx,
-            model_id: model_id.clone(),
-            enqueued_at: std::time::Instant::now(),
-            enable_thinking,
-            extra_stop_token_ids,
-        })
-        .map_err(|_| {
-            error_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Engine unavailable",
-                "server_error",
-            )
-        })?;
+    for i in 0..n {
+        let (response_tx, response_rx) = tokio_mpsc::unbounded_channel();
+        // Give each completion a distinct seed offset so n>1 produces different outputs.
+        let seed = base_sampling_params.seed.map(|s| s.wrapping_add(i as u64));
+        let sampling_params = SamplingParams { seed, ..base_sampling_params.clone() };
+
+        handle
+            .request_tx
+            .send(IncomingRequest {
+                prompt_tokens: prompt_tokens.clone(),
+                sampling_params,
+                max_tokens,
+                response_tx,
+                model_id: model_id.clone(),
+                enqueued_at: std::time::Instant::now(),
+                enable_thinking,
+                extra_stop_token_ids: extra_stop_token_ids.clone(),
+            })
+            .map_err(|_| {
+                error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Engine unavailable",
+                    "server_error",
+                )
+            })?;
+        completion_rxs.push(response_rx);
+    }
 
     let chat_id = make_chat_id();
     let created = unix_timestamp();
@@ -768,181 +998,315 @@ async fn chat_completions(
         .unwrap_or(false);
 
     if stream {
-        let model_id_clone = model_id.clone();
+        // For n=1: use the existing direct-channel approach (avoids merge overhead).
+        // For n>1: merge all N receivers into a single (index, event) channel.
 
-        let (sse_tx, sse_rx) = tokio_mpsc::unbounded_channel::<
-            Result<Event, std::convert::Infallible>,
-        >();
+        let (sse_tx, sse_rx) = tokio_mpsc::unbounded_channel::<Result<Event, std::convert::Infallible>>();
 
-        let sse_tx_clone = sse_tx.clone();
-        tokio::spawn(async move {
-            let role_chunk = ChatCompletionChunk {
-                id: chat_id.clone(),
-                object: "chat.completion.chunk".to_string(),
-                created,
-                model: model_id_clone.clone(),
-                choices: vec![ChunkChoice {
-                    index: 0,
-                    delta: Delta {
-                        role: Some("assistant".to_string()),
-                        content: None,
-                        reasoning_content: None,
-                    },
-                    finish_reason: None,
-                }],
-                usage: None,
-                system_fingerprint: Some(fp.clone()),
-            };
-            let _ = sse_tx_clone.send(Ok(Event::default()
-                .data(serde_json::to_string(&role_chunk).unwrap())));
+        if n == 1 {
+            let mut response_rx = completion_rxs.remove(0);
+            let model_id_clone = model_id.clone();
 
-            let mut rx = response_rx;
-            while let Some(event) = rx.recv().await {
-                match event {
-                    EngineEvent::Token(text) => {
-                        let chunk = ChatCompletionChunk {
-                            id: chat_id.clone(),
-                            object: "chat.completion.chunk".to_string(),
-                            created,
-                            model: model_id_clone.clone(),
-                            choices: vec![ChunkChoice {
-                                index: 0,
-                                delta: Delta {
-                                    role: None,
-                                    content: Some(text),
-                                    reasoning_content: None,
-                                },
-                                finish_reason: None,
-                            }],
-                            usage: None,
-                            system_fingerprint: Some(fp.clone()),
-                        };
-                        let _ = sse_tx_clone.send(Ok(Event::default()
-                            .data(serde_json::to_string(&chunk).unwrap())));
-                    }
-                    EngineEvent::ReasoningToken(text) => {
-                        let chunk = ChatCompletionChunk {
-                            id: chat_id.clone(),
-                            object: "chat.completion.chunk".to_string(),
-                            created,
-                            model: model_id_clone.clone(),
-                            choices: vec![ChunkChoice {
-                                index: 0,
-                                delta: Delta {
-                                    role: None,
-                                    content: None,
-                                    reasoning_content: Some(text),
-                                },
-                                finish_reason: None,
-                            }],
-                            usage: None,
-                            system_fingerprint: Some(fp.clone()),
-                        };
-                        let _ = sse_tx_clone.send(Ok(Event::default()
-                            .data(serde_json::to_string(&chunk).unwrap())));
-                    }
-                    EngineEvent::Finish { finish_reason, completion_tokens } => {
-                        let chunk = ChatCompletionChunk {
-                            id: chat_id.clone(),
-                            object: "chat.completion.chunk".to_string(),
-                            created,
-                            model: model_id_clone.clone(),
-                            choices: vec![ChunkChoice {
-                                index: 0,
-                                delta: Delta {
-                                    role: None,
-                                    content: None,
-                                    reasoning_content: None,
-                                },
-                                finish_reason: Some(finish_reason),
-                            }],
-                            usage: None,
-                            system_fingerprint: Some(fp.clone()),
-                        };
-                        let _ = sse_tx_clone.send(Ok(Event::default()
-                            .data(serde_json::to_string(&chunk).unwrap())));
+            tokio::spawn(async move {
+                // Role chunk.
+                let role_chunk = ChatCompletionChunk {
+                    id: chat_id.clone(),
+                    object: "chat.completion.chunk".to_string(),
+                    created,
+                    model: model_id_clone.clone(),
+                    choices: vec![ChunkChoice {
+                        index: 0,
+                        delta: Delta { role: Some("assistant".to_string()), content: None, reasoning_content: None },
+                        finish_reason: None,
+                        logprobs: None,
+                    }],
+                    usage: None,
+                    system_fingerprint: Some(fp.clone()),
+                };
+                let _ = sse_tx.send(Ok(Event::default().data(serde_json::to_string(&role_chunk).unwrap())));
 
-                        if include_usage {
-                            let usage_chunk = ChatCompletionChunk {
+                while let Some(event) = response_rx.recv().await {
+                    match event {
+                        EngineEvent::Token { text, logprob_entries } => {
+                            if text.is_empty() && logprob_entries.is_empty() {
+                                continue;
+                            }
+                            let chunk_logprobs = if wants_logprobs && !logprob_entries.is_empty() {
+                                Some(build_logprobs_content(&logprob_entries, req_top_n))
+                            } else if wants_logprobs {
+                                Some(Logprobs { content: vec![], refusal: None })
+                            } else {
+                                None
+                            };
+                            let chunk = ChatCompletionChunk {
                                 id: chat_id.clone(),
                                 object: "chat.completion.chunk".to_string(),
                                 created,
                                 model: model_id_clone.clone(),
-                                choices: vec![],
-                                usage: Some(Usage {
-                                    prompt_tokens: prompt_len,
-                                    completion_tokens,
-                                    total_tokens: prompt_len + completion_tokens,
-                                    completion_tokens_details: None,
-                                }),
+                                choices: vec![ChunkChoice {
+                                    index: 0,
+                                    delta: Delta { role: None, content: Some(text), reasoning_content: None },
+                                    finish_reason: None,
+                                    logprobs: chunk_logprobs,
+                                }],
+                                usage: None,
                                 system_fingerprint: Some(fp.clone()),
                             };
-                            let _ = sse_tx_clone.send(Ok(Event::default()
-                                .data(serde_json::to_string(&usage_chunk).unwrap())));
+                            let _ = sse_tx.send(Ok(Event::default().data(serde_json::to_string(&chunk).unwrap())));
+                        }
+                        EngineEvent::ReasoningToken(text) => {
+                            let chunk = ChatCompletionChunk {
+                                id: chat_id.clone(),
+                                object: "chat.completion.chunk".to_string(),
+                                created,
+                                model: model_id_clone.clone(),
+                                choices: vec![ChunkChoice {
+                                    index: 0,
+                                    delta: Delta { role: None, content: None, reasoning_content: Some(text) },
+                                    finish_reason: None,
+                                    logprobs: None,
+                                }],
+                                usage: None,
+                                system_fingerprint: Some(fp.clone()),
+                            };
+                            let _ = sse_tx.send(Ok(Event::default().data(serde_json::to_string(&chunk).unwrap())));
+                        }
+                        EngineEvent::Finish { finish_reason, completion_tokens } => {
+                            let chunk = ChatCompletionChunk {
+                                id: chat_id.clone(),
+                                object: "chat.completion.chunk".to_string(),
+                                created,
+                                model: model_id_clone.clone(),
+                                choices: vec![ChunkChoice {
+                                    index: 0,
+                                    delta: Delta { role: None, content: None, reasoning_content: None },
+                                    finish_reason: Some(finish_reason),
+                                    logprobs: None,
+                                }],
+                                usage: None,
+                                system_fingerprint: Some(fp.clone()),
+                            };
+                            let _ = sse_tx.send(Ok(Event::default().data(serde_json::to_string(&chunk).unwrap())));
+
+                            if include_usage {
+                                let usage_chunk = ChatCompletionChunk {
+                                    id: chat_id.clone(),
+                                    object: "chat.completion.chunk".to_string(),
+                                    created,
+                                    model: model_id_clone.clone(),
+                                    choices: vec![],
+                                    usage: Some(Usage {
+                                        prompt_tokens: prompt_len,
+                                        completion_tokens,
+                                        total_tokens: prompt_len + completion_tokens,
+                                        completion_tokens_details: None,
+                                    }),
+                                    system_fingerprint: Some(fp.clone()),
+                                };
+                                let _ = sse_tx.send(Ok(Event::default().data(serde_json::to_string(&usage_chunk).unwrap())));
+                            }
+                        }
+                        EngineEvent::StreamEnd => {
+                            let _ = sse_tx.send(Ok(Event::default().data("[DONE]")));
+                            break;
+                        }
+                        EngineEvent::Error(msg) => {
+                            let err = serde_json::json!({
+                                "error": { "message": msg, "type": "server_error", "param": null, "code": null }
+                            });
+                            let _ = sse_tx.send(Ok(Event::default().data(serde_json::to_string(&err).unwrap())));
                         }
                     }
-                    EngineEvent::StreamEnd => {
-                        let _ = sse_tx_clone.send(Ok(Event::default().data("[DONE]")));
-                        break;
+                }
+            });
+        } else {
+            // n > 1: merge all receivers into a tagged channel.
+            let (merged_tx, merged_rx) = tokio_mpsc::unbounded_channel::<(usize, EngineEvent)>();
+            for (i, rx) in completion_rxs.into_iter().enumerate() {
+                let tx = merged_tx.clone();
+                tokio::spawn(async move {
+                    let mut rx = rx;
+                    while let Some(ev) = rx.recv().await {
+                        if tx.send((i, ev)).is_err() { break; }
                     }
-                    EngineEvent::Error(msg) => {
-                        let err = serde_json::json!({
-                            "error": {
-                                "message": msg,
-                                "type": "server_error",
-                                "param": null,
-                                "code": null,
+                });
+            }
+            drop(merged_tx);
+
+            let model_id_clone = model_id.clone();
+
+            tokio::spawn(async move {
+                // Send role chunk for each completion.
+                for i in 0..n {
+                    let role_chunk = ChatCompletionChunk {
+                        id: chat_id.clone(),
+                        object: "chat.completion.chunk".to_string(),
+                        created,
+                        model: model_id_clone.clone(),
+                        choices: vec![ChunkChoice {
+                            index: i,
+                            delta: Delta { role: Some("assistant".to_string()), content: None, reasoning_content: None },
+                            finish_reason: None,
+                            logprobs: None,
+                        }],
+                        usage: None,
+                        system_fingerprint: Some(fp.clone()),
+                    };
+                    let _ = sse_tx.send(Ok(Event::default().data(serde_json::to_string(&role_chunk).unwrap())));
+                }
+
+                let mut rx = merged_rx;
+                let mut stream_ends: usize = 0;
+                let mut total_completion_tokens: usize = 0;
+
+                while let Some((idx, event)) = rx.recv().await {
+                    match event {
+                        EngineEvent::Token { text, logprob_entries } => {
+                            if text.is_empty() && logprob_entries.is_empty() {
+                                continue;
                             }
-                        });
-                        let _ = sse_tx_clone.send(Ok(Event::default()
-                            .data(serde_json::to_string(&err).unwrap())));
+                            let chunk_logprobs = if wants_logprobs && !logprob_entries.is_empty() {
+                                Some(build_logprobs_content(&logprob_entries, req_top_n))
+                            } else if wants_logprobs {
+                                Some(Logprobs { content: vec![], refusal: None })
+                            } else {
+                                None
+                            };
+                            let chunk = ChatCompletionChunk {
+                                id: chat_id.clone(),
+                                object: "chat.completion.chunk".to_string(),
+                                created,
+                                model: model_id_clone.clone(),
+                                choices: vec![ChunkChoice {
+                                    index: idx,
+                                    delta: Delta { role: None, content: Some(text), reasoning_content: None },
+                                    finish_reason: None,
+                                    logprobs: chunk_logprobs,
+                                }],
+                                usage: None,
+                                system_fingerprint: Some(fp.clone()),
+                            };
+                            let _ = sse_tx.send(Ok(Event::default().data(serde_json::to_string(&chunk).unwrap())));
+                        }
+                        EngineEvent::ReasoningToken(text) => {
+                            let chunk = ChatCompletionChunk {
+                                id: chat_id.clone(),
+                                object: "chat.completion.chunk".to_string(),
+                                created,
+                                model: model_id_clone.clone(),
+                                choices: vec![ChunkChoice {
+                                    index: idx,
+                                    delta: Delta { role: None, content: None, reasoning_content: Some(text) },
+                                    finish_reason: None,
+                                    logprobs: None,
+                                }],
+                                usage: None,
+                                system_fingerprint: Some(fp.clone()),
+                            };
+                            let _ = sse_tx.send(Ok(Event::default().data(serde_json::to_string(&chunk).unwrap())));
+                        }
+                        EngineEvent::Finish { finish_reason, completion_tokens } => {
+                            total_completion_tokens += completion_tokens;
+                            let chunk = ChatCompletionChunk {
+                                id: chat_id.clone(),
+                                object: "chat.completion.chunk".to_string(),
+                                created,
+                                model: model_id_clone.clone(),
+                                choices: vec![ChunkChoice {
+                                    index: idx,
+                                    delta: Delta { role: None, content: None, reasoning_content: None },
+                                    finish_reason: Some(finish_reason),
+                                    logprobs: None,
+                                }],
+                                usage: None,
+                                system_fingerprint: Some(fp.clone()),
+                            };
+                            let _ = sse_tx.send(Ok(Event::default().data(serde_json::to_string(&chunk).unwrap())));
+                        }
+                        EngineEvent::StreamEnd => {
+                            stream_ends += 1;
+                            if stream_ends == n {
+                                if include_usage {
+                                    let usage_chunk = ChatCompletionChunk {
+                                        id: chat_id.clone(),
+                                        object: "chat.completion.chunk".to_string(),
+                                        created,
+                                        model: model_id_clone.clone(),
+                                        choices: vec![],
+                                        usage: Some(Usage {
+                                            prompt_tokens: prompt_len,
+                                            completion_tokens: total_completion_tokens,
+                                            total_tokens: prompt_len + total_completion_tokens,
+                                            completion_tokens_details: None,
+                                        }),
+                                        system_fingerprint: Some(fp.clone()),
+                                    };
+                                    let _ = sse_tx.send(Ok(Event::default().data(serde_json::to_string(&usage_chunk).unwrap())));
+                                }
+                                let _ = sse_tx.send(Ok(Event::default().data("[DONE]")));
+                                break;
+                            }
+                        }
+                        EngineEvent::Error(msg) => {
+                            let err = serde_json::json!({
+                                "error": { "message": msg, "type": "server_error", "param": null, "code": null }
+                            });
+                            let _ = sse_tx.send(Ok(Event::default().data(serde_json::to_string(&err).unwrap())));
+                        }
                     }
                 }
-            }
-        });
-
-        let stream = UnboundedReceiverStream::new(sse_rx);
-        Ok(Sse::new(stream).into_response())
-    } else {
-        let mut rx = response_rx;
-        let mut content = String::new();
-        let mut reasoning_content = String::new();
-        let mut finish_reason = "stop".to_string();
-        let mut completion_tokens: usize = 0;
-        let mut reasoning_tokens: usize = 0;
-
-        while let Some(event) = rx.recv().await {
-            match event {
-                EngineEvent::Token(text) => {
-                    content.push_str(&text);
-                }
-                EngineEvent::ReasoningToken(text) => {
-                    reasoning_content.push_str(&text);
-                    reasoning_tokens += 1;
-                }
-                EngineEvent::Finish { finish_reason: fr, completion_tokens: ct } => {
-                    finish_reason = fr;
-                    completion_tokens = ct;
-                }
-                EngineEvent::StreamEnd => break,
-                EngineEvent::Error(msg) => {
-                    return Err(error_response(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        msg,
-                        "server_error",
-                    ));
-                }
-            }
+            });
         }
 
-        let reasoning_opt = if reasoning_content.is_empty() {
-            None
-        } else {
-            Some(reasoning_content.trim().to_string())
-        };
+        let sse_stream = UnboundedReceiverStream::new(sse_rx);
+        Ok(Sse::new(sse_stream).into_response())
+    } else {
+        // Non-streaming: collect all N completions concurrently.
+        let mut handles = Vec::with_capacity(n);
+        for rx in completion_rxs {
+            handles.push(tokio::spawn(collect_one_completion(rx)));
+        }
 
-        let completion_tokens_details = if reasoning_tokens > 0 {
-            Some(CompletionTokensDetails { reasoning_tokens })
+        let mut all_choices: Vec<Choice> = Vec::with_capacity(n);
+        let mut total_completion_tokens: usize = 0;
+        let mut total_reasoning_tokens: usize = 0;
+
+        for (i, handle) in handles.into_iter().enumerate() {
+            let data = handle
+                .await
+                .map_err(|_| {
+                    error_response(StatusCode::INTERNAL_SERVER_ERROR, "Task panic", "server_error")
+                })??;
+
+            total_completion_tokens += data.completion_tokens;
+            total_reasoning_tokens += data.reasoning_tokens;
+
+            let reasoning_opt = if data.reasoning_content.is_empty() {
+                None
+            } else {
+                Some(data.reasoning_content.trim().to_string())
+            };
+
+            let logprobs = if wants_logprobs {
+                Some(build_logprobs_content(&data.logprob_entries, req_top_n))
+            } else {
+                None
+            };
+
+            all_choices.push(Choice {
+                index: i,
+                message: ChatMessage {
+                    role: "assistant".to_string(),
+                    content: data.content.trim().to_string(),
+                    reasoning_content: reasoning_opt,
+                },
+                finish_reason: data.finish_reason,
+                logprobs,
+            });
+        }
+
+        let completion_tokens_details = if total_reasoning_tokens > 0 {
+            Some(CompletionTokensDetails { reasoning_tokens: total_reasoning_tokens })
         } else {
             None
         };
@@ -952,27 +1316,23 @@ async fn chat_completions(
             object: "chat.completion".to_string(),
             created,
             model: model_id,
-            choices: vec![Choice {
-                index: 0,
-                message: ChatMessage {
-                    role: "assistant".to_string(),
-                    content: content.trim().to_string(),
-                    reasoning_content: reasoning_opt,
-                },
-                finish_reason,
-            }],
+            choices: all_choices,
             usage: Usage {
                 prompt_tokens: prompt_len,
-                completion_tokens,
-                total_tokens: prompt_len + completion_tokens,
+                completion_tokens: total_completion_tokens,
+                total_tokens: prompt_len + total_completion_tokens,
                 completion_tokens_details,
             },
-            system_fingerprint: Some(fp.clone()),
+            system_fingerprint: Some(fp),
         };
 
         Ok(Json(response).into_response())
     }
 }
+
+// ---------------------------------------------------------------------------
+// Misc helpers
+// ---------------------------------------------------------------------------
 
 fn make_chat_id() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};

@@ -220,14 +220,14 @@ checksum = "1e748733b7cbc798e1434b6ac524f0c1ff2ab456fe201501e6497c8417a4fc33"
 
 [[package]]
 name = "candle-core"
-version = "0.9.2"
-source = "git+https://github.com/huggingface/candle.git#bf9e950cd300493b8768d77baec1a23ad6d44d94"
+version = "0.10.1"
+source = "git+https://github.com/huggingface/candle.git?tag=0.10.1#904bf22e63168d3e3cf712058ed9ae65fd5a6176"
 dependencies = [
  "byteorder",
  "candle-kernels",
  "candle-metal-kernels",
  "candle-ug",
- "cudarc 0.19.2",
+ "cudarc 0.19.4",
  "float8",
  "gemm 0.19.0",
  "half",
@@ -249,16 +249,16 @@ dependencies = [
 
 [[package]]
 name = "candle-kernels"
-version = "0.9.2"
-source = "git+https://github.com/huggingface/candle.git#bf9e950cd300493b8768d77baec1a23ad6d44d94"
+version = "0.10.1"
+source = "git+https://github.com/huggingface/candle.git?tag=0.10.1#904bf22e63168d3e3cf712058ed9ae65fd5a6176"
 dependencies = [
  "cudaforge",
 ]
 
 [[package]]
 name = "candle-metal-kernels"
-version = "0.9.2"
-source = "git+https://github.com/huggingface/candle.git#bf9e950cd300493b8768d77baec1a23ad6d44d94"
+version = "0.10.1"
+source = "git+https://github.com/huggingface/candle.git?tag=0.10.1#904bf22e63168d3e3cf712058ed9ae65fd5a6176"
 dependencies = [
  "half",
  "objc2",
@@ -271,8 +271,8 @@ dependencies = [
 
 [[package]]
 name = "candle-ug"
-version = "0.9.2"
-source = "git+https://github.com/huggingface/candle.git#bf9e950cd300493b8768d77baec1a23ad6d44d94"
+version = "0.10.1"
+source = "git+https://github.com/huggingface/candle.git?tag=0.10.1#904bf22e63168d3e3cf712058ed9ae65fd5a6176"
 dependencies = [
  "ug",
  "ug-cuda",
@@ -492,9 +492,9 @@ dependencies = [
 
 [[package]]
 name = "cudarc"
-version = "0.19.2"
+version = "0.19.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aed81f178e780f3d5d354d12b4c5c5a484c4a9c329ecd037ac57f2a0e0648397"
+checksum = "f071cd6a7b5d51607df76aa2d426aaabc7a74bc6bdb885b8afa63a880572ad9b"
 dependencies = [
  "float8",
  "half",

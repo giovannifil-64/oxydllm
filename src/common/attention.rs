@@ -12,6 +12,7 @@ thread_local! {
     static SDPA_FALLBACK_LOGGED: Cell<bool> = const { Cell::new(false) };
 }
 
+#[cfg(feature = "metal")]
 fn log_sdpa_fallback_once(head_dim: usize, dtype: candle_core::DType) {
     SDPA_FALLBACK_LOGGED.with(|logged| {
         if !logged.get() {
@@ -84,6 +85,46 @@ fn rms_norm_no_weight(x: &Tensor, eps: f64) -> Result<Tensor> {
     let x_f32 = x.contiguous()?.to_dtype(candle_core::DType::F32)?;
     let variance = x_f32.sqr()?.mean_keepdim(D::Minus1)?;
     x_f32.broadcast_div(&(variance + eps)?.sqrt()?)?.to_dtype(dtype)
+}
+
+#[cfg(feature = "metal")]
+fn sdpa_softcap_prefill_chunked(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    scale: f32,
+    softcap: f32,
+) -> Result<Tensor> {
+    let (b, n_heads, q_len, hd) = q.dims4()?;
+    let total_kv = k.dim(2)?;
+    let old_kv = total_kv.saturating_sub(q_len);
+    if old_kv != 0 {
+        candle_core::bail!(
+            "chunked softcap SDPA expects zero cached prefix, got old_kv={old_kv}"
+        );
+    }
+
+    let out = Tensor::zeros((b, n_heads, q_len, hd), q.dtype(), q.device())?;
+    let mut start = 0usize;
+    while start < q_len {
+        let len = (q_len - start).min(8);
+        let q_chunk = q.narrow(2, start, len)?.contiguous()?;
+        let kv_end = old_kv + start + len;
+        let k_chunk = k.narrow(2, 0, kv_end)?.contiguous()?;
+        let v_chunk = v.narrow(2, 0, kv_end)?.contiguous()?;
+        let o_chunk = super::metal_ops::sdpa(
+            &q_chunk,
+            &k_chunk,
+            &v_chunk,
+            None,
+            true,
+            scale,
+            softcap,
+        )?;
+        out.slice_set(&o_chunk.contiguous()?, 2, start)?;
+        start += len;
+    }
+    Ok(out)
 }
 
 impl Attention {
@@ -352,6 +393,43 @@ impl Attention {
                     k_parts[i].clone(), v_parts[i].clone(),
                     kv_lengths[i], self.sliding_window, seg.num_tokens,
                 )?;
+
+                #[cfg(feature = "metal")]
+                if let Some(softcap) = self.attn_softcap {
+                    // Softcapped SDPA full path is unavailable on Metal.
+                    // For prefill without cached prefix, we can still use the
+                    // vector path by chunking q into slices of <= 8 tokens.
+                    let old_kv = kv_len.saturating_sub(seg.num_tokens);
+                    let can_use_segment_sdpa = mask.is_none()
+                        && old_kv == 0
+                        && super::metal_ops::sdpa_available(&q_seg, self.head_dim);
+
+                    if can_use_segment_sdpa {
+                        let seg_out = if seg.num_tokens <= 8 {
+                            super::metal_ops::sdpa(
+                                &q_seg.contiguous()?,
+                                &k_seg.contiguous()?,
+                                &v_seg.contiguous()?,
+                                None,
+                                seg.num_tokens > 1,
+                                self.scale as f32,
+                                softcap as f32,
+                            )?
+                        } else {
+                            sdpa_softcap_prefill_chunked(
+                                &q_seg,
+                                &k_seg,
+                                &v_seg,
+                                self.scale as f32,
+                                softcap as f32,
+                            )?
+                        };
+                        out_buf.slice_set(&seg_out.contiguous()?, 2, q_offset)?;
+                        q_offset += seg.num_tokens;
+                        continue;
+                    }
+                }
+
                 let k_seg = self.repeat_kv(k_seg)?;
                 let v_seg = self.repeat_kv(v_seg)?;
 

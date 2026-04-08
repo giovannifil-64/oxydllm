@@ -537,6 +537,14 @@ fn enqueue_request(
     });
 }
 
+fn clamp_to_char_boundary(s: &str, idx: usize) -> usize {
+    let mut i = idx.min(s.len());
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
 fn prefix_decode_token(
     tokenizer: &Tokenizer,
     decode_cache: &mut TokenDecodeCache,
@@ -550,12 +558,14 @@ fn prefix_decode_token(
         return Some(single);
     }
     let full = tokenizer.decode(all_ids).unwrap_or_default();
-    let new_text = &full[*decoded_len..];
+    let start = clamp_to_char_boundary(&full, *decoded_len);
+    let new_text = &full[start..];
     let emit = new_text.trim_end_matches('\u{FFFD}');
     if !emit.is_empty() {
-        *decoded_len += emit.len();
+        *decoded_len = start + emit.len();
         Some(emit.to_string())
     } else {
+        *decoded_len = start;
         None
     }
 }
@@ -679,9 +689,14 @@ pub fn engine_loop(
                             let remaining_text = if !tracker.output_ids.is_empty() {
                                 let full = tokenizer.decode(&tracker.output_ids).unwrap_or_default();
                                 if tracker.decoded_len < full.len() {
-                                    let rest = full[tracker.decoded_len..].to_string();
-                                    tracker.decoded_len = full.len();
-                                    rest
+                                    let start = clamp_to_char_boundary(&full, tracker.decoded_len);
+                                    if start < full.len() {
+                                        let rest = full[start..].to_string();
+                                        tracker.decoded_len = full.len();
+                                        rest
+                                    } else {
+                                        String::new()
+                                    }
                                 } else {
                                     String::new()
                                 }
@@ -714,7 +729,8 @@ pub fn engine_loop(
                             if !tracker.thinking_ids.is_empty() {
                                 let full = tokenizer.decode(&tracker.thinking_ids).unwrap_or_default();
                                 if tracker.thinking_decoded_len < full.len() {
-                                    let rest = &full[tracker.thinking_decoded_len..];
+                                    let start = clamp_to_char_boundary(&full, tracker.thinking_decoded_len);
+                                    let rest = &full[start..];
                                     if !rest.is_empty() {
                                         let _ = tracker.tx.send(EngineEvent::ReasoningToken(rest.to_string()));
                                     }

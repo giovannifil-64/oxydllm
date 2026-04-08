@@ -4,6 +4,8 @@ use serde::Serialize;
 
 use crate::server::ChatMessage;
 
+const MAX_STRFTIME_FMT_LEN: usize = 128;
+
 pub fn apply_chat_template(
     template: &str,
     messages: &[ChatMessage],
@@ -155,6 +157,71 @@ fn raise_exception(msg: String) -> Result<Value, minijinja::Error> {
     ))
 }
 
-fn strftime_now(fmt: String) -> String {
-    chrono::Local::now().format(&fmt).to_string()
+fn strftime_now(fmt: String) -> std::result::Result<String, minijinja::Error> {
+    if fmt.len() > MAX_STRFTIME_FMT_LEN {
+        return Err(minijinja::Error::new(
+            minijinja::ErrorKind::InvalidOperation,
+            format!(
+                "strftime_now format is too long (max {} chars)",
+                MAX_STRFTIME_FMT_LEN
+            ),
+        ));
+    }
+    if fmt.contains('\n') || fmt.contains('\r') {
+        return Err(minijinja::Error::new(
+            minijinja::ErrorKind::InvalidOperation,
+            "strftime_now format must be a single line",
+        ));
+    }
+    Ok(chrono::Local::now().format(&fmt).to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn apply_chat_template_renders_basic_template() {
+        let messages = vec![ChatMessage {
+            role: "user".to_string(),
+            content: "hello".to_string(),
+            reasoning_content: None,
+        }];
+
+        let rendered = apply_chat_template(
+            "{% for m in messages %}{{ m.role }}: {{ m.content }}{% endfor %}",
+            &messages,
+            None,
+            None,
+            false,
+            false,
+        )
+        .expect("template should render");
+
+        assert_eq!(rendered, "user: hello");
+    }
+
+    #[test]
+    fn strftime_now_rejects_overlong_format() {
+        let fmt = "x".repeat(MAX_STRFTIME_FMT_LEN + 1);
+        let err = strftime_now(fmt).expect_err("overlong format should fail");
+        let msg = err.to_string();
+        assert!(msg.contains("strftime_now format is too long"));
+    }
+
+    #[test]
+    fn strftime_now_rejects_newline_format() {
+        let err = strftime_now("%Y-%m-%d\n%H:%M".to_string())
+            .expect_err("multiline format should fail");
+        let msg = err.to_string();
+        assert!(msg.contains("strftime_now format must be a single line"));
+    }
+
+    #[test]
+    fn apply_chat_template_fails_on_invalid_strftime_format() {
+        let fmt = "x".repeat(MAX_STRFTIME_FMT_LEN + 1);
+        let template = format!("{{{{ strftime_now(\"{}\") }}}}", fmt);
+        let result = apply_chat_template(&template, &[], None, None, false, false);
+        assert!(result.is_err());
+    }
 }

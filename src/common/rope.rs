@@ -6,6 +6,7 @@ pub enum RopeScaling {
     Linear { factor: f64 },
     Llama3 { factor: f64, low_freq_factor: f64, high_freq_factor: f64, original_max_pos: usize },
     Yarn { factor: f64, original_max_pos: usize, beta_fast: f64, beta_slow: f64 },
+    LongRope { short_factor: Vec<f64>, long_factor: Vec<f64>, original_max_pos: usize },
 }
 
 pub struct RotaryEmbedding {
@@ -42,13 +43,17 @@ impl RotaryEmbedding {
             RopeScaling::Llama3 { factor, low_freq_factor, high_freq_factor, original_max_pos } => {
                 let low_freq_wavelen = original_max_pos as f32 / low_freq_factor as f32;
                 let high_freq_wavelen = original_max_pos as f32 / high_freq_factor as f32;
+                let denom = high_freq_factor as f32 - low_freq_factor as f32;
                 
                 for i in 0..head_dim / 2 {
                     let wavelen = 2.0 * std::f32::consts::PI / inv_freq[i];
                     if wavelen > low_freq_wavelen {
                         inv_freq[i] /= factor as f32;
                     } else if wavelen > high_freq_wavelen {
-                        let smooth = (original_max_pos as f32 / wavelen - low_freq_factor as f32) / (high_freq_factor as f32 - low_freq_factor as f32);
+                        if denom.abs() < 1e-6 {
+                            continue;
+                        }
+                        let smooth = (original_max_pos as f32 / wavelen - low_freq_factor as f32) / denom;
                         inv_freq[i] /= (1.0 - smooth) * factor as f32 + smooth;
                     }
                 }
@@ -82,6 +87,22 @@ impl RotaryEmbedding {
                     // ramp=0 → keep original freq (high-freq dims, small index)
                     // ramp=1 → scale by factor  (low-freq dims, large index)
                     inv_freq[i] = freq_inter * ramp + freq_extra * (1.0 - ramp);
+                }
+            }
+            RopeScaling::LongRope {
+                short_factor,
+                long_factor,
+                original_max_pos,
+            } => {
+                let use_long = max_seq_len > original_max_pos;
+                let factors = if use_long { &long_factor } else { &short_factor };
+                let fallback = factors.last().copied().unwrap_or(1.0);
+
+                for i in 0..head_dim / 2 {
+                    let factor = factors.get(i).copied().unwrap_or(fallback);
+                    if factor > 0.0 {
+                        inv_freq[i] /= factor as f32;
+                    }
                 }
             }
             RopeScaling::None => {}
@@ -130,5 +151,82 @@ impl RotaryEmbedding {
         let out2 = (x2.broadcast_mul(&cos)? + x1.broadcast_mul(&sin)?)?;
 
         Tensor::cat(&[&out1, &out2], D::Minus1)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn llama3_equal_freq_factors_do_not_produce_nan() {
+        let device = Device::Cpu;
+        let rope = RotaryEmbedding::new_with_scaling(
+            8,
+            32,
+            10_000.0,
+            RopeScaling::Llama3 {
+                factor: 8.0,
+                low_freq_factor: 1.0,
+                high_freq_factor: 1.0,
+                original_max_pos: 4,
+            },
+            DType::F32,
+            &device,
+        )
+        .expect("llama3 rope construction should succeed");
+
+        let cos = rope
+            .cos
+            .to_vec2::<f32>()
+            .expect("cos should be materializable for test");
+        let sin = rope
+            .sin
+            .to_vec2::<f32>()
+            .expect("sin should be materializable for test");
+
+        assert!(cos.iter().flatten().all(|v| v.is_finite()));
+        assert!(sin.iter().flatten().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn longrope_scales_frequencies_for_long_context() {
+        let device = Device::Cpu;
+        let base = RotaryEmbedding::new_with_scaling(
+            8,
+            32,
+            10_000.0,
+            RopeScaling::None,
+            DType::F32,
+            &device,
+        )
+        .expect("base rope should construct");
+
+        let long = RotaryEmbedding::new_with_scaling(
+            8,
+            32,
+            10_000.0,
+            RopeScaling::LongRope {
+                short_factor: vec![1.0],
+                long_factor: vec![2.0],
+                original_max_pos: 4,
+            },
+            DType::F32,
+            &device,
+        )
+        .expect("longrope should construct");
+
+        let base_cos = base
+            .cos
+            .to_vec2::<f32>()
+            .expect("base cos should be materializable");
+        let long_cos = long
+            .cos
+            .to_vec2::<f32>()
+            .expect("longrope cos should be materializable");
+
+        // At position=1, dim=0 has frequency 1.0 in baseline and 0.5 in the longrope case.
+        // Therefore cos should be larger in the longrope case (cos(0.5) > cos(1.0)).
+        assert!(long_cos[1][0] > base_cos[1][0]);
     }
 }

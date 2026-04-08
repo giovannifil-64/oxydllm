@@ -172,5 +172,14 @@ curl http://localhost:11313/v1/chat/completions \
 - **Gemma4 edge cases**: Some checkpoints may require architecture-specific tuning.
 - **CUDA optimization**: Support exists but is not optimized for production use.
 
+## CUDA Status
+
+CUDA is currently a functional compatibility path, not a performance-tuned backend.
+
+- Build/runtime support is available via `--features cuda`.
+- Core model execution works, but the CUDA path currently relies mostly on Candle generic kernels.
+- Metal has additional fused kernels in this project (attention/RMSNorm/RoPE/softmax), so CUDA throughput can be lower than specialized CUDA stacks.
+- Performance claims for NVIDIA should be treated as hardware-dependent until validated on target GPUs.
+
 ## License
 The code in this repository is made available under the Apache 2.0 license. See [LICENSE](LICENSE) for details.

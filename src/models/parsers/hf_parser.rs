@@ -309,6 +309,72 @@ fn parse_rope_scaling(v: &Value) -> RopeScaling {
             let beta_slow = v["beta_slow"].as_f64().unwrap_or(1.0);
             RopeScaling::Yarn { factor, original_max_pos, beta_fast, beta_slow }
         }
-        _ => RopeScaling::None,
+        "longrope" => {
+            let original_max_pos = v["original_max_position_embeddings"].as_u64().unwrap_or(4096) as usize;
+            let short_factor = parse_rope_factor(&v["short_factor"], 1.0);
+            let long_factor = parse_rope_factor(&v["long_factor"], factor.max(1.0));
+            RopeScaling::LongRope {
+                short_factor,
+                long_factor,
+                original_max_pos,
+            }
+        }
+        _ => {
+            if !rope_type.is_empty() {
+                eprintln!(
+                    "[rope] Unknown rope_scaling type '{rope_type}', falling back to no scaling"
+                );
+            }
+            RopeScaling::None
+        }
+    }
+}
+
+fn parse_rope_factor(v: &Value, default: f64) -> Vec<f64> {
+    match v {
+        Value::Number(n) => n.as_f64().map(|x| vec![x]).unwrap_or_else(|| vec![default]),
+        Value::Array(arr) => {
+            let vals: Vec<f64> = arr.iter().filter_map(Value::as_f64).collect();
+            if vals.is_empty() { vec![default] } else { vals }
+        }
+        _ => vec![default],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn parse_longrope_scaling_from_config() {
+        let v = json!({
+            "type": "longrope",
+            "short_factor": [1.0, 1.5],
+            "long_factor": [2.0, 2.5],
+            "original_max_position_embeddings": 8192
+        });
+
+        match parse_rope_scaling(&v) {
+            RopeScaling::LongRope {
+                short_factor,
+                long_factor,
+                original_max_pos,
+            } => {
+                assert_eq!(short_factor, vec![1.0, 1.5]);
+                assert_eq!(long_factor, vec![2.0, 2.5]);
+                assert_eq!(original_max_pos, 8192);
+            }
+            _ => panic!("expected longrope variant"),
+        }
+    }
+
+    #[test]
+    fn parse_unknown_rope_scaling_falls_back_to_none() {
+        let v = json!({
+            "type": "mystery_rope",
+            "factor": 2.0
+        });
+        assert!(matches!(parse_rope_scaling(&v), RopeScaling::None));
     }
 }

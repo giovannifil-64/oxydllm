@@ -37,7 +37,7 @@ pub struct StandardTransformer {
     pub(crate) blocks: Vec<TransformerBlock>,
     pub(crate) norm: RMSNorm,
     pub(crate) lm_head: AnyLinear,
-    pub(crate) rope: RotaryEmbedding,
+    pub(crate) ropes: Vec<RotaryEmbedding>,
     pub(crate) allocators: Vec<SharedBlockAllocator>,
     pub(crate) device: Device,
     pub(crate) stop_token_ids: Vec<u32>,
@@ -45,6 +45,13 @@ pub struct StandardTransformer {
     pub(crate) max_seq_len: usize,
     pub(crate) embed_scale: Option<f64>,
     pub(crate) logit_softcap: Option<f64>,
+    pub(crate) per_layer_input_embed: Option<Embedding>,
+    pub(crate) per_layer_input_embed_scale: Option<f64>,
+    pub(crate) per_layer_model_projection: Option<Linear>,
+    pub(crate) per_layer_model_projection_scale: Option<f64>,
+    pub(crate) per_layer_projection_norm: Option<RMSNorm>,
+    pub(crate) per_layer_input_scale: Option<f64>,
+    pub(crate) kv_shared_layer_map: Option<Vec<Option<usize>>>,
 }
 
 pub(crate) struct GgufTopology {
@@ -87,9 +94,16 @@ impl StandardTransformer {
             blocks: &self.blocks,
             norm: &self.norm,
             lm_head: &self.lm_head,
-            rope: &self.rope,
+            ropes: &self.ropes,
             embed_scale: self.embed_scale,
             logit_softcap: self.logit_softcap,
+            per_layer_input_embed: self.per_layer_input_embed.as_ref(),
+            per_layer_input_embed_scale: self.per_layer_input_embed_scale,
+            per_layer_model_projection: self.per_layer_model_projection.as_ref(),
+            per_layer_model_projection_scale: self.per_layer_model_projection_scale,
+            per_layer_projection_norm: self.per_layer_projection_norm.as_ref(),
+            per_layer_input_scale: self.per_layer_input_scale,
+            kv_shared_layer_map: self.kv_shared_layer_map.as_deref(),
         }
     }
 
@@ -112,6 +126,7 @@ impl StandardTransformer {
         let attn_softcap = arch_def.attn_softcap;
         let has_ffn_norms = arch_def.has_ffn_norms;
         let has_qk_norm = arch_def.qk_norm;
+        let has_v_norm = arch_def.v_norm;
         
         let topo = parse_gguf_topology(gguf)?;
         let num_hidden_layers = topo.num_hidden_layers;
@@ -193,6 +208,7 @@ impl StandardTransformer {
             activation,
             norm_type,
             attn_softcap,
+            v_norm: has_v_norm,
             has_ffn_norms,
             sliding_window,
         };
@@ -210,9 +226,13 @@ impl StandardTransformer {
         let norm = RMSNorm::from_qtensor(&norm_qt, device, dtype, rms_norm_eps, norm_type)
             .map_err(|e| anyhow::anyhow!("Failed to load output_norm: {e}"))?;
 
-        let rope =
-            RotaryEmbedding::new(head_dim, max_position_embeddings, rope_theta, dtype, device)
-                .map_err(|e| anyhow::anyhow!("Failed to create RoPE: {e}"))?;
+        let mut ropes = Vec::with_capacity(num_hidden_layers);
+        for _ in 0..num_hidden_layers {
+            let rope =
+                RotaryEmbedding::new(head_dim, max_position_embeddings, rope_theta, dtype, device)
+                    .map_err(|e| anyhow::anyhow!("Failed to create RoPE: {e}"))?;
+            ropes.push(rope);
+        }
 
         let mut allocators = Vec::with_capacity(num_hidden_layers);
         for _ in 0..num_hidden_layers {
@@ -238,7 +258,7 @@ impl StandardTransformer {
             blocks,
             norm,
             lm_head,
-            rope,
+            ropes,
             allocators,
             device: device.clone(),
             stop_token_ids,
@@ -246,6 +266,13 @@ impl StandardTransformer {
             max_seq_len: max_position_embeddings,
             embed_scale,
             logit_softcap,
+            per_layer_input_embed: None,
+            per_layer_input_embed_scale: None,
+            per_layer_model_projection: None,
+            per_layer_model_projection_scale: None,
+            per_layer_projection_norm: None,
+            per_layer_input_scale: None,
+            kv_shared_layer_map: None,
         })
     }
 }

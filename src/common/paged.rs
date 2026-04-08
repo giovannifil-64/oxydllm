@@ -573,6 +573,15 @@ impl PagedKvCache {
         ))
     }
 
+    pub fn current(&self) -> Result<(Tensor, Tensor)> {
+        match (&self.contig_k, &self.contig_v) {
+            (Some(k), Some(v)) if self.contig_len > 0 => {
+                Ok((k.narrow(2, 0, self.contig_len)?, v.narrow(2, 0, self.contig_len)?))
+            }
+            _ => Err(candle_core::Error::Msg("KV cache is empty".to_string())),
+        }
+    }
+
     /// Flush deferred quantized writes to the block pool.
     ///
     /// Three optimizations applied here:

@@ -4,6 +4,7 @@ pub struct ArchDefaults {
     pub activation: Activation,
     pub norm_type: NormType,
     pub qk_norm: bool,
+    pub v_norm: bool,
     pub has_ffn_norms: bool,
     pub embed_scale_from_hidden: bool,
     pub attn_softcap: Option<f64>,
@@ -19,6 +20,7 @@ impl Default for ArchDefaults {
             activation: Activation::SiLU,
             norm_type: NormType::Standard,
             qk_norm: false,
+            v_norm: false,
             has_ffn_norms: false,
             embed_scale_from_hidden: false,
             attn_softcap: None,
@@ -35,6 +37,7 @@ pub fn llama_defaults() -> ArchDefaults {
         activation: Activation::SiLU,
         norm_type: NormType::Standard,
         qk_norm: false,
+        v_norm: false,
         has_ffn_norms: false,
         embed_scale_from_hidden: false,
         attn_softcap: None,
@@ -104,6 +107,21 @@ pub fn arch_defaults(arch: &str) -> Option<ArchDefaults> {
             qk_norm: true,
             has_ffn_norms: true,
             embed_scale_from_hidden: true,
+            extra_eos_ids: &[1, 106],
+            ..Default::default()
+        }),
+        "gemma4"
+        | "gemma-4"
+        | "gemma4_text"
+        | "Gemma4ForCausalLM"
+        | "Gemma4ForConditionalGeneration" => Some(ArchDefaults {
+            activation: Activation::GeLUTanh,
+            norm_type: NormType::Standard,
+            qk_norm: true,
+            v_norm: true,
+            has_ffn_norms: true,
+            embed_scale_from_hidden: true,
+            logit_softcap: Some(30.0),
             extra_eos_ids: &[1, 106],
             ..Default::default()
         }),

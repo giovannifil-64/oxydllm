@@ -37,9 +37,10 @@ pub fn parse(config_path: &str) -> Result<StandardTransformerConfig> {
     let arch_def = crate::models::arch_defaults::arch_defaults(arch)
         .with_context(|| format!("Architecture '{arch}' not supported"))?;
 
-    let hidden_size          = req_usize(&v, "hidden_size")?;
-    let num_attention_heads  = req_usize(&v, "num_attention_heads")?;
-    let num_key_value_heads  = v["num_key_value_heads"].as_u64()
+    let hidden_size = req_usize(&v, "hidden_size")?;
+    let num_hidden_layers = req_usize(&v, "num_hidden_layers")?;
+    let num_attention_heads = req_usize(&v, "num_attention_heads")?;
+    let num_key_value_heads = v["num_key_value_heads"].as_u64()
         .map(|x| x as usize)
         .unwrap_or(num_attention_heads);
     let head_dim = v["head_dim"].as_u64()
@@ -53,6 +54,13 @@ pub fn parse(config_path: &str) -> Result<StandardTransformerConfig> {
             eos_token_ids.push(e);
         }
     }
+
+    for e in parse_generation_eos(config_path) {
+        if !eos_token_ids.contains(&e) {
+            eos_token_ids.push(e);
+        }
+    }
+
     if eos_token_ids.is_empty() {
         eos_token_ids = vec![2]; // generic <eos>
     }
@@ -76,21 +84,145 @@ pub fn parse(config_path: &str) -> Result<StandardTransformerConfig> {
     if let Some(scalar) = v["query_pre_attn_scalar"].as_f64() {
         attention_scale = Some(1.0 / scalar.sqrt());
     }
+    if attention_scale.is_none()
+        && (arch == "gemma4"
+            || arch == "gemma-4"
+            || arch == "gemma4_text"
+            || arch == "Gemma4ForCausalLM"
+            || arch == "Gemma4ForConditionalGeneration")
+    {
+        attention_scale = Some(1.0);
+    }
 
     let tie_word_embeddings = v["tie_word_embeddings"].as_bool()
-        .unwrap_or(arch == "GemmaForCausalLM" || arch == "Gemma2ForCausalLM" || arch == "Gemma3ForCausalLM"); // Temporary fallback logic for tying
+        .unwrap_or(
+            arch == "GemmaForCausalLM"
+                || arch == "Gemma2ForCausalLM"
+                || arch == "Gemma3ForCausalLM"
+                || arch == "Gemma4ForCausalLM"
+                || arch == "Gemma4ForConditionalGeneration",
+        );
 
     let rope_scaling = parse_rope_scaling(&v["rope_scaling"]);
     let sliding_window = v["sliding_window"].as_u64().map(|x| x as usize);
 
+    let layer_types = parse_string_array(&v["layer_types"]).filter(|x| x.len() == num_hidden_layers);
+    let global_head_dim = v["global_head_dim"].as_u64().map(|x| x as usize).filter(|&x| x > 0);
+    let num_global_key_value_heads = v["num_global_key_value_heads"]
+        .as_u64()
+        .map(|x| x as usize)
+        .filter(|&x| x > 0);
+
+    let rope_parameters = v.get("rope_parameters").unwrap_or(&Value::Null);
+    let full_rope_theta = rope_parameters
+        .get("full_attention")
+        .and_then(|x| x.get("rope_theta"))
+        .and_then(Value::as_f64);
+    let sliding_rope_theta = rope_parameters
+        .get("sliding_attention")
+        .and_then(|x| x.get("rope_theta"))
+        .and_then(Value::as_f64)
+        .or_else(|| rope_parameters.get("rope_theta").and_then(Value::as_f64));
+
+    let rope_theta = v["rope_theta"]
+        .as_f64()
+        .or(sliding_rope_theta)
+        .or(full_rope_theta)
+        .unwrap_or(arch_def.default_rope_theta);
+
+    let per_layer_head_dims = layer_types.as_ref().map(|types| {
+        types
+            .iter()
+            .map(|layer_type| {
+                if layer_type == "full_attention" {
+                    global_head_dim.unwrap_or(head_dim)
+                } else {
+                    head_dim
+                }
+            })
+            .collect::<Vec<_>>()
+    });
+
+    let per_layer_num_key_value_heads = layer_types.as_ref().map(|types| {
+        types
+            .iter()
+            .map(|layer_type| {
+                if layer_type == "full_attention" {
+                    num_global_key_value_heads.unwrap_or(num_key_value_heads)
+                } else {
+                    num_key_value_heads
+                }
+            })
+            .collect::<Vec<_>>()
+    });
+
+    let per_layer_sliding_windows = layer_types.as_ref().and_then(|types| {
+        sliding_window.map(|w| {
+            types
+                .iter()
+                .map(|layer_type| if layer_type == "full_attention" { None } else { Some(w) })
+                .collect::<Vec<_>>()
+        })
+    });
+
+    let per_layer_rope_thetas = layer_types.as_ref().map(|types| {
+        types
+            .iter()
+            .map(|layer_type| {
+                if layer_type == "full_attention" {
+                    full_rope_theta.unwrap_or(rope_theta)
+                } else {
+                    sliding_rope_theta.unwrap_or(rope_theta)
+                }
+            })
+            .collect::<Vec<_>>()
+    });
+
+    let num_kv_shared_layers = v["num_kv_shared_layers"].as_u64().unwrap_or(0) as usize;
+    let kv_shared_layer_map = layer_types.as_ref().and_then(|types| {
+        if num_kv_shared_layers == 0 {
+            return None;
+        }
+        let first_shared = num_hidden_layers.saturating_sub(num_kv_shared_layers);
+        let mut map = vec![None; num_hidden_layers];
+        for layer_idx in first_shared..num_hidden_layers {
+            if let Some(ref_layer) = (0..first_shared)
+                .rev()
+                .find(|&j| types[j] == types[layer_idx])
+            {
+                map[layer_idx] = Some(ref_layer);
+            }
+        }
+        Some(map)
+    });
+
+    let per_layer_input_hidden_size = v["hidden_size_per_layer_input"]
+        .as_u64()
+        .map(|x| x as usize)
+        .filter(|&x| x > 0);
+    let per_layer_input_vocab_size = v["vocab_size_per_layer_input"]
+        .as_u64()
+        .map(|x| x as usize)
+        .filter(|&x| x > 0);
+    let (per_layer_input_embed_scale, per_layer_model_projection_scale, per_layer_input_scale) =
+        if let Some(h) = per_layer_input_hidden_size {
+            (
+                Some((h as f64).sqrt()),
+                Some(1.0 / (hidden_size as f64).sqrt()),
+                Some(1.0 / (2.0f64).sqrt()),
+            )
+        } else {
+            (None, None, None)
+        };
+
     Ok(StandardTransformerConfig {
         vocab_size:               req_usize(&v, "vocab_size")?,
-        num_hidden_layers:        req_usize(&v, "num_hidden_layers")?,
+        num_hidden_layers,
         num_attention_heads,
         num_key_value_heads,
         head_dim,
         rms_norm_eps:             v["rms_norm_eps"].as_f64().unwrap_or(1e-5),
-        rope_theta:               v["rope_theta"].as_f64().unwrap_or(arch_def.default_rope_theta),
+        rope_theta,
         rope_scaling,
         max_position_embeddings:  v["max_position_embeddings"].as_u64().unwrap_or(131_072) as usize,
         qk_norm:                  arch_def.qk_norm,
@@ -102,8 +234,19 @@ pub fn parse(config_path: &str) -> Result<StandardTransformerConfig> {
         embed_scale,
         attn_softcap,
         logit_softcap,
+        v_norm:                   arch_def.v_norm,
         has_ffn_norms:            arch_def.has_ffn_norms,
         sliding_window,
+        per_layer_num_key_value_heads,
+        per_layer_head_dims,
+        per_layer_sliding_windows,
+        per_layer_rope_thetas,
+        kv_shared_layer_map,
+        per_layer_input_hidden_size,
+        per_layer_input_vocab_size,
+        per_layer_input_embed_scale,
+        per_layer_model_projection_scale,
+        per_layer_input_scale,
     })
 }
 
@@ -120,6 +263,28 @@ fn parse_eos(v: &Value) -> Vec<u32> {
         Value::Array(arr) => arr.iter().filter_map(|x| x.as_u64()).map(|x| x as u32).collect(),
         _ => vec![],
     }
+}
+
+fn parse_string_array(v: &Value) -> Option<Vec<String>> {
+    v.as_array()
+        .map(|arr| arr.iter().filter_map(|x| x.as_str().map(str::to_string)).collect::<Vec<_>>())
+}
+
+fn parse_generation_eos(config_path: &str) -> Vec<u32> {
+    let config_path = std::path::Path::new(config_path);
+    let Some(parent) = config_path.parent() else {
+        return Vec::new();
+    };
+    let generation_config_path = parent.join("generation_config.json");
+    let raw = match std::fs::read_to_string(generation_config_path) {
+        Ok(raw) => raw,
+        Err(_) => return Vec::new(),
+    };
+    let v: Value = match serde_json::from_str(&raw) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    parse_eos(&v["eos_token_id"])
 }
 
 fn parse_rope_scaling(v: &Value) -> RopeScaling {

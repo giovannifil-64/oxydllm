@@ -76,6 +76,10 @@ impl PrefixCache {
         let num_full_blocks = tokens.len() / block_size;
         debug_assert!(start_block + new_block_ids.len() <= num_full_blocks);
 
+        if new_block_ids.iter().any(|ids| ids.len() != allocators.len()) {
+            return;
+        }
+
         let mut prev_hash: u64 = 0;
         for block_idx in 0..start_block {
             prev_hash = chain_hash(
@@ -85,14 +89,6 @@ impl PrefixCache {
         }
 
         for (i, block_ids) in new_block_ids.iter().enumerate() {
-            if block_ids.len() != allocators.len() {
-                eprintln!(
-                    "[prefix_cache] register: block_ids.len()={} != allocators.len()={} at block {}, skipping remaining",
-                    block_ids.len(), allocators.len(), start_block + i,
-                );
-                break;
-            }
-
             let block_idx = start_block + i;
             let h = chain_hash(
                 &tokens[block_idx * block_size..(block_idx + 1) * block_size],

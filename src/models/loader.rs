@@ -245,6 +245,10 @@ fn discover_gguf_model(id: &str, gguf_path: &Path) -> Option<DiscoveredModel> {
         "llama" => "LlamaForCausalLM (GGUF)".to_string(),
         "qwen2" => "Qwen2ForCausalLM (GGUF)".to_string(),
         "qwen3" => "Qwen3ForCausalLM (GGUF)".to_string(),
+        "gemma" => "GemmaForCausalLM (GGUF)".to_string(),
+        "gemma2" => "Gemma2ForCausalLM (GGUF)".to_string(),
+        "gemma3" => "Gemma3ForCausalLM (GGUF)".to_string(),
+        "gemma4" => "Gemma4ForConditionalGeneration (GGUF)".to_string(),
         other => format!("{} (GGUF)", other),
     };
 
@@ -320,12 +324,38 @@ fn load_standard_safetensors(
     let weights = ModelWeights::load(&weight_path_refs, device, dtype)?;
     let weights_size = weights.total_size_bytes();
 
+    let num_layers = cfg.num_hidden_layers;
+    let per_layer_head_dims = cfg
+        .per_layer_head_dims
+        .clone()
+        .filter(|v| v.len() == num_layers)
+        .unwrap_or_else(|| vec![cfg.head_dim; num_layers]);
+    let per_layer_kv_heads = cfg
+        .per_layer_num_key_value_heads
+        .clone()
+        .filter(|v| v.len() == num_layers)
+        .unwrap_or_else(|| vec![cfg.num_key_value_heads; num_layers]);
+    let per_layer_sliding_windows = cfg
+        .per_layer_sliding_windows
+        .clone()
+        .filter(|v| v.len() == num_layers)
+        .unwrap_or_else(|| vec![cfg.sliding_window; num_layers]);
+    let per_layer_rope_thetas = cfg
+        .per_layer_rope_thetas
+        .clone()
+        .filter(|v| v.len() == num_layers)
+        .unwrap_or_else(|| vec![cfg.rope_theta; num_layers]);
+
+    let layer_kv_specs: Vec<(usize, usize)> = per_layer_kv_heads
+        .iter()
+        .copied()
+        .zip(per_layer_head_dims.iter().copied())
+        .collect();
+
     let ctx = max_context_len.min(cfg.max_position_embeddings);
     let (num_blocks, acquired_kv_bytes) = compute_kv_blocks(
         &KvBlockParams {
-            num_layers: cfg.num_hidden_layers,
-            n_kv_heads: cfg.num_key_value_heads,
-            head_dim: cfg.head_dim,
+            layer_kv_specs: layer_kv_specs.clone(),
             max_context_len: ctx,
             max_num_sequences,
             dtype,
@@ -334,9 +364,12 @@ fn load_standard_safetensors(
         kv_budget,
     )?;
 
-    let quantizer: Option<Arc<KvQuantizer>> = match kv_quant {
-        KvQuantMode::Off => None,
-        mode => Some(Arc::new(KvQuantizer::new(mode.bit_width(), cfg.head_dim))),
+    let layer_quantizers: Vec<Option<Arc<KvQuantizer>>> = match kv_quant {
+        KvQuantMode::Off => vec![None; num_layers],
+        mode => per_layer_head_dims
+            .iter()
+            .map(|&hd| Some(Arc::new(KvQuantizer::new(mode.bit_width(), hd))))
+            .collect(),
     };
 
     let result = (|| -> anyhow::Result<(Box<dyn BatchModel>, usize)> {
@@ -352,36 +385,89 @@ fn load_standard_safetensors(
         };
         let embed_tokens = Embedding::new(embed_weight);
 
-        let block_cfg = cfg.block_config();
         let blocks = (0..cfg.num_hidden_layers)
-            .map(|i| TransformerBlock::load(&block_cfg, i, &weights))
+            .map(|i| {
+                let mut block_cfg = cfg.block_config();
+                block_cfg.head_dim = per_layer_head_dims[i];
+                block_cfg.n_kv_heads = per_layer_kv_heads[i];
+                block_cfg.sliding_window = per_layer_sliding_windows[i];
+                TransformerBlock::load(&block_cfg, i, &weights)
+            })
             .collect::<candle_core::Result<Vec<_>>>()?;
 
         let norm = RMSNorm::load(&weights, "model.norm", cfg.rms_norm_eps, cfg.norm_type)?;
-        let rope = RotaryEmbedding::new_with_scaling(
-            cfg.head_dim,
-            ctx,
-            cfg.rope_theta,
-            cfg.rope_scaling.clone(),
-            dtype,
-            device,
-        )?;
+
+        let ropes = (0..cfg.num_hidden_layers)
+            .map(|i| {
+                RotaryEmbedding::new_with_scaling(
+                    per_layer_head_dims[i],
+                    ctx,
+                    per_layer_rope_thetas[i],
+                    cfg.rope_scaling.clone(),
+                    dtype,
+                    device,
+                )
+            })
+            .collect::<candle_core::Result<Vec<_>>>()?;
 
         let allocators = (0..cfg.num_hidden_layers)
-            .map(|_| -> candle_core::Result<SharedBlockAllocator> {
+            .map(|i| -> candle_core::Result<SharedBlockAllocator> {
                 Ok(Arc::new(Mutex::new(BlockAllocator::new(
-                    num_blocks, DEFAULT_BLOCK_SIZE, cfg.num_key_value_heads, cfg.head_dim, dtype, device,
-                    quantizer.clone(),
+                    num_blocks,
+                    DEFAULT_BLOCK_SIZE,
+                    per_layer_kv_heads[i],
+                    per_layer_head_dims[i],
+                    dtype,
+                    device,
+                    layer_quantizers[i].clone(),
                 )?)))
             })
             .collect::<candle_core::Result<Vec<_>>>()?;
+
+        let has_per_layer_stream = cfg.per_layer_input_hidden_size.is_some()
+            && cfg.per_layer_input_vocab_size.is_some()
+            && weights.try_get("model.embed_tokens_per_layer.weight").is_some()
+            && weights.try_get("model.per_layer_model_projection.weight").is_some()
+            && weights.try_get("model.per_layer_projection_norm.weight").is_some();
+
+        let per_layer_input_embed = if has_per_layer_stream {
+            Some(Embedding::new(
+                weights
+                    .get("model.embed_tokens_per_layer.weight")
+                    .map_err(|e| anyhow::anyhow!("{e}"))?
+                    .clone(),
+            ))
+        } else {
+            None
+        };
+        let per_layer_model_projection = if has_per_layer_stream {
+            Some(Linear::new(
+                weights
+                    .get("model.per_layer_model_projection.weight")
+                    .map_err(|e| anyhow::anyhow!("{e}"))?
+                    .clone(),
+                None,
+            ))
+        } else {
+            None
+        };
+        let per_layer_projection_norm = if has_per_layer_stream {
+            Some(RMSNorm::load(
+                &weights,
+                "model.per_layer_projection_norm",
+                cfg.rms_norm_eps,
+                cfg.norm_type,
+            )?)
+        } else {
+            None
+        };
 
         Ok((Box::new(StandardTransformer {
             embed_tokens,
             blocks,
             norm,
             lm_head,
-            rope,
+            ropes,
             allocators,
             device: device.clone(),
             stop_token_ids: cfg.eos_token_ids,
@@ -389,6 +475,13 @@ fn load_standard_safetensors(
             max_seq_len: ctx,
             embed_scale: cfg.embed_scale,
             logit_softcap: cfg.logit_softcap,
+            per_layer_input_embed,
+            per_layer_input_embed_scale: cfg.per_layer_input_embed_scale,
+            per_layer_model_projection,
+            per_layer_model_projection_scale: cfg.per_layer_model_projection_scale,
+            per_layer_projection_norm,
+            per_layer_input_scale: cfg.per_layer_input_scale,
+            kv_shared_layer_map: cfg.kv_shared_layer_map.clone(),
         }), weights_size))
     })();
 
@@ -455,11 +548,10 @@ fn load_batch_model_gguf(
 
     let topo = crate::models::gguf_model::parse_gguf_topology(&gguf)?;
     let ctx = max_context_len.min(topo.context_length);
+    let layer_kv_specs = vec![(topo.num_key_value_heads, topo.head_dim); topo.num_hidden_layers];
     let (num_blocks, acquired_kv_bytes) = compute_kv_blocks(
         &KvBlockParams {
-            num_layers: topo.num_hidden_layers,
-            n_kv_heads: topo.num_key_value_heads,
-            head_dim: topo.head_dim,
+            layer_kv_specs,
             max_context_len: ctx,
             max_num_sequences,
             dtype,
@@ -484,9 +576,7 @@ fn load_batch_model_gguf(
 }
 
 struct KvBlockParams {
-    num_layers: usize,
-    n_kv_heads: usize,
-    head_dim: usize,
+    layer_kv_specs: Vec<(usize, usize)>,
     max_context_len: usize,
     max_num_sequences: usize,
     dtype: DType,
@@ -500,13 +590,21 @@ fn compute_kv_blocks(p: &KvBlockParams, kv_budget: &GlobalKvBudget) -> anyhow::R
 
     // Bytes for one block summed across all layers (K + V).
     let per_block_bytes = match p.kv_quant {
-        KvQuantMode::Off => {
-            DEFAULT_BLOCK_SIZE * p.n_kv_heads * p.head_dim * p.dtype.size_in_bytes() * 2 * p.num_layers
-        }
-        mode => {
-            let bph = kv_quant::quantized_bytes_per_head(p.head_dim, mode.bit_width());
-            DEFAULT_BLOCK_SIZE * p.n_kv_heads * bph * 2 * p.num_layers
-        }
+        KvQuantMode::Off => p
+            .layer_kv_specs
+            .iter()
+            .map(|(n_kv_heads, head_dim)| {
+                DEFAULT_BLOCK_SIZE * (*n_kv_heads) * (*head_dim) * p.dtype.size_in_bytes() * 2
+            })
+            .sum::<usize>(),
+        mode => p
+            .layer_kv_specs
+            .iter()
+            .map(|(n_kv_heads, head_dim)| {
+                let bph = kv_quant::quantized_bytes_per_head(*head_dim, mode.bit_width());
+                DEFAULT_BLOCK_SIZE * (*n_kv_heads) * bph * 2
+            })
+            .sum::<usize>(),
     };
 
     if per_block_bytes == 0 {

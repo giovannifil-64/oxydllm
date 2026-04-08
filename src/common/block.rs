@@ -2,7 +2,7 @@ use candle_core::Result;
 use candle_core::Tensor;
 use super::{
     attention::{Attention, SegmentInfo},
-    config::BlockConfig,
+    config::{Activation, BlockConfig},
     ffn::FeedForward,
     gguf_weights::GgufWeights,
     linear::{AnyLinear, Embedding},
@@ -19,6 +19,29 @@ pub struct TransformerBlock {
     ffn: FeedForward,
     pre_ffn_norm: Option<RMSNorm>,
     post_ffn_norm: Option<RMSNorm>,
+    per_layer_input_gate: Option<AnyLinear>,
+    per_layer_projection: Option<AnyLinear>,
+    post_per_layer_input_norm: Option<RMSNorm>,
+    layer_scalar: Option<f64>,
+    activation: Activation,
+}
+
+fn tensor_to_scalar_f64(t: &Tensor) -> Result<f64> {
+    let t = if t.dtype() == candle_core::DType::F32 {
+        t.clone()
+    } else {
+        t.to_dtype(candle_core::DType::F32)?
+    };
+
+    if t.rank() == 0 {
+        return Ok(t.to_scalar::<f32>()? as f64);
+    }
+    let flat = t.flatten_all()?;
+    let vals = flat.to_vec1::<f32>()?;
+    vals.first()
+        .copied()
+        .map(|v| v as f64)
+        .ok_or_else(|| candle_core::Error::Msg("layer_scalar tensor is empty".to_string()))
 }
 
 impl TransformerBlock {
@@ -35,8 +58,36 @@ impl TransformerBlock {
             pre_ffn_norm = Some(RMSNorm::load(weights, &format!("{}.pre_feedforward_layernorm", p), cfg.rms_norm_eps, cfg.norm_type)?);
             post_ffn_norm = Some(RMSNorm::load(weights, &format!("{}.post_feedforward_layernorm", p), cfg.rms_norm_eps, cfg.norm_type)?);
         }
+
+        let per_layer_input_gate = weights
+            .try_get(&format!("{}.per_layer_input_gate.weight", p))
+            .map(|w| AnyLinear::Float(super::linear::Linear::new(w.clone(), None)));
+        let per_layer_projection = weights
+            .try_get(&format!("{}.per_layer_projection.weight", p))
+            .map(|w| AnyLinear::Float(super::linear::Linear::new(w.clone(), None)));
+        let post_per_layer_input_norm = if per_layer_input_gate.is_some() && per_layer_projection.is_some() {
+            Some(RMSNorm::load(weights, &format!("{}.post_per_layer_input_norm", p), cfg.rms_norm_eps, cfg.norm_type)?)
+        } else {
+            None
+        };
+        let layer_scalar = weights
+            .try_get(&format!("{}.layer_scalar", p))
+            .map(tensor_to_scalar_f64)
+            .transpose()?;
         
-        Ok(Self { input_norm, attention, ffn_norm, ffn, pre_ffn_norm, post_ffn_norm })
+        Ok(Self {
+            input_norm,
+            attention,
+            ffn_norm,
+            ffn,
+            pre_ffn_norm,
+            post_ffn_norm,
+            per_layer_input_gate,
+            per_layer_projection,
+            post_per_layer_input_norm,
+            layer_scalar,
+            activation: cfg.activation,
+        })
     }
 
     pub fn load_gguf(
@@ -58,7 +109,19 @@ impl TransformerBlock {
         let attention = Attention::load_gguf(cfg, layer_idx, gguf, device, dtype)?;
         let ffn = FeedForward::load_gguf(layer_idx, gguf, intermediate_size, device, dtype, cfg.activation)?;
 
-        Ok(Self { input_norm, attention, ffn_norm, ffn, pre_ffn_norm: None, post_ffn_norm: None })
+        Ok(Self {
+            input_norm,
+            attention,
+            ffn_norm,
+            ffn,
+            pre_ffn_norm: None,
+            post_ffn_norm: None,
+            per_layer_input_gate: None,
+            per_layer_projection: None,
+            post_per_layer_input_norm: None,
+            layer_scalar: None,
+            activation: cfg.activation,
+        })
     }
 
     pub fn forward_batch(
@@ -66,6 +129,7 @@ impl TransformerBlock {
         x: &Tensor,
         rope: &RotaryEmbedding,
         position_ids: &Tensor,
+        per_layer_input: Option<&Tensor>,
         mask: Option<&Tensor>,
         segments: &mut [SegmentInfo],
     ) -> Result<Tensor> {
@@ -93,6 +157,29 @@ impl TransformerBlock {
         }
         
         x = (residual + ffn_out)?;
+
+        if let (Some(gate), Some(proj), Some(post_norm), Some(per_layer_input)) = (
+            &self.per_layer_input_gate,
+            &self.per_layer_projection,
+            &self.post_per_layer_input_norm,
+            per_layer_input,
+        ) {
+            let residual = x.clone();
+            let mut gated = gate.forward(&x)?;
+            gated = match self.activation {
+                Activation::SiLU => gated.silu()?,
+                Activation::GeLUTanh => gated.gelu()?,
+            };
+            let mixed = (gated * per_layer_input)?;
+            let projected = proj.forward(&mixed)?;
+            let projected = post_norm.forward(&projected)?;
+            x = (residual + projected)?;
+        }
+
+        if let Some(layer_scalar) = self.layer_scalar {
+            x = (x * layer_scalar)?;
+        }
+
         Ok(x)
     }
 }
@@ -103,9 +190,16 @@ pub struct TransformerComponents<'a> {
     pub blocks: &'a [TransformerBlock],
     pub norm: &'a RMSNorm,
     pub lm_head: &'a AnyLinear,
-    pub rope: &'a RotaryEmbedding,
+    pub ropes: &'a [RotaryEmbedding],
     pub embed_scale: Option<f64>,
     pub logit_softcap: Option<f64>,
+    pub per_layer_input_embed: Option<&'a Embedding>,
+    pub per_layer_input_embed_scale: Option<f64>,
+    pub per_layer_model_projection: Option<&'a super::linear::Linear>,
+    pub per_layer_model_projection_scale: Option<f64>,
+    pub per_layer_projection_norm: Option<&'a RMSNorm>,
+    pub per_layer_input_scale: Option<f64>,
+    pub kv_shared_layer_map: Option<&'a [Option<usize>]>,
 }
 
 /// Shared batched forward pass for standard transformer models.
@@ -137,15 +231,71 @@ pub fn run_transformer_layers_batch(
         x = (x * scale)?;
     }
 
+    let per_layer_inputs = if let (
+        Some(embed),
+        Some(embed_scale),
+        Some(model_proj),
+        Some(model_proj_scale),
+        Some(proj_norm),
+        Some(input_scale),
+    ) = (
+        c.per_layer_input_embed,
+        c.per_layer_input_embed_scale,
+        c.per_layer_model_projection,
+        c.per_layer_model_projection_scale,
+        c.per_layer_projection_norm,
+        c.per_layer_input_scale,
+    ) {
+        let mut per_token = embed.forward(token_ids)?;
+        per_token = (per_token * embed_scale)?;
+        let (b, s, flat_dim) = per_token.dims3()?;
+        let n_layers = c.blocks.len();
+        let per_layer_hidden = flat_dim / n_layers;
+        let per_token = per_token.reshape((b, s, n_layers, per_layer_hidden))?;
+
+        let projected = model_proj.forward(&x)?;
+        let projected = (projected * model_proj_scale)?;
+        let projected = projected.reshape((b, s, n_layers, per_layer_hidden))?;
+        let projected = proj_norm.forward(&projected)?;
+
+        Some(((projected + per_token)? * input_scale)?)
+    } else {
+        None
+    };
+
     for (layer_idx, block) in c.blocks.iter().enumerate() {
         let mut segments: Vec<SegmentInfo> = Vec::with_capacity(seq_caches.len());
         for (seq_idx, seq_cache) in seq_caches.iter_mut().enumerate() {
+            let shared_cache_idx = c
+                .kv_shared_layer_map
+                .and_then(|m| m.get(layer_idx).copied().flatten());
+            let use_shared_cache = shared_cache_idx.is_some();
+            let cache_idx = if use_shared_cache {
+                shared_cache_idx.unwrap_or(layer_idx)
+            } else {
+                layer_idx
+            };
             segments.push(SegmentInfo {
                 num_tokens: token_counts[seq_idx],
-                cache: &mut seq_cache[layer_idx],
+                cache: &mut seq_cache[cache_idx],
+                reuse_cache: use_shared_cache,
             });
         }
-        x = block.forward_batch(&x, c.rope, position_ids, None, &mut segments)?;
+
+        let per_layer_input = if let Some(all_inputs) = &per_layer_inputs {
+            Some(all_inputs.narrow(2, layer_idx, 1)?.squeeze(2)?)
+        } else {
+            None
+        };
+
+        x = block.forward_batch(
+            &x,
+            &c.ropes[layer_idx],
+            position_ids,
+            per_layer_input.as_ref(),
+            None,
+            &mut segments,
+        )?;
     }
 
     for seq_cache in seq_caches.iter_mut() {

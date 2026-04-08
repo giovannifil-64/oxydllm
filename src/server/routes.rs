@@ -26,6 +26,26 @@ pub struct StreamOptions {
     pub include_usage: Option<bool>,
 }
 
+#[derive(Deserialize, Clone)]
+#[allow(dead_code)]
+pub struct JsonSchemaSpec {
+    pub name: String,
+    #[serde(default)]
+    pub schema: Option<serde_json::Value>,
+    #[serde(default)]
+    pub strict: Option<bool>,
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+#[derive(Deserialize, Clone)]
+pub struct ResponseFormat {
+    #[serde(rename = "type")]
+    pub format_type: String,
+    #[serde(default)]
+    pub json_schema: Option<JsonSchemaSpec>,
+}
+
 #[derive(Deserialize)]
 pub struct ChatCompletionRequest {
     #[serde(default)]
@@ -71,10 +91,8 @@ pub struct ChatCompletionRequest {
     pub keep_alive: Option<u64>,
     #[serde(default)]
     pub enable_thinking: Option<bool>,
-    // Accepted but ignored (allows OpenAI SDK clients to pass these without errors)
     #[serde(default)]
-    #[allow(dead_code)]
-    pub response_format: Option<serde_json::Value>,
+    pub response_format: Option<ResponseFormat>,
     #[serde(default)]
     #[allow(dead_code)]
     pub user: Option<String>,
@@ -313,8 +331,76 @@ fn build_logprob_entry(
     EngineLogprobEntry { token_str, logprob, bytes, top_logprobs }
 }
 
+/// Strip markdown code fences (```json ... ```) that models often wrap JSON in.
+fn strip_json_fences(s: &str) -> &str {
+    let s = s.trim();
+    let inner = s
+        .strip_prefix("```json")
+        .or_else(|| s.strip_prefix("```JSON"))
+        .or_else(|| s.strip_prefix("```"))
+        .and_then(|t| t.trim_start_matches('\n').strip_suffix("```"))
+        .map(|t| t.trim_end_matches('\n').trim());
+    inner.unwrap_or(s)
+}
+
+/// Build the JSON mode system instruction from a `ResponseFormat`.
+fn json_system_instruction(rf: &ResponseFormat) -> String {
+    match rf.format_type.as_str() {
+        "json_schema" => {
+            if let Some(spec) = &rf.json_schema {
+                let schema_part = spec
+                    .schema
+                    .as_ref()
+                    .and_then(|s| serde_json::to_string_pretty(s).ok())
+                    .filter(|s| !s.is_empty())
+                    .map(|s| {
+                        format!(
+                            " that conforms to the following JSON Schema:\n```json\n{}\n```",
+                            s
+                        )
+                    })
+                    .unwrap_or_default();
+                format!(
+                    "You must respond with valid JSON only{}. Do not include any explanation, markdown, or text outside of the JSON object.",
+                    schema_part
+                )
+            } else {
+                "You must respond with valid JSON only. Do not include any explanation, markdown, or text outside of the JSON object.".to_string()
+            }
+        }
+        _ => {
+            // json_object or anything else that signals JSON mode
+            "You must respond with valid JSON only. Do not include any explanation, markdown, or text outside of the JSON object.".to_string()
+        }
+    }
+}
+
 pub fn apply_chat_template(tokenizer: &Tokenizer, messages: &[ChatMessage], enable_thinking: bool) -> String {
     let Some(template) = tokenizer.chat_template() else {
+        if tokenizer.special_token_id("<|turn>").is_some()
+            && tokenizer.special_token_id("<turn|>").is_some() {
+                return chat_template::format_turn_chat(
+                    messages,
+                    tokenizer.bos_token(),
+                    "<|turn>",
+                    "<turn|>",
+                    true,
+                    enable_thinking,
+                );
+            }
+
+        if tokenizer.special_token_id("<start_of_turn>").is_some()
+            && tokenizer.special_token_id("<end_of_turn>").is_some() {
+                return chat_template::format_turn_chat(
+                    messages,
+                    tokenizer.bos_token(),
+                    "<start_of_turn>",
+                    "<end_of_turn>",
+                    true,
+                    enable_thinking,
+                );
+            }
+
         return chat_template::format_plain_chat(messages);
     };
 
@@ -879,7 +965,35 @@ async fn chat_completions(
     let t_template = std::time::Instant::now();
     let enable_thinking = body.enable_thinking.unwrap_or(false)
         && handle.tokenizer.has_thinking_support();
-    let prompt = apply_chat_template(&handle.tokenizer, &body.messages, enable_thinking);
+
+    // Build the message list, optionally injecting a JSON-mode system instruction.
+    let json_mode = body
+        .response_format
+        .as_ref()
+        .map(|rf| rf.format_type == "json_object" || rf.format_type == "json_schema")
+        .unwrap_or(false);
+    let messages_for_prompt: std::borrow::Cow<[ChatMessage]> = if let Some(rf) = &body.response_format {
+        if json_mode {
+            let instr = json_system_instruction(rf);
+            let mut msgs = body.messages.clone();
+            if let Some(sys) = msgs.iter_mut().find(|m| m.role == "system") {
+                sys.content = format!("{}\n\n{}", sys.content, instr);
+            } else {
+                msgs.insert(0, ChatMessage {
+                    role: "system".to_string(),
+                    content: instr,
+                    reasoning_content: None,
+                });
+            }
+            std::borrow::Cow::Owned(msgs)
+        } else {
+            std::borrow::Cow::Borrowed(&body.messages)
+        }
+    } else {
+        std::borrow::Cow::Borrowed(&body.messages)
+    };
+
+    let prompt = apply_chat_template(&handle.tokenizer, &messages_for_prompt, enable_thinking);
     let template_ms = t_template.elapsed().as_secs_f64() * 1000.0;
 
     let t_encode = std::time::Instant::now();
@@ -1293,14 +1407,29 @@ async fn chat_completions(
                 None
             };
 
+            // In JSON mode, strip markdown fences and validate syntax.
+            let (content, finish_reason) = if json_mode {
+                let raw = strip_json_fences(data.content.trim()).to_string();
+                let reason = if serde_json::from_str::<serde_json::Value>(&raw).is_ok() {
+                    data.finish_reason.clone()
+                } else {
+                    // Output is not valid JSON — signal this via finish_reason while still
+                    // returning the raw text so callers can inspect it.
+                    "content_filter".to_string()
+                };
+                (raw, reason)
+            } else {
+                (data.content.trim().to_string(), data.finish_reason.clone())
+            };
+
             all_choices.push(Choice {
                 index: i,
                 message: ChatMessage {
                     role: "assistant".to_string(),
-                    content: data.content.trim().to_string(),
+                    content,
                     reasoning_content: reasoning_opt,
                 },
-                finish_reason: data.finish_reason,
+                finish_reason,
                 logprobs,
             });
         }

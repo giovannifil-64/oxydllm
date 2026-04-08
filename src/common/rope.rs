@@ -120,7 +120,6 @@ impl RotaryEmbedding {
             return super::metal_ops::rope_fused(&x_c, &cos_c, &sin_c);
         }
 
-        // CPU / non-Metal fallback
         let cos = cos.unsqueeze(0)?.unsqueeze(0)?;
         let sin = sin.unsqueeze(0)?.unsqueeze(0)?;
 

@@ -40,31 +40,58 @@ impl Tokenizer {
             .and_then(|raw| serde_json::from_str(&raw).ok())
             .unwrap_or(serde_json::Value::Null);
 
-        let chat_template = match cfg.get("chat_template") {
-            Some(serde_json::Value::String(s)) if !s.trim().is_empty() => Some(s.clone()),
-            Some(serde_json::Value::Array(arr)) => {
-                arr.iter()
+        let parse_chat_template = |val: &serde_json::Value| -> Option<String> {
+            match val {
+                serde_json::Value::String(s) if !s.trim().is_empty() => Some(s.clone()),
+                serde_json::Value::Array(arr) => arr
+                    .iter()
                     .find(|v| v.get("name").and_then(|n| n.as_str()) == Some("default"))
                     .or_else(|| arr.first())
                     .and_then(|v| v.get("template").and_then(|t| t.as_str()))
-                    .map(|s| s.to_string())
+                    .map(|s| s.to_string()),
+                _ => None,
             }
-            _ => None,
         };
 
+        let mut chat_template = cfg.get("chat_template").and_then(parse_chat_template);
+
+        if chat_template.is_none() {
+            let processor_cfg_path = format!("{}/processor_config.json", model_dir);
+            let processor_cfg: serde_json::Value = std::fs::read_to_string(&processor_cfg_path)
+                .ok()
+                .and_then(|raw| serde_json::from_str(&raw).ok())
+                .unwrap_or(serde_json::Value::Null);
+            chat_template = processor_cfg
+                .get("chat_template")
+                .and_then(parse_chat_template);
+        }
+
+        if chat_template.is_none() {
+            let template_path = format!("{}/chat_template.jinja", model_dir);
+            if let Ok(raw) = std::fs::read_to_string(&template_path) {
+                if !raw.trim().is_empty() {
+                    chat_template = Some(raw);
+                }
+            }
+        }
+
         let mut special_tokens = HashMap::new();
-        for key in &["bos_token", "eos_token", "pad_token", "unk_token"] {
-            if let Some(val) = cfg.get(*key) {
+        if let Some(obj) = cfg.as_object() {
+            for (key, val) in obj {
+                if !key.ends_with("_token") {
+                    continue;
+                }
                 let s = match val {
                     serde_json::Value::String(s) => Some(s.clone()),
-                    serde_json::Value::Object(obj) => {
-                        obj.get("content").and_then(|c| c.as_str()).map(|s| s.to_string())
+                    serde_json::Value::Object(o) => {
+                        o.get("content").and_then(|c| c.as_str()).map(|s| s.to_string())
                     }
                     _ => None,
                 };
-                if let Some(tok_str) = s {
-                    special_tokens.insert(key.to_string(), tok_str);
-                }
+                if let Some(tok_str) = s
+                    && !tok_str.is_empty() {
+                        special_tokens.insert(key.clone(), tok_str);
+                    }
             }
         }
 
@@ -80,6 +107,13 @@ impl Tokenizer {
                         special_token_ids.insert(content.to_string(), id);
                     }
             }
+        }
+
+        for tok_str in special_tokens.values() {
+            if !special_token_ids.contains_key(tok_str)
+                && let Some(id) = inner.token_to_id(tok_str) {
+                    special_token_ids.insert(tok_str.clone(), id);
+                }
         }
 
         Ok(Self {
@@ -217,12 +251,23 @@ impl Tokenizer {
         if let Some(id) = self.eos_token_id() {
             ids.push(id);
         }
+
+        for key in &["eot_token", "eom_token", "end_of_turn_token"] {
+            if let Some(content) = self.special_tokens.get(*key)
+                && let Some(id) = self.special_token_id(content)
+                    && !ids.contains(&id) {
+                        ids.push(id);
+                    }
+        }
+
         for content in &[
             "<|eot_id|>",
             "<|eom_id|>",
             "<|end_of_text|>",
             "<|im_end|>",
             "<|endoftext|>",
+            "<turn|>",
+            "<end_of_turn>",
         ] {
             if let Some(id) = self.special_token_id(content)
                 && !ids.contains(&id) {

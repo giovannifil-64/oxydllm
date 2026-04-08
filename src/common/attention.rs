@@ -27,6 +27,7 @@ fn log_sdpa_fallback_once(head_dim: usize, dtype: candle_core::DType) {
 pub struct SegmentInfo<'a> {
     pub num_tokens: usize,
     pub cache: &'a mut PagedKvCache,
+    pub reuse_cache: bool,
 }
 
 enum QkvProjection {
@@ -47,6 +48,8 @@ pub struct Attention {
     scale: f64,
     attn_softcap: Option<f64>,
     sliding_window: Option<usize>,
+    v_norm: bool,
+    rms_norm_eps: f64,
 }
 
 fn truncate_kv_window(
@@ -74,6 +77,13 @@ fn compute_sliding_window(cfg: &BlockConfig, layer_idx: usize) -> Option<usize> 
     } else {
         cfg.sliding_window
     }
+}
+
+fn rms_norm_no_weight(x: &Tensor, eps: f64) -> Result<Tensor> {
+    let dtype = x.dtype();
+    let x_f32 = x.contiguous()?.to_dtype(candle_core::DType::F32)?;
+    let variance = x_f32.sqr()?.mean_keepdim(D::Minus1)?;
+    x_f32.broadcast_div(&(variance + eps)?.sqrt()?)?.to_dtype(dtype)
 }
 
 impl Attention {
@@ -136,6 +146,8 @@ impl Attention {
             scale: cfg.attention_scale.unwrap_or(1.0 / (hd as f64).sqrt()),
             attn_softcap: cfg.attn_softcap,
             sliding_window: actual_window,
+            v_norm: cfg.v_norm,
+            rms_norm_eps: cfg.rms_norm_eps,
         })
     }
 
@@ -187,6 +199,8 @@ impl Attention {
             scale: cfg.attention_scale.unwrap_or(1.0 / (hd as f64).sqrt()),
             attn_softcap: cfg.attn_softcap,
             sliding_window: actual_window,
+            v_norm: cfg.v_norm,
+            rms_norm_eps: cfg.rms_norm_eps,
         })
     }
 
@@ -250,6 +264,11 @@ impl Attention {
             Some(norm) => norm.forward(&k)?,
             None => k,
         };
+        let v = if self.v_norm {
+            rms_norm_no_weight(&v, self.rms_norm_eps)?
+        } else {
+            v
+        };
 
         let (q, k) = if let Some((r, position_ids)) = rope {
             (r.apply_with_positions(&q, position_ids)?, r.apply_with_positions(&k, position_ids)?)
@@ -263,9 +282,13 @@ impl Attention {
         let mut offset = 0usize;
 
         for seg in segments.iter_mut() {
-            let seg_k = k.narrow(2, offset, seg.num_tokens)?;
-            let seg_v = v.narrow(2, offset, seg.num_tokens)?;
-            let (full_k, full_v) = seg.cache.append(&seg_k, &seg_v)?;
+            let (full_k, full_v) = if seg.reuse_cache {
+                seg.cache.current()?
+            } else {
+                let seg_k = k.narrow(2, offset, seg.num_tokens)?;
+                let seg_v = v.narrow(2, offset, seg.num_tokens)?;
+                seg.cache.append(&seg_k, &seg_v)?
+            };
             let kv_len = full_k.dim(2)?;
             kv_lengths.push(kv_len);
             k_parts.push(full_k);

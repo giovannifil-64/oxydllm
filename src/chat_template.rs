@@ -71,6 +71,62 @@ pub fn format_plain_chat(messages: &[ChatMessage]) -> String {
     prompt
 }
 
+pub fn format_turn_chat(
+    messages: &[ChatMessage],
+    bos_token: Option<&str>,
+    start_turn_token: &str,
+    end_turn_token: &str,
+    add_generation_prompt: bool,
+    enable_thinking: bool,
+) -> String {
+    let mut prompt = String::new();
+    if let Some(bos) = bos_token {
+        prompt.push_str(bos);
+    }
+
+    let mut start_idx = 0usize;
+    let first_is_system = messages
+        .first()
+        .map(|m| m.role == "system" || m.role == "developer")
+        .unwrap_or(false);
+
+    if enable_thinking || first_is_system {
+        prompt.push_str(start_turn_token);
+        prompt.push_str("system\n");
+        if enable_thinking {
+            prompt.push_str("<|think|>");
+        }
+        if first_is_system {
+            prompt.push_str(messages[0].content.trim());
+            start_idx = 1;
+        }
+        prompt.push_str(end_turn_token);
+        prompt.push('\n');
+    }
+
+    for message in &messages[start_idx..] {
+        let role = if message.role == "assistant" {
+            "model"
+        } else {
+            message.role.as_str()
+        };
+
+        prompt.push_str(start_turn_token);
+        prompt.push_str(role);
+        prompt.push('\n');
+        prompt.push_str(message.content.trim());
+        prompt.push_str(end_turn_token);
+        prompt.push('\n');
+    }
+
+    if add_generation_prompt {
+        prompt.push_str(start_turn_token);
+        prompt.push_str("model\n");
+    }
+
+    prompt
+}
+
 fn preprocess_template(template: &str) -> String {
     let mut t = template.to_string();
     t = t.replace("[::-1]", "|reverse");

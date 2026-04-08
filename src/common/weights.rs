@@ -29,14 +29,34 @@ impl ModelWeights {
         Ok(Self { tensors })
     }
 
+    fn resolve_name<'a>(&'a self, name: &str) -> Option<&'a Tensor> {
+        if let Some(t) = self.tensors.get(name) {
+            return Some(t);
+        }
+
+        // Gemma4 multimodal checkpoints keep text weights under
+        // `model.language_model.*` while this runtime expects `model.*`.
+        if let Some(rest) = name.strip_prefix("model.") {
+            let alias = format!("model.language_model.{rest}");
+            if let Some(t) = self.tensors.get(&alias) {
+                return Some(t);
+            }
+        }
+
+        if name == "lm_head.weight" {
+            return self.tensors.get("model.lm_head.weight");
+        }
+
+        None
+    }
+
     pub fn get(&self, name: &str) -> candle_core::Result<&Tensor> {
-        self.tensors
-            .get(name)
+        self.resolve_name(name)
             .ok_or_else(|| candle_core::Error::Msg(format!("Tensor not found: {}", name)))
     }
 
     pub fn try_get(&self, name: &str) -> Option<&Tensor> {
-        self.tensors.get(name)
+        self.resolve_name(name)
     }
 
     /// Returns the actual memory footprint of all loaded tensors in bytes.

@@ -96,6 +96,11 @@ impl Scheduler {
         let id = self.next_id;
         self.next_id += 1;
 
+        let mut token_counts: HashMap<u32, u32> = HashMap::new();
+        for &tok in &prompt_tokens {
+            *token_counts.entry(tok).or_insert(0) += 1;
+        }
+
         let caches = (0..self.num_layers)
             .map(|i| PagedKvCache::new(Arc::clone(&self.allocators[i])))
             .collect();
@@ -106,6 +111,7 @@ impl Scheduler {
             prompt_len,
             num_generated: 0,
             all_tokens: prompt_tokens,
+            token_counts,
             sampling_params,
             status: SequenceStatus::Waiting,
             phase: SequencePhase::Prefill,

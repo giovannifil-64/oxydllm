@@ -7,6 +7,9 @@ pub struct SamplingParams {
     pub top_p: f32,
     pub min_p: f32,
     pub repetition_penalty: f32,
+    /// Number of trailing tokens considered for repetition penalty.
+    /// 0 means full history (current default behavior).
+    pub repetition_window: usize,
     pub frequency_penalty: f32,
     pub presence_penalty: f32,
     pub seed: Option<u64>,
@@ -22,6 +25,7 @@ impl Default for SamplingParams {
             top_p: 1.0,
             min_p: 0.0,
             repetition_penalty: 1.0,
+            repetition_window: 0,
             frequency_penalty: 0.0,
             presence_penalty: 0.0,
             seed: None,
@@ -37,7 +41,12 @@ pub struct SampleOutput {
     pub top_logprobs: Vec<(u32, f32)>,
 }
 
-pub fn sample(logits: &Tensor, params: &SamplingParams, prev_tokens: &[u32]) -> Result<SampleOutput> {
+pub fn sample(
+    logits: &Tensor,
+    params: &SamplingParams,
+    prev_tokens: &[u32],
+    token_counts: Option<&std::collections::HashMap<u32, u32>>,
+) -> Result<SampleOutput> {
     let no_mods = params.repetition_penalty == 1.0
         && params.frequency_penalty == 0.0
         && params.presence_penalty == 0.0
@@ -51,15 +60,34 @@ pub fn sample(logits: &Tensor, params: &SamplingParams, prev_tokens: &[u32]) -> 
     let mut logits_vec: Vec<f32> = logits.to_dtype(candle_core::DType::F32)?.to_vec1()?;
 
     if params.repetition_penalty != 1.0 {
-        apply_repetition_penalty_cpu(&mut logits_vec, prev_tokens, params.repetition_penalty);
+        let repetition_tokens = repetition_window_slice(prev_tokens, params.repetition_window);
+        let can_use_full_counts = repetition_tokens.len() == prev_tokens.len();
+        if can_use_full_counts {
+            if let Some(counts) = token_counts {
+                apply_repetition_penalty_with_counts(&mut logits_vec, counts, params.repetition_penalty);
+            } else {
+                apply_repetition_penalty_cpu(&mut logits_vec, repetition_tokens, params.repetition_penalty);
+            }
+        } else {
+            apply_repetition_penalty_cpu(&mut logits_vec, repetition_tokens, params.repetition_penalty);
+        }
     }
     if params.frequency_penalty != 0.0 || params.presence_penalty != 0.0 {
-        apply_frequency_presence_penalty(
-            &mut logits_vec,
-            prev_tokens,
-            params.frequency_penalty,
-            params.presence_penalty,
-        );
+        if let Some(counts) = token_counts {
+            apply_frequency_presence_penalty_with_counts(
+                &mut logits_vec,
+                counts,
+                params.frequency_penalty,
+                params.presence_penalty,
+            );
+        } else {
+            apply_frequency_presence_penalty(
+                &mut logits_vec,
+                prev_tokens,
+                params.frequency_penalty,
+                params.presence_penalty,
+            );
+        }
     }
     if let Some(ref bias) = params.logit_bias {
         for &(tok, b) in bias {
@@ -105,6 +133,14 @@ pub fn sample(logits: &Tensor, params: &SamplingParams, prev_tokens: &[u32]) -> 
     }
 }
 
+fn repetition_window_slice(prev_tokens: &[u32], repetition_window: usize) -> &[u32] {
+    if repetition_window == 0 || repetition_window >= prev_tokens.len() {
+        prev_tokens
+    } else {
+        &prev_tokens[prev_tokens.len() - repetition_window..]
+    }
+}
+
 fn compute_log_probs(logits: &[f32], temperature: f32) -> (Vec<f32>, Vec<f32>) {
     let temp = temperature.max(1e-8_f32);
     let max_logit = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
@@ -138,6 +174,21 @@ fn apply_repetition_penalty_cpu(logits: &mut [f32], prev_tokens: &[u32], penalty
     }
 }
 
+fn apply_repetition_penalty_with_counts(
+    logits: &mut [f32],
+    token_counts: &std::collections::HashMap<u32, u32>,
+    penalty: f32,
+) {
+    for (&tok, &count) in token_counts {
+        let idx = tok as usize;
+        if idx < logits.len() {
+            let l = logits[idx];
+            let factor = penalty.powf(count as f32);
+            logits[idx] = if l > 0.0 { l / factor } else { l * factor };
+        }
+    }
+}
+
 fn apply_frequency_presence_penalty(
     logits: &mut [f32],
     prev_tokens: &[u32],
@@ -148,7 +199,16 @@ fn apply_frequency_presence_penalty(
     for &tok in prev_tokens {
         *counts.entry(tok).or_insert(0) += 1;
     }
-    for (&tok, &count) in &counts {
+    apply_frequency_presence_penalty_with_counts(logits, &counts, frequency_penalty, presence_penalty);
+}
+
+fn apply_frequency_presence_penalty_with_counts(
+    logits: &mut [f32],
+    counts: &std::collections::HashMap<u32, u32>,
+    frequency_penalty: f32,
+    presence_penalty: f32,
+) {
+    for (&tok, &count) in counts {
         let idx = tok as usize;
         if idx < logits.len() {
             logits[idx] -= frequency_penalty * count as f32 + presence_penalty;
@@ -282,7 +342,7 @@ mod tests {
         let device = candle_core::Device::Cpu;
         let logits = Tensor::from_vec(vec![1.0_f32, 5.0, 3.0, 2.0], (4,), &device).unwrap();
         let params = SamplingParams::default();
-        let token = sample(&logits, &params, &[]).unwrap().token;
+        let token = sample(&logits, &params, &[], None).unwrap().token;
         assert_eq!(token, 1);
     }
 
@@ -294,7 +354,7 @@ mod tests {
             temperature: 0.8,
             ..Default::default()
         };
-        let token = sample(&logits, &params, &[]).unwrap().token;
+        let token = sample(&logits, &params, &[], None).unwrap().token;
         assert!(token < 4);
     }
 
@@ -312,6 +372,33 @@ mod tests {
         apply_repetition_penalty_cpu(&mut logits, &[1], 2.0);
         assert!(logits[1] < 3.0);
         assert_eq!(logits[0], 2.0);
+    }
+
+    #[test]
+    fn repetition_window_limits_penalty_scope() {
+        let device = candle_core::Device::Cpu;
+        let logits = Tensor::from_vec(vec![10.0_f32, 9.0, 8.0], (3,), &device).unwrap();
+        let prev_tokens = vec![0_u32, 0, 0, 1];
+        let mut counts = std::collections::HashMap::new();
+        counts.insert(0_u32, 3_u32);
+        counts.insert(1_u32, 1_u32);
+
+        let params = SamplingParams {
+            temperature: 0.0,
+            repetition_penalty: 2.0,
+            repetition_window: 1,
+            ..Default::default()
+        };
+
+        let out = sample(&logits, &params, &prev_tokens, Some(&counts)).unwrap();
+        assert_eq!(out.token, 0, "only the last token should be repetition-penalized");
+    }
+
+    #[test]
+    fn repetition_window_zero_uses_full_history() {
+        let prev_tokens = vec![1_u32, 2, 3, 4];
+        let full = repetition_window_slice(&prev_tokens, 0);
+        assert_eq!(full, prev_tokens.as_slice());
     }
 
     #[test]
@@ -352,7 +439,7 @@ mod tests {
             top_logprobs_k: 3,
             ..Default::default()
         };
-        let out = sample(&logits, &params, &[]).unwrap();
+        let out = sample(&logits, &params, &[], None).unwrap();
         assert!(out.logprob.is_some(), "logprob should be set");
         assert_eq!(out.top_logprobs.len(), 3, "should have 3 top logprobs");
         let lps: Vec<f32> = out.top_logprobs.iter().map(|&(_, lp)| lp).collect();
@@ -370,7 +457,7 @@ mod tests {
             logit_bias: Some(vec![(0, -100.0)]),
             ..Default::default()
         };
-        let out = sample(&logits, &params, &[]).unwrap();
+        let out = sample(&logits, &params, &[], None).unwrap();
         assert_ne!(out.token, 0, "token 0 should be suppressed by logit_bias");
     }
 
@@ -383,7 +470,7 @@ mod tests {
             top_logprobs_k: 4,
             ..Default::default()
         };
-        let out = sample(&logits, &params, &[]).unwrap();
+        let out = sample(&logits, &params, &[], None).unwrap();
         let sum: f32 = out.top_logprobs.iter().map(|&(_, lp)| lp.exp()).sum();
         assert!((sum - 1.0).abs() < 1e-4, "exp(logprobs) should sum to ~1");
     }

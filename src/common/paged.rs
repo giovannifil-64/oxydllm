@@ -420,7 +420,7 @@ struct PendingWrite {
     v_chunk: Tensor,
 }
 
-/// Metadata for one block-pool write, sent to the background quantization thread.
+/// Metadata for one staged block-pool write emitted during flush.
 struct BgFlushItem {
     block_id: usize,
     offset: usize,
@@ -437,8 +437,6 @@ pub struct PagedKvCache {
     contig_v: Option<Tensor>,
     contig_len: usize,
     pending_writes: Vec<PendingWrite>,
-    /// Option 2: handle for the background quantization thread spawned by flush_pending().
-    bg_flush: Option<std::thread::JoinHandle<()>>,
 }
 
 impl PagedKvCache {
@@ -456,7 +454,6 @@ impl PagedKvCache {
             contig_v: None,
             contig_len: 0,
             pending_writes: Vec::new(),
-            bg_flush: None,
         }
     }
 
@@ -584,25 +581,15 @@ impl PagedKvCache {
 
     /// Flush deferred quantized writes to the block pool.
     ///
-    /// Three optimizations applied here:
-    /// - Option 3: decode steps never populate `pending_writes`, so this is a
-    ///   no-op for every decode token (see `append`).
-    /// - Option 1: all pending K chunks and all pending V chunks are concatenated
-    ///   into one tensor each before the GPU→CPU transfer, reducing 28 Metal
-    ///   command-buffer syncs to 2.
-    /// - Option 2: after the (cheap) batched transfer the CPU quantization is
-    ///   dispatched to a background thread so the GPU can start the next forward
-    ///   pass immediately.  The join happens at the start of the *next* call, by
-    ///   which time the GPU decode step (≥21 ms) has given the CPU thread
-    ///   (≈15 ms) ample time to finish.
+    /// Two optimizations are applied here:
+    /// - decode steps never populate `pending_writes`, so this is a no-op for
+    ///   every decode token (see `append`).
+    /// - all pending K chunks and all pending V chunks are concatenated into one
+    ///   tensor each before the GPU→CPU transfer, reducing many small syncs to 2.
+    ///
+    /// The final quantize+pool-write is synchronous to guarantee that newly
+    /// registered prefix-cache blocks always point to fully materialized data.
     pub fn flush_pending(&mut self) -> Result<()> {
-        // Always join a previous background flush before touching pending_writes.
-        if let Some(handle) = self.bg_flush.take() {
-            handle.join().map_err(|_| {
-                candle_core::Error::Msg("bg flush thread panicked".to_string())
-            })?;
-        }
-
         if self.pending_writes.is_empty() {
             return Ok(());
         }
@@ -617,23 +604,25 @@ impl PagedKvCache {
         }
 
         // ── Option 1: single batched GPU→CPU transfer ─────────────────────────
-        let token_counts: Vec<usize> = self.pending_writes.iter()
+        let pending_writes = std::mem::take(&mut self.pending_writes);
+
+        let token_counts: Vec<usize> = pending_writes.iter()
             .map(|pw| pw.k_chunk.dim(0).unwrap_or(1))
             .collect();
 
-        let k_cat = if self.pending_writes.len() == 1 {
-            self.pending_writes[0].k_chunk.clone()
+        let k_cat = if pending_writes.len() == 1 {
+            pending_writes[0].k_chunk.clone()
         } else {
             Tensor::cat(
-                &self.pending_writes.iter().map(|pw| &pw.k_chunk).collect::<Vec<_>>(),
+                &pending_writes.iter().map(|pw| &pw.k_chunk).collect::<Vec<_>>(),
                 0,
             )?
         };
-        let v_cat = if self.pending_writes.len() == 1 {
-            self.pending_writes[0].v_chunk.clone()
+        let v_cat = if pending_writes.len() == 1 {
+            pending_writes[0].v_chunk.clone()
         } else {
             Tensor::cat(
-                &self.pending_writes.iter().map(|pw| &pw.v_chunk).collect::<Vec<_>>(),
+                &pending_writes.iter().map(|pw| &pw.v_chunk).collect::<Vec<_>>(),
                 0,
             )?
         };
@@ -650,9 +639,8 @@ impl PagedKvCache {
             .flatten_all()?
             .to_vec1()?;
 
-        // Build a lightweight write plan (no Tensor references — safe to send).
-        let items: Vec<BgFlushItem> = self.pending_writes
-            .drain(..)
+        let items: Vec<BgFlushItem> = pending_writes
+            .iter()
             .zip(token_counts.iter())
             .map(|(pw, &n)| BgFlushItem {
                 block_id: pw.block_id,
@@ -661,66 +649,52 @@ impl PagedKvCache {
             })
             .collect();
 
-        // Capture owned values for the background thread.
-        let allocator = Arc::clone(&self.allocator);
         let quantizer = Arc::clone(self.quantizer.as_ref().unwrap());
-        let (nkv, hd) = allocator.lock().unwrap().dims();
+        let (nkv, hd) = self.allocator.lock().unwrap().dims();
+        let bph = quantizer.packed_index_bytes();
+        let total_tokens: usize = items.iter().map(|it| it.n_tokens).sum();
 
-        // ── Option 2: async CPU quantization ──────────────────────────────────
-        // The GPU→CPU data is already on the CPU.  Quantization is pure CPU math
-        // and can overlap with the GPU's next forward pass.  We hold the
-        // allocator lock only for the final bulk memcpy, not during quantization.
-        self.bg_flush = Some(std::thread::spawn(move || {
-            let bph = quantizer.packed_index_bytes();
-            let total_tokens: usize = items.iter().map(|it| it.n_tokens).sum();
+        let mut pk_staged = vec![0u8; total_tokens * nkv * bph];
+        let mut nk_staged = vec![0f32; total_tokens * nkv];
+        let mut pv_staged = vec![0u8; total_tokens * nkv * bph];
+        let mut nv_staged = vec![0f32; total_tokens * nkv];
 
-            // Pre-quantize into staging buffers — no lock needed.
-            let mut pk_staged = vec![0u8; total_tokens * nkv * bph];
-            let mut nk_staged = vec![0f32; total_tokens * nkv];
-            let mut pv_staged = vec![0u8; total_tokens * nkv * bph];
-            let mut nv_staged = vec![0f32; total_tokens * nkv];
+        for t in 0..total_tokens {
+            for h in 0..nkv {
+                let src = (t * nkv + h) * hd;
+                let db = (t * nkv + h) * bph;
+                let dn = t * nkv + h;
 
-            for t in 0..total_tokens {
-                for h in 0..nkv {
-                    let src = (t * nkv + h) * hd;
-                    let db = (t * nkv + h) * bph;
-                    let dn = t * nkv + h;
+                let (pk, nk) = quantizer.quantize(&k_vec[src..src + hd]);
+                pk_staged[db..db + bph].copy_from_slice(&pk);
+                nk_staged[dn] = nk;
 
-                    let (pk, nk) = quantizer.quantize(&k_vec[src..src + hd]);
-                    pk_staged[db..db + bph].copy_from_slice(&pk);
-                    nk_staged[dn] = nk;
-
-                    let (pv, nv) = quantizer.quantize(&v_vec[src..src + hd]);
-                    pv_staged[db..db + bph].copy_from_slice(&pv);
-                    nv_staged[dn] = nv;
-                }
+                let (pv, nv) = quantizer.quantize(&v_vec[src..src + hd]);
+                pv_staged[db..db + bph].copy_from_slice(&pv);
+                nv_staged[dn] = nv;
             }
+        }
 
-            // Acquire lock once for a fast bulk memcpy.
-            let mut alloc = allocator.lock().unwrap();
-            let mut t_off = 0usize;
-            for item in &items {
-                let t_end = t_off + item.n_tokens;
-                alloc.write_staged(
-                    item.block_id,
-                    item.offset,
-                    item.n_tokens,
-                    &pk_staged[t_off * nkv * bph..t_end * nkv * bph],
-                    &nk_staged[t_off * nkv..t_end * nkv],
-                    &pv_staged[t_off * nkv * bph..t_end * nkv * bph],
-                    &nv_staged[t_off * nkv..t_end * nkv],
-                );
-                t_off += item.n_tokens;
-            }
-        }));
+        let mut alloc = self.allocator.lock().unwrap();
+        let mut t_off = 0usize;
+        for item in &items {
+            let t_end = t_off + item.n_tokens;
+            alloc.write_staged(
+                item.block_id,
+                item.offset,
+                item.n_tokens,
+                &pk_staged[t_off * nkv * bph..t_end * nkv * bph],
+                &nk_staged[t_off * nkv..t_end * nkv],
+                &pv_staged[t_off * nkv * bph..t_end * nkv * bph],
+                &nv_staged[t_off * nkv..t_end * nkv],
+            );
+            t_off += item.n_tokens;
+        }
 
         Ok(())
     }
 
     pub fn clear(&mut self) {
-        if let Some(handle) = self.bg_flush.take() {
-            handle.join().ok();
-        }
         self.pending_writes.clear();
         if !self.table.block_ids.is_empty() {
             let mut alloc = self.allocator.lock().unwrap();

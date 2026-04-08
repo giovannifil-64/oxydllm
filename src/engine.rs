@@ -230,7 +230,12 @@ impl Engine {
 
             let sample_out = {
                 let seq = scheduler.get_running(info.seq_id).unwrap();
-                sampling::sample(&seq_logits, &seq.sampling_params, &seq.all_tokens)?
+                sampling::sample(
+                    &seq_logits,
+                    &seq.sampling_params,
+                    &seq.all_tokens,
+                    Some(&seq.token_counts),
+                )?
             };
             let next_token = sample_out.token;
             let is_stop = stop_token_ids.contains(&next_token) || {
@@ -240,7 +245,7 @@ impl Engine {
 
             let emit = {
                 let seq = scheduler.get_running_mut(info.seq_id).unwrap();
-                seq.all_tokens.push(next_token);
+                seq.append_token(next_token);
                 seq.num_processed_tokens = seq.all_tokens.len() - 1;
                 seq.phase = SequencePhase::Decode;
                 seq.apply_token(next_token, is_stop)
@@ -282,14 +287,19 @@ impl Engine {
             let seq_logits = batch_logits.get(total_prefill_tokens + i)?;
             let sample_out = {
                 let seq = scheduler.get_running(seq_id).unwrap();
-                sampling::sample(&seq_logits, &seq.sampling_params, &seq.all_tokens)?
+                sampling::sample(
+                    &seq_logits,
+                    &seq.sampling_params,
+                    &seq.all_tokens,
+                    Some(&seq.token_counts),
+                )?
             };
             let next_token = sample_out.token;
             let seq = scheduler.get_running_mut(seq_id).unwrap();
             let is_stop = stop_token_ids.contains(&next_token)
                 || seq.extra_stop_token_ids.contains(&next_token);
 
-            seq.all_tokens.push(next_token);
+            seq.append_token(next_token);
             seq.num_processed_tokens = seq.all_tokens.len() - 1;
 
             if seq.apply_token(next_token, is_stop) {

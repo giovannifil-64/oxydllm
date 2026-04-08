@@ -134,6 +134,7 @@ Chat options (run):
   --top-p <P>               Nucleus sampling (default: 1.0)
   --min-p <P>               Min-p filtering (default: 0.0)
   --repeat-penalty <R>      Repetition penalty (default: 1.0)
+  --repeat-window <N>       Trailing token window for repetition penalty (default: 0 = full history)
 
 Remove options (rm):
   --models-dir <DIR>        Models directory (default: ~/.rllm/models/)
@@ -494,6 +495,14 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
                     .ok_or("--repeat-penalty requires a value")?
                     .parse()
                     .map_err(|_| "Invalid repeat-penalty")?;
+            }
+            "--repeat-window" => {
+                i += 1;
+                params.repetition_window = args
+                    .get(i)
+                    .ok_or("--repeat-window requires a value")?
+                    .parse()
+                    .map_err(|_| "Invalid repeat-window")?;
             }
             "--kv-quant" => {
                 i += 1;

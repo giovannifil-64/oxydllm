@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -9,6 +10,7 @@ use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Json};
 use axum::routing::{get, post};
 use axum::Router;
+use lru::LruCache;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc as tokio_mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
@@ -87,6 +89,8 @@ pub struct ChatCompletionRequest {
     pub min_p: Option<f32>,
     #[serde(default)]
     pub repetition_penalty: Option<f32>,
+    #[serde(default)]
+    pub repetition_window: Option<usize>,
     #[serde(default)]
     pub keep_alive: Option<u64>,
     #[serde(default)]
@@ -286,6 +290,39 @@ fn system_fingerprint(model_id: &str) -> String {
     format!("fp_{:012x}", h.finish() & 0xFFFF_FFFF_FFFF)
 }
 
+const TOKEN_DECODE_CACHE_CAP: usize = 8192;
+
+#[derive(Clone)]
+struct DecodedToken {
+    text: String,
+    bytes: Vec<u8>,
+}
+
+struct TokenDecodeCache {
+    entries: LruCache<u32, DecodedToken>,
+}
+
+impl TokenDecodeCache {
+    fn new() -> Self {
+        Self {
+            entries: LruCache::new(NonZeroUsize::new(TOKEN_DECODE_CACHE_CAP).unwrap()),
+        }
+    }
+
+    fn decode_token(&mut self, tokenizer: &Tokenizer, token_id: u32) -> DecodedToken {
+        if let Some(hit) = self.entries.get(&token_id) {
+            return hit.clone();
+        }
+        let text = tokenizer.decode(&[token_id]).unwrap_or_default();
+        let decoded = DecodedToken {
+            bytes: text.as_bytes().to_vec(),
+            text,
+        };
+        self.entries.push(token_id, decoded.clone());
+        decoded
+    }
+}
+
 /// Convert engine logprob entries into the serializable `Logprobs` response struct.
 fn build_logprobs_content(entries: &[EngineLogprobEntry], req_top_n: usize) -> Logprobs {
     Logprobs {
@@ -314,18 +351,19 @@ fn build_logprobs_content(entries: &[EngineLogprobEntry], req_top_n: usize) -> L
 /// Build an `EngineLogprobEntry` by decoding token IDs to strings.
 fn build_logprob_entry(
     tokenizer: &Tokenizer,
+    decode_cache: &mut TokenDecodeCache,
     token_id: u32,
     logprob: f32,
     top_lps: Vec<(u32, f32)>,
 ) -> EngineLogprobEntry {
-    let token_str = tokenizer.decode(&[token_id]).unwrap_or_default();
-    let bytes = token_str.as_bytes().to_vec();
+    let decoded = decode_cache.decode_token(tokenizer, token_id);
+    let token_str = decoded.text;
+    let bytes = decoded.bytes;
     let top_logprobs = top_lps
         .into_iter()
         .map(|(tid, lp)| {
-            let ts = tokenizer.decode(&[tid]).unwrap_or_default();
-            let tb = ts.as_bytes().to_vec();
-            (ts, lp, tb)
+            let decoded = decode_cache.decode_token(tokenizer, tid);
+            (decoded.text, lp, decoded.bytes)
         })
         .collect();
     EngineLogprobEntry { token_str, logprob, bytes, top_logprobs }
@@ -485,11 +523,12 @@ fn enqueue_request(
 
 fn prefix_decode_token(
     tokenizer: &Tokenizer,
+    decode_cache: &mut TokenDecodeCache,
     all_ids: &[u32],
     decoded_len: &mut usize,
     token: u32,
 ) -> Option<String> {
-    let single = tokenizer.decode(&[token]).unwrap_or_default();
+    let single = decode_cache.decode_token(tokenizer, token).text;
     if !single.is_empty() && !single.contains('\u{FFFD}') {
         *decoded_len += single.len();
         return Some(single);
@@ -517,6 +556,7 @@ pub fn engine_loop(
 
     let think_start_id = tokenizer.special_token_id("<think>");
     let think_end_id = tokenizer.special_token_id("</think>");
+    let mut decode_cache = TokenDecodeCache::new();
 
     loop {
         if shutdown.load(std::sync::atomic::Ordering::Acquire) {
@@ -575,7 +615,11 @@ pub fn engine_loop(
                             if tracker.in_thinking {
                                 tracker.thinking_ids.push(tok.token);
                                 if let Some(text) = prefix_decode_token(
-                                    &tokenizer, &tracker.thinking_ids, &mut tracker.thinking_decoded_len, tok.token,
+                                    &tokenizer,
+                                    &mut decode_cache,
+                                    &tracker.thinking_ids,
+                                    &mut tracker.thinking_decoded_len,
+                                    tok.token,
                                 ) {
                                     let _ = tracker.tx.send(EngineEvent::ReasoningToken(text));
                                 }
@@ -590,13 +634,24 @@ pub fn engine_loop(
                                 }
                                 tracker.output_ids.push(tok.token);
                                 if let Some(text) = prefix_decode_token(
-                                    &tokenizer, &tracker.output_ids, &mut tracker.decoded_len, tok.token,
+                                    &tokenizer,
+                                    &mut decode_cache,
+                                    &tracker.output_ids,
+                                    &mut tracker.decoded_len,
+                                    tok.token,
                                 ) {
-                                    let logprob_entries: Vec<EngineLogprobEntry> =
-                                        std::mem::take(&mut tracker.pending_raw_lps)
-                                            .into_iter()
-                                            .map(|(tid, lp, top)| build_logprob_entry(&tokenizer, tid, lp, top))
-                                            .collect();
+                                    let drained = std::mem::take(&mut tracker.pending_raw_lps);
+                                    let mut logprob_entries: Vec<EngineLogprobEntry> =
+                                        Vec::with_capacity(drained.len());
+                                    for (tid, lp, top) in drained {
+                                        logprob_entries.push(build_logprob_entry(
+                                            &tokenizer,
+                                            &mut decode_cache,
+                                            tid,
+                                            lp,
+                                            top,
+                                        ));
+                                    }
                                     let _ = tracker.tx.send(EngineEvent::Token { text, logprob_entries });
                                 }
                             }
@@ -619,11 +674,18 @@ pub fn engine_loop(
                             };
 
                             // Drain any buffered logprob entries (tokens whose text was still in the buffer).
-                            let remaining_lp_entries: Vec<EngineLogprobEntry> =
-                                std::mem::take(&mut tracker.pending_raw_lps)
-                                    .into_iter()
-                                    .map(|(tid, lp, top)| build_logprob_entry(&tokenizer, tid, lp, top))
-                                    .collect();
+                            let drained = std::mem::take(&mut tracker.pending_raw_lps);
+                            let mut remaining_lp_entries: Vec<EngineLogprobEntry> =
+                                Vec::with_capacity(drained.len());
+                            for (tid, lp, top) in drained {
+                                remaining_lp_entries.push(build_logprob_entry(
+                                    &tokenizer,
+                                    &mut decode_cache,
+                                    tid,
+                                    lp,
+                                    top,
+                                ));
+                            }
 
                             if !remaining_text.is_empty() || !remaining_lp_entries.is_empty() {
                                 let _ = tracker.tx.send(EngineEvent::Token {
@@ -1055,6 +1117,7 @@ async fn chat_completions(
         top_p: body.top_p.unwrap_or(1.0),
         min_p: body.min_p.unwrap_or(0.0),
         repetition_penalty: body.repetition_penalty.unwrap_or(1.0),
+        repetition_window: body.repetition_window.unwrap_or(0),
         frequency_penalty: body.frequency_penalty.unwrap_or(0.0),
         presence_penalty: body.presence_penalty.unwrap_or(0.0),
         seed: body.seed,

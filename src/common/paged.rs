@@ -140,6 +140,7 @@ enum KvPool {
         packed_k: Vec<u8>,
         packed_v: Vec<u8>,
         norms_k: Vec<f32>,
+        residual_norms_k: Option<Vec<f32>>,
         norms_v: Vec<f32>,
         quantizer: Arc<KvQuantizer>,
     },
@@ -172,11 +173,17 @@ impl BlockAllocator {
         let ref_counts = vec![0u32; num_blocks];
 
         let pool = if let Some(q) = quantizer {
-            let bph = q.packed_index_bytes();
+            let key_bph = q.key_packed_bytes();
+            let value_bph = q.value_packed_bytes();
             KvPool::Quantized {
-                packed_k: vec![0u8; total_slots * n_kv_heads * bph],
-                packed_v: vec![0u8; total_slots * n_kv_heads * bph],
+                packed_k: vec![0u8; total_slots * n_kv_heads * key_bph],
+                packed_v: vec![0u8; total_slots * n_kv_heads * value_bph],
                 norms_k: vec![0f32; total_slots * n_kv_heads],
+                residual_norms_k: if q.qjl_quantization_enabled() {
+                    Some(vec![0f32; total_slots * n_kv_heads])
+                } else {
+                    None
+                },
                 norms_v: vec![0f32; total_slots * n_kv_heads],
                 quantizer: q,
             }
@@ -254,25 +261,39 @@ impl BlockAllocator {
         n_tokens: usize,
         pk_staged: &[u8],
         nk_staged: &[f32],
+        rk_staged: &[f32],
         pv_staged: &[u8],
         nv_staged: &[f32],
     ) {
-        let KvPool::Quantized { packed_k, norms_k, packed_v, norms_v, quantizer } = &mut self.pool
+        let KvPool::Quantized {
+            packed_k,
+            norms_k,
+            residual_norms_k,
+            packed_v,
+            norms_v,
+            quantizer,
+        } = &mut self.pool
         else {
             return;
         };
-        let bph = quantizer.packed_index_bytes();
+        let key_bph = quantizer.key_packed_bytes();
+        let value_bph = quantizer.value_packed_bytes();
         let nkv = self.n_kv_heads;
         let start = block_id * self.block_size + offset;
         for t in 0..n_tokens {
             let slot = start + t;
-            let sb = t * nkv * bph;
+            let sbk = t * nkv * key_bph;
+            let sbv = t * nkv * value_bph;
             let sn = t * nkv;
-            let db = slot * nkv * bph;
+            let dbk = slot * nkv * key_bph;
+            let dbv = slot * nkv * value_bph;
             let dn = slot * nkv;
-            packed_k[db..db + nkv * bph].copy_from_slice(&pk_staged[sb..sb + nkv * bph]);
+            packed_k[dbk..dbk + nkv * key_bph].copy_from_slice(&pk_staged[sbk..sbk + nkv * key_bph]);
             norms_k[dn..dn + nkv].copy_from_slice(&nk_staged[sn..sn + nkv]);
-            packed_v[db..db + nkv * bph].copy_from_slice(&pv_staged[sb..sb + nkv * bph]);
+            if let Some(residual_norms_k) = residual_norms_k.as_mut() {
+                residual_norms_k[dn..dn + nkv].copy_from_slice(&rk_staged[sn..sn + nkv]);
+            }
+            packed_v[dbv..dbv + nkv * value_bph].copy_from_slice(&pv_staged[sbv..sbv + nkv * value_bph]);
             norms_v[dn..dn + nkv].copy_from_slice(&nv_staged[sn..sn + nkv]);
         }
     }
@@ -283,9 +304,16 @@ impl BlockAllocator {
                 pool_k.elem_count() * pool_k.dtype().size_in_bytes()
                     + pool_v.elem_count() * pool_v.dtype().size_in_bytes()
             }
-            KvPool::Quantized { packed_k, packed_v, norms_k, norms_v, .. } => {
+            KvPool::Quantized {
+                packed_k,
+                packed_v,
+                norms_k,
+                residual_norms_k,
+                norms_v,
+                ..
+            } => {
                 packed_k.len() + packed_v.len()
-                    + (norms_k.len() + norms_v.len()) * std::mem::size_of::<f32>()
+                    + (norms_k.len() + residual_norms_k.as_ref().map_or(0, Vec::len) + norms_v.len()) * std::mem::size_of::<f32>()
             }
         }
     }
@@ -305,14 +333,22 @@ impl BlockAllocator {
                 pool_k.slice_set(data_k, 0, start)?;
                 pool_v.slice_set(data_v, 0, start)?;
             }
-            KvPool::Quantized { packed_k, packed_v, norms_k, norms_v, quantizer } => {
+            KvPool::Quantized {
+                packed_k,
+                packed_v,
+                norms_k,
+                residual_norms_k,
+                norms_v,
+                quantizer,
+            } => {
                 let n_tokens = data_k.dim(0)?;
                 let k_f32 = data_k.to_dtype(DType::F32)?.to_device(&Device::Cpu)?;
                 let v_f32 = data_v.to_dtype(DType::F32)?.to_device(&Device::Cpu)?;
                 let k_vec: Vec<f32> = k_f32.flatten_all()?.to_vec1()?;
                 let v_vec: Vec<f32> = v_f32.flatten_all()?.to_vec1()?;
 
-                let bph = quantizer.packed_index_bytes();
+                let key_bph = quantizer.key_packed_bytes();
+                let value_bph = quantizer.value_packed_bytes();
                 let hd = self.head_dim;
                 let nkv = self.n_kv_heads;
 
@@ -320,15 +356,19 @@ impl BlockAllocator {
                     let slot = start + t;
                     for h in 0..nkv {
                         let src = (t * nkv + h) * hd;
-                        let byte_dst = slot * nkv * bph + h * bph;
+                        let key_byte_dst = slot * nkv * key_bph + h * key_bph;
+                        let value_byte_dst = slot * nkv * value_bph + h * value_bph;
                         let norm_dst = slot * nkv + h;
 
-                        let (pk, nk) = quantizer.quantize(&k_vec[src..src + hd]);
-                        packed_k[byte_dst..byte_dst + bph].copy_from_slice(&pk);
+                        let (pk, nk, rk) = quantizer.quantize_key(&k_vec[src..src + hd]);
+                        packed_k[key_byte_dst..key_byte_dst + key_bph].copy_from_slice(&pk);
                         norms_k[norm_dst] = nk;
+                        if let Some(residual_norms_k) = residual_norms_k.as_mut() {
+                            residual_norms_k[norm_dst] = rk;
+                        }
 
                         let (pv, nv) = quantizer.quantize(&v_vec[src..src + hd]);
-                        packed_v[byte_dst..byte_dst + bph].copy_from_slice(&pv);
+                        packed_v[value_byte_dst..value_byte_dst + value_bph].copy_from_slice(&pv);
                         norms_v[norm_dst] = nv;
                     }
                 }
@@ -348,12 +388,20 @@ impl BlockAllocator {
                 let v = v.transpose(0, 1)?.unsqueeze(0)?;
                 Ok((k, v))
             }
-            KvPool::Quantized { packed_k, packed_v, norms_k, norms_v, quantizer } => {
+            KvPool::Quantized {
+                packed_k,
+                packed_v,
+                norms_k,
+                residual_norms_k,
+                norms_v,
+                quantizer,
+            } => {
                 let indices: Vec<u32> = slot_indices
                     .to_device(&Device::Cpu)?
                     .to_vec1()?;
                 let num_tokens = indices.len();
-                let bph = quantizer.packed_index_bytes();
+                let key_bph = quantizer.key_packed_bytes();
+                let value_bph = quantizer.value_packed_bytes();
                 let hd = self.head_dim;
                 let nkv = self.n_kv_heads;
 
@@ -363,18 +411,22 @@ impl BlockAllocator {
                 for (t, &slot) in indices.iter().enumerate() {
                     let slot = slot as usize;
                     for h in 0..nkv {
-                        let byte_src = slot * nkv * bph + h * bph;
+                        let key_byte_src = slot * nkv * key_bph + h * key_bph;
+                        let value_byte_src = slot * nkv * value_bph + h * value_bph;
                         let norm_src = slot * nkv + h;
                         let dst = (t * nkv + h) * hd;
 
-                        let dk = quantizer.dequantize(
-                            &packed_k[byte_src..byte_src + bph],
+                        let dk = quantizer.dequantize_key(
+                            &packed_k[key_byte_src..key_byte_src + key_bph],
                             norms_k[norm_src],
+                            residual_norms_k
+                                .as_ref()
+                                .map_or(0.0, |residual_norms_k| residual_norms_k[norm_src]),
                         );
                         k_data[dst..dst + hd].copy_from_slice(&dk);
 
                         let dv = quantizer.dequantize(
-                            &packed_v[byte_src..byte_src + bph],
+                            &packed_v[value_byte_src..value_byte_src + value_bph],
                             norms_v[norm_src],
                         );
                         v_data[dst..dst + hd].copy_from_slice(&dv);
@@ -651,26 +703,37 @@ impl PagedKvCache {
 
         let quantizer = Arc::clone(self.quantizer.as_ref().unwrap());
         let (nkv, hd) = self.allocator.lock().unwrap().dims();
-        let bph = quantizer.packed_index_bytes();
+        let qjl_enabled = quantizer.qjl_quantization_enabled();
+        let key_bph = quantizer.key_packed_bytes();
+        let value_bph = quantizer.value_packed_bytes();
         let total_tokens: usize = items.iter().map(|it| it.n_tokens).sum();
 
-        let mut pk_staged = vec![0u8; total_tokens * nkv * bph];
+        let mut pk_staged = vec![0u8; total_tokens * nkv * key_bph];
         let mut nk_staged = vec![0f32; total_tokens * nkv];
-        let mut pv_staged = vec![0u8; total_tokens * nkv * bph];
+        let mut rk_staged = if qjl_enabled {
+            vec![0f32; total_tokens * nkv]
+        } else {
+            Vec::new()
+        };
+        let mut pv_staged = vec![0u8; total_tokens * nkv * value_bph];
         let mut nv_staged = vec![0f32; total_tokens * nkv];
 
         for t in 0..total_tokens {
             for h in 0..nkv {
                 let src = (t * nkv + h) * hd;
-                let db = (t * nkv + h) * bph;
+                let dbk = (t * nkv + h) * key_bph;
+                let dbv = (t * nkv + h) * value_bph;
                 let dn = t * nkv + h;
 
-                let (pk, nk) = quantizer.quantize(&k_vec[src..src + hd]);
-                pk_staged[db..db + bph].copy_from_slice(&pk);
+                let (pk, nk, rk) = quantizer.quantize_key(&k_vec[src..src + hd]);
+                pk_staged[dbk..dbk + key_bph].copy_from_slice(&pk);
                 nk_staged[dn] = nk;
+                if qjl_enabled {
+                    rk_staged[dn] = rk;
+                }
 
                 let (pv, nv) = quantizer.quantize(&v_vec[src..src + hd]);
-                pv_staged[db..db + bph].copy_from_slice(&pv);
+                pv_staged[dbv..dbv + value_bph].copy_from_slice(&pv);
                 nv_staged[dn] = nv;
             }
         }
@@ -679,13 +742,19 @@ impl PagedKvCache {
         let mut t_off = 0usize;
         for item in &items {
             let t_end = t_off + item.n_tokens;
+            let rk_slice: &[f32] = if qjl_enabled {
+                &rk_staged[t_off * nkv..t_end * nkv]
+            } else {
+                &[]
+            };
             alloc.write_staged(
                 item.block_id,
                 item.offset,
                 item.n_tokens,
-                &pk_staged[t_off * nkv * bph..t_end * nkv * bph],
+                &pk_staged[t_off * nkv * key_bph..t_end * nkv * key_bph],
                 &nk_staged[t_off * nkv..t_end * nkv],
-                &pv_staged[t_off * nkv * bph..t_end * nkv * bph],
+                rk_slice,
+                &pv_staged[t_off * nkv * value_bph..t_end * nkv * value_bph],
                 &nv_staged[t_off * nkv..t_end * nkv],
             );
             t_off += item.n_tokens;
@@ -835,7 +904,7 @@ mod tests {
 
     #[test]
     fn quantized_pool_reduces_memory() {
-        let q = Arc::new(super::super::kv_quant::KvQuantizer::new(4, 64));
+        let q = Arc::new(super::super::kv_quant::KvQuantizer::new_with_qjl(4, 64, true));
         let alloc_q = Arc::new(Mutex::new(
             BlockAllocator::new(4, 2, 2, 64, DType::F32, &Device::Cpu, Some(q)).unwrap(),
         ));

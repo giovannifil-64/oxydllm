@@ -40,6 +40,7 @@ struct StartArgs {
     cuda_devices: Vec<usize>,
     max_context_len: usize,
     kv_quant: common::kv_quant::KvQuantMode,
+    qjl_quantization: bool,
 }
 
 struct RunArgs {
@@ -49,6 +50,7 @@ struct RunArgs {
     cuda_device: Option<usize>,
     max_context_len: usize,
     kv_quant: common::kv_quant::KvQuantMode,
+    qjl_quantization: bool,
 }
 
 struct RmArgs {
@@ -123,12 +125,14 @@ Server options (start):
                             lossless: 4-bit, quality-neutral (~3.7x compression)
                             balanced: 3-bit, near-identical quality (~4.9x compression)
                             aggressive: 2-bit, maximum compression (~7x compression)
+  --qjl-quantization        Enable Stage-2 QJL key residual quantization (default: disabled)
 
 Chat options (run):
   --models-dir <DIR>        Models directory (default: ~/.rllm/models/)
   --devices <ID>            CUDA device index to use (default: auto, env: RLLM_DEVICES)
   --max-context-len <N>     Max tokens per sequence for KV cache (default: 4096)
   --kv-quant <MODE>         KV cache quantization: off, lossless, balanced, aggressive
+  --qjl-quantization        Enable Stage-2 QJL key residual quantization (default: disabled)
   --temperature <T>         Sampling temperature (default: 0.7)
   --top-k <K>               Top-k filtering (default: 0, disabled)
   --top-p <P>               Nucleus sampling (default: 1.0)
@@ -351,6 +355,7 @@ fn parse_start_args(args: &[String]) -> Result<StartArgs, String> {
     let mut devices_raw: Option<Vec<usize>> = None;
     let mut max_context_len: usize = 4096;
     let mut kv_quant = common::kv_quant::KvQuantMode::Off;
+    let mut qjl_quantization = false;
     let mut i = 0;
 
     while i < args.len() {
@@ -406,6 +411,9 @@ fn parse_start_args(args: &[String]) -> Result<StartArgs, String> {
                     args.get(i).ok_or("--kv-quant requires a value")?,
                 )?;
             }
+            "--qjl-quantization" => {
+                qjl_quantization = true;
+            }
             other => return Err(format!("Unknown option: {}", other)),
         }
         i += 1;
@@ -419,6 +427,7 @@ fn parse_start_args(args: &[String]) -> Result<StartArgs, String> {
         cuda_devices: resolve_devices(devices_raw),
         max_context_len,
         kv_quant,
+        qjl_quantization,
     })
 }
 
@@ -428,6 +437,7 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
     let mut devices_raw: Option<Vec<usize>> = None;
     let mut max_context_len: usize = 4096;
     let mut kv_quant = common::kv_quant::KvQuantMode::Off;
+    let mut qjl_quantization = false;
     let mut params = SamplingParams {
         temperature: 0.7,
         ..SamplingParams::default()
@@ -510,6 +520,9 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
                     args.get(i).ok_or("--kv-quant requires a value")?,
                 )?;
             }
+            "--qjl-quantization" => {
+                qjl_quantization = true;
+            }
             _ if !args[i].starts_with('-') && model_name.is_empty() => {
                 model_name = args[i].clone();
             }
@@ -539,6 +552,7 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
         cuda_device: resolve_devices(devices_raw).into_iter().next(),
         max_context_len,
         kv_quant,
+        qjl_quantization,
     })
 }
 
@@ -559,7 +573,14 @@ fn run_interactive(args: &RunArgs) -> anyhow::Result<()> {
         )
     );
     let (batch_model, weights_size_bytes) = models::loader::load_batch_model(
-        &args.model_dir, &args.model_id, &device, args.max_context_len, 1, &kv_budget, args.kv_quant,
+        &args.model_dir,
+        &args.model_id,
+        &device,
+        args.max_context_len,
+        1,
+        &kv_budget,
+        args.kv_quant,
+        args.qjl_quantization,
     )?;
     let max_seq_len = batch_model.max_seq_len();
     let kv_cache_bytes = batch_model.kv_cache_bytes();
@@ -708,7 +729,16 @@ fn main() -> anyhow::Result<()> {
                 print_usage();
                 std::process::exit(1);
             });
-            server::start_server(start_args.models_dir, start_args.port, start_args.keep_alive, start_args.memory_budget_bytes, start_args.cuda_devices, start_args.max_context_len, start_args.kv_quant)?;
+            server::start_server(
+                start_args.models_dir,
+                start_args.port,
+                start_args.keep_alive,
+                start_args.memory_budget_bytes,
+                start_args.cuda_devices,
+                start_args.max_context_len,
+                start_args.kv_quant,
+                start_args.qjl_quantization,
+            )?;
         }
         "run" => {
             let run_args = parse_run_args(&args[2..]).unwrap_or_else(|e| {

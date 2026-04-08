@@ -105,10 +105,8 @@ impl Scheduler {
             .map(|i| PagedKvCache::new(Arc::clone(&self.allocators[i])))
             .collect();
 
-        let prompt_len = prompt_tokens.len();
         let seq = SequenceState {
             id,
-            prompt_len,
             num_generated: 0,
             all_tokens: prompt_tokens,
             token_counts,

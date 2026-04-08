@@ -18,10 +18,9 @@ pub enum SequenceStatus {
 
 pub struct SequenceState {
     pub id: SequenceId,
-    #[allow(dead_code)]
-    pub prompt_len: usize,
     pub num_generated: usize,
     pub all_tokens: Vec<u32>,
+    pub token_counts: std::collections::HashMap<u32, u32>,
     pub sampling_params: SamplingParams,
     pub status: SequenceStatus,
     pub phase: SequencePhase,
@@ -33,13 +32,13 @@ pub struct SequenceState {
 }
 
 impl SequenceState {
-    #[allow(dead_code)]
-    pub fn generated_tokens(&self) -> &[u32] {
-        &self.all_tokens[self.prompt_len..]
-    }
-
     pub fn tokens_and_caches(&mut self) -> (&[u32], &SamplingParams, &mut Vec<PagedKvCache>) {
         (&self.all_tokens, &self.sampling_params, &mut self.caches)
+    }
+
+    pub fn append_token(&mut self, token: u32) {
+        self.all_tokens.push(token);
+        *self.token_counts.entry(token).or_insert(0) += 1;
     }
 
     pub fn apply_token(&mut self, _next_token: u32, is_stop: bool) -> bool {

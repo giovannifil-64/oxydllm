@@ -29,7 +29,6 @@ pub struct StreamOptions {
 }
 
 #[derive(Deserialize, Clone)]
-#[allow(dead_code)]
 pub struct JsonSchemaSpec {
     pub name: String,
     #[serde(default)]
@@ -98,13 +97,10 @@ pub struct ChatCompletionRequest {
     #[serde(default)]
     pub response_format: Option<ResponseFormat>,
     #[serde(default)]
-    #[allow(dead_code)]
     pub user: Option<String>,
     #[serde(default)]
-    #[allow(dead_code)]
     pub tools: Option<serde_json::Value>,
     #[serde(default)]
-    #[allow(dead_code)]
     pub tool_choice: Option<serde_json::Value>,
 }
 
@@ -398,9 +394,29 @@ fn json_system_instruction(rf: &ResponseFormat) -> String {
                         )
                     })
                     .unwrap_or_default();
+                let name_part = if spec.name.trim().is_empty() {
+                    String::new()
+                } else {
+                    format!(" The schema name is \"{}\".", spec.name.trim())
+                };
+                let description_part = spec
+                    .description
+                    .as_ref()
+                    .map(|d| d.trim())
+                    .filter(|d| !d.is_empty())
+                    .map(|d| format!(" Schema description: {}.", d))
+                    .unwrap_or_default();
+                let strict_part = if spec.strict.unwrap_or(false) {
+                    " Follow the schema exactly and do not add unspecified fields.".to_string()
+                } else {
+                    String::new()
+                };
                 format!(
-                    "You must respond with valid JSON only{}. Do not include any explanation, markdown, or text outside of the JSON object.",
-                    schema_part
+                    "You must respond with valid JSON only. Do not include any explanation, markdown, or text outside of the JSON object.{}{}{}{}",
+                    schema_part,
+                    name_part,
+                    description_part,
+                    strict_part,
                 )
             } else {
                 "You must respond with valid JSON only. Do not include any explanation, markdown, or text outside of the JSON object.".to_string()
@@ -977,6 +993,8 @@ async fn chat_completions(
         ));
     }
 
+    let _client_metadata = (&body.user, &body.tools, &body.tool_choice);
+
     // Validate logit_bias shape early.
     if let Some(ref lb) = body.logit_bias {
         if !lb.is_null() && !lb.is_object() {
@@ -1545,6 +1563,7 @@ pub fn start_server(
     cuda_devices: Vec<usize>,
     max_context_len: usize,
     kv_quant: crate::common::kv_quant::KvQuantMode,
+    qjl_quantization: bool,
 ) -> anyhow::Result<()> {
     if !models_dir.exists() {
         std::fs::create_dir_all(&models_dir)?;
@@ -1564,6 +1583,7 @@ pub fn start_server(
         cuda_devices,
         max_context_len,
         kv_quant,
+        qjl_quantization,
     )));
 
     let state = Arc::new(AppState {

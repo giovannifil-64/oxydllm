@@ -299,14 +299,34 @@ pub fn load_batch_model(
     max_num_sequences: usize,
     kv_budget: &SharedGlobalKvBudget,
     kv_quant: KvQuantMode,
+    qjl_quantization: bool,
 ) -> anyhow::Result<(Box<dyn BatchModel>, usize)> {
     if is_gguf_model(model_dir) {
-        return load_batch_model_gguf(model_dir, model_id, device, max_context_len, max_num_sequences, kv_budget, kv_quant);
+        return load_batch_model_gguf(
+            model_dir,
+            model_id,
+            device,
+            max_context_len,
+            max_num_sequences,
+            kv_budget,
+            kv_quant,
+            qjl_quantization,
+        );
     }
 
     let dtype = if matches!(device, Device::Cpu) { DType::F32 } else { DType::BF16 };
     let cfg = hf_parser::parse(&format!("{}/config.json", model_dir))?;
-    load_standard_safetensors(cfg, model_dir, device, dtype, max_context_len, max_num_sequences, kv_budget, kv_quant)
+    load_standard_safetensors(
+        cfg,
+        model_dir,
+        device,
+        dtype,
+        max_context_len,
+        max_num_sequences,
+        kv_budget,
+        kv_quant,
+        qjl_quantization,
+    )
 }
 
 fn load_standard_safetensors(
@@ -318,6 +338,7 @@ fn load_standard_safetensors(
     max_num_sequences: usize,
     kv_budget: &SharedGlobalKvBudget,
     kv_quant: KvQuantMode,
+    qjl_quantization: bool,
 ) -> anyhow::Result<(Box<dyn BatchModel>, usize)> {
     let weight_paths = resolve_weight_paths(model_dir)?;
     let weight_path_refs: Vec<&str> = weight_paths.iter().map(|s| s.as_str()).collect();
@@ -360,6 +381,7 @@ fn load_standard_safetensors(
             max_num_sequences,
             dtype,
             kv_quant,
+            qjl_quantization,
         },
         kv_budget,
     )?;
@@ -368,7 +390,7 @@ fn load_standard_safetensors(
         KvQuantMode::Off => vec![None; num_layers],
         mode => per_layer_head_dims
             .iter()
-            .map(|&hd| Some(Arc::new(KvQuantizer::new(mode.bit_width(), hd))))
+            .map(|&hd| Some(Arc::new(KvQuantizer::new_with_qjl(mode.bit_width(), hd, qjl_quantization))))
             .collect(),
     };
 
@@ -499,6 +521,7 @@ fn load_batch_model_gguf(
     max_num_sequences: usize,
     kv_budget: &SharedGlobalKvBudget,
     kv_quant: KvQuantMode,
+    qjl_quantization: bool,
 ) -> anyhow::Result<(Box<dyn BatchModel>, usize)> {
     let dir = Path::new(model_dir);
     let all_gguf_paths = find_gguf_files(dir)
@@ -556,13 +579,18 @@ fn load_batch_model_gguf(
             max_num_sequences,
             dtype,
             kv_quant,
+            qjl_quantization,
         },
         kv_budget,
     )?;
 
     let quantizer: Option<Arc<KvQuantizer>> = match kv_quant {
         KvQuantMode::Off => None,
-        mode => Some(Arc::new(KvQuantizer::new(mode.bit_width(), topo.head_dim))),
+        mode => Some(Arc::new(KvQuantizer::new_with_qjl(
+            mode.bit_width(),
+            topo.head_dim,
+            qjl_quantization,
+        ))),
     };
 
     let model = match StandardTransformer::load_gguf(&gguf, device, dtype, num_blocks, quantizer) {
@@ -581,6 +609,7 @@ struct KvBlockParams {
     max_num_sequences: usize,
     dtype: DType,
     kv_quant: KvQuantMode,
+    qjl_quantization: bool,
 }
 
 fn compute_kv_blocks(p: &KvBlockParams, kv_budget: &GlobalKvBudget) -> anyhow::Result<(usize, usize)> {
@@ -601,8 +630,13 @@ fn compute_kv_blocks(p: &KvBlockParams, kv_budget: &GlobalKvBudget) -> anyhow::R
             .layer_kv_specs
             .iter()
             .map(|(n_kv_heads, head_dim)| {
-                let bph = kv_quant::quantized_bytes_per_head(*head_dim, mode.bit_width());
-                DEFAULT_BLOCK_SIZE * (*n_kv_heads) * bph * 2
+                let key_bph = kv_quant::quantized_key_bytes_per_head_with_qjl(
+                    *head_dim,
+                    mode.bit_width(),
+                    p.qjl_quantization,
+                );
+                let value_bph = kv_quant::quantized_value_bytes_per_head(*head_dim, mode.bit_width());
+                DEFAULT_BLOCK_SIZE * (*n_kv_heads) * (key_bph + value_bph)
             })
             .sum::<usize>(),
     };

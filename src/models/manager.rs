@@ -73,6 +73,7 @@ pub struct ModelManager {
     max_context_len: usize,
     kv_budget: SharedGlobalKvBudget,
     kv_quant: KvQuantMode,
+    qjl_quantization: bool,
 }
 
 pub type SharedModelManager = Arc<tokio::sync::Mutex<ModelManager>>;
@@ -141,6 +142,7 @@ impl ModelManager {
         cuda_devices: Vec<usize>,
         max_context_len: usize,
         kv_quant: KvQuantMode,
+        qjl_quantization: bool,
     ) -> Self {
         let mut registry = load_registry(&models_dir);
         // Remove registry entries whose model directory no longer exists.
@@ -166,6 +168,10 @@ impl ModelManager {
         let kv_budget = Arc::new(GlobalKvBudget::new(kv_total));
         if kv_quant != KvQuantMode::Off {
             println!("[kv-pool] KV cache quantization: {}", kv_quant.label());
+            println!(
+                "[kv-pool] QJL key quantization: {}",
+                if qjl_quantization { "enabled" } else { "disabled" }
+            );
         }
 
         Self {
@@ -178,6 +184,7 @@ impl ModelManager {
             max_context_len,
             kv_budget,
             kv_quant,
+            qjl_quantization,
         }
     }
 
@@ -379,6 +386,7 @@ impl ModelManager {
             self.max_context_len,
             Arc::clone(&self.kv_budget),
             self.kv_quant,
+            self.qjl_quantization,
         );
 
         GetResult::Wait(rx)
@@ -522,6 +530,7 @@ fn spawn_load(
     max_context_len: usize,
     kv_budget: SharedGlobalKvBudget,
     kv_quant: KvQuantMode,
+    qjl_quantization: bool,
 ) {
     let (result_tx, result_rx) = oneshot::channel::<Result<LoadResult, String>>();
 
@@ -550,7 +559,16 @@ fn spawn_load(
 
         println!("\nLoading model '{}'...", model_id_thread);
         let max_num_sequences: usize = 8;
-        let (batch_model, weights_size_bytes) = match loader::load_batch_model(&model_dir, &model_id_thread, &device, max_context_len, max_num_sequences, &kv_budget, kv_quant) {
+        let (batch_model, weights_size_bytes) = match loader::load_batch_model(
+            &model_dir,
+            &model_id_thread,
+            &device,
+            max_context_len,
+            max_num_sequences,
+            &kv_budget,
+            kv_quant,
+            qjl_quantization,
+        ) {
             Ok(m) => m,
             Err(e) => {
                 let _ = result_tx.send(Err(format!("Failed to load model: {e}")));

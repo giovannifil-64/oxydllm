@@ -807,6 +807,9 @@ fn main() -> anyhow::Result<()> {
         "--help" | "-h" | "help" => {
             print_usage();
         }
+        "--version" | "-v" => {
+            println!("rllm {}", env!("CARGO_PKG_VERSION"));
+        }
         _ => {
             eprintln!("Unknown command: {}", args[1]);
             print_usage();

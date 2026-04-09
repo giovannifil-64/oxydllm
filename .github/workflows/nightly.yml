@@ -1,0 +1,156 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# nightly.yml — Nightly builds from main
+#
+# Triggered by:
+#   - Cron schedule: every day at 03:00 UTC
+#   - Manual dispatch (workflow_dispatch)
+#
+# Creates/updates a rolling "nightly" pre-release on GitHub with the
+# latest binaries. Docker images are tagged :nightly and :nightly-cpu.
+#
+# The nightly release is always a pre-release and always overwrites the
+# previous nightly — users get exactly one "nightly" entry, not a flood.
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: Nightly
+
+on:
+  schedule:
+    # 03:00 UTC every day
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: write
+
+# Only one nightly build at a time
+concurrency:
+  group: nightly
+  cancel-in-progress: true
+
+jobs:
+  # ── Guard: skip if no new commits since last nightly ────────────────────────
+  check-changes:
+    name: Check for new commits
+    runs-on: ubuntu-22.04
+    outputs:
+      should_build: ${{ steps.check.outputs.should_build }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Check for commits in last 25 hours
+        id: check
+        run: |
+          # For manual dispatch, always build
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            echo "Manual dispatch — building."
+            exit 0
+          fi
+
+          LAST_COMMIT=$(git log -1 --format=%ct)
+          NOW=$(date +%s)
+          DIFF=$((NOW - LAST_COMMIT))
+          THRESHOLD=90000  # 25 hours in seconds
+
+          if [ "$DIFF" -lt "$THRESHOLD" ]; then
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            echo "New commits found (${DIFF}s ago) — building."
+          else
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+            echo "No new commits (last: ${DIFF}s ago) — skipping."
+          fi
+
+  build:
+    name: Build all targets
+    needs: check-changes
+    if: needs.check-changes.outputs.should_build == 'true'
+    uses: ./.github/workflows/build.yml
+    with:
+      channel: nightly
+      version_tag: nightly
+      push_docker: true
+    permissions:
+      contents: read
+      packages: write
+
+  release-nightly:
+    name: Update nightly release
+    needs: build
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Download all binary artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist/
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -lh dist/
+
+      - name: Get short SHA and date
+        id: meta
+        run: |
+          echo "sha_short=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          echo "date=$(date -u +%Y-%m-%d)" >> "$GITHUB_OUTPUT"
+
+      # Delete previous nightly release + tag (if exists) so we can recreate it
+      - name: Delete previous nightly release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release delete nightly --yes --cleanup-tag 2>/dev/null || true
+
+      - name: Create nightly release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: nightly
+          name: "Nightly (${{ steps.meta.outputs.date }} · ${{ steps.meta.outputs.sha_short }})"
+          files: dist/*
+          prerelease: true
+          draft: false
+          body: |
+            ## Nightly build
+
+            Built from `main` at commit `${{ steps.meta.outputs.sha_short }}` on ${{ steps.meta.outputs.date }}.
+
+            > **Warning**: Nightly builds are untested and may contain breaking changes.
+            > Use a tagged release for production.
+
+            ### Install
+
+            **macOS (Apple Silicon)**
+            ```bash
+            curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/main/install.sh | RLLM_CHANNEL=nightly sh
+            ```
+
+            **Linux (CUDA)**
+            ```bash
+            curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/main/install.sh | RLLM_CHANNEL=nightly sh
+            ```
+
+            **Linux (CPU)**
+            ```bash
+            curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/main/install.sh | RLLM_CHANNEL=nightly RLLM_NO_GPU=1 sh
+            ```
+
+            **Docker (CUDA)**
+            ```bash
+            docker run --gpus all -p 11313:11313 \
+              -v ~/.rllm/models:/root/.rllm/models \
+              ghcr.io/${{ github.repository }}:nightly start
+            ```
+
+            **Docker (CPU)**
+            ```bash
+            docker run -p 11313:11313 \
+              -v ~/.rllm/models:/root/.rllm/models \
+              ghcr.io/${{ github.repository }}:nightly-cpu start
+            ```

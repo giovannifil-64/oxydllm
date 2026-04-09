@@ -1,0 +1,55 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# rLLM — CPU-only image (Linux x86_64, no GPU required)
+#
+# Build:
+#   docker build -f Dockerfile.cpu -t rllm:cpu .
+#
+# Run:
+#   docker run -p 11313:11313 \
+#     -v ~/.rllm/models:/root/.rllm/models \
+#     rllm:cpu start
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Stage 1: build ───────────────────────────────────────────────────────────
+FROM ubuntu:22.04 AS builder
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl build-essential pkg-config libssl-dev git ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+    | sh -s -- -y --default-toolchain stable --profile minimal
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+WORKDIR /app
+
+COPY Cargo.toml Cargo.lock ./
+RUN mkdir -p src && echo 'fn main(){}' > src/main.rs \
+    && cargo build --release --no-default-features 2>/dev/null || true \
+    && rm -rf src
+
+COPY src ./src
+RUN touch src/main.rs \
+    && cargo build --release --no-default-features
+
+# ── Stage 2: runtime ─────────────────────────────────────────────────────────
+# Same Ubuntu version as builder → glibc match guaranteed.
+FROM ubuntu:22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libssl3 ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /app/target/release/rllm /usr/local/bin/rllm
+RUN chmod +x /usr/local/bin/rllm
+
+VOLUME ["/root/.rllm/models"]
+EXPOSE 11313
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD curl -f http://localhost:11313/health || exit 1
+
+ENTRYPOINT ["rllm"]
+CMD ["start", "--models-dir", "/root/.rllm/models"]

@@ -1,0 +1,274 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# build.yml — Reusable workflow: builds native binaries + Docker images
+#
+# Called by release.yml (on v* tags) and nightly.yml (on cron / manual).
+# Not triggered directly.
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: Build
+
+on:
+  workflow_call:
+    inputs:
+      # "release" or "nightly"
+      channel:
+        required: true
+        type: string
+      # The version tag (e.g. "v0.1.0" for release, "nightly" for nightly)
+      version_tag:
+        required: true
+        type: string
+      # Whether to push Docker images to GHCR
+      push_docker:
+        required: false
+        type: boolean
+        default: true
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  CARGO_TERM_COLOR: always
+  CUDA_ARCH: "89"
+
+jobs:
+  # ── macOS Apple Silicon (Metal) ─────────────────────────────────────────────
+  build-macos-metal:
+    name: Build · macOS arm64 (Metal)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Cache Cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: macos-arm64-metal-${{ hashFiles('Cargo.lock') }}
+          restore-keys: macos-arm64-metal-
+
+      - name: Build (Metal, release)
+        run: cargo build --release
+
+      - name: Package binary
+        run: |
+          cd target/release
+          tar -czf ../../rllm-macos-arm64.tar.gz rllm
+          cd ../..
+          shasum -a 256 rllm-macos-arm64.tar.gz > rllm-macos-arm64.tar.gz.sha256
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: rllm-macos-arm64
+          path: |
+            rllm-macos-arm64.tar.gz
+            rllm-macos-arm64.tar.gz.sha256
+          retention-days: 7
+
+  # ── Linux CPU ───────────────────────────────────────────────────────────────
+  build-linux-cpu:
+    name: Build · Linux x86_64 (CPU)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: linux-x86_64-cpu-${{ hashFiles('Cargo.lock') }}
+          restore-keys: linux-x86_64-cpu-
+
+      - name: Install system deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends pkg-config libssl-dev
+
+      - name: Build (CPU-only, release)
+        run: cargo build --release --no-default-features
+
+      - name: Package binary
+        run: |
+          cd target/release
+          tar -czf ../../rllm-linux-x86_64-cpu.tar.gz rllm
+          cd ../..
+          sha256sum rllm-linux-x86_64-cpu.tar.gz > rllm-linux-x86_64-cpu.tar.gz.sha256
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: rllm-linux-x86_64-cpu
+          path: |
+            rllm-linux-x86_64-cpu.tar.gz
+            rllm-linux-x86_64-cpu.tar.gz.sha256
+          retention-days: 7
+
+  # ── Linux CUDA ──────────────────────────────────────────────────────────────
+  build-linux-cuda:
+    name: Build · Linux x86_64 (CUDA)
+    runs-on: ubuntu-22.04
+    container:
+      image: nvidia/cuda:12.9.0-runtime-ubuntu22.04
+      options: --user root
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install build deps
+        run: |
+          apt-get update -qq
+          apt-get install -y --no-install-recommends \
+            curl build-essential pkg-config libssl-dev git ca-certificates
+
+      - name: Install Rust stable
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --default-toolchain stable --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Cache Cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: linux-x86_64-cuda-${{ hashFiles('Cargo.lock') }}
+          restore-keys: linux-x86_64-cuda-
+
+      - name: Build (CUDA, release)
+        env:
+          CUDA_COMPUTE_CAP: ${{ env.CUDA_ARCH }}
+        run: cargo build --release --no-default-features --features cuda
+
+      - name: Package binary
+        run: |
+          cd target/release
+          tar -czf ../../rllm-linux-x86_64-cuda.tar.gz rllm
+          cd ../..
+          sha256sum rllm-linux-x86_64-cuda.tar.gz > rllm-linux-x86_64-cuda.tar.gz.sha256
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: rllm-linux-x86_64-cuda
+          path: |
+            rllm-linux-x86_64-cuda.tar.gz
+            rllm-linux-x86_64-cuda.tar.gz.sha256
+          retention-days: 7
+
+  # ── Docker CPU ──────────────────────────────────────────────────────────────
+  docker-cpu:
+    name: Docker · CPU
+    if: ${{ inputs.push_docker }}
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute Docker tags
+        id: tags
+        run: |
+          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
+          IMAGE=$(echo "$IMAGE" | tr '[:upper:]' '[:lower:]')
+          CHANNEL="${{ inputs.channel }}"
+          TAG="${{ inputs.version_tag }}"
+          if [ "$CHANNEL" = "nightly" ]; then
+            echo "tags=${IMAGE}:nightly-cpu" >> "$GITHUB_OUTPUT"
+          else
+            # Strip leading 'v' for semver tags
+            VER="${TAG#v}"
+            MAJOR_MINOR="${VER%.*}"
+            echo "tags=${IMAGE}:${VER}-cpu,${IMAGE}:${MAJOR_MINOR}-cpu,${IMAGE}:cpu" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build and push CPU image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: Dockerfile.cpu
+          push: true
+          tags: ${{ steps.tags.outputs.tags }}
+          cache-from: type=gha,scope=cpu
+          cache-to: type=gha,mode=max,scope=cpu
+
+  # ── Docker CUDA ─────────────────────────────────────────────────────────────
+  docker-cuda:
+    name: Docker · CUDA
+    if: ${{ inputs.push_docker }}
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android
+          sudo docker image prune -af
+          df -h
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute Docker tags
+        id: tags
+        run: |
+          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
+          IMAGE=$(echo "$IMAGE" | tr '[:upper:]' '[:lower:]')
+          CHANNEL="${{ inputs.channel }}"
+          TAG="${{ inputs.version_tag }}"
+          if [ "$CHANNEL" = "nightly" ]; then
+            echo "tags=${IMAGE}:nightly,${IMAGE}:nightly-cuda" >> "$GITHUB_OUTPUT"
+          else
+            VER="${TAG#v}"
+            MAJOR_MINOR="${VER%.*}"
+            echo "tags=${IMAGE}:${VER},${IMAGE}:${VER}-cuda,${IMAGE}:${MAJOR_MINOR},${IMAGE}:cuda,${IMAGE}:latest" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build and push CUDA image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: Dockerfile
+          push: true
+          tags: ${{ steps.tags.outputs.tags }}
+          build-args: |
+            CUDA_ARCH=${{ env.CUDA_ARCH }}
+          cache-from: type=gha,scope=cuda
+          cache-to: type=gha,mode=max,scope=cuda

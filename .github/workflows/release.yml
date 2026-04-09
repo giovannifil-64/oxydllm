@@ -1,0 +1,91 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# release.yml — Build + publish on version tags
+#
+# Triggered by: push of a tag matching v* (e.g. v0.1.0)
+#
+# Calls the reusable build.yml workflow, then creates a GitHub Release
+# with all binary artifacts attached.
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  build:
+    name: Build all targets
+    uses: ./.github/workflows/build.yml
+    with:
+      channel: release
+      version_tag: ${{ github.ref_name }}
+      push_docker: true
+    permissions:
+      contents: read
+      packages: write
+
+  release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Download all binary artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist/
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -lh dist/
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          body: |
+            ## Installation
+
+            **macOS (Apple Silicon)**
+            ```bash
+            curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/main/install.sh | sh
+            ```
+
+            **Linux (CUDA — Ada Lovelace+)**
+            ```bash
+            curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/main/install.sh | sh
+            ```
+
+            **Linux (CPU only)**
+            ```bash
+            curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/main/install.sh | RLLM_NO_GPU=1 sh
+            ```
+
+            **Docker (CUDA)**
+            ```bash
+            docker run --gpus all -p 11313:11313 \
+              -v ~/.rllm/models:/root/.rllm/models \
+              ghcr.io/${{ github.repository }}:latest start
+            ```
+
+            **Docker (CPU)**
+            ```bash
+            docker run -p 11313:11313 \
+              -v ~/.rllm/models:/root/.rllm/models \
+              ghcr.io/${{ github.repository }}:cpu start
+            ```
+
+            ## SHA-256 checksums
+            See the `.sha256` files attached to this release.

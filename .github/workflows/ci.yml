@@ -1,0 +1,142 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# ci.yml — Compile checks + clippy + unit tests on every PR and push to main
+#
+# Does NOT build Docker images or publish artifacts (those happen in
+# release.yml and nightly.yml).
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+# Cancel superseded runs for the same PR / branch
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ── Format check (fast, runs first) ─────────────────────────────────────────
+  fmt:
+    name: Format
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --check
+
+  # ── macOS: check + clippy + test with Metal feature ─────────────────────────
+  check-macos:
+    name: Check · macOS arm64 (Metal)
+    needs: fmt
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache Cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: macos-arm64-metal-ci-${{ hashFiles('Cargo.lock') }}
+          restore-keys: macos-arm64-metal-ci-
+
+      - name: Check (Metal)
+        run: cargo check --release
+
+      - name: Clippy (Metal)
+        run: cargo clippy --release -- -D warnings
+
+      - name: Unit tests (Metal — CPU-only tests, no GPU needed)
+        run: cargo test --release -- --test-threads=4
+
+  # ── Linux: check + clippy + test CPU-only ───────────────────────────────────
+  check-linux-cpu:
+    name: Check · Linux x86_64 (CPU)
+    needs: fmt
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache Cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: linux-x86_64-cpu-ci-${{ hashFiles('Cargo.lock') }}
+          restore-keys: linux-x86_64-cpu-ci-
+
+      - name: Install system deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends pkg-config libssl-dev
+
+      - name: Check (CPU-only)
+        run: cargo check --release --no-default-features
+
+      - name: Clippy (CPU-only)
+        run: cargo clippy --release --no-default-features -- -D warnings
+
+      - name: Unit tests (CPU-only)
+        run: cargo test --release --no-default-features -- --test-threads=4
+
+  # ── Linux CUDA: compile check only (no GPU on runner) ───────────────────────
+  check-linux-cuda:
+    name: Check · Linux x86_64 (CUDA compile)
+    needs: fmt
+    runs-on: ubuntu-22.04
+    container:
+      image: nvidia/cuda:12.9.0-runtime-ubuntu22.04
+      options: --user root
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install build deps
+        run: |
+          apt-get update -qq
+          apt-get install -y --no-install-recommends \
+            curl build-essential pkg-config libssl-dev git ca-certificates
+
+      - name: Install Rust stable
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --default-toolchain stable --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Cache Cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: linux-x86_64-cuda-ci-${{ hashFiles('Cargo.lock') }}
+          restore-keys: linux-x86_64-cuda-ci-
+
+      - name: Check (CUDA)
+        run: cargo check --no-default-features --features cuda

@@ -1,0 +1,69 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# docker-compose.yml — rLLM convenience launcher
+#
+# CUDA:    docker compose up rllm-cuda
+# CPU:     docker compose up rllm-cpu
+# Nightly: RLLM_TAG=nightly docker compose up rllm-cuda
+#
+# Override the image tag:
+#   RLLM_TAG=v0.1.0 docker compose up rllm-cuda
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: rllm
+
+x-common: &common
+  restart: unless-stopped
+  volumes:
+    - models:/root/.rllm/models
+  ports:
+    - "${RLLM_PORT:-11313}:11313"
+  environment:
+    - RUST_LOG=${RUST_LOG:-warn}
+  healthcheck:
+    test: ["CMD", "curl", "-f", "http://localhost:11313/health"]
+    interval: 30s
+    timeout: 5s
+    retries: 3
+    start_period: 15s
+
+services:
+  rllm-cuda:
+    <<: *common
+    image: ghcr.io/giovannifil-64/rllm:${RLLM_TAG:-latest}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    command:
+      - start
+      - --models-dir
+      - /root/.rllm/models
+      - --port
+      - "11313"
+      - --max-context-len
+      - "${RLLM_CONTEXT_LEN:-4096}"
+    profiles: [cuda, default]
+
+  rllm-cpu:
+    <<: *common
+    image: ghcr.io/giovannifil-64/rllm:${RLLM_TAG:-cpu}
+    command:
+      - start
+      - --models-dir
+      - /root/.rllm/models
+      - --port
+      - "11313"
+      - --max-context-len
+      - "${RLLM_CONTEXT_LEN:-4096}"
+    profiles: [cpu]
+
+volumes:
+  models:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${RLLM_MODELS_DIR:-${HOME}/.rllm/models}

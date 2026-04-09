@@ -2,8 +2,8 @@
 // gpu_lock.rs — Global GPU lock for cross-model serialisation
 // ─────────────────────────────────────────────────────────────────────────────
 //
-// When multiple models are loaded simultaneously, their independent 
-// engine loops would otherwise submit Metal/CUDA work concurrently, 
+// When multiple models are loaded simultaneously, their independent
+// engine loops would otherwise submit Metal/CUDA work concurrently,
 // causing contention and degraded throughput for both.
 //
 // This module provides a process-wide Mutex that every engine acquires

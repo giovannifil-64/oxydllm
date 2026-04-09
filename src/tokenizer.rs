@@ -68,10 +68,10 @@ impl Tokenizer {
 
         if chat_template.is_none() {
             let template_path = format!("{}/chat_template.jinja", model_dir);
-            if let Ok(raw) = std::fs::read_to_string(&template_path) {
-                if !raw.trim().is_empty() {
-                    chat_template = Some(raw);
-                }
+            if let Ok(raw) = std::fs::read_to_string(&template_path)
+                && !raw.trim().is_empty()
+            {
+                chat_template = Some(raw);
             }
         }
 
@@ -83,37 +83,44 @@ impl Tokenizer {
                 }
                 let s = match val {
                     serde_json::Value::String(s) => Some(s.clone()),
-                    serde_json::Value::Object(o) => {
-                        o.get("content").and_then(|c| c.as_str()).map(|s| s.to_string())
-                    }
+                    serde_json::Value::Object(o) => o
+                        .get("content")
+                        .and_then(|c| c.as_str())
+                        .map(|s| s.to_string()),
                     _ => None,
                 };
                 if let Some(tok_str) = s
-                    && !tok_str.is_empty() {
-                        special_tokens.insert(key.clone(), tok_str);
-                    }
+                    && !tok_str.is_empty()
+                {
+                    special_tokens.insert(key.clone(), tok_str);
+                }
             }
         }
 
         let mut special_token_ids: HashMap<String, u32> = HashMap::new();
         if let Some(decoder) = cfg.get("added_tokens_decoder").and_then(|v| v.as_object()) {
             for (id_str, info) in decoder {
-                let is_special = info.get("special").and_then(|v| v.as_bool()).unwrap_or(false);
+                let is_special = info
+                    .get("special")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
                 if is_special
                     && let (Ok(id), Some(content)) = (
                         id_str.parse::<u32>(),
                         info.get("content").and_then(|c| c.as_str()),
-                    ) {
-                        special_token_ids.insert(content.to_string(), id);
-                    }
+                    )
+                {
+                    special_token_ids.insert(content.to_string(), id);
+                }
             }
         }
 
         for tok_str in special_tokens.values() {
             if !special_token_ids.contains_key(tok_str)
-                && let Some(id) = inner.token_to_id(tok_str) {
-                    special_token_ids.insert(tok_str.clone(), id);
-                }
+                && let Some(id) = inner.token_to_id(tok_str)
+            {
+                special_token_ids.insert(tok_str.clone(), id);
+            }
         }
 
         Ok(Self {
@@ -138,7 +145,8 @@ impl Tokenizer {
         let chat_template = content
             .metadata
             .get("tokenizer.chat_template")
-            .and_then(|v| v.to_string().ok()).cloned();
+            .and_then(|v| v.to_string().ok())
+            .cloned();
 
         let mut special_tokens = HashMap::new();
         let mut special_token_ids: HashMap<String, u32> = HashMap::new();
@@ -154,9 +162,7 @@ impl Tokenizer {
             })
             .unwrap_or_default();
 
-        let get_token_str = |id: u32| -> Option<String> {
-            tokens_arr.get(id as usize).cloned()
-        };
+        let get_token_str = |id: u32| -> Option<String> { tokens_arr.get(id as usize).cloned() };
 
         for (gguf_key, name) in [
             ("tokenizer.ggml.bos_token_id", "bos_token"),
@@ -166,24 +172,27 @@ impl Tokenizer {
         ] {
             if let Some(val) = content.metadata.get(gguf_key)
                 && let Ok(id) = val.to_u32()
-                    && let Some(tok_str) = get_token_str(id) {
-                        special_tokens.insert(name.to_string(), tok_str.clone());
-                        special_token_ids.insert(tok_str, id);
-                    }
+                && let Some(tok_str) = get_token_str(id)
+            {
+                special_tokens.insert(name.to_string(), tok_str.clone());
+                special_token_ids.insert(tok_str, id);
+            }
         }
 
         if let Some(type_arr) = content.metadata.get("tokenizer.ggml.token_type")
-            && let Ok(arr) = type_arr.to_vec() {
-                for (idx, v) in arr.iter().enumerate() {
-                    if let Ok(ty) = v.to_u32()
-                        && matches!(ty, 2..=5)
-                            && let Some(tok_str) = tokens_arr.get(idx) {
-                                special_token_ids
-                                    .entry(tok_str.clone())
-                                    .or_insert(idx as u32);
-                            }
+            && let Ok(arr) = type_arr.to_vec()
+        {
+            for (idx, v) in arr.iter().enumerate() {
+                if let Ok(ty) = v.to_u32()
+                    && matches!(ty, 2..=5)
+                    && let Some(tok_str) = tokens_arr.get(idx)
+                {
+                    special_token_ids
+                        .entry(tok_str.clone())
+                        .or_insert(idx as u32);
                 }
             }
+        }
 
         println!(
             "[gguf] Tokenizer loaded from GGUF ({} tokens, template={})",
@@ -255,9 +264,10 @@ impl Tokenizer {
         for key in &["eot_token", "eom_token", "end_of_turn_token"] {
             if let Some(content) = self.special_tokens.get(*key)
                 && let Some(id) = self.special_token_id(content)
-                    && !ids.contains(&id) {
-                        ids.push(id);
-                    }
+                && !ids.contains(&id)
+            {
+                ids.push(id);
+            }
         }
 
         for content in &[
@@ -270,9 +280,10 @@ impl Tokenizer {
             "<end_of_turn>",
         ] {
             if let Some(id) = self.special_token_id(content)
-                && !ids.contains(&id) {
-                    ids.push(id);
-                }
+                && !ids.contains(&id)
+            {
+                ids.push(id);
+            }
         }
         ids
     }

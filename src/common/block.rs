@@ -1,5 +1,3 @@
-use candle_core::Result;
-use candle_core::Tensor;
 use super::{
     attention::{Attention, SegmentInfo},
     config::{Activation, BlockConfig},
@@ -11,6 +9,8 @@ use super::{
     rope::RotaryEmbedding,
     weights::ModelWeights,
 };
+use candle_core::Result;
+use candle_core::Tensor;
 
 pub struct TransformerBlock {
     input_norm: RMSNorm,
@@ -47,16 +47,36 @@ fn tensor_to_scalar_f64(t: &Tensor) -> Result<f64> {
 impl TransformerBlock {
     pub fn load(cfg: &BlockConfig, layer_idx: usize, weights: &ModelWeights) -> Result<Self> {
         let p = format!("model.layers.{}", layer_idx);
-        let input_norm = RMSNorm::load(weights, &format!("{}.input_layernorm", p), cfg.rms_norm_eps, cfg.norm_type)?;
-        let ffn_norm = RMSNorm::load(weights, &format!("{}.post_attention_layernorm", p), cfg.rms_norm_eps, cfg.norm_type)?;
+        let input_norm = RMSNorm::load(
+            weights,
+            &format!("{}.input_layernorm", p),
+            cfg.rms_norm_eps,
+            cfg.norm_type,
+        )?;
+        let ffn_norm = RMSNorm::load(
+            weights,
+            &format!("{}.post_attention_layernorm", p),
+            cfg.rms_norm_eps,
+            cfg.norm_type,
+        )?;
         let attention = Attention::load(cfg, layer_idx, weights)?;
         let ffn = FeedForward::load(layer_idx, weights, cfg.activation)?;
-        
+
         let mut pre_ffn_norm = None;
         let mut post_ffn_norm = None;
         if cfg.has_ffn_norms {
-            pre_ffn_norm = Some(RMSNorm::load(weights, &format!("{}.pre_feedforward_layernorm", p), cfg.rms_norm_eps, cfg.norm_type)?);
-            post_ffn_norm = Some(RMSNorm::load(weights, &format!("{}.post_feedforward_layernorm", p), cfg.rms_norm_eps, cfg.norm_type)?);
+            pre_ffn_norm = Some(RMSNorm::load(
+                weights,
+                &format!("{}.pre_feedforward_layernorm", p),
+                cfg.rms_norm_eps,
+                cfg.norm_type,
+            )?);
+            post_ffn_norm = Some(RMSNorm::load(
+                weights,
+                &format!("{}.post_feedforward_layernorm", p),
+                cfg.rms_norm_eps,
+                cfg.norm_type,
+            )?);
         }
 
         let per_layer_input_gate = weights
@@ -65,16 +85,22 @@ impl TransformerBlock {
         let per_layer_projection = weights
             .try_get(&format!("{}.per_layer_projection.weight", p))
             .map(|w| AnyLinear::Float(super::linear::Linear::new(w.clone(), None)));
-        let post_per_layer_input_norm = if per_layer_input_gate.is_some() && per_layer_projection.is_some() {
-            Some(RMSNorm::load(weights, &format!("{}.post_per_layer_input_norm", p), cfg.rms_norm_eps, cfg.norm_type)?)
-        } else {
-            None
-        };
+        let post_per_layer_input_norm =
+            if per_layer_input_gate.is_some() && per_layer_projection.is_some() {
+                Some(RMSNorm::load(
+                    weights,
+                    &format!("{}.post_per_layer_input_norm", p),
+                    cfg.rms_norm_eps,
+                    cfg.norm_type,
+                )?)
+            } else {
+                None
+            };
         let layer_scalar = weights
             .try_get(&format!("{}.layer_scalar", p))
             .map(tensor_to_scalar_f64)
             .transpose()?;
-        
+
         Ok(Self {
             input_norm,
             attention,
@@ -101,13 +127,27 @@ impl TransformerBlock {
         let prefix = format!("blk.{}", layer_idx);
 
         let attn_norm_qt = gguf.get(&format!("{prefix}.attn_norm.weight"))?;
-        let input_norm = RMSNorm::from_qtensor(&attn_norm_qt, device, dtype, cfg.rms_norm_eps, cfg.norm_type)?;
+        let input_norm = RMSNorm::from_qtensor(
+            &attn_norm_qt,
+            device,
+            dtype,
+            cfg.rms_norm_eps,
+            cfg.norm_type,
+        )?;
 
         let ffn_norm_qt = gguf.get(&format!("{prefix}.ffn_norm.weight"))?;
-        let ffn_norm = RMSNorm::from_qtensor(&ffn_norm_qt, device, dtype, cfg.rms_norm_eps, cfg.norm_type)?;
+        let ffn_norm =
+            RMSNorm::from_qtensor(&ffn_norm_qt, device, dtype, cfg.rms_norm_eps, cfg.norm_type)?;
 
         let attention = Attention::load_gguf(cfg, layer_idx, gguf, device, dtype)?;
-        let ffn = FeedForward::load_gguf(layer_idx, gguf, intermediate_size, device, dtype, cfg.activation)?;
+        let ffn = FeedForward::load_gguf(
+            layer_idx,
+            gguf,
+            intermediate_size,
+            device,
+            dtype,
+            cfg.activation,
+        )?;
 
         Ok(Self {
             input_norm,
@@ -135,8 +175,10 @@ impl TransformerBlock {
     ) -> Result<Tensor> {
         let residual = x;
         let normed = self.input_norm.forward(x)?;
-        let mut attn_out = self.attention.forward_batch(&normed, rope, position_ids, mask, segments)?;
-        
+        let mut attn_out =
+            self.attention
+                .forward_batch(&normed, rope, position_ids, mask, segments)?;
+
         if self.pre_ffn_norm.is_some() {
             attn_out = self.ffn_norm.forward(&attn_out)?;
         }
@@ -150,12 +192,12 @@ impl TransformerBlock {
         } else {
             ffn_inp = self.ffn_norm.forward(&x)?;
         }
-        
+
         let mut ffn_out = self.ffn.forward(&ffn_inp)?;
         if let Some(post_norm) = &self.post_ffn_norm {
             ffn_out = post_norm.forward(&ffn_out)?;
         }
-        
+
         x = (residual + ffn_out)?;
 
         if let (Some(gate), Some(proj), Some(post_norm), Some(per_layer_input)) = (
@@ -211,7 +253,8 @@ pub fn run_transformer_layers_batch(
     token_counts: &[usize],
 ) -> Result<Tensor> {
     debug_assert_eq!(
-        token_counts.len(), seq_caches.len(),
+        token_counts.len(),
+        seq_caches.len(),
         "token_counts.len() must equal seq_caches.len()"
     );
     debug_assert_eq!(
@@ -221,7 +264,8 @@ pub fn run_transformer_layers_batch(
     );
     for (i, seq_cache) in seq_caches.iter().enumerate() {
         debug_assert_eq!(
-            seq_cache.len(), c.blocks.len(),
+            seq_cache.len(),
+            c.blocks.len(),
             "seq_caches[{i}].len() must equal number of transformer blocks"
         );
     }
@@ -306,9 +350,9 @@ pub fn run_transformer_layers_batch(
 
     let x = c.norm.forward(&x)?;
     let logits = c.lm_head.forward(&x)?;
-    
+
     if let Some(cap) = c.logit_softcap {
-        let cap_t = cap as f64;
+        let cap_t = cap;
         (logits / cap_t)?.tanh()?.affine(cap_t, 0.0)
     } else {
         Ok(logits)

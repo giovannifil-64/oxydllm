@@ -1,0 +1,8 @@
+#!/usr/bin/env sh
+set -eu
+
+echo "[pre-commit] cargo fmt --check"
+cargo fmt --check
+
+echo "[pre-commit] cargo clippy --release -- -D warnings"
+cargo clippy --release -- -D warnings

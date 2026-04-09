@@ -4,12 +4,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use axum::Router;
 use axum::extract::{Path as AxumPath, State};
 use axum::http::StatusCode;
 use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Json};
 use axum::routing::{get, post};
-use axum::Router;
 use lru::LruCache;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc as tokio_mpsc;
@@ -237,9 +237,15 @@ pub struct IncomingRequest {
 }
 
 pub enum EngineEvent {
-    Token { text: String, logprob_entries: Vec<EngineLogprobEntry> },
+    Token {
+        text: String,
+        logprob_entries: Vec<EngineLogprobEntry>,
+    },
     ReasoningToken(String),
-    Finish { finish_reason: String, completion_tokens: usize },
+    Finish {
+        finish_reason: String,
+        completion_tokens: usize,
+    },
     StreamEnd,
     Error(String),
 }
@@ -362,7 +368,12 @@ fn build_logprob_entry(
             (decoded.text, lp, decoded.bytes)
         })
         .collect();
-    EngineLogprobEntry { token_str, logprob, bytes, top_logprobs }
+    EngineLogprobEntry {
+        token_str,
+        logprob,
+        bytes,
+        top_logprobs,
+    }
 }
 
 /// Strip markdown code fences (```json ... ```) that models often wrap JSON in.
@@ -413,10 +424,7 @@ fn json_system_instruction(rf: &ResponseFormat) -> String {
                 };
                 format!(
                     "You must respond with valid JSON only. Do not include any explanation, markdown, or text outside of the JSON object.{}{}{}{}",
-                    schema_part,
-                    name_part,
-                    description_part,
-                    strict_part,
+                    schema_part, name_part, description_part, strict_part,
                 )
             } else {
                 "You must respond with valid JSON only. Do not include any explanation, markdown, or text outside of the JSON object.".to_string()
@@ -429,31 +437,37 @@ fn json_system_instruction(rf: &ResponseFormat) -> String {
     }
 }
 
-pub fn apply_chat_template(tokenizer: &Tokenizer, messages: &[ChatMessage], enable_thinking: bool) -> String {
+pub fn apply_chat_template(
+    tokenizer: &Tokenizer,
+    messages: &[ChatMessage],
+    enable_thinking: bool,
+) -> String {
     let Some(template) = tokenizer.chat_template() else {
         if tokenizer.special_token_id("<|turn>").is_some()
-            && tokenizer.special_token_id("<turn|>").is_some() {
-                return chat_template::format_turn_chat(
-                    messages,
-                    tokenizer.bos_token(),
-                    "<|turn>",
-                    "<turn|>",
-                    true,
-                    enable_thinking,
-                );
-            }
+            && tokenizer.special_token_id("<turn|>").is_some()
+        {
+            return chat_template::format_turn_chat(
+                messages,
+                tokenizer.bos_token(),
+                "<|turn>",
+                "<turn|>",
+                true,
+                enable_thinking,
+            );
+        }
 
         if tokenizer.special_token_id("<start_of_turn>").is_some()
-            && tokenizer.special_token_id("<end_of_turn>").is_some() {
-                return chat_template::format_turn_chat(
-                    messages,
-                    tokenizer.bos_token(),
-                    "<start_of_turn>",
-                    "<end_of_turn>",
-                    true,
-                    enable_thinking,
-                );
-            }
+            && tokenizer.special_token_id("<end_of_turn>").is_some()
+        {
+            return chat_template::format_turn_chat(
+                messages,
+                tokenizer.bos_token(),
+                "<start_of_turn>",
+                "<end_of_turn>",
+                true,
+                enable_thinking,
+            );
+        }
 
         return chat_template::format_plain_chat(messages);
     };
@@ -478,12 +492,16 @@ pub fn apply_chat_template(tokenizer: &Tokenizer, messages: &[ChatMessage], enab
             if without_system.len() < messages.len() {
                 let msgs_ref: Vec<ChatMessage> = without_system.into_iter().cloned().collect();
                 if let Ok(prompt) = try_render(&msgs_ref) {
-                    eprintln!("Warning: system role not supported by this model's template — retrying without system message.");
+                    eprintln!(
+                        "Warning: system role not supported by this model's template — retrying without system message."
+                    );
                     return prompt;
                 }
             }
 
-            eprintln!("Warning: chat template rendering failed: {e:#}. Falling back to plain text.");
+            eprintln!(
+                "Warning: chat template rendering failed: {e:#}. Falling back to plain text."
+            );
             chat_template::format_plain_chat(messages)
         }
     }
@@ -492,6 +510,9 @@ pub fn apply_chat_template(tokenizer: &Tokenizer, messages: &[ChatMessage], enab
 // ---------------------------------------------------------------------------
 // Engine loop and per-sequence tracking
 // ---------------------------------------------------------------------------
+
+type RawTopLogprobs = Vec<(u32, f32)>;
+type PendingRawLogprob = (u32, f32, RawTopLogprobs);
 
 struct SeqTracker {
     tx: tokio_mpsc::UnboundedSender<EngineEvent>,
@@ -505,7 +526,7 @@ struct SeqTracker {
     decoded_len: usize,
     thinking_decoded_len: usize,
     /// Raw logprob data buffered for output tokens not yet emitted as text.
-    pending_raw_lps: Vec<(u32, f32, Vec<(u32, f32)>)>,
+    pending_raw_lps: Vec<PendingRawLogprob>,
 }
 
 fn enqueue_request(
@@ -522,19 +543,22 @@ fn enqueue_request(
         req.extra_stop_token_ids,
     );
     eprintln!("[req] {} seq={} enqueued", model_id, seq_id);
-    trackers.insert(seq_id, SeqTracker {
-        tx: req.response_tx,
-        model_id,
-        enqueued_at,
-        first_token_at: None,
-        token_count: 0,
-        in_thinking: req.enable_thinking,
-        output_ids: Vec::new(),
-        thinking_ids: Vec::new(),
-        decoded_len: 0,
-        thinking_decoded_len: 0,
-        pending_raw_lps: Vec::new(),
-    });
+    trackers.insert(
+        seq_id,
+        SeqTracker {
+            tx: req.response_tx,
+            model_id,
+            enqueued_at,
+            first_token_at: None,
+            token_count: 0,
+            in_thinking: req.enable_thinking,
+            output_ids: Vec::new(),
+            thinking_ids: Vec::new(),
+            decoded_len: 0,
+            thinking_decoded_len: 0,
+            pending_raw_lps: Vec::new(),
+        },
+    );
 }
 
 fn clamp_to_char_boundary(s: &str, idx: usize) -> usize {
@@ -613,7 +637,10 @@ pub fn engine_loop(
                         if let Some(tracker) = trackers.get_mut(&tok.seq_id) {
                             if tracker.first_token_at.is_none() {
                                 let ttft_ms = tracker.enqueued_at.elapsed().as_secs_f64() * 1000.0;
-                                eprintln!("[timing] {} seq={} TTFT: {:.1}ms", tracker.model_id, tok.seq_id, ttft_ms);
+                                eprintln!(
+                                    "[timing] {} seq={} TTFT: {:.1}ms",
+                                    tracker.model_id, tok.seq_id, ttft_ms
+                                );
                                 tracker.first_token_at = Some(std::time::Instant::now());
                             }
                             tracker.token_count += 1;
@@ -624,14 +651,14 @@ pub fn engine_loop(
                                     .decode_with_special(&[tok.token])
                                     .unwrap_or_default();
 
-                                let is_think_start = think_start_id == Some(tok.token)
-                                    || raw.contains("<think>");
+                                let is_think_start =
+                                    think_start_id == Some(tok.token) || raw.contains("<think>");
                                 if is_think_start {
                                     continue;
                                 }
 
-                                let is_think_end = think_end_id == Some(tok.token)
-                                    || raw.contains("</think>");
+                                let is_think_end =
+                                    think_end_id == Some(tok.token) || raw.contains("</think>");
                                 if is_think_end {
                                     tracker.in_thinking = false;
                                     continue;
@@ -651,10 +678,10 @@ pub fn engine_loop(
                                 }
                             } else {
                                 // Buffer logprob raw data (if logprobs were requested).
-                                if tok.logprob.is_some() {
+                                if let Some(logprob) = tok.logprob {
                                     tracker.pending_raw_lps.push((
                                         tok.token,
-                                        tok.logprob.unwrap(),
+                                        logprob,
                                         tok.top_logprobs.clone(),
                                     ));
                                 }
@@ -678,7 +705,10 @@ pub fn engine_loop(
                                             top,
                                         ));
                                     }
-                                    let _ = tracker.tx.send(EngineEvent::Token { text, logprob_entries });
+                                    let _ = tracker.tx.send(EngineEvent::Token {
+                                        text,
+                                        logprob_entries,
+                                    });
                                 }
                             }
                         }
@@ -687,7 +717,8 @@ pub fn engine_loop(
                         if let Some(mut tracker) = trackers.remove(&completed.id) {
                             // Flush any remaining buffered text.
                             let remaining_text = if !tracker.output_ids.is_empty() {
-                                let full = tokenizer.decode(&tracker.output_ids).unwrap_or_default();
+                                let full =
+                                    tokenizer.decode(&tracker.output_ids).unwrap_or_default();
                                 if tracker.decoded_len < full.len() {
                                     let start = clamp_to_char_boundary(&full, tracker.decoded_len);
                                     if start < full.len() {
@@ -727,31 +758,38 @@ pub fn engine_loop(
 
                             // Flush remaining thinking text.
                             if !tracker.thinking_ids.is_empty() {
-                                let full = tokenizer.decode(&tracker.thinking_ids).unwrap_or_default();
+                                let full =
+                                    tokenizer.decode(&tracker.thinking_ids).unwrap_or_default();
                                 if tracker.thinking_decoded_len < full.len() {
-                                    let start = clamp_to_char_boundary(&full, tracker.thinking_decoded_len);
+                                    let start =
+                                        clamp_to_char_boundary(&full, tracker.thinking_decoded_len);
                                     let rest = &full[start..];
                                     if !rest.is_empty() {
-                                        let _ = tracker.tx.send(EngineEvent::ReasoningToken(rest.to_string()));
+                                        let _ = tracker
+                                            .tx
+                                            .send(EngineEvent::ReasoningToken(rest.to_string()));
                                     }
                                 }
                             }
 
                             let total_ms = tracker.enqueued_at.elapsed().as_secs_f64() * 1000.0;
-                            let decode_s = tracker.first_token_at
+                            let decode_s = tracker
+                                .first_token_at
                                 .map(|t| t.elapsed().as_secs_f64())
                                 .unwrap_or(0.001);
                             let tps = tracker.token_count as f64 / decode_s.max(0.001);
                             eprintln!(
                                 "[timing] {} seq={} done: {} tokens, total={:.1}ms, decode={:.1}ms ({:.1} tok/s)",
-                                tracker.model_id, completed.id,
+                                tracker.model_id,
+                                completed.id,
                                 tracker.token_count,
                                 total_ms,
                                 decode_s * 1000.0,
                                 tps,
                             );
                             let _ = tracker.tx.send(EngineEvent::Finish {
-                                finish_reason: completed.finish_reason
+                                finish_reason: completed
+                                    .finish_reason
                                     .as_deref()
                                     .unwrap_or("stop")
                                     .to_string(),
@@ -766,7 +804,9 @@ pub fn engine_loop(
                     eprintln!("Engine error ({consecutive_errors}/{MAX_CONSECUTIVE_ERRORS}): {e}");
 
                     if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
-                        eprintln!("[CRITICAL] {consecutive_errors} consecutive engine errors — aborting all sequences");
+                        eprintln!(
+                            "[CRITICAL] {consecutive_errors} consecutive engine errors — aborting all sequences"
+                        );
                         let aborted_ids = engine.abort_all();
                         for id in aborted_ids {
                             if let Some(tracker) = trackers.remove(&id) {
@@ -790,7 +830,9 @@ pub fn engine_loop(
     }
 
     for (_, tracker) in trackers.drain() {
-        let _ = tracker.tx.send(EngineEvent::Error("Model unloaded".to_string()));
+        let _ = tracker
+            .tx
+            .send(EngineEvent::Error("Model unloaded".to_string()));
         let _ = tracker.tx.send(EngineEvent::StreamEnd);
     }
 }
@@ -814,14 +856,8 @@ async fn list_models(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let data: Vec<serde_json::Value> = discovered
         .iter()
         .map(|m| {
-            let size_bytes = registry
-                .get(&m.id)
-                .map(|e| e.size_bytes)
-                .unwrap_or(0);
-            let last_used_secs = registry
-                .get(&m.id)
-                .map(|e| e.last_used_secs)
-                .unwrap_or(0);
+            let size_bytes = registry.get(&m.id).map(|e| e.size_bytes).unwrap_or(0);
+            let last_used_secs = registry.get(&m.id).map(|e| e.last_used_secs).unwrap_or(0);
             serde_json::json!({
                 "id": m.id,
                 "object": "model",
@@ -888,21 +924,19 @@ async fn list_running_models(State(state): State<Arc<AppState>>) -> impl IntoRes
     let data: Vec<serde_json::Value> = running
         .iter()
         .map(|m| {
-            {
-                let total = m.weights_size_bytes + m.kv_cache_bytes;
-                serde_json::json!({
-                    "id": m.id,
-                    "object": "model",
-                    "architecture": m.architecture,
-                    "vocab_size": m.vocab_size,
-                    "num_layers": m.num_layers,
-                    "idle_seconds": m.idle_seconds,
-                    "weights_size_bytes": m.weights_size_bytes,
-                    "kv_cache_bytes": m.kv_cache_bytes,
-                    "total_size_bytes": total,
-                    "total_size_gb": (total as f64 / 1_073_741_824.0 * 100.0).round() / 100.0,
-                })
-            }
+            let total = m.weights_size_bytes + m.kv_cache_bytes;
+            serde_json::json!({
+                "id": m.id,
+                "object": "model",
+                "architecture": m.architecture,
+                "vocab_size": m.vocab_size,
+                "num_layers": m.num_layers,
+                "idle_seconds": m.idle_seconds,
+                "weights_size_bytes": m.weights_size_bytes,
+                "kv_cache_bytes": m.kv_cache_bytes,
+                "total_size_bytes": total,
+                "total_size_gb": (total as f64 / 1_073_741_824.0 * 100.0).round() / 100.0,
+            })
         })
         .collect();
 
@@ -915,7 +949,8 @@ async fn list_running_models(State(state): State<Arc<AppState>>) -> impl IntoRes
 
     if let Some(budget) = budget_bytes {
         resp["memory_budget_bytes"] = budget.into();
-        resp["memory_budget_gb"] = ((budget as f64 / 1_073_741_824.0 * 100.0).round() / 100.0).into();
+        resp["memory_budget_gb"] =
+            ((budget as f64 / 1_073_741_824.0 * 100.0).round() / 100.0).into();
         resp["memory_free_bytes"] = budget.saturating_sub(total_loaded).into();
     }
 
@@ -950,7 +985,10 @@ async fn collect_one_completion(
     };
     while let Some(event) = rx.recv().await {
         match event {
-            EngineEvent::Token { text, logprob_entries } => {
+            EngineEvent::Token {
+                text,
+                logprob_entries,
+            } => {
                 data.content.push_str(&text);
                 data.logprob_entries.extend(logprob_entries);
             }
@@ -958,7 +996,10 @@ async fn collect_one_completion(
                 data.reasoning_content.push_str(&text);
                 data.reasoning_tokens += 1;
             }
-            EngineEvent::Finish { finish_reason, completion_tokens } => {
+            EngineEvent::Finish {
+                finish_reason,
+                completion_tokens,
+            } => {
                 data.finish_reason = finish_reason;
                 data.completion_tokens = completion_tokens;
             }
@@ -1012,14 +1053,15 @@ async fn chat_completions(
     let _client_metadata = (&body.user, &body.tools, &body.tool_choice);
 
     // Validate logit_bias shape early.
-    if let Some(ref lb) = body.logit_bias {
-        if !lb.is_null() && !lb.is_object() {
-            return Err(error_response(
-                StatusCode::BAD_REQUEST,
-                "logit_bias must be a JSON object mapping token IDs to biases",
-                "invalid_request_error",
-            ));
-        }
+    if let Some(ref lb) = body.logit_bias
+        && !lb.is_null()
+        && !lb.is_object()
+    {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "logit_bias must be a JSON object mapping token IDs to biases",
+            "invalid_request_error",
+        ));
     }
 
     let t_request = std::time::Instant::now();
@@ -1034,7 +1076,11 @@ async fn chat_completions(
 
     let handle = match get_result {
         GetResult::Ready(h) => {
-            eprintln!("[timing] {} manager lock+ready: {:.1}ms", model_id, t_after_lock.as_secs_f64() * 1000.0);
+            eprintln!(
+                "[timing] {} manager lock+ready: {:.1}ms",
+                model_id,
+                t_after_lock.as_secs_f64() * 1000.0
+            );
             h
         }
         GetResult::Wait(rx) => {
@@ -1053,14 +1099,18 @@ async fn chat_completions(
                 };
                 error_response(status, e, "server_error")
             })?;
-            eprintln!("[timing] {} load completed: {:.1}ms", model_id, t_request.elapsed().as_secs_f64() * 1000.0);
+            eprintln!(
+                "[timing] {} load completed: {:.1}ms",
+                model_id,
+                t_request.elapsed().as_secs_f64() * 1000.0
+            );
             h
         }
     };
 
     let t_template = std::time::Instant::now();
-    let enable_thinking = body.enable_thinking.unwrap_or(false)
-        && handle.tokenizer.has_thinking_support();
+    let enable_thinking =
+        body.enable_thinking.unwrap_or(false) && handle.tokenizer.has_thinking_support();
 
     // Build the message list, optionally injecting a JSON-mode system instruction.
     let json_mode = body
@@ -1068,40 +1118,52 @@ async fn chat_completions(
         .as_ref()
         .map(|rf| rf.format_type == "json_object" || rf.format_type == "json_schema")
         .unwrap_or(false);
-    let messages_for_prompt: std::borrow::Cow<[ChatMessage]> = if let Some(rf) = &body.response_format {
-        if json_mode {
-            let instr = json_system_instruction(rf);
-            let mut msgs = body.messages.clone();
-            if let Some(sys) = msgs.iter_mut().find(|m| m.role == "system") {
-                sys.content = format!("{}\n\n{}", sys.content, instr);
+    let messages_for_prompt: std::borrow::Cow<[ChatMessage]> =
+        if let Some(rf) = &body.response_format {
+            if json_mode {
+                let instr = json_system_instruction(rf);
+                let mut msgs = body.messages.clone();
+                if let Some(sys) = msgs.iter_mut().find(|m| m.role == "system") {
+                    sys.content = format!("{}\n\n{}", sys.content, instr);
+                } else {
+                    msgs.insert(
+                        0,
+                        ChatMessage {
+                            role: "system".to_string(),
+                            content: instr,
+                            reasoning_content: None,
+                        },
+                    );
+                }
+                std::borrow::Cow::Owned(msgs)
             } else {
-                msgs.insert(0, ChatMessage {
-                    role: "system".to_string(),
-                    content: instr,
-                    reasoning_content: None,
-                });
+                std::borrow::Cow::Borrowed(&body.messages)
             }
-            std::borrow::Cow::Owned(msgs)
         } else {
             std::borrow::Cow::Borrowed(&body.messages)
-        }
-    } else {
-        std::borrow::Cow::Borrowed(&body.messages)
-    };
+        };
 
     let prompt = apply_chat_template(&handle.tokenizer, &messages_for_prompt, enable_thinking);
     let template_ms = t_template.elapsed().as_secs_f64() * 1000.0;
 
     let t_encode = std::time::Instant::now();
     let prompt_tokens = handle.tokenizer.encode(&prompt).map_err(|e| {
-        error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string(), "server_error")
+        error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            e.to_string(),
+            "server_error",
+        )
     })?;
     let encode_ms = t_encode.elapsed().as_secs_f64() * 1000.0;
     let prompt_len = prompt_tokens.len();
 
     eprintln!(
         "[timing] {} template: {:.1}ms, encode: {:.1}ms ({} tokens), total pre-engine: {:.1}ms",
-        model_id, template_ms, encode_ms, prompt_len, t_request.elapsed().as_secs_f64() * 1000.0
+        model_id,
+        template_ms,
+        encode_ms,
+        prompt_len,
+        t_request.elapsed().as_secs_f64() * 1000.0
     );
 
     // Parse stop strings into token IDs (single-token stops only).
@@ -1167,14 +1229,16 @@ async fn chat_completions(
         .min(remaining);
 
     // Spawn N requests (one per completion).
-    let mut completion_rxs: Vec<tokio_mpsc::UnboundedReceiver<EngineEvent>> =
-        Vec::with_capacity(n);
+    let mut completion_rxs: Vec<tokio_mpsc::UnboundedReceiver<EngineEvent>> = Vec::with_capacity(n);
 
     for i in 0..n {
         let (response_tx, response_rx) = tokio_mpsc::unbounded_channel();
         // Give each completion a distinct seed offset so n>1 produces different outputs.
         let seed = base_sampling_params.seed.map(|s| s.wrapping_add(i as u64));
-        let sampling_params = SamplingParams { seed, ..base_sampling_params.clone() };
+        let sampling_params = SamplingParams {
+            seed,
+            ..base_sampling_params.clone()
+        };
 
         handle
             .request_tx
@@ -1212,7 +1276,8 @@ async fn chat_completions(
         // For n=1: use the existing direct-channel approach (avoids merge overhead).
         // For n>1: merge all N receivers into a single (index, event) channel.
 
-        let (sse_tx, sse_rx) = tokio_mpsc::unbounded_channel::<Result<Event, std::convert::Infallible>>();
+        let (sse_tx, sse_rx) =
+            tokio_mpsc::unbounded_channel::<Result<Event, std::convert::Infallible>>();
 
         if n == 1 {
             let mut response_rx = completion_rxs.remove(0);
@@ -1227,25 +1292,37 @@ async fn chat_completions(
                     model: model_id_clone.clone(),
                     choices: vec![ChunkChoice {
                         index: 0,
-                        delta: Delta { role: Some("assistant".to_string()), content: None, reasoning_content: None },
+                        delta: Delta {
+                            role: Some("assistant".to_string()),
+                            content: None,
+                            reasoning_content: None,
+                        },
                         finish_reason: None,
                         logprobs: None,
                     }],
                     usage: None,
                     system_fingerprint: Some(fp.clone()),
                 };
-                let _ = sse_tx.send(Ok(Event::default().data(serde_json::to_string(&role_chunk).unwrap())));
+                let _ = sse_tx.send(Ok(
+                    Event::default().data(serde_json::to_string(&role_chunk).unwrap())
+                ));
 
                 while let Some(event) = response_rx.recv().await {
                     match event {
-                        EngineEvent::Token { text, logprob_entries } => {
+                        EngineEvent::Token {
+                            text,
+                            logprob_entries,
+                        } => {
                             if text.is_empty() && logprob_entries.is_empty() {
                                 continue;
                             }
                             let chunk_logprobs = if wants_logprobs && !logprob_entries.is_empty() {
                                 Some(build_logprobs_content(&logprob_entries, req_top_n))
                             } else if wants_logprobs {
-                                Some(Logprobs { content: vec![], refusal: None })
+                                Some(Logprobs {
+                                    content: vec![],
+                                    refusal: None,
+                                })
                             } else {
                                 None
                             };
@@ -1256,14 +1333,21 @@ async fn chat_completions(
                                 model: model_id_clone.clone(),
                                 choices: vec![ChunkChoice {
                                     index: 0,
-                                    delta: Delta { role: None, content: Some(text), reasoning_content: None },
+                                    delta: Delta {
+                                        role: None,
+                                        content: Some(text),
+                                        reasoning_content: None,
+                                    },
                                     finish_reason: None,
                                     logprobs: chunk_logprobs,
                                 }],
                                 usage: None,
                                 system_fingerprint: Some(fp.clone()),
                             };
-                            let _ = sse_tx.send(Ok(Event::default().data(serde_json::to_string(&chunk).unwrap())));
+                            let _ =
+                                sse_tx
+                                    .send(Ok(Event::default()
+                                        .data(serde_json::to_string(&chunk).unwrap())));
                         }
                         EngineEvent::ReasoningToken(text) => {
                             let chunk = ChatCompletionChunk {
@@ -1273,16 +1357,26 @@ async fn chat_completions(
                                 model: model_id_clone.clone(),
                                 choices: vec![ChunkChoice {
                                     index: 0,
-                                    delta: Delta { role: None, content: None, reasoning_content: Some(text) },
+                                    delta: Delta {
+                                        role: None,
+                                        content: None,
+                                        reasoning_content: Some(text),
+                                    },
                                     finish_reason: None,
                                     logprobs: None,
                                 }],
                                 usage: None,
                                 system_fingerprint: Some(fp.clone()),
                             };
-                            let _ = sse_tx.send(Ok(Event::default().data(serde_json::to_string(&chunk).unwrap())));
+                            let _ =
+                                sse_tx
+                                    .send(Ok(Event::default()
+                                        .data(serde_json::to_string(&chunk).unwrap())));
                         }
-                        EngineEvent::Finish { finish_reason, completion_tokens } => {
+                        EngineEvent::Finish {
+                            finish_reason,
+                            completion_tokens,
+                        } => {
                             let chunk = ChatCompletionChunk {
                                 id: chat_id.clone(),
                                 object: "chat.completion.chunk".to_string(),
@@ -1290,14 +1384,21 @@ async fn chat_completions(
                                 model: model_id_clone.clone(),
                                 choices: vec![ChunkChoice {
                                     index: 0,
-                                    delta: Delta { role: None, content: None, reasoning_content: None },
+                                    delta: Delta {
+                                        role: None,
+                                        content: None,
+                                        reasoning_content: None,
+                                    },
                                     finish_reason: Some(finish_reason),
                                     logprobs: None,
                                 }],
                                 usage: None,
                                 system_fingerprint: Some(fp.clone()),
                             };
-                            let _ = sse_tx.send(Ok(Event::default().data(serde_json::to_string(&chunk).unwrap())));
+                            let _ =
+                                sse_tx
+                                    .send(Ok(Event::default()
+                                        .data(serde_json::to_string(&chunk).unwrap())));
 
                             if include_usage {
                                 let usage_chunk = ChatCompletionChunk {
@@ -1314,7 +1415,8 @@ async fn chat_completions(
                                     }),
                                     system_fingerprint: Some(fp.clone()),
                                 };
-                                let _ = sse_tx.send(Ok(Event::default().data(serde_json::to_string(&usage_chunk).unwrap())));
+                                let _ = sse_tx.send(Ok(Event::default()
+                                    .data(serde_json::to_string(&usage_chunk).unwrap())));
                             }
                         }
                         EngineEvent::StreamEnd => {
@@ -1325,7 +1427,9 @@ async fn chat_completions(
                             let err = serde_json::json!({
                                 "error": { "message": msg, "type": "server_error", "param": null, "code": null }
                             });
-                            let _ = sse_tx.send(Ok(Event::default().data(serde_json::to_string(&err).unwrap())));
+                            let _ = sse_tx.send(Ok(
+                                Event::default().data(serde_json::to_string(&err).unwrap())
+                            ));
                         }
                     }
                 }
@@ -1338,7 +1442,9 @@ async fn chat_completions(
                 tokio::spawn(async move {
                     let mut rx = rx;
                     while let Some(ev) = rx.recv().await {
-                        if tx.send((i, ev)).is_err() { break; }
+                        if tx.send((i, ev)).is_err() {
+                            break;
+                        }
                     }
                 });
             }
@@ -1356,14 +1462,20 @@ async fn chat_completions(
                         model: model_id_clone.clone(),
                         choices: vec![ChunkChoice {
                             index: i,
-                            delta: Delta { role: Some("assistant".to_string()), content: None, reasoning_content: None },
+                            delta: Delta {
+                                role: Some("assistant".to_string()),
+                                content: None,
+                                reasoning_content: None,
+                            },
                             finish_reason: None,
                             logprobs: None,
                         }],
                         usage: None,
                         system_fingerprint: Some(fp.clone()),
                     };
-                    let _ = sse_tx.send(Ok(Event::default().data(serde_json::to_string(&role_chunk).unwrap())));
+                    let _ = sse_tx.send(Ok(
+                        Event::default().data(serde_json::to_string(&role_chunk).unwrap())
+                    ));
                 }
 
                 let mut rx = merged_rx;
@@ -1372,14 +1484,20 @@ async fn chat_completions(
 
                 while let Some((idx, event)) = rx.recv().await {
                     match event {
-                        EngineEvent::Token { text, logprob_entries } => {
+                        EngineEvent::Token {
+                            text,
+                            logprob_entries,
+                        } => {
                             if text.is_empty() && logprob_entries.is_empty() {
                                 continue;
                             }
                             let chunk_logprobs = if wants_logprobs && !logprob_entries.is_empty() {
                                 Some(build_logprobs_content(&logprob_entries, req_top_n))
                             } else if wants_logprobs {
-                                Some(Logprobs { content: vec![], refusal: None })
+                                Some(Logprobs {
+                                    content: vec![],
+                                    refusal: None,
+                                })
                             } else {
                                 None
                             };
@@ -1390,14 +1508,21 @@ async fn chat_completions(
                                 model: model_id_clone.clone(),
                                 choices: vec![ChunkChoice {
                                     index: idx,
-                                    delta: Delta { role: None, content: Some(text), reasoning_content: None },
+                                    delta: Delta {
+                                        role: None,
+                                        content: Some(text),
+                                        reasoning_content: None,
+                                    },
                                     finish_reason: None,
                                     logprobs: chunk_logprobs,
                                 }],
                                 usage: None,
                                 system_fingerprint: Some(fp.clone()),
                             };
-                            let _ = sse_tx.send(Ok(Event::default().data(serde_json::to_string(&chunk).unwrap())));
+                            let _ =
+                                sse_tx
+                                    .send(Ok(Event::default()
+                                        .data(serde_json::to_string(&chunk).unwrap())));
                         }
                         EngineEvent::ReasoningToken(text) => {
                             let chunk = ChatCompletionChunk {
@@ -1407,16 +1532,26 @@ async fn chat_completions(
                                 model: model_id_clone.clone(),
                                 choices: vec![ChunkChoice {
                                     index: idx,
-                                    delta: Delta { role: None, content: None, reasoning_content: Some(text) },
+                                    delta: Delta {
+                                        role: None,
+                                        content: None,
+                                        reasoning_content: Some(text),
+                                    },
                                     finish_reason: None,
                                     logprobs: None,
                                 }],
                                 usage: None,
                                 system_fingerprint: Some(fp.clone()),
                             };
-                            let _ = sse_tx.send(Ok(Event::default().data(serde_json::to_string(&chunk).unwrap())));
+                            let _ =
+                                sse_tx
+                                    .send(Ok(Event::default()
+                                        .data(serde_json::to_string(&chunk).unwrap())));
                         }
-                        EngineEvent::Finish { finish_reason, completion_tokens } => {
+                        EngineEvent::Finish {
+                            finish_reason,
+                            completion_tokens,
+                        } => {
                             total_completion_tokens += completion_tokens;
                             let chunk = ChatCompletionChunk {
                                 id: chat_id.clone(),
@@ -1425,14 +1560,21 @@ async fn chat_completions(
                                 model: model_id_clone.clone(),
                                 choices: vec![ChunkChoice {
                                     index: idx,
-                                    delta: Delta { role: None, content: None, reasoning_content: None },
+                                    delta: Delta {
+                                        role: None,
+                                        content: None,
+                                        reasoning_content: None,
+                                    },
                                     finish_reason: Some(finish_reason),
                                     logprobs: None,
                                 }],
                                 usage: None,
                                 system_fingerprint: Some(fp.clone()),
                             };
-                            let _ = sse_tx.send(Ok(Event::default().data(serde_json::to_string(&chunk).unwrap())));
+                            let _ =
+                                sse_tx
+                                    .send(Ok(Event::default()
+                                        .data(serde_json::to_string(&chunk).unwrap())));
                         }
                         EngineEvent::StreamEnd => {
                             stream_ends += 1;
@@ -1452,7 +1594,8 @@ async fn chat_completions(
                                         }),
                                         system_fingerprint: Some(fp.clone()),
                                     };
-                                    let _ = sse_tx.send(Ok(Event::default().data(serde_json::to_string(&usage_chunk).unwrap())));
+                                    let _ = sse_tx.send(Ok(Event::default()
+                                        .data(serde_json::to_string(&usage_chunk).unwrap())));
                                 }
                                 let _ = sse_tx.send(Ok(Event::default().data("[DONE]")));
                                 break;
@@ -1462,7 +1605,9 @@ async fn chat_completions(
                             let err = serde_json::json!({
                                 "error": { "message": msg, "type": "server_error", "param": null, "code": null }
                             });
-                            let _ = sse_tx.send(Ok(Event::default().data(serde_json::to_string(&err).unwrap())));
+                            let _ = sse_tx.send(Ok(
+                                Event::default().data(serde_json::to_string(&err).unwrap())
+                            ));
                         }
                     }
                 }
@@ -1483,11 +1628,13 @@ async fn chat_completions(
         let mut total_reasoning_tokens: usize = 0;
 
         for (i, handle) in handles.into_iter().enumerate() {
-            let data = handle
-                .await
-                .map_err(|_| {
-                    error_response(StatusCode::INTERNAL_SERVER_ERROR, "Task panic", "server_error")
-                })??;
+            let data = handle.await.map_err(|_| {
+                error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Task panic",
+                    "server_error",
+                )
+            })??;
 
             total_completion_tokens += data.completion_tokens;
             total_reasoning_tokens += data.reasoning_tokens;
@@ -1532,7 +1679,9 @@ async fn chat_completions(
         }
 
         let completion_tokens_details = if total_reasoning_tokens > 0 {
-            Some(CompletionTokensDetails { reasoning_tokens: total_reasoning_tokens })
+            Some(CompletionTokensDetails {
+                reasoning_tokens: total_reasoning_tokens,
+            })
         } else {
             None
         };
@@ -1571,23 +1720,44 @@ fn make_chat_id() -> String {
     format!("chatcmpl-{:x}{:x}-{}", t.as_secs(), t.subsec_nanos(), seq)
 }
 
-pub fn start_server(
-    models_dir: PathBuf,
-    port: u16,
-    keep_alive: Duration,
-    memory_budget_bytes: Option<usize>,
-    cuda_devices: Vec<usize>,
-    max_context_len: usize,
-    kv_quant: crate::common::kv_quant::KvQuantMode,
-    qjl_quantization: bool,
-) -> anyhow::Result<()> {
+pub struct StartServerArgs {
+    pub models_dir: PathBuf,
+    pub port: u16,
+    pub keep_alive: Duration,
+    pub memory_budget_bytes: Option<usize>,
+    pub cuda_devices: Vec<usize>,
+    pub max_context_len: usize,
+    pub kv_quant: crate::common::kv_quant::KvQuantMode,
+    pub qjl_quantization: bool,
+}
+
+pub fn start_server(args: StartServerArgs) -> anyhow::Result<()> {
+    let StartServerArgs {
+        models_dir,
+        port,
+        keep_alive,
+        memory_budget_bytes,
+        cuda_devices,
+        max_context_len,
+        kv_quant,
+        qjl_quantization,
+    } = args;
+
     if !models_dir.exists() {
         std::fs::create_dir_all(&models_dir)?;
         println!("Created models directory: {}", models_dir.display());
     }
     let available = crate::models::loader::discover_models(&models_dir);
     println!("Models directory: {}", models_dir.display());
-    println!("Discovered {} {}:", available.len(), if available.len() == 1 { "model" } else { "models" });
+    println!(
+        "Discovered {} {}:",
+        available.len(),
+        if available.len() == 1 {
+            "model"
+        } else {
+            "models"
+        }
+    );
     for m in &available {
         println!("  - {} ({})", m.id, m.architecture);
     }
@@ -1624,18 +1794,12 @@ pub fn start_server(
             "API endpoint:   POST http://localhost:{}/v1/chat/completions",
             port
         );
-        println!(
-            "Models:         GET  http://localhost:{}/v1/models",
-            port
-        );
+        println!("Models:         GET  http://localhost:{}/v1/models", port);
         println!(
             "Running models: GET  http://localhost:{}/v1/models/running",
             port
         );
-        println!(
-            "Health check:   GET  http://localhost:{}/health",
-            port
-        );
+        println!("Health check:   GET  http://localhost:{}/health", port);
         println!(
             "\nKeep-alive: {}s (models evicted after idle timeout)",
             keep_alive.as_secs()
@@ -1647,7 +1811,10 @@ pub fn start_server(
             ),
             None => println!("Memory budget: unlimited"),
         }
-        println!("Max context length: {} tokens per sequence\n", max_context_len);
+        println!(
+            "Max context length: {} tokens per sequence\n",
+            max_context_len
+        );
 
         let listener = tokio::net::TcpListener::bind(&addr).await?;
         axum::serve(listener, app).await?;

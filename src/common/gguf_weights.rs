@@ -2,9 +2,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::Context;
-use candle_core::quantized::gguf_file;
-use candle_core::quantized::QTensor;
 use candle_core::Device;
+use candle_core::quantized::QTensor;
+use candle_core::quantized::gguf_file;
 use rustc_hash::FxHashMap;
 
 pub struct GgufWeights {
@@ -82,7 +82,8 @@ impl GgufWeights {
             .get(key)
             .ok_or_else(|| anyhow::anyhow!("Missing GGUF metadata key: {}", key))
             .and_then(|v| {
-                v.to_string().cloned()
+                v.to_string()
+                    .cloned()
                     .map_err(|e| anyhow::anyhow!("Bad string for '{}': {}", key, e))
             })
     }
@@ -127,13 +128,21 @@ impl GgufWeights {
             }
             total_tensors += content.tensor_infos.len();
             for name in content.tensor_infos.keys() {
-                let qt = content
-                    .tensor(&mut file, name, device)
-                    .map_err(|e| anyhow::anyhow!("Failed to load tensor '{}' from shard '{}': {}", name, path, e))?;
+                let qt = content.tensor(&mut file, name, device).map_err(|e| {
+                    anyhow::anyhow!(
+                        "Failed to load tensor '{}' from shard '{}': {}",
+                        name,
+                        path,
+                        e
+                    )
+                })?;
                 tensors.insert(name.clone(), Arc::new(qt));
             }
         }
-        println!("[gguf] {} tensors loaded from {} shards", total_tensors, total_shards);
+        println!(
+            "[gguf] {} tensors loaded from {} shards",
+            total_tensors, total_shards
+        );
         Ok(Self { tensors, metadata })
     }
 
@@ -151,9 +160,10 @@ impl GgufWeights {
         {
             for v in arr {
                 if let gguf_file::Value::U32(id) = v
-                    && !ids.contains(id) {
-                        ids.push(*id);
-                    }
+                    && !ids.contains(id)
+                {
+                    ids.push(*id);
+                }
             }
         }
         ids

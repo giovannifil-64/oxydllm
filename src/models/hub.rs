@@ -40,7 +40,7 @@ fn strip_split_suffix(stem: &str) -> &str {
         && parts[n - 1].chars().all(|c| c.is_ascii_digit())
         && parts[n - 3].chars().all(|c| c.is_ascii_digit())
     {
-        let trim = 1 + parts[n-1].len() + 1 + parts[n-2].len() + 1 + parts[n-3].len();
+        let trim = 1 + parts[n - 1].len() + 1 + parts[n - 2].len() + 1 + parts[n - 3].len();
         &stem[..stem.len() - trim]
     } else {
         stem
@@ -76,7 +76,6 @@ fn group_gguf_variants(gguf_files: &[(String, u64)]) -> Vec<GgufVariant> {
         .collect()
 }
 
-
 fn select_variant<'a>(
     variants: &'a [GgufVariant],
     preferred: Option<&str>,
@@ -109,7 +108,11 @@ fn select_variant<'a>(
     let recommended_idx = best_variant_idx(variants);
 
     for (i, v) in variants.iter().enumerate() {
-        let star = if Some(i) == recommended_idx { " ★" } else { "" };
+        let star = if Some(i) == recommended_idx {
+            " ★"
+        } else {
+            ""
+        };
         let files_label = if v.is_split() {
             format!("{} shards", v.files.len())
         } else {
@@ -226,7 +229,9 @@ pub fn pull(config: &PullConfig) -> anyhow::Result<()> {
         .filter(|(f, _)| is_relevant_file(f))
         .partition(|(f, _)| f.to_lowercase().ends_with(".gguf"));
 
-    let has_safetensors = metadata_files.iter().any(|(f, _)| f.ends_with(".safetensors"));
+    let has_safetensors = metadata_files
+        .iter()
+        .any(|(f, _)| f.ends_with(".safetensors"));
     let mut download_safetensors = false;
 
     let gguf_to_download: Vec<String> = if gguf_files.is_empty() {
@@ -235,18 +240,22 @@ pub fn pull(config: &PullConfig) -> anyhow::Result<()> {
     } else {
         let mut variants = group_gguf_variants(&gguf_files);
         if has_safetensors {
-            let st_files: Vec<_> = metadata_files.iter()
+            let st_files: Vec<_> = metadata_files
+                .iter()
                 .filter(|(f, _)| f.ends_with(".safetensors"))
                 .cloned()
                 .collect();
-            variants.insert(0, GgufVariant {
-                quant_name: "Safetensors".to_string(),
-                files: st_files,
-            });
+            variants.insert(
+                0,
+                GgufVariant {
+                    quant_name: "Safetensors".to_string(),
+                    files: st_files,
+                },
+            );
         }
-        
+
         println!();
-        
+
         let target_variant_str = config.variant.as_deref().map(|s| {
             if s.eq_ignore_ascii_case("safetensors") {
                 "Safetensors"
@@ -365,7 +374,13 @@ pub fn pull(config: &PullConfig) -> anyhow::Result<()> {
     let mut download_ok = true;
     let mut downloaded_files: Vec<String> = Vec::new();
     for filename in &to_download {
-        match download_file(&client, &config.repo_id, filename, &dest, config.token.as_deref()) {
+        match download_file(
+            &client,
+            &config.repo_id,
+            filename,
+            &dest,
+            config.token.as_deref(),
+        ) {
             Ok(()) => downloaded_files.push(filename.clone()),
             Err(e) => {
                 eprintln!("\nError downloading '{}': {}", filename, e);
@@ -380,7 +395,11 @@ pub fn pull(config: &PullConfig) -> anyhow::Result<()> {
         for f in &downloaded_files {
             let _ = std::fs::remove_file(dest.join(f));
         }
-        if dest.read_dir().map(|mut d| d.next().is_none()).unwrap_or(true) {
+        if dest
+            .read_dir()
+            .map(|mut d| d.next().is_none())
+            .unwrap_or(true)
+        {
             let _ = std::fs::remove_dir(&dest);
         }
         anyhow::bail!("Download incomplete.");
@@ -419,7 +438,6 @@ pub fn pull(config: &PullConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
-
 fn list_repo_files(
     client: &reqwest::blocking::Client,
     repo_id: &str,
@@ -435,9 +453,9 @@ fn list_repo_files(
     check_status(status, repo_id)?;
 
     let json: serde_json::Value = resp.json()?;
-    let siblings = json["siblings"]
-        .as_array()
-        .ok_or_else(|| anyhow::anyhow!("Unexpected HuggingFace API response (missing 'siblings')"))?;
+    let siblings = json["siblings"].as_array().ok_or_else(|| {
+        anyhow::anyhow!("Unexpected HuggingFace API response (missing 'siblings')")
+    })?;
 
     Ok(siblings
         .iter()
@@ -457,7 +475,11 @@ fn is_relevant_file(f: &str) -> bool {
         return false;
     }
     let l = f.to_lowercase();
-    if l == "consolidated.safetensors" || l.ends_with(".pth") || l.ends_with(".pt") || l.ends_with(".bin") {
+    if l == "consolidated.safetensors"
+        || l.ends_with(".pth")
+        || l.ends_with(".pt")
+        || l.ends_with(".bin")
+    {
         return false;
     }
     l.ends_with(".json")

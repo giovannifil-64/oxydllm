@@ -1,6 +1,6 @@
+use crate::common::config::StandardTransformerConfig;
 use anyhow::{Context, Result};
 use serde_json::Value;
-use crate::common::config::StandardTransformerConfig;
 
 use crate::common::rope::RopeScaling;
 
@@ -40,10 +40,12 @@ pub fn parse(config_path: &str) -> Result<StandardTransformerConfig> {
     let hidden_size = req_usize(&v, "hidden_size")?;
     let num_hidden_layers = req_usize(&v, "num_hidden_layers")?;
     let num_attention_heads = req_usize(&v, "num_attention_heads")?;
-    let num_key_value_heads = v["num_key_value_heads"].as_u64()
+    let num_key_value_heads = v["num_key_value_heads"]
+        .as_u64()
         .map(|x| x as usize)
         .unwrap_or(num_attention_heads);
-    let head_dim = v["head_dim"].as_u64()
+    let head_dim = v["head_dim"]
+        .as_u64()
         .map(|x| x as usize)
         .unwrap_or(hidden_size / num_attention_heads);
 
@@ -94,20 +96,23 @@ pub fn parse(config_path: &str) -> Result<StandardTransformerConfig> {
         attention_scale = Some(1.0);
     }
 
-    let tie_word_embeddings = v["tie_word_embeddings"].as_bool()
-        .unwrap_or(
-            arch == "GemmaForCausalLM"
-                || arch == "Gemma2ForCausalLM"
-                || arch == "Gemma3ForCausalLM"
-                || arch == "Gemma4ForCausalLM"
-                || arch == "Gemma4ForConditionalGeneration",
-        );
+    let tie_word_embeddings = v["tie_word_embeddings"].as_bool().unwrap_or(
+        arch == "GemmaForCausalLM"
+            || arch == "Gemma2ForCausalLM"
+            || arch == "Gemma3ForCausalLM"
+            || arch == "Gemma4ForCausalLM"
+            || arch == "Gemma4ForConditionalGeneration",
+    );
 
     let rope_scaling = parse_rope_scaling(&v["rope_scaling"]);
     let sliding_window = v["sliding_window"].as_u64().map(|x| x as usize);
 
-    let layer_types = parse_string_array(&v["layer_types"]).filter(|x| x.len() == num_hidden_layers);
-    let global_head_dim = v["global_head_dim"].as_u64().map(|x| x as usize).filter(|&x| x > 0);
+    let layer_types =
+        parse_string_array(&v["layer_types"]).filter(|x| x.len() == num_hidden_layers);
+    let global_head_dim = v["global_head_dim"]
+        .as_u64()
+        .map(|x| x as usize)
+        .filter(|&x| x > 0);
     let num_global_key_value_heads = v["num_global_key_value_heads"]
         .as_u64()
         .map(|x| x as usize)
@@ -160,7 +165,13 @@ pub fn parse(config_path: &str) -> Result<StandardTransformerConfig> {
         sliding_window.map(|w| {
             types
                 .iter()
-                .map(|layer_type| if layer_type == "full_attention" { None } else { Some(w) })
+                .map(|layer_type| {
+                    if layer_type == "full_attention" {
+                        None
+                    } else {
+                        Some(w)
+                    }
+                })
                 .collect::<Vec<_>>()
         })
     });
@@ -216,26 +227,26 @@ pub fn parse(config_path: &str) -> Result<StandardTransformerConfig> {
         };
 
     Ok(StandardTransformerConfig {
-        vocab_size:               req_usize(&v, "vocab_size")?,
+        vocab_size: req_usize(&v, "vocab_size")?,
         num_hidden_layers,
         num_attention_heads,
         num_key_value_heads,
         head_dim,
-        rms_norm_eps:             v["rms_norm_eps"].as_f64().unwrap_or(1e-5),
+        rms_norm_eps: v["rms_norm_eps"].as_f64().unwrap_or(1e-5),
         rope_theta,
         rope_scaling,
-        max_position_embeddings:  v["max_position_embeddings"].as_u64().unwrap_or(131_072) as usize,
-        qk_norm:                  arch_def.qk_norm,
+        max_position_embeddings: v["max_position_embeddings"].as_u64().unwrap_or(131_072) as usize,
+        qk_norm: arch_def.qk_norm,
         tie_word_embeddings,
         attention_scale,
         eos_token_ids,
-        activation:               arch_def.activation,
-        norm_type:                arch_def.norm_type,
+        activation: arch_def.activation,
+        norm_type: arch_def.norm_type,
         embed_scale,
         attn_softcap,
         logit_softcap,
-        v_norm:                   arch_def.v_norm,
-        has_ffn_norms:            arch_def.has_ffn_norms,
+        v_norm: arch_def.v_norm,
+        has_ffn_norms: arch_def.has_ffn_norms,
         sliding_window,
         per_layer_num_key_value_heads,
         per_layer_head_dims,
@@ -260,14 +271,21 @@ fn req_usize(v: &Value, key: &str) -> Result<usize> {
 fn parse_eos(v: &Value) -> Vec<u32> {
     match v {
         Value::Number(n) => n.as_u64().map(|x| vec![x as u32]).unwrap_or_default(),
-        Value::Array(arr) => arr.iter().filter_map(|x| x.as_u64()).map(|x| x as u32).collect(),
+        Value::Array(arr) => arr
+            .iter()
+            .filter_map(|x| x.as_u64())
+            .map(|x| x as u32)
+            .collect(),
         _ => vec![],
     }
 }
 
 fn parse_string_array(v: &Value) -> Option<Vec<String>> {
-    v.as_array()
-        .map(|arr| arr.iter().filter_map(|x| x.as_str().map(str::to_string)).collect::<Vec<_>>())
+    v.as_array().map(|arr| {
+        arr.iter()
+            .filter_map(|x| x.as_str().map(str::to_string))
+            .collect::<Vec<_>>()
+    })
 }
 
 fn parse_generation_eos(config_path: &str) -> Vec<u32> {
@@ -291,26 +309,45 @@ fn parse_rope_scaling(v: &Value) -> RopeScaling {
     if v.is_null() {
         return RopeScaling::None;
     }
-    
-    let rope_type = v["rope_type"].as_str().or_else(|| v["type"].as_str()).unwrap_or("");
+
+    let rope_type = v["rope_type"]
+        .as_str()
+        .or_else(|| v["type"].as_str())
+        .unwrap_or("");
     let factor = v["factor"].as_f64().unwrap_or(1.0);
-    
+
     match rope_type {
         "linear" => RopeScaling::Linear { factor },
         "llama3" => {
             let low_freq_factor = v["low_freq_factor"].as_f64().unwrap_or(1.0);
             let high_freq_factor = v["high_freq_factor"].as_f64().unwrap_or(1.0);
-            let original_max_pos = v["original_max_position_embeddings"].as_u64().unwrap_or(8192) as usize;
-            RopeScaling::Llama3 { factor, low_freq_factor, high_freq_factor, original_max_pos }
+            let original_max_pos = v["original_max_position_embeddings"]
+                .as_u64()
+                .unwrap_or(8192) as usize;
+            RopeScaling::Llama3 {
+                factor,
+                low_freq_factor,
+                high_freq_factor,
+                original_max_pos,
+            }
         }
         "yarn" => {
-            let original_max_pos = v["original_max_position_embeddings"].as_u64().unwrap_or(8192) as usize;
+            let original_max_pos = v["original_max_position_embeddings"]
+                .as_u64()
+                .unwrap_or(8192) as usize;
             let beta_fast = v["beta_fast"].as_f64().unwrap_or(32.0);
             let beta_slow = v["beta_slow"].as_f64().unwrap_or(1.0);
-            RopeScaling::Yarn { factor, original_max_pos, beta_fast, beta_slow }
+            RopeScaling::Yarn {
+                factor,
+                original_max_pos,
+                beta_fast,
+                beta_slow,
+            }
         }
         "longrope" => {
-            let original_max_pos = v["original_max_position_embeddings"].as_u64().unwrap_or(4096) as usize;
+            let original_max_pos = v["original_max_position_embeddings"]
+                .as_u64()
+                .unwrap_or(4096) as usize;
             let short_factor = parse_rope_factor(&v["short_factor"], 1.0);
             let long_factor = parse_rope_factor(&v["long_factor"], factor.max(1.0));
             RopeScaling::LongRope {

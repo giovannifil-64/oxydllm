@@ -3,7 +3,7 @@ pub mod sequence;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
-use crate::common::paged::{PagedKvCache, SharedBlockAllocator, DEFAULT_BLOCK_SIZE};
+use crate::common::paged::{DEFAULT_BLOCK_SIZE, PagedKvCache, SharedBlockAllocator};
 use crate::common::prefix_cache::PrefixCache;
 use crate::sampling::SamplingParams;
 use sequence::*;
@@ -131,12 +131,17 @@ impl Scheduler {
         self.allocators[0].lock().unwrap().num_free()
     }
 
-    fn blocks_needed_for_prefill(&self, seq: &SequenceState, prefix_cache: Option<&PrefixCache>) -> usize {
+    fn blocks_needed_for_prefill(
+        &self,
+        seq: &SequenceState,
+        prefix_cache: Option<&PrefixCache>,
+    ) -> usize {
         let total_tokens = seq.all_tokens.len();
         let total_blocks = total_tokens.div_ceil(self.block_size);
         let cached = prefix_cache.map_or(0, |pc| {
             let max_cacheable = total_tokens.saturating_sub(1) / self.block_size;
-            pc.count_cached_blocks(&seq.all_tokens, self.block_size).min(max_cacheable)
+            pc.count_cached_blocks(&seq.all_tokens, self.block_size)
+                .min(max_cacheable)
         });
         total_blocks.saturating_sub(cached)
     }
@@ -154,7 +159,10 @@ impl Scheduler {
             if self.decode_needs_new_block(seq) {
                 seqs_needing_block.push(seq.id);
             } else if budget > 0 {
-                scheduled.push(ScheduledSequence { id: seq.id, phase: SequencePhase::Decode });
+                scheduled.push(ScheduledSequence {
+                    id: seq.id,
+                    phase: SequencePhase::Decode,
+                });
                 budget -= 1;
             }
         }
@@ -162,7 +170,10 @@ impl Scheduler {
         for &seq_id in &seqs_needing_block {
             if self.num_free_blocks() > 0 {
                 if budget > 0 {
-                    scheduled.push(ScheduledSequence { id: seq_id, phase: SequencePhase::Decode });
+                    scheduled.push(ScheduledSequence {
+                        id: seq_id,
+                        phase: SequencePhase::Decode,
+                    });
                     budget -= 1;
                 }
             } else {
@@ -228,7 +239,8 @@ impl Scheduler {
     }
 
     pub fn retire_finished(&mut self) -> Vec<CompletedSequence> {
-        let finished: Vec<SequenceId> = self.running
+        let finished: Vec<SequenceId> = self
+            .running
             .iter()
             .filter(|s| s.status == SequenceStatus::Finished)
             .map(|s| s.id)
@@ -241,7 +253,10 @@ impl Scheduler {
             for cache in &mut seq.caches {
                 cache.clear();
             }
-            completed.push(CompletedSequence { id: seq.id, finish_reason: seq.finish_reason.clone() });
+            completed.push(CompletedSequence {
+                id: seq.id,
+                finish_reason: seq.finish_reason.clone(),
+            });
         }
         completed
     }
@@ -294,8 +309,16 @@ mod tests {
         (0..num_layers)
             .map(|_| {
                 Arc::new(Mutex::new(
-                    BlockAllocator::new(num_blocks, DEFAULT_BLOCK_SIZE, 2, 4, DType::F32, &Device::Cpu, None)
-                        .unwrap(),
+                    BlockAllocator::new(
+                        num_blocks,
+                        DEFAULT_BLOCK_SIZE,
+                        2,
+                        4,
+                        DType::F32,
+                        &Device::Cpu,
+                        None,
+                    )
+                    .unwrap(),
                 ))
             })
             .collect()
@@ -395,7 +418,6 @@ mod tests {
 
         let id0 = sched.add_request(vec![1, 2, 3], SamplingParams::default(), 10);
         sched.schedule(None);
-
 
         sched.get_running_mut(id0).unwrap().status = SequenceStatus::Finished;
         sched.retire_finished();

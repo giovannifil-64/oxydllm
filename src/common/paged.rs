@@ -1,8 +1,8 @@
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
-use candle_core::{DType, Device, Result, Tensor};
 use super::kv_quant::KvQuantizer;
+use candle_core::{DType, Device, Result, Tensor};
 
 pub const DEFAULT_BLOCK_SIZE: usize = 16;
 
@@ -15,7 +15,10 @@ pub type SharedGlobalKvBudget = Arc<GlobalKvBudget>;
 
 impl GlobalKvBudget {
     pub fn new(total_bytes: usize) -> Self {
-        Self { total_bytes, allocated_bytes: AtomicUsize::new(0) }
+        Self {
+            total_bytes,
+            allocated_bytes: AtomicUsize::new(0),
+        }
     }
 
     pub fn acquire(&self, desired_bytes: usize) -> usize {
@@ -69,7 +72,11 @@ fn detect_system_memory_bytes() -> Option<usize> {
         .args(["-n", "hw.memsize"])
         .output()
         .ok()?;
-    std::str::from_utf8(&output.stdout).ok()?.trim().parse().ok()
+    std::str::from_utf8(&output.stdout)
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
 }
 
 #[cfg(target_os = "macos")]
@@ -88,14 +95,13 @@ fn detect_available_memory_bytes() -> Option<usize> {
         let reclaimable = line.starts_with("Pages free:")
             || line.starts_with("Pages inactive:")
             || line.starts_with("Pages speculative:");
-        if reclaimable {
-            if let Some(n) = line
+        if reclaimable
+            && let Some(n) = line
                 .split_whitespace()
                 .last()
                 .and_then(|s| s.trim_end_matches('.').parse::<usize>().ok())
-            {
-                pages += n;
-            }
+        {
+            pages += n;
         }
     }
     Some(pages * page_size)
@@ -103,7 +109,8 @@ fn detect_available_memory_bytes() -> Option<usize> {
 
 #[cfg(target_os = "linux")]
 fn parse_meminfo_kb(key: &str) -> Option<usize> {
-    std::fs::read_to_string("/proc/meminfo").ok()?
+    std::fs::read_to_string("/proc/meminfo")
+        .ok()?
         .lines()
         .find(|l| l.starts_with(key))
         .and_then(|l| l.split_whitespace().nth(1))
@@ -158,6 +165,14 @@ pub struct BlockAllocator {
     device: Device,
 }
 
+pub struct StagedKvData<'a> {
+    pub packed_k: &'a [u8],
+    pub norms_k: &'a [f32],
+    pub residual_norms_k: &'a [f32],
+    pub packed_v: &'a [u8],
+    pub norms_v: &'a [f32],
+}
+
 impl BlockAllocator {
     pub fn new(
         num_blocks: usize,
@@ -195,8 +210,15 @@ impl BlockAllocator {
         };
 
         Ok(Self {
-            pool, free_list, ref_counts, num_blocks, block_size,
-            n_kv_heads, head_dim, dtype, device: device.clone(),
+            pool,
+            free_list,
+            ref_counts,
+            num_blocks,
+            block_size,
+            n_kv_heads,
+            head_dim,
+            dtype,
+            device: device.clone(),
         })
     }
 
@@ -213,13 +235,19 @@ impl BlockAllocator {
 
     pub fn share(&mut self, block_id: usize) {
         debug_assert!(block_id < self.num_blocks, "invalid block_id {block_id}");
-        debug_assert!(self.ref_counts[block_id] > 0, "share on un-allocated block {block_id}");
+        debug_assert!(
+            self.ref_counts[block_id] > 0,
+            "share on un-allocated block {block_id}"
+        );
         self.ref_counts[block_id] += 1;
     }
 
     pub fn free(&mut self, block_id: usize) {
         debug_assert!(block_id < self.num_blocks, "invalid block_id {block_id}");
-        debug_assert!(self.ref_counts[block_id] > 0, "double-free of block {block_id}");
+        debug_assert!(
+            self.ref_counts[block_id] > 0,
+            "double-free of block {block_id}"
+        );
         self.ref_counts[block_id] -= 1;
         if self.ref_counts[block_id] == 0 {
             self.free_list.push(block_id);
@@ -259,11 +287,7 @@ impl BlockAllocator {
         block_id: usize,
         offset: usize,
         n_tokens: usize,
-        pk_staged: &[u8],
-        nk_staged: &[f32],
-        rk_staged: &[f32],
-        pv_staged: &[u8],
-        nv_staged: &[f32],
+        staged: StagedKvData<'_>,
     ) {
         let KvPool::Quantized {
             packed_k,
@@ -288,13 +312,16 @@ impl BlockAllocator {
             let dbk = slot * nkv * key_bph;
             let dbv = slot * nkv * value_bph;
             let dn = slot * nkv;
-            packed_k[dbk..dbk + nkv * key_bph].copy_from_slice(&pk_staged[sbk..sbk + nkv * key_bph]);
-            norms_k[dn..dn + nkv].copy_from_slice(&nk_staged[sn..sn + nkv]);
+            packed_k[dbk..dbk + nkv * key_bph]
+                .copy_from_slice(&staged.packed_k[sbk..sbk + nkv * key_bph]);
+            norms_k[dn..dn + nkv].copy_from_slice(&staged.norms_k[sn..sn + nkv]);
             if let Some(residual_norms_k) = residual_norms_k.as_mut() {
-                residual_norms_k[dn..dn + nkv].copy_from_slice(&rk_staged[sn..sn + nkv]);
+                residual_norms_k[dn..dn + nkv]
+                    .copy_from_slice(&staged.residual_norms_k[sn..sn + nkv]);
             }
-            packed_v[dbv..dbv + nkv * value_bph].copy_from_slice(&pv_staged[sbv..sbv + nkv * value_bph]);
-            norms_v[dn..dn + nkv].copy_from_slice(&nv_staged[sn..sn + nkv]);
+            packed_v[dbv..dbv + nkv * value_bph]
+                .copy_from_slice(&staged.packed_v[sbv..sbv + nkv * value_bph]);
+            norms_v[dn..dn + nkv].copy_from_slice(&staged.norms_v[sn..sn + nkv]);
         }
     }
 
@@ -312,8 +339,12 @@ impl BlockAllocator {
                 norms_v,
                 ..
             } => {
-                packed_k.len() + packed_v.len()
-                    + (norms_k.len() + residual_norms_k.as_ref().map_or(0, Vec::len) + norms_v.len()) * std::mem::size_of::<f32>()
+                packed_k.len()
+                    + packed_v.len()
+                    + (norms_k.len()
+                        + residual_norms_k.as_ref().map_or(0, Vec::len)
+                        + norms_v.len())
+                        * std::mem::size_of::<f32>()
             }
         }
     }
@@ -396,9 +427,7 @@ impl BlockAllocator {
                 norms_v,
                 quantizer,
             } => {
-                let indices: Vec<u32> = slot_indices
-                    .to_device(&Device::Cpu)?
-                    .to_vec1()?;
+                let indices: Vec<u32> = slot_indices.to_device(&Device::Cpu)?.to_vec1()?;
                 let num_tokens = indices.len();
                 let key_bph = quantizer.key_packed_bytes();
                 let value_bph = quantizer.value_packed_bytes();
@@ -449,7 +478,6 @@ impl BlockAllocator {
     }
 }
 
-
 pub type SharedBlockAllocator = Arc<Mutex<BlockAllocator>>;
 
 pub struct BlockTable {
@@ -460,7 +488,11 @@ pub struct BlockTable {
 
 impl BlockTable {
     pub fn new() -> Self {
-        Self { block_ids: Vec::new(), num_tokens: 0, cached_slots: Vec::new() }
+        Self {
+            block_ids: Vec::new(),
+            num_tokens: 0,
+            cached_slots: Vec::new(),
+        }
     }
 }
 
@@ -617,16 +649,23 @@ impl PagedKvCache {
         self.contig_len = total_needed;
 
         Ok((
-            self.contig_k.as_ref().unwrap().narrow(2, 0, self.contig_len)?,
-            self.contig_v.as_ref().unwrap().narrow(2, 0, self.contig_len)?,
+            self.contig_k
+                .as_ref()
+                .unwrap()
+                .narrow(2, 0, self.contig_len)?,
+            self.contig_v
+                .as_ref()
+                .unwrap()
+                .narrow(2, 0, self.contig_len)?,
         ))
     }
 
     pub fn current(&self) -> Result<(Tensor, Tensor)> {
         match (&self.contig_k, &self.contig_v) {
-            (Some(k), Some(v)) if self.contig_len > 0 => {
-                Ok((k.narrow(2, 0, self.contig_len)?, v.narrow(2, 0, self.contig_len)?))
-            }
+            (Some(k), Some(v)) if self.contig_len > 0 => Ok((
+                k.narrow(2, 0, self.contig_len)?,
+                v.narrow(2, 0, self.contig_len)?,
+            )),
             _ => Err(candle_core::Error::Msg("KV cache is empty".to_string())),
         }
     }
@@ -658,7 +697,8 @@ impl PagedKvCache {
         // ── Option 1: single batched GPU→CPU transfer ─────────────────────────
         let pending_writes = std::mem::take(&mut self.pending_writes);
 
-        let token_counts: Vec<usize> = pending_writes.iter()
+        let token_counts: Vec<usize> = pending_writes
+            .iter()
             .map(|pw| pw.k_chunk.dim(0).unwrap_or(1))
             .collect();
 
@@ -666,7 +706,10 @@ impl PagedKvCache {
             pending_writes[0].k_chunk.clone()
         } else {
             Tensor::cat(
-                &pending_writes.iter().map(|pw| &pw.k_chunk).collect::<Vec<_>>(),
+                &pending_writes
+                    .iter()
+                    .map(|pw| &pw.k_chunk)
+                    .collect::<Vec<_>>(),
                 0,
             )?
         };
@@ -674,7 +717,10 @@ impl PagedKvCache {
             pending_writes[0].v_chunk.clone()
         } else {
             Tensor::cat(
-                &pending_writes.iter().map(|pw| &pw.v_chunk).collect::<Vec<_>>(),
+                &pending_writes
+                    .iter()
+                    .map(|pw| &pw.v_chunk)
+                    .collect::<Vec<_>>(),
                 0,
             )?
         };
@@ -751,11 +797,13 @@ impl PagedKvCache {
                 item.block_id,
                 item.offset,
                 item.n_tokens,
-                &pk_staged[t_off * nkv * key_bph..t_end * nkv * key_bph],
-                &nk_staged[t_off * nkv..t_end * nkv],
-                rk_slice,
-                &pv_staged[t_off * nkv * value_bph..t_end * nkv * value_bph],
-                &nv_staged[t_off * nkv..t_end * nkv],
+                StagedKvData {
+                    packed_k: &pk_staged[t_off * nkv * key_bph..t_end * nkv * key_bph],
+                    norms_k: &nk_staged[t_off * nkv..t_end * nkv],
+                    residual_norms_k: rk_slice,
+                    packed_v: &pv_staged[t_off * nkv * value_bph..t_end * nkv * value_bph],
+                    norms_v: &nv_staged[t_off * nkv..t_end * nkv],
+                },
             );
             t_off += item.n_tokens;
         }
@@ -851,7 +899,14 @@ mod tests {
 
         let k1_gathered = k_out.squeeze(0).unwrap().transpose(0, 1).unwrap();
         let k1_flat = k1.squeeze(0).unwrap().transpose(0, 1).unwrap();
-        let diff = (k1_gathered - k1_flat).unwrap().abs().unwrap().sum_all().unwrap().to_scalar::<f32>().unwrap();
+        let diff = (k1_gathered - k1_flat)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .sum_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
         assert!(diff < 1e-6, "prefill K mismatch: diff={diff}");
 
         let mut naive_k = k1.clone();
@@ -864,8 +919,22 @@ mod tests {
             naive_k = Tensor::cat(&[&naive_k, &k_new], 2).unwrap();
             naive_v = Tensor::cat(&[&naive_v, &v_new], 2).unwrap();
 
-            let dk = (&k_paged - &naive_k).unwrap().abs().unwrap().sum_all().unwrap().to_scalar::<f32>().unwrap();
-            let dv = (&v_paged - &naive_v).unwrap().abs().unwrap().sum_all().unwrap().to_scalar::<f32>().unwrap();
+            let dk = (&k_paged - &naive_k)
+                .unwrap()
+                .abs()
+                .unwrap()
+                .sum_all()
+                .unwrap()
+                .to_scalar::<f32>()
+                .unwrap();
+            let dv = (&v_paged - &naive_v)
+                .unwrap()
+                .abs()
+                .unwrap()
+                .sum_all()
+                .unwrap()
+                .to_scalar::<f32>()
+                .unwrap();
             assert!(dk < 1e-6, "decode K mismatch: diff={dk}");
             assert!(dv < 1e-6, "decode V mismatch: diff={dv}");
         }
@@ -904,7 +973,9 @@ mod tests {
 
     #[test]
     fn quantized_pool_reduces_memory() {
-        let q = Arc::new(super::super::kv_quant::KvQuantizer::new_with_qjl(4, 64, true));
+        let q = Arc::new(super::super::kv_quant::KvQuantizer::new_with_qjl(
+            4, 64, true,
+        ));
         let alloc_q = Arc::new(Mutex::new(
             BlockAllocator::new(4, 2, 2, 64, DType::F32, &Device::Cpu, Some(q)).unwrap(),
         ));
@@ -913,6 +984,9 @@ mod tests {
         ));
         let q_bytes = alloc_q.lock().unwrap().pool_bytes();
         let f_bytes = alloc_f.lock().unwrap().pool_bytes();
-        assert!(q_bytes < f_bytes / 3, "quantized pool not smaller: q={q_bytes} f={f_bytes}");
+        assert!(
+            q_bytes < f_bytes / 3,
+            "quantized pool not smaller: q={q_bytes} f={f_bytes}"
+        );
     }
 }

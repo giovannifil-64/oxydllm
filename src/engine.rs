@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use candle_core::{Device, Result, Tensor};
 
-use crate::common::paged::{SharedBlockAllocator, DEFAULT_BLOCK_SIZE};
+use crate::common::paged::{DEFAULT_BLOCK_SIZE, SharedBlockAllocator};
 use crate::common::prefix_cache::PrefixCache;
 use crate::models::traits::BatchModel;
 use crate::sampling::{self, SamplingParams};
@@ -47,8 +47,7 @@ impl Engine {
         } else {
             allocators[0].lock().unwrap().block_size()
         };
-        let mut stop_token_ids: HashSet<u32> =
-            model.stop_token_ids().iter().copied().collect();
+        let mut stop_token_ids: HashSet<u32> = model.stop_token_ids().iter().copied().collect();
         for &id in extra_stop_ids {
             stop_token_ids.insert(id);
         }
@@ -56,7 +55,15 @@ impl Engine {
             allocators.iter().map(Arc::clone).collect();
         let scheduler = Scheduler::new(config, scheduler_allocators, num_layers);
         let prefix_cache = PrefixCache::new(512);
-        Self { model, scheduler, device, stop_token_ids, allocators, prefix_cache, block_size }
+        Self {
+            model,
+            scheduler,
+            device,
+            stop_token_ids,
+            allocators,
+            prefix_cache,
+            block_size,
+        }
     }
 
     pub fn add_request(
@@ -65,7 +72,8 @@ impl Engine {
         sampling_params: SamplingParams,
         max_tokens: usize,
     ) -> SequenceId {
-        self.scheduler.add_request(prompt_tokens, sampling_params, max_tokens)
+        self.scheduler
+            .add_request(prompt_tokens, sampling_params, max_tokens)
     }
 
     pub fn add_request_with_stop(
@@ -75,13 +83,24 @@ impl Engine {
         max_tokens: usize,
         extra_stop_token_ids: Vec<u32>,
     ) -> SequenceId {
-        self.scheduler.add_request_with_stop(prompt_tokens, sampling_params, max_tokens, extra_stop_token_ids)
+        self.scheduler.add_request_with_stop(
+            prompt_tokens,
+            sampling_params,
+            max_tokens,
+            extra_stop_token_ids,
+        )
     }
 
     pub fn step(&mut self) -> Result<StepOutput> {
         let Engine {
-            model, scheduler, device, stop_token_ids,
-            allocators, prefix_cache, block_size, ..
+            model,
+            scheduler,
+            device,
+            stop_token_ids,
+            allocators,
+            prefix_cache,
+            block_size,
+            ..
         } = self;
         let block_size = *block_size;
 
@@ -181,7 +200,10 @@ impl Engine {
 
         if total_tokens == 0 {
             let completed = scheduler.retire_finished();
-            return Ok(StepOutput { new_tokens, completed });
+            return Ok(StepOutput {
+                new_tokens,
+                completed,
+            });
         }
 
         let num_seqs = prefill_infos.len() + decode_ids.len();
@@ -202,12 +224,8 @@ impl Engine {
         let input = Tensor::from_vec(all_token_ids, (1, total_tokens), device)?;
         let position_ids = Tensor::from_vec(all_positions, (total_tokens,), device)?;
 
-        let logits_result = model.forward_batch(
-            &input,
-            &position_ids,
-            &mut cache_slices,
-            &token_counts,
-        );
+        let logits_result =
+            model.forward_batch(&input, &position_ids, &mut cache_slices, &token_counts);
 
         for (i, info) in prefill_infos.iter().enumerate() {
             let seq = scheduler.get_running_mut(info.seq_id).unwrap();
@@ -313,7 +331,10 @@ impl Engine {
         }
 
         let completed = scheduler.retire_finished();
-        Ok(StepOutput { new_tokens, completed })
+        Ok(StepOutput {
+            new_tokens,
+            completed,
+        })
     }
 
     pub fn abort_running(&mut self) -> Vec<SequenceId> {

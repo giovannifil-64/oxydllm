@@ -211,8 +211,8 @@ mod tests {
 
     #[test]
     fn strftime_now_rejects_newline_format() {
-        let err = strftime_now("%Y-%m-%d\n%H:%M".to_string())
-            .expect_err("multiline format should fail");
+        let err =
+            strftime_now("%Y-%m-%d\n%H:%M".to_string()).expect_err("multiline format should fail");
         let msg = err.to_string();
         assert!(msg.contains("strftime_now format must be a single line"));
     }

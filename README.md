@@ -88,6 +88,15 @@ cargo build --release --features metal   # Apple Silicon
 cargo build --release --features cuda    # NVIDIA
 ```
 
+Enable local pre-commit checks (recommended for contributors)
+
+```bash
+chmod +x .githooks/pre-commit
+git config core.hooksPath .githooks
+```
+
+The pre-commit hook runs formatting and strict clippy checks before each commit.
+
 ## Usage
 
 Start the server

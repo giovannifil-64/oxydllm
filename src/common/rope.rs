@@ -1,12 +1,28 @@
-use candle_core::{DType, Tensor, Device, Result, D};
+use candle_core::{D, DType, Device, Result, Tensor};
 
 #[derive(Debug, Clone)]
 pub enum RopeScaling {
     None,
-    Linear { factor: f64 },
-    Llama3 { factor: f64, low_freq_factor: f64, high_freq_factor: f64, original_max_pos: usize },
-    Yarn { factor: f64, original_max_pos: usize, beta_fast: f64, beta_slow: f64 },
-    LongRope { short_factor: Vec<f64>, long_factor: Vec<f64>, original_max_pos: usize },
+    Linear {
+        factor: f64,
+    },
+    Llama3 {
+        factor: f64,
+        low_freq_factor: f64,
+        high_freq_factor: f64,
+        original_max_pos: usize,
+    },
+    Yarn {
+        factor: f64,
+        original_max_pos: usize,
+        beta_fast: f64,
+        beta_slow: f64,
+    },
+    LongRope {
+        short_factor: Vec<f64>,
+        long_factor: Vec<f64>,
+        original_max_pos: usize,
+    },
 }
 
 pub struct RotaryEmbedding {
@@ -22,7 +38,14 @@ impl RotaryEmbedding {
         dtype: DType,
         device: &Device,
     ) -> Result<Self> {
-        Self::new_with_scaling(head_dim, max_seq_len, rope_theta, RopeScaling::None, dtype, device)
+        Self::new_with_scaling(
+            head_dim,
+            max_seq_len,
+            rope_theta,
+            RopeScaling::None,
+            dtype,
+            device,
+        )
     }
 
     pub fn new_with_scaling(
@@ -34,27 +57,31 @@ impl RotaryEmbedding {
         device: &Device,
     ) -> Result<Self> {
         let mut inv_freq: Vec<f32> = (0..head_dim / 2)
-            .map(|i| {
-                1.0 / (rope_theta as f32).powf(2.0 * i as f32 / head_dim as f32)
-            })
+            .map(|i| 1.0 / (rope_theta as f32).powf(2.0 * i as f32 / head_dim as f32))
             .collect();
-            
+
         match scaling {
-            RopeScaling::Llama3 { factor, low_freq_factor, high_freq_factor, original_max_pos } => {
+            RopeScaling::Llama3 {
+                factor,
+                low_freq_factor,
+                high_freq_factor,
+                original_max_pos,
+            } => {
                 let low_freq_wavelen = original_max_pos as f32 / low_freq_factor as f32;
                 let high_freq_wavelen = original_max_pos as f32 / high_freq_factor as f32;
                 let denom = high_freq_factor as f32 - low_freq_factor as f32;
-                
-                for i in 0..head_dim / 2 {
-                    let wavelen = 2.0 * std::f32::consts::PI / inv_freq[i];
+
+                for inv in inv_freq.iter_mut().take(head_dim / 2) {
+                    let wavelen = 2.0 * std::f32::consts::PI / *inv;
                     if wavelen > low_freq_wavelen {
-                        inv_freq[i] /= factor as f32;
+                        *inv /= factor as f32;
                     } else if wavelen > high_freq_wavelen {
                         if denom.abs() < 1e-6 {
                             continue;
                         }
-                        let smooth = (original_max_pos as f32 / wavelen - low_freq_factor as f32) / denom;
-                        inv_freq[i] /= (1.0 - smooth) * factor as f32 + smooth;
+                        let smooth =
+                            (original_max_pos as f32 / wavelen - low_freq_factor as f32) / denom;
+                        *inv /= (1.0 - smooth) * factor as f32 + smooth;
                     }
                 }
             }
@@ -63,20 +90,29 @@ impl RotaryEmbedding {
                     *f /= factor as f32;
                 }
             }
-            RopeScaling::Yarn { factor, original_max_pos, beta_fast, beta_slow } => {
+            RopeScaling::Yarn {
+                factor,
+                original_max_pos,
+                beta_fast,
+                beta_slow,
+            } => {
                 let dim = head_dim;
                 let base = rope_theta;
 
                 let find_correction_dim = |num_rotations: f64| -> f64 {
-                    (dim as f64 * (original_max_pos as f64 / (num_rotations * 2.0 * std::f64::consts::PI)).ln())
+                    (dim as f64
+                        * (original_max_pos as f64 / (num_rotations * 2.0 * std::f64::consts::PI))
+                            .ln())
                         / (2.0 * base.ln())
                 };
                 let low = (find_correction_dim(beta_fast).floor().max(0.0)) as usize;
-                let high = (find_correction_dim(beta_slow).ceil().min((dim / 2 - 1) as f64)) as usize;
+                let high = (find_correction_dim(beta_slow)
+                    .ceil()
+                    .min((dim / 2 - 1) as f64)) as usize;
 
-                for i in 0..dim / 2 {
-                    let freq_extra = inv_freq[i];
-                    let freq_inter = inv_freq[i] / factor as f32;
+                for (i, inv) in inv_freq.iter_mut().enumerate().take(dim / 2) {
+                    let freq_extra = *inv;
+                    let freq_inter = *inv / factor as f32;
 
                     let ramp = if high <= low {
                         if i < low { 0.0f32 } else { 1.0 }
@@ -86,7 +122,7 @@ impl RotaryEmbedding {
 
                     // ramp=0 → keep original freq (high-freq dims, small index)
                     // ramp=1 → scale by factor  (low-freq dims, large index)
-                    inv_freq[i] = freq_inter * ramp + freq_extra * (1.0 - ramp);
+                    *inv = freq_inter * ramp + freq_extra * (1.0 - ramp);
                 }
             }
             RopeScaling::LongRope {
@@ -95,32 +131,28 @@ impl RotaryEmbedding {
                 original_max_pos,
             } => {
                 let use_long = max_seq_len > original_max_pos;
-                let factors = if use_long { &long_factor } else { &short_factor };
+                let factors = if use_long {
+                    &long_factor
+                } else {
+                    &short_factor
+                };
                 let fallback = factors.last().copied().unwrap_or(1.0);
 
-                for i in 0..head_dim / 2 {
+                for (i, inv) in inv_freq.iter_mut().enumerate().take(head_dim / 2) {
                     let factor = factors.get(i).copied().unwrap_or(fallback);
                     if factor > 0.0 {
-                        inv_freq[i] /= factor as f32;
+                        *inv /= factor as f32;
                     }
                 }
             }
             RopeScaling::None => {}
         }
-        
-        let inv_freq = Tensor::from_vec(
-            inv_freq, 
-            (1, head_dim / 2),
-            device
-        )?;
-        
+
+        let inv_freq = Tensor::from_vec(inv_freq, (1, head_dim / 2), device)?;
+
         let positions: Vec<f32> = (0..max_seq_len).map(|p| p as f32).collect();
-        let positions = Tensor::from_vec(
-            positions,
-            (max_seq_len, 1),
-            device
-        )?;
-        
+        let positions = Tensor::from_vec(positions, (max_seq_len, 1), device)?;
+
         let freqs = positions.matmul(&inv_freq)?;
         let cos = freqs.cos()?.to_dtype(dtype)?;
         let sin = freqs.sin()?.to_dtype(dtype)?;
@@ -135,9 +167,21 @@ impl RotaryEmbedding {
 
         #[cfg(feature = "metal")]
         if x.device().is_metal() {
-            let x_c   = if x.is_contiguous()   { x.clone()   } else { x.contiguous()?   };
-            let cos_c = if cos.is_contiguous() { cos.clone() } else { cos.contiguous()? };
-            let sin_c = if sin.is_contiguous() { sin.clone() } else { sin.contiguous()? };
+            let x_c = if x.is_contiguous() {
+                x.clone()
+            } else {
+                x.contiguous()?
+            };
+            let cos_c = if cos.is_contiguous() {
+                cos.clone()
+            } else {
+                cos.contiguous()?
+            };
+            let sin_c = if sin.is_contiguous() {
+                sin.clone()
+            } else {
+                sin.contiguous()?
+            };
             return super::metal_ops::rope_fused(&x_c, &cos_c, &sin_c);
         }
 

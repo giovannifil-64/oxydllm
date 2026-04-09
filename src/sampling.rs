@@ -1,4 +1,4 @@
-use candle_core::{Result, Tensor, D};
+use candle_core::{D, Result, Tensor};
 
 #[derive(Debug, Clone)]
 pub struct SamplingParams {
@@ -54,7 +54,11 @@ pub fn sample(
 
     if params.temperature == 0.0 && params.top_logprobs_k == 0 && no_mods {
         let token = logits.argmax(D::Minus1)?.to_scalar::<u32>()?;
-        return Ok(SampleOutput { token, logprob: None, top_logprobs: Vec::new() });
+        return Ok(SampleOutput {
+            token,
+            logprob: None,
+            top_logprobs: Vec::new(),
+        });
     }
 
     let mut logits_vec: Vec<f32> = logits.to_dtype(candle_core::DType::F32)?.to_vec1()?;
@@ -64,12 +68,24 @@ pub fn sample(
         let can_use_full_counts = repetition_tokens.len() == prev_tokens.len();
         if can_use_full_counts {
             if let Some(counts) = token_counts {
-                apply_repetition_penalty_with_counts(&mut logits_vec, counts, params.repetition_penalty);
+                apply_repetition_penalty_with_counts(
+                    &mut logits_vec,
+                    counts,
+                    params.repetition_penalty,
+                );
             } else {
-                apply_repetition_penalty_cpu(&mut logits_vec, repetition_tokens, params.repetition_penalty);
+                apply_repetition_penalty_cpu(
+                    &mut logits_vec,
+                    repetition_tokens,
+                    params.repetition_penalty,
+                );
             }
         } else {
-            apply_repetition_penalty_cpu(&mut logits_vec, repetition_tokens, params.repetition_penalty);
+            apply_repetition_penalty_cpu(
+                &mut logits_vec,
+                repetition_tokens,
+                params.repetition_penalty,
+            );
         }
     }
     if params.frequency_penalty != 0.0 || params.presence_penalty != 0.0 {
@@ -108,27 +124,61 @@ pub fn sample(
 
         if params.top_logprobs_k > 0 {
             let (log_probs, _) = compute_log_probs(&logits_vec, 1.0);
-            let lp = log_probs.get(token as usize).copied().unwrap_or(f32::NEG_INFINITY);
+            let lp = log_probs
+                .get(token as usize)
+                .copied()
+                .unwrap_or(f32::NEG_INFINITY);
             let top = top_k_by_logprob(&log_probs, params.top_logprobs_k);
-            Ok(SampleOutput { token, logprob: Some(lp), top_logprobs: top })
+            Ok(SampleOutput {
+                token,
+                logprob: Some(lp),
+                top_logprobs: top,
+            })
         } else {
-            Ok(SampleOutput { token, logprob: None, top_logprobs: Vec::new() })
+            Ok(SampleOutput {
+                token,
+                logprob: None,
+                top_logprobs: Vec::new(),
+            })
         }
     } else {
         let (log_probs, probs_vec) = compute_log_probs(&logits_vec, params.temperature);
 
-        let probs_vec = if params.min_p > 0.0 { apply_min_p(&probs_vec, params.min_p) } else { probs_vec };
-        let probs_vec = if params.top_k > 0 { apply_top_k(&probs_vec, params.top_k) } else { probs_vec };
-        let probs_vec = if params.top_p < 1.0 { apply_top_p(&probs_vec, params.top_p) } else { probs_vec };
+        let probs_vec = if params.min_p > 0.0 {
+            apply_min_p(&probs_vec, params.min_p)
+        } else {
+            probs_vec
+        };
+        let probs_vec = if params.top_k > 0 {
+            apply_top_k(&probs_vec, params.top_k)
+        } else {
+            probs_vec
+        };
+        let probs_vec = if params.top_p < 1.0 {
+            apply_top_p(&probs_vec, params.top_p)
+        } else {
+            probs_vec
+        };
 
         let token = categorical_sample(&probs_vec, params.seed, prev_tokens.len() as u64)?;
 
         if params.top_logprobs_k > 0 {
-            let lp = log_probs.get(token as usize).copied().unwrap_or(f32::NEG_INFINITY);
+            let lp = log_probs
+                .get(token as usize)
+                .copied()
+                .unwrap_or(f32::NEG_INFINITY);
             let top = top_k_by_logprob(&log_probs, params.top_logprobs_k);
-            Ok(SampleOutput { token, logprob: Some(lp), top_logprobs: top })
+            Ok(SampleOutput {
+                token,
+                logprob: Some(lp),
+                top_logprobs: top,
+            })
         } else {
-            Ok(SampleOutput { token, logprob: None, top_logprobs: Vec::new() })
+            Ok(SampleOutput {
+                token,
+                logprob: None,
+                top_logprobs: Vec::new(),
+            })
         }
     }
 }
@@ -144,16 +194,23 @@ fn repetition_window_slice(prev_tokens: &[u32], repetition_window: usize) -> &[u
 fn compute_log_probs(logits: &[f32], temperature: f32) -> (Vec<f32>, Vec<f32>) {
     let temp = temperature.max(1e-8_f32);
     let max_logit = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-    let mut probs: Vec<f32> = logits.iter().map(|&l| ((l - max_logit) / temp).exp()).collect();
+    let mut probs: Vec<f32> = logits
+        .iter()
+        .map(|&l| ((l - max_logit) / temp).exp())
+        .collect();
     let sum: f32 = probs.iter().sum();
     let inv_sum = 1.0 / sum.max(1e-10_f32);
-    for p in probs.iter_mut() { *p *= inv_sum; }
+    for p in probs.iter_mut() {
+        *p *= inv_sum;
+    }
     let log_probs: Vec<f32> = probs.iter().map(|&p| p.ln().max(-100.0_f32)).collect();
     (log_probs, probs)
 }
 
 fn top_k_by_logprob(log_probs: &[f32], k: usize) -> Vec<(u32, f32)> {
-    if k == 0 { return Vec::new(); }
+    if k == 0 {
+        return Vec::new();
+    }
     let mut indexed: Vec<(u32, f32)> = log_probs
         .iter()
         .enumerate()
@@ -199,7 +256,12 @@ fn apply_frequency_presence_penalty(
     for &tok in prev_tokens {
         *counts.entry(tok).or_insert(0) += 1;
     }
-    apply_frequency_presence_penalty_with_counts(logits, &counts, frequency_penalty, presence_penalty);
+    apply_frequency_presence_penalty_with_counts(
+        logits,
+        &counts,
+        frequency_penalty,
+        presence_penalty,
+    );
 }
 
 fn apply_frequency_presence_penalty_with_counts(
@@ -219,7 +281,10 @@ fn apply_frequency_presence_penalty_with_counts(
 fn apply_min_p(probs: &[f32], min_p: f32) -> Vec<f32> {
     let max_prob = probs.iter().cloned().fold(0.0_f32, f32::max);
     let threshold = min_p * max_prob;
-    let mut filtered: Vec<f32> = probs.iter().map(|&p| if p >= threshold { p } else { 0.0 }).collect();
+    let mut filtered: Vec<f32> = probs
+        .iter()
+        .map(|&p| if p >= threshold { p } else { 0.0 })
+        .collect();
     renormalize(&mut filtered);
     filtered
 }
@@ -234,7 +299,10 @@ fn apply_top_k(probs: &[f32], k: usize) -> Vec<f32> {
     });
     let threshold = temp[k];
 
-    let mut filtered: Vec<f32> = probs.iter().map(|&p| if p > threshold { p } else { 0.0 }).collect();
+    let mut filtered: Vec<f32> = probs
+        .iter()
+        .map(|&p| if p > threshold { p } else { 0.0 })
+        .collect();
     let mut count = filtered.iter().filter(|&&p| p > 0.0).count();
 
     if count < k {
@@ -310,8 +378,8 @@ fn splitmix64_f32(x: u64) -> f32 {
 }
 
 fn thread_rand_f32() -> f32 {
-    use std::hash::{Hash, Hasher};
     use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
     use std::time::SystemTime;
 
     thread_local! {
@@ -391,7 +459,10 @@ mod tests {
         };
 
         let out = sample(&logits, &params, &prev_tokens, Some(&counts)).unwrap();
-        assert_eq!(out.token, 0, "only the last token should be repetition-penalized");
+        assert_eq!(
+            out.token, 0,
+            "only the last token should be repetition-penalized"
+        );
     }
 
     #[test]
@@ -409,7 +480,10 @@ mod tests {
         let r1 = categorical_sample(&probs, seed, 1).unwrap();
         let r2 = categorical_sample(&probs, seed, 2).unwrap();
 
-        assert!(!(r0 == r1 && r1 == r2), "seeded sampling returned same token for 3 consecutive steps");
+        assert!(
+            !(r0 == r1 && r1 == r2),
+            "seeded sampling returned same token for 3 consecutive steps"
+        );
     }
 
     #[test]
@@ -444,7 +518,10 @@ mod tests {
         assert_eq!(out.top_logprobs.len(), 3, "should have 3 top logprobs");
         let lps: Vec<f32> = out.top_logprobs.iter().map(|&(_, lp)| lp).collect();
         for i in 1..lps.len() {
-            assert!(lps[i - 1] >= lps[i], "top_logprobs should be sorted descending");
+            assert!(
+                lps[i - 1] >= lps[i],
+                "top_logprobs should be sorted descending"
+            );
         }
     }
 

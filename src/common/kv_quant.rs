@@ -49,8 +49,8 @@ const CENTROIDS_3BIT: &[f32] = &[
     -2.1520, -1.3439, -0.7560, -0.2451, 0.2451, 0.7560, 1.3439, 2.1520,
 ];
 const CENTROIDS_4BIT: &[f32] = &[
-    -2.7326, -2.0691, -1.6180, -1.2562, -0.9423, -0.6568, -0.3881, -0.1284,
-    0.1284, 0.3881, 0.6568, 0.9423, 1.2562, 1.6180, 2.0691, 2.7326,
+    -2.7326, -2.0691, -1.6180, -1.2562, -0.9423, -0.6568, -0.3881, -0.1284, 0.1284, 0.3881, 0.6568,
+    0.9423, 1.2562, 1.6180, 2.0691, 2.7326,
 ];
 
 fn compute_boundaries(centroids: &[f32]) -> Vec<f32> {
@@ -254,9 +254,9 @@ impl KvQuantizer {
 
         let mut residual = vec![0.0f32; self.head_dim];
         let mut residual_sq = 0.0f32;
-        for i in 0..self.head_dim {
-            let r = x[i] - x_mse[i];
-            residual[i] = r;
+        for (r_slot, (&xv, &x_msev)) in residual.iter_mut().zip(x.iter().zip(x_mse.iter())) {
+            let r = xv - x_msev;
+            *r_slot = r;
             residual_sq += r * r;
         }
         let residual_norm = residual_sq.sqrt();
@@ -267,14 +267,14 @@ impl KvQuantizer {
         }
 
         // Stage-2 residual signs: sign(S r), approximated via randomized Hadamard.
-        for i in 0..self.head_dim {
-            residual[i] *= self.qjl_signs[i];
+        for (r, &sign) in residual.iter_mut().zip(self.qjl_signs.iter()) {
+            *r *= sign;
         }
         wht_inplace(&mut residual);
 
         let mut qjl_bits = vec![0u8; self.head_dim];
-        for i in 0..self.head_dim {
-            qjl_bits[i] = if residual[i] >= 0.0 { 1 } else { 0 };
+        for (bit, &res) in qjl_bits.iter_mut().zip(residual.iter()) {
+            *bit = if res >= 0.0 { 1 } else { 0 };
         }
         let qjl_packed = self.pack_indices_bits(&qjl_bits, 1);
         packed.extend_from_slice(&qjl_packed);
@@ -310,15 +310,15 @@ impl KvQuantizer {
 
         let qjl_indices = self.unpack_indices_bits(&packed[mse_bytes..mse_bytes + qjl_bytes], 1);
         let mut qjl = vec![0.0f32; self.head_dim];
-        for i in 0..self.head_dim {
-            qjl[i] = if qjl_indices[i] == 0 { -1.0 } else { 1.0 };
+        for (q, &idx) in qjl.iter_mut().zip(qjl_indices.iter()) {
+            *q = if idx == 0 { -1.0 } else { 1.0 };
         }
 
         // x_qjl = gamma * sqrt(pi/2) / d * S^T sign(Sr), with S approximated by HD.
         wht_inplace(&mut qjl);
         let scale = residual_norm * self.qjl_scale;
-        for i in 0..self.head_dim {
-            out[i] += scale * qjl[i] * self.qjl_signs[i];
+        for ((out_i, &q), &sign) in out.iter_mut().zip(qjl.iter()).zip(self.qjl_signs.iter()) {
+            *out_i += scale * q * sign;
         }
 
         out
@@ -352,8 +352,8 @@ impl KvQuantizer {
         }
 
         // Forward rotation: y = (1/sqrt(d)) * H * D * x_hat
-        for i in 0..self.head_dim {
-            y[i] *= self.mse_signs[i];
+        for (yv, &sign) in y.iter_mut().zip(self.mse_signs.iter()) {
+            *yv *= sign;
         }
         wht_inplace(&mut y);
         for v in y.iter_mut() {
@@ -361,8 +361,8 @@ impl KvQuantizer {
         }
 
         let mut indices = vec![0u8; self.head_dim];
-        for j in 0..self.head_dim {
-            indices[j] = Self::find_nearest(boundaries, y[j]);
+        for (idx, &yv) in indices.iter_mut().zip(y.iter()) {
+            *idx = Self::find_nearest(boundaries, yv);
         }
 
         (self.pack_indices_bits(&indices, bit_width), norm)
@@ -392,8 +392,8 @@ impl KvQuantizer {
         }
 
         wht_inplace(&mut y);
-        for i in 0..self.head_dim {
-            y[i] *= self.inv_sqrt_d * self.mse_signs[i] * norm;
+        for (yv, &sign) in y.iter_mut().zip(self.mse_signs.iter()) {
+            *yv *= self.inv_sqrt_d * sign * norm;
         }
 
         y
@@ -414,7 +414,7 @@ impl KvQuantizer {
     }
 
     fn packed_bytes_for_bits(&self, bit_width: u8) -> usize {
-        (self.head_dim * bit_width as usize + 7) / 8
+        (self.head_dim * bit_width as usize).div_ceil(8)
     }
 
     fn pack_indices_bits(&self, indices: &[u8], bit_width: u8) -> Vec<u8> {
@@ -439,9 +439,9 @@ impl KvQuantizer {
 
     fn pack_1bit(&self, indices: &[u8]) -> Vec<u8> {
         let n = self.head_dim;
-        let mut packed = vec![0u8; (n + 7) / 8];
-        for i in 0..n {
-            if (indices[i] & 1) != 0 {
+        let mut packed = vec![0u8; n.div_ceil(8)];
+        for (i, &idx) in indices.iter().enumerate().take(n) {
+            if (idx & 1) != 0 {
                 packed[i / 8] |= 1 << (i % 8);
             }
         }
@@ -451,15 +451,15 @@ impl KvQuantizer {
     fn unpack_1bit(&self, packed: &[u8]) -> Vec<u8> {
         let n = self.head_dim;
         let mut indices = vec![0u8; n];
-        for i in 0..n {
-            indices[i] = (packed[i / 8] >> (i % 8)) & 1;
+        for (i, idx) in indices.iter_mut().enumerate().take(n) {
+            *idx = (packed[i / 8] >> (i % 8)) & 1;
         }
         indices
     }
 
     fn pack_4bit(&self, indices: &[u8]) -> Vec<u8> {
         let n = self.head_dim;
-        let mut packed = vec![0u8; (n + 1) / 2];
+        let mut packed = vec![0u8; n.div_ceil(2)];
         for i in (0..n).step_by(2) {
             let lo = indices[i] & 0x0F;
             let hi = if i + 1 < n { indices[i + 1] & 0x0F } else { 0 };
@@ -482,10 +482,10 @@ impl KvQuantizer {
 
     fn pack_3bit(&self, indices: &[u8]) -> Vec<u8> {
         let n = self.head_dim;
-        let total_bytes = (n * 3 + 7) / 8;
+        let total_bytes = (n * 3).div_ceil(8);
         let mut packed = vec![0u8; total_bytes];
-        for i in 0..n {
-            let val = indices[i] & 0x07;
+        for (i, &idx) in indices.iter().enumerate().take(n) {
+            let val = idx & 0x07;
             let bit_offset = i * 3;
             let byte_idx = bit_offset / 8;
             let bit_idx = bit_offset % 8;
@@ -500,7 +500,7 @@ impl KvQuantizer {
     fn unpack_3bit(&self, packed: &[u8]) -> Vec<u8> {
         let n = self.head_dim;
         let mut indices = vec![0u8; n];
-        for i in 0..n {
+        for (i, idx) in indices.iter_mut().enumerate().take(n) {
             let bit_offset = i * 3;
             let byte_idx = bit_offset / 8;
             let bit_idx = bit_offset % 8;
@@ -508,14 +508,14 @@ impl KvQuantizer {
             if bit_idx > 5 && byte_idx + 1 < packed.len() {
                 val |= (packed[byte_idx + 1] << (8 - bit_idx)) & 0x07;
             }
-            indices[i] = val;
+            *idx = val;
         }
         indices
     }
 
     fn pack_2bit(&self, indices: &[u8]) -> Vec<u8> {
         let n = self.head_dim;
-        let mut packed = vec![0u8; (n + 3) / 4];
+        let mut packed = vec![0u8; n.div_ceil(4)];
         for i in (0..n).step_by(4) {
             let mut byte = 0u8;
             for j in 0..4 {
@@ -545,7 +545,7 @@ impl KvQuantizer {
 
 /// Value-side bytes per head (`packed_indices + f32 norm`).
 pub fn quantized_value_bytes_per_head(head_dim: usize, bit_width: u8) -> usize {
-    (head_dim * bit_width as usize + 7) / 8 + 4
+    (head_dim * bit_width as usize).div_ceil(8) + 4
 }
 
 /// Key-side bytes per head, configurable between Stage-1 and Stage-2.
@@ -556,9 +556,9 @@ pub fn quantized_key_bytes_per_head_with_qjl(
 ) -> usize {
     if qjl_quantization {
         let key_mse_bits = bit_width.saturating_sub(1);
-        (head_dim * key_mse_bits as usize + 7) / 8 + (head_dim + 7) / 8 + 8
+        (head_dim * key_mse_bits as usize).div_ceil(8) + head_dim.div_ceil(8) + 8
     } else {
-        (head_dim * bit_width as usize + 7) / 8 + 4
+        (head_dim * bit_width as usize).div_ceil(8) + 4
     }
 }
 
@@ -574,24 +574,41 @@ mod tests {
         let original: Vec<f32> = (0..d).map(|i| (i as f32 * 0.1).sin()).collect();
 
         let mut y = original.clone();
-        for i in 0..d { y[i] *= signs[i]; }
+        for i in 0..d {
+            y[i] *= signs[i];
+        }
         wht_inplace(&mut y);
-        for v in y.iter_mut() { *v *= inv; }
+        for v in y.iter_mut() {
+            *v *= inv;
+        }
 
         wht_inplace(&mut y);
-        for i in 0..d { y[i] *= inv * signs[i]; }
+        for i in 0..d {
+            y[i] *= inv * signs[i];
+        }
 
-        let diff: f32 = original.iter().zip(y.iter()).map(|(a, b)| (a - b).abs()).sum();
+        let diff: f32 = original
+            .iter()
+            .zip(y.iter())
+            .map(|(a, b)| (a - b).abs())
+            .sum();
         assert!(diff < 1e-3, "WHT roundtrip error: {diff}");
     }
 
     #[test]
     fn quantize_dequantize_4bit_d128() {
         let q = KvQuantizer::new_with_qjl(4, 128, true);
-        let x: Vec<f32> = (0..128).map(|i| (i as f32 * 0.3 + 0.5).sin() * 2.0).collect();
+        let x: Vec<f32> = (0..128)
+            .map(|i| (i as f32 * 0.3 + 0.5).sin() * 2.0)
+            .collect();
         let (packed, norm) = q.quantize(&x);
         let y = q.dequantize(&packed, norm);
-        let mse: f32 = x.iter().zip(y.iter()).map(|(a, b)| (a - b).powi(2)).sum::<f32>() / 128.0;
+        let mse: f32 = x
+            .iter()
+            .zip(y.iter())
+            .map(|(a, b)| (a - b).powi(2))
+            .sum::<f32>()
+            / 128.0;
         let var: f32 = x.iter().map(|v| v * v).sum::<f32>() / 128.0;
         let nmse = mse / var;
         assert!(nmse < 0.05, "4-bit d=128 NMSE too high: {nmse}");
@@ -600,10 +617,17 @@ mod tests {
     #[test]
     fn quantize_dequantize_4bit_d64() {
         let q = KvQuantizer::new_with_qjl(4, 64, true);
-        let x: Vec<f32> = (0..64).map(|i| (i as f32 * 0.3 + 0.5).sin() * 2.0).collect();
+        let x: Vec<f32> = (0..64)
+            .map(|i| (i as f32 * 0.3 + 0.5).sin() * 2.0)
+            .collect();
         let (packed, norm) = q.quantize(&x);
         let y = q.dequantize(&packed, norm);
-        let mse: f32 = x.iter().zip(y.iter()).map(|(a, b)| (a - b).powi(2)).sum::<f32>() / 64.0;
+        let mse: f32 = x
+            .iter()
+            .zip(y.iter())
+            .map(|(a, b)| (a - b).powi(2))
+            .sum::<f32>()
+            / 64.0;
         let var: f32 = x.iter().map(|v| v * v).sum::<f32>() / 64.0;
         let nmse = mse / var;
         assert!(nmse < 0.08, "4-bit d=64 NMSE too high: {nmse}");
@@ -615,7 +639,12 @@ mod tests {
         let x: Vec<f32> = (0..128).map(|i| (i as f32 * 0.3).sin() * 1.5).collect();
         let (packed, norm) = q.quantize(&x);
         let y = q.dequantize(&packed, norm);
-        let mse: f32 = x.iter().zip(y.iter()).map(|(a, b)| (a - b).powi(2)).sum::<f32>() / 128.0;
+        let mse: f32 = x
+            .iter()
+            .zip(y.iter())
+            .map(|(a, b)| (a - b).powi(2))
+            .sum::<f32>()
+            / 128.0;
         let var: f32 = x.iter().map(|v| v * v).sum::<f32>() / 128.0;
         let nmse = mse / var;
         assert!(nmse < 0.15, "3-bit NMSE too high: {nmse}");
@@ -627,7 +656,12 @@ mod tests {
         let x: Vec<f32> = (0..128).map(|i| (i as f32 * 0.3).sin() * 1.5).collect();
         let (packed, norm) = q.quantize(&x);
         let y = q.dequantize(&packed, norm);
-        let mse: f32 = x.iter().zip(y.iter()).map(|(a, b)| (a - b).powi(2)).sum::<f32>() / 128.0;
+        let mse: f32 = x
+            .iter()
+            .zip(y.iter())
+            .map(|(a, b)| (a - b).powi(2))
+            .sum::<f32>()
+            / 128.0;
         let var: f32 = x.iter().map(|v| v * v).sum::<f32>() / 128.0;
         let nmse = mse / var;
         assert!(nmse < 0.35, "2-bit NMSE too high: {nmse}");
@@ -636,10 +670,17 @@ mod tests {
     #[test]
     fn key_quantize_dequantize_4bit() {
         let q = KvQuantizer::new_with_qjl(4, 128, true);
-        let x: Vec<f32> = (0..128).map(|i| (i as f32 * 0.21 + 0.7).cos() * 1.7).collect();
+        let x: Vec<f32> = (0..128)
+            .map(|i| (i as f32 * 0.21 + 0.7).cos() * 1.7)
+            .collect();
         let (packed, norm, residual_norm) = q.quantize_key(&x);
         let y = q.dequantize_key(&packed, norm, residual_norm);
-        let mse: f32 = x.iter().zip(y.iter()).map(|(a, b)| (a - b).powi(2)).sum::<f32>() / 128.0;
+        let mse: f32 = x
+            .iter()
+            .zip(y.iter())
+            .map(|(a, b)| (a - b).powi(2))
+            .sum::<f32>()
+            / 128.0;
         let var: f32 = x.iter().map(|v| v * v).sum::<f32>() / 128.0;
         let nmse = mse / var;
         assert!(nmse < 0.25, "Stage-2 key 4-bit NMSE too high: {nmse}");
@@ -648,7 +689,9 @@ mod tests {
     #[test]
     fn key_quantization_without_qjl_matches_stage1() {
         let q = KvQuantizer::new_with_qjl(4, 128, false);
-        let x: Vec<f32> = (0..128).map(|i| (i as f32 * 0.11 + 0.3).sin() * 1.3).collect();
+        let x: Vec<f32> = (0..128)
+            .map(|i| (i as f32 * 0.11 + 0.3).sin() * 1.3)
+            .collect();
 
         let (k_packed, k_norm, k_residual_norm) = q.quantize_key(&x);
         let (v_packed, v_norm) = q.quantize(&x);
@@ -659,12 +702,11 @@ mod tests {
 
         let yk = q.dequantize_key(&k_packed, k_norm, k_residual_norm);
         let yv = q.dequantize(&v_packed, v_norm);
-        let diff: f32 = yk
-            .iter()
-            .zip(yv.iter())
-            .map(|(a, b)| (a - b).abs())
-            .sum();
-        assert!(diff < 1e-6, "QJL-off key path diverged from Stage-1: {diff}");
+        let diff: f32 = yk.iter().zip(yv.iter()).map(|(a, b)| (a - b).abs()).sum();
+        assert!(
+            diff < 1e-6,
+            "QJL-off key path diverged from Stage-1: {diff}"
+        );
     }
 
     #[test]
@@ -726,9 +768,21 @@ mod tests {
         assert_eq!(quantized_key_bytes_per_head_with_qjl(128, 2, true), 40);
 
         // Combined K+V budget per head for d=128.
-        assert_eq!(quantized_key_bytes_per_head_with_qjl(128, 4, true) + quantized_value_bytes_per_head(128, 4), 140);
-        assert_eq!(quantized_key_bytes_per_head_with_qjl(128, 3, true) + quantized_value_bytes_per_head(128, 3), 108);
-        assert_eq!(quantized_key_bytes_per_head_with_qjl(128, 2, true) + quantized_value_bytes_per_head(128, 2), 76);
+        assert_eq!(
+            quantized_key_bytes_per_head_with_qjl(128, 4, true)
+                + quantized_value_bytes_per_head(128, 4),
+            140
+        );
+        assert_eq!(
+            quantized_key_bytes_per_head_with_qjl(128, 3, true)
+                + quantized_value_bytes_per_head(128, 3),
+            108
+        );
+        assert_eq!(
+            quantized_key_bytes_per_head_with_qjl(128, 2, true)
+                + quantized_value_bytes_per_head(128, 2),
+            76
+        );
 
         // Stage-1 key path when QJL is disabled: b-bit indices + 1 norm.
         assert_eq!(quantized_key_bytes_per_head_with_qjl(128, 4, false), 68);

@@ -73,9 +73,12 @@ fn dirs_home() -> PathBuf {
 fn parse_devices(s: &str) -> Result<Vec<usize>, String> {
     s.split(',')
         .map(|part| {
-            part.trim()
-                .parse::<usize>()
-                .map_err(|_| format!("Invalid device index: '{}'  (expected integer)", part.trim()))
+            part.trim().parse::<usize>().map_err(|_| {
+                format!(
+                    "Invalid device index: '{}'  (expected integer)",
+                    part.trim()
+                )
+            })
         })
         .collect()
 }
@@ -85,12 +88,13 @@ fn resolve_devices(explicit: Option<Vec<usize>>) -> Vec<usize> {
         return d;
     }
     if let Ok(env) = std::env::var("RLLM_DEVICES")
-        && !env.trim().is_empty() {
-            match parse_devices(&env) {
-                Ok(d) => return d,
-                Err(e) => eprintln!("Warning: RLLM_DEVICES ignored — {}", e),
-            }
+        && !env.trim().is_empty()
+    {
+        match parse_devices(&env) {
+            Ok(d) => return d,
+            Err(e) => eprintln!("Warning: RLLM_DEVICES ignored — {}", e),
         }
+    }
     vec![]
 }
 
@@ -308,20 +312,25 @@ fn parse_rm_args(args: &[String]) -> Result<RmArgs, String> {
 }
 
 fn run_rm(args: &RmArgs) -> anyhow::Result<()> {
-    use std::io::{Write, BufRead};
+    use std::io::{BufRead, Write};
 
     let model_path = models::loader::resolve_model_path(&args.models_dir, &args.model_name)
-        .ok_or_else(|| anyhow::anyhow!(
-            "Model '{}' not found in '{}'",
-            args.model_name,
-            args.models_dir.display()
-        ))?;
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Model '{}' not found in '{}'",
+                args.model_name,
+                args.models_dir.display()
+            )
+        })?;
 
     println!("Model:     {}", args.model_name);
     println!("Directory: {}", model_path.display());
 
     if !args.force {
-        print!("Remove model '{}' and all its files? [y/N] ", args.model_name);
+        print!(
+            "Remove model '{}' and all its files? [y/N] ",
+            args.model_name
+        );
         std::io::stdout().flush()?;
         let mut answer = String::new();
         std::io::stdin().lock().read_line(&mut answer)?;
@@ -393,9 +402,9 @@ fn parse_start_args(args: &[String]) -> Result<StartArgs, String> {
             }
             "--devices" => {
                 i += 1;
-                devices_raw = Some(
-                    parse_devices(args.get(i).ok_or("--devices requires a value")?)?,
-                );
+                devices_raw = Some(parse_devices(
+                    args.get(i).ok_or("--devices requires a value")?,
+                )?);
             }
             "--max-context-len" => {
                 i += 1;
@@ -567,20 +576,20 @@ fn run_interactive(args: &RunArgs) -> anyhow::Result<()> {
 
     println!("Loading model from '{}'...", args.model_dir);
     let is_cpu = matches!(device, candle_core::Device::Cpu);
-    let kv_budget = std::sync::Arc::new(
-        crate::common::paged::GlobalKvBudget::new(
-            crate::common::paged::detect_system_kv_budget(None, is_cpu),
-        )
-    );
+    let kv_budget = std::sync::Arc::new(crate::common::paged::GlobalKvBudget::new(
+        crate::common::paged::detect_system_kv_budget(None, is_cpu),
+    ));
     let (batch_model, weights_size_bytes) = models::loader::load_batch_model(
         &args.model_dir,
         &args.model_id,
         &device,
-        args.max_context_len,
-        1,
-        &kv_budget,
-        args.kv_quant,
-        args.qjl_quantization,
+        models::loader::LoadBatchOptions {
+            max_context_len: args.max_context_len,
+            max_num_sequences: 1,
+            kv_budget: &kv_budget,
+            kv_quant: args.kv_quant,
+            qjl_quantization: args.qjl_quantization,
+        },
     )?;
     let max_seq_len = batch_model.max_seq_len();
     let kv_cache_bytes = batch_model.kv_cache_bytes();
@@ -729,16 +738,16 @@ fn main() -> anyhow::Result<()> {
                 print_usage();
                 std::process::exit(1);
             });
-            server::start_server(
-                start_args.models_dir,
-                start_args.port,
-                start_args.keep_alive,
-                start_args.memory_budget_bytes,
-                start_args.cuda_devices,
-                start_args.max_context_len,
-                start_args.kv_quant,
-                start_args.qjl_quantization,
-            )?;
+            server::start_server(server::StartServerArgs {
+                models_dir: start_args.models_dir,
+                port: start_args.port,
+                keep_alive: start_args.keep_alive,
+                memory_budget_bytes: start_args.memory_budget_bytes,
+                cuda_devices: start_args.cuda_devices,
+                max_context_len: start_args.max_context_len,
+                kv_quant: start_args.kv_quant,
+                qjl_quantization: start_args.qjl_quantization,
+            })?;
         }
         "run" => {
             let run_args = parse_run_args(&args[2..]).unwrap_or_else(|e| {

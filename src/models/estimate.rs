@@ -20,7 +20,6 @@ use candle_core::quantized::gguf_file;
 
 const HF_ENDPOINT: &str = "https://huggingface.co";
 
-
 pub struct EstimateArgs {
     pub model: String,
     pub models_dir: PathBuf,
@@ -50,7 +49,6 @@ pub fn run_estimate(args: &EstimateArgs) -> Result<()> {
         )
     }
 }
-
 
 fn resolve_local_path(model: &str, models_dir: &Path) -> Option<PathBuf> {
     if model.starts_with('/') || model.starts_with('.') {
@@ -98,15 +96,13 @@ fn estimate_local_gguf(gguf_path: &Path, ctx_len: usize, num_seqs: usize) -> Res
     let content = gguf_file::Content::read(&mut file)
         .map_err(|e| anyhow::anyhow!("Cannot parse GGUF header: {}", e))?;
 
-    let arch = meta_string(&content, "general.architecture").unwrap_or_else(|| "unknown".to_string());
+    let arch =
+        meta_string(&content, "general.architecture").unwrap_or_else(|| "unknown".to_string());
     let prefix = &arch;
 
     let weights_bytes = std::fs::metadata(gguf_path)?.len() as usize;
 
-    let filename = gguf_path
-        .file_name()
-        .unwrap_or_default()
-        .to_string_lossy();
+    let filename = gguf_path.file_name().unwrap_or_default().to_string_lossy();
     let quant_str = extract_quant_from_filename(&filename)
         .or_else(|| detect_quant_from_content(&content))
         .unwrap_or_else(|| "unknown".to_string());
@@ -124,7 +120,6 @@ fn estimate_local_gguf(gguf_path: &Path, ctx_len: usize, num_seqs: usize) -> Res
 
     Ok(())
 }
-
 
 fn estimate_local_safetensors(dir: &Path, ctx_len: usize, num_seqs: usize) -> Result<()> {
     let model_name = dir
@@ -148,8 +143,7 @@ fn estimate_local_safetensors(dir: &Path, ctx_len: usize, num_seqs: usize) -> Re
         None
     };
 
-    let dtype_str = read_torch_dtype(&config_path)
-        .unwrap_or_else(|| "F32 / BF16".to_string());
+    let dtype_str = read_torch_dtype(&config_path).unwrap_or_else(|| "F32 / BF16".to_string());
 
     println!();
     println!("  Model    {}", model_name);
@@ -163,8 +157,12 @@ fn estimate_local_safetensors(dir: &Path, ctx_len: usize, num_seqs: usize) -> Re
     Ok(())
 }
 
-
-fn estimate_remote(repo_id: &str, token: Option<&str>, ctx_len: usize, num_seqs: usize) -> Result<()> {
+fn estimate_remote(
+    repo_id: &str,
+    token: Option<&str>,
+    ctx_len: usize,
+    num_seqs: usize,
+) -> Result<()> {
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .user_agent(concat!("rllm/", env!("CARGO_PKG_VERSION")))
@@ -218,9 +216,7 @@ fn estimate_remote(repo_id: &str, token: Option<&str>, ctx_len: usize, num_seqs:
         .sum();
 
     let geometry = fetch_remote_config(&client, repo_id, token).or_else(|| {
-        let base_repo = repo_id
-            .trim_end_matches("-GGUF")
-            .trim_end_matches("-gguf");
+        let base_repo = repo_id.trim_end_matches("-GGUF").trim_end_matches("-gguf");
         if base_repo != repo_id {
             fetch_remote_config(&client, base_repo, token)
         } else {
@@ -243,14 +239,19 @@ fn estimate_remote(repo_id: &str, token: Option<&str>, ctx_len: usize, num_seqs:
         let recommended = best_recommendation(&gguf_files);
 
         for (filename, size) in &gguf_files {
-            let quant = extract_quant_from_filename(filename)
-                .unwrap_or_else(|| "?".to_string());
-            let kv_bytes = geometry.as_ref().map(|g| kv_cache_bytes(g, ctx_len, num_seqs));
+            let quant = extract_quant_from_filename(filename).unwrap_or_else(|| "?".to_string());
+            let kv_bytes = geometry
+                .as_ref()
+                .map(|g| kv_cache_bytes(g, ctx_len, num_seqs));
             let total = kv_bytes.map(|kv| *size as usize + kv);
             let kv_str = kv_bytes.map(fmt_bytes).unwrap_or_else(|| "?".to_string());
             let total_str = total.map(fmt_bytes).unwrap_or_else(|| "?".to_string());
             let acc = quant_accuracy_str(&quant);
-            let star = if Some(filename.as_str()) == recommended { " ★" } else { "" };
+            let star = if Some(filename.as_str()) == recommended {
+                " ★"
+            } else {
+                ""
+            };
 
             println!(
                 "  {:<26}  {:>9}  {:>9}  {:>10}  {}{}",
@@ -276,7 +277,9 @@ fn estimate_remote(repo_id: &str, token: Option<&str>, ctx_len: usize, num_seqs:
 
     if safetensors_bytes > 0 {
         println!();
-        let kv_bytes = geometry.as_ref().map(|g| kv_cache_bytes(g, ctx_len, num_seqs));
+        let kv_bytes = geometry
+            .as_ref()
+            .map(|g| kv_cache_bytes(g, ctx_len, num_seqs));
         let kv_str = kv_bytes.map(fmt_bytes).unwrap_or_else(|| "?".to_string());
         let total = kv_bytes.map(|b| b + safetensors_bytes as usize);
         let total_str = total.map(fmt_bytes).unwrap_or_else(|| "?".to_string());
@@ -341,7 +344,11 @@ fn read_geometry_from_content(content: &gguf_file::Content, prefix: &str) -> Res
                 .unwrap_or(64)
         });
 
-    Ok(ModelGeometry { num_layers, num_kv_heads, head_dim })
+    Ok(ModelGeometry {
+        num_layers,
+        num_kv_heads,
+        head_dim,
+    })
 }
 
 fn parse_geometry_from_config_file(path: &Path) -> Result<ModelGeometry> {
@@ -363,13 +370,16 @@ fn parse_geometry_from_json(json: &serde_json::Value) -> Option<ModelGeometry> {
         let heads = json["num_attention_heads"].as_u64()? as usize;
         hidden / heads
     };
-    Some(ModelGeometry { num_layers, num_kv_heads, head_dim })
+    Some(ModelGeometry {
+        num_layers,
+        num_kv_heads,
+        head_dim,
+    })
 }
 
 fn kv_cache_bytes(g: &ModelGeometry, ctx_len: usize, num_seqs: usize) -> usize {
     2 * g.num_layers * g.num_kv_heads * g.head_dim * 2 * ctx_len * num_seqs
 }
-
 
 fn print_weights_kv_total(
     weights_bytes: usize,
@@ -404,27 +414,19 @@ fn print_accuracy_line(quant: &str) {
 
 pub fn extract_quant_from_filename(filename: &str) -> Option<String> {
     const KNOWN: &[&str] = &[
-        "IQ1_S", "IQ1_M",
-        "IQ2_XXS", "IQ2_XS", "IQ2_S", "IQ2_M",
-        "IQ3_XXS", "IQ3_XS", "IQ3_S", "IQ3_M", "IQ3_K_S", "IQ3_K_M",
-        "IQ4_NL", "IQ4_XS",
-        "Q2_K_S", "Q2_K",
-        "Q3_K_S", "Q3_K_M", "Q3_K_L", "Q3_K",
-        "Q4_0", "Q4_1", "Q4_K_S", "Q4_K_M", "Q4_K",
-        "Q5_0", "Q5_1", "Q5_K_S", "Q5_K_M", "Q5_K",
-        "Q6_K_L", "Q6_K",
-        "Q8_0", "Q8_K_M", "Q8_K_S", "Q8_K",
-        "BF16", "F16", "F32",
+        "IQ1_S", "IQ1_M", "IQ2_XXS", "IQ2_XS", "IQ2_S", "IQ2_M", "IQ3_XXS", "IQ3_XS", "IQ3_S",
+        "IQ3_M", "IQ3_K_S", "IQ3_K_M", "IQ4_NL", "IQ4_XS", "Q2_K_S", "Q2_K", "Q3_K_S", "Q3_K_M",
+        "Q3_K_L", "Q3_K", "Q4_0", "Q4_1", "Q4_K_S", "Q4_K_M", "Q4_K", "Q5_0", "Q5_1", "Q5_K_S",
+        "Q5_K_M", "Q5_K", "Q6_K_L", "Q6_K", "Q8_0", "Q8_K_M", "Q8_K_S", "Q8_K", "BF16", "F16",
+        "F32",
     ];
 
     let upper = filename.to_uppercase();
     for &q in KNOWN {
         if let Some(pos) = upper.find(q) {
-            let before_ok = pos == 0
-                || !upper.as_bytes()[pos - 1].is_ascii_alphanumeric();
+            let before_ok = pos == 0 || !upper.as_bytes()[pos - 1].is_ascii_alphanumeric();
             let end = pos + q.len();
-            let after_ok = end >= upper.len()
-                || !upper.as_bytes()[end].is_ascii_alphanumeric();
+            let after_ok = end >= upper.len() || !upper.as_bytes()[end].is_ascii_alphanumeric();
             if before_ok && after_ok {
                 return Some(q.to_string());
             }
@@ -434,29 +436,34 @@ pub fn extract_quant_from_filename(filename: &str) -> Option<String> {
 }
 
 fn detect_quant_from_content(content: &gguf_file::Content) -> Option<String> {
-    let info = content.tensor_infos.get("blk.0.ffn_down.weight")
+    let info = content
+        .tensor_infos
+        .get("blk.0.ffn_down.weight")
         .or_else(|| content.tensor_infos.get("blk.0.attn_q.weight"))?;
     Some(ggml_dtype_label(&format!("{:?}", info.ggml_dtype)))
 }
 
 fn ggml_dtype_label(debug: &str) -> String {
     match debug {
-        "F32"  => "F32",
-        "F16"  => "F16",
+        "F32" => "F32",
+        "F16" => "F16",
         "BF16" => "BF16",
-        "Q4_0" => "Q4_0", "Q4_1" => "Q4_1",
-        "Q5_0" => "Q5_0", "Q5_1" => "Q5_1",
-        "Q8_0" => "Q8_0", "Q8_1" => "Q8_1",
-        "Q2K"  => "Q2_K",
-        "Q3K"  => "Q3_K",
-        "Q4K"  => "Q4_K",
-        "Q5K"  => "Q5_K",
-        "Q6K"  => "Q6_K",
-        "Q8K"  => "Q8_K",
-        other  => other,
-    }.to_string()
+        "Q4_0" => "Q4_0",
+        "Q4_1" => "Q4_1",
+        "Q5_0" => "Q5_0",
+        "Q5_1" => "Q5_1",
+        "Q8_0" => "Q8_0",
+        "Q8_1" => "Q8_1",
+        "Q2K" => "Q2_K",
+        "Q3K" => "Q3_K",
+        "Q4K" => "Q4_K",
+        "Q5K" => "Q5_K",
+        "Q6K" => "Q6_K",
+        "Q8K" => "Q8_K",
+        other => other,
+    }
+    .to_string()
 }
-
 
 fn quant_accuracy(quant: &str) -> Option<(&'static str, &'static str)> {
     match quant.to_uppercase().as_str() {
@@ -464,12 +471,8 @@ fn quant_accuracy(quant: &str) -> Option<(&'static str, &'static str)> {
         "IQ2_XXS" | "IQ2_XS" | "IQ2_S" | "IQ2_M" | "Q2_K" | "Q2_K_S" => {
             Some(("~95%", "aggressive, noticeable quality loss"))
         }
-        "IQ3_XXS" | "IQ3_XS" | "IQ3_S" | "Q3_K_S" => {
-            Some(("~96%", "compact, some quality loss"))
-        }
-        "Q3_K" | "Q3_K_M" | "IQ3_M" | "IQ3_K_S" => {
-            Some(("~96.5%", "compact, moderate quality"))
-        }
+        "IQ3_XXS" | "IQ3_XS" | "IQ3_S" | "Q3_K_S" => Some(("~96%", "compact, some quality loss")),
+        "Q3_K" | "Q3_K_M" | "IQ3_M" | "IQ3_K_S" => Some(("~96.5%", "compact, moderate quality")),
         "Q3_K_L" | "IQ3_K_M" => Some(("~97%", "compact, good quality")),
         "Q4_0" | "Q4_1" => Some(("~97.5%", "good compression")),
         "Q4_K_S" | "IQ4_XS" => Some(("~97.8%", "good balance")),
@@ -506,21 +509,21 @@ fn best_recommendation(files: &[(String, u64)]) -> Option<&str> {
     })
 }
 
-
 fn meta_u32(content: &gguf_file::Content, key: &str) -> Option<u32> {
     content.metadata.get(key).and_then(|v| v.to_u32().ok())
 }
 
 fn meta_string(content: &gguf_file::Content, key: &str) -> Option<String> {
-    content.metadata.get(key).and_then(|v| v.to_string().ok().cloned())
+    content
+        .metadata
+        .get(key)
+        .and_then(|v| v.to_string().ok().cloned())
 }
 
 fn read_torch_dtype(config_path: &Path) -> Option<String> {
     let content = std::fs::read_to_string(config_path).ok()?;
     let json: serde_json::Value = serde_json::from_str(&content).ok()?;
-    json["torch_dtype"]
-        .as_str()
-        .map(|s| s.to_uppercase())
+    json["torch_dtype"].as_str().map(|s| s.to_uppercase())
 }
 
 fn fmt_bytes(bytes: usize) -> String {

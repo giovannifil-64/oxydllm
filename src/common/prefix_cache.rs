@@ -18,7 +18,9 @@ pub struct PrefixCache {
 impl PrefixCache {
     pub fn new(capacity: usize) -> Self {
         let cap = NonZeroUsize::new(capacity.max(1)).unwrap();
-        Self { entries: LruCache::new(cap) }
+        Self {
+            entries: LruCache::new(cap),
+        }
     }
 
     pub fn count_cached_blocks(&self, tokens: &[u32], block_size: usize) -> usize {
@@ -37,7 +39,7 @@ impl PrefixCache {
                 _ => break,
             }
         }
-        
+
         count
     }
 
@@ -76,7 +78,10 @@ impl PrefixCache {
         let num_full_blocks = tokens.len() / block_size;
         debug_assert!(start_block + new_block_ids.len() <= num_full_blocks);
 
-        if new_block_ids.iter().any(|ids| ids.len() != allocators.len()) {
+        if new_block_ids
+            .iter()
+            .any(|ids| ids.len() != allocators.len())
+        {
             return;
         }
 
@@ -95,13 +100,20 @@ impl PrefixCache {
                 prev_hash,
             );
 
-            let block_tokens = tokens[block_idx * block_size..(block_idx + 1) * block_size].to_vec();
+            let block_tokens =
+                tokens[block_idx * block_size..(block_idx + 1) * block_size].to_vec();
             if !self.entries.contains(&h) {
                 for (layer_idx, &bid) in block_ids.iter().enumerate() {
                     allocators[layer_idx].lock().unwrap().share(bid);
                 }
 
-                if let Some((_, evicted)) = self.entries.push(h, PrefixEntry { block_ids: block_ids.clone(), block_tokens }) {
+                if let Some((_, evicted)) = self.entries.push(
+                    h,
+                    PrefixEntry {
+                        block_ids: block_ids.clone(),
+                        block_tokens,
+                    },
+                ) {
                     for (layer_idx, bid) in evicted.block_ids.iter().enumerate() {
                         if layer_idx < allocators.len() {
                             allocators[layer_idx].lock().unwrap().free(*bid);

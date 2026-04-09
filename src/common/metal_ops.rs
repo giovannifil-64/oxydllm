@@ -13,8 +13,8 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 use candle_core::{
-    backend::BackendStorage, CpuStorage, CustomOp1, CustomOp2, CustomOp3, DType, Layout,
-    MetalStorage, Result, Shape, Tensor, D,
+    CpuStorage, CustomOp1, CustomOp2, CustomOp3, D, DType, Layout, MetalStorage, Result, Shape,
+    Tensor, backend::BackendStorage,
 };
 use candle_metal_kernels::SdpaDType;
 
@@ -81,13 +81,14 @@ impl CustomOp3 for Sdpa {
         let supports_sdpa_full_mask = self.mask.is_none() || q_seq <= k_seq;
         let supports_sdpa_full =
             q_seq > 8 && supported_head_dim && supports_sdpa_full_mask && self.softcapping == 1.0;
-        let supports_sdpa_vector =
-            q_seq <= 8 && supported_head_dim && q_seq <= k_seq;
+        let supports_sdpa_vector = q_seq <= 8 && supported_head_dim && q_seq <= k_seq;
 
         if !supported_head_dim || !(supports_sdpa_full || supports_sdpa_vector) {
             candle_core::bail!(
                 "Metal SDPA does not support q dims {:?}, k dims {:?}, v dims {:?}",
-                q_l.dims(), k_l.dims(), v_l.dims()
+                q_l.dims(),
+                k_l.dims(),
+                v_l.dims()
             );
         }
 
@@ -413,7 +414,9 @@ impl CustomOp3 for RopeOp {
         if cos.dtype() != src.dtype() || sin.dtype() != src.dtype() {
             candle_core::bail!(
                 "RopeOp dtype mismatch: src={:?} cos={:?} sin={:?}",
-                src.dtype(), cos.dtype(), sin.dtype()
+                src.dtype(),
+                cos.dtype(),
+                sin.dtype()
             );
         }
 
@@ -439,10 +442,10 @@ impl CustomOp3 for RopeOp {
             &encoder,
             device.kernels(),
             name,
-            b * h,   // bh
-            t * d,   // td
-            d,       // full head_dim
-            0,       // stride_b = 0 (2D cos/sin, no per-batch offset)
+            b * h, // bh
+            t * d, // td
+            d,     // full head_dim
+            0,     // stride_b = 0 (2D cos/sin, no per-batch offset)
             src.buffer(),
             l_src.start_offset() * src.dtype().size_in_bytes(),
             cos.buffer(),
@@ -519,9 +522,6 @@ pub fn rope_fused(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
 /// - head_dim is one of 32, 64, 72, 80, 96, 128, 256
 pub fn sdpa_available(tensor: &Tensor, head_dim: usize) -> bool {
     tensor.device().is_metal()
-        && matches!(
-            tensor.dtype(),
-            DType::F16 | DType::BF16 | DType::F32
-        )
+        && matches!(tensor.dtype(), DType::F16 | DType::BF16 | DType::F32)
         && matches!(head_dim, 32 | 64 | 72 | 80 | 96 | 128 | 256)
 }

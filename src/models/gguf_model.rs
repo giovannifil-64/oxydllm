@@ -24,7 +24,7 @@ use crate::common::{
     kv_quant::KvQuantizer,
     linear::{AnyLinear, Embedding, Linear, QLinear},
     norm::RMSNorm,
-    paged::{BlockAllocator, PagedKvCache, SharedBlockAllocator, DEFAULT_BLOCK_SIZE},
+    paged::{BlockAllocator, DEFAULT_BLOCK_SIZE, PagedKvCache, SharedBlockAllocator},
     rope::RotaryEmbedding,
 };
 use crate::models::traits::BatchModel;
@@ -71,8 +71,7 @@ pub(crate) fn parse_gguf_topology(gguf: &GgufWeights) -> anyhow::Result<GgufTopo
     let num_key_value_heads =
         gguf.metadata_u32(&format!("{prefix}.attention.head_count_kv"))? as usize;
     let head_dim = {
-        let from_meta =
-            gguf.metadata_u32_or(&format!("{prefix}.attention.key_length"), 0) as usize;
+        let from_meta = gguf.metadata_u32_or(&format!("{prefix}.attention.key_length"), 0) as usize;
         if from_meta > 0 {
             from_meta
         } else {
@@ -82,9 +81,14 @@ pub(crate) fn parse_gguf_topology(gguf: &GgufWeights) -> anyhow::Result<GgufTopo
             q0.shape().dims()[0] / num_attention_heads
         }
     };
-    let context_length =
-        gguf.metadata_u32_or(&format!("{prefix}.context_length"), 131072) as usize;
-    Ok(GgufTopology { num_hidden_layers, num_attention_heads, num_key_value_heads, head_dim, context_length })
+    let context_length = gguf.metadata_u32_or(&format!("{prefix}.context_length"), 131072) as usize;
+    Ok(GgufTopology {
+        num_hidden_layers,
+        num_attention_heads,
+        num_key_value_heads,
+        head_dim,
+        context_length,
+    })
 }
 
 impl StandardTransformer {
@@ -119,7 +123,7 @@ impl StandardTransformer {
 
         let arch_def = crate::models::arch_defaults::arch_defaults(&arch)
             .ok_or_else(|| anyhow::anyhow!("Architecture '{arch}' not supported"))?;
-            
+
         let activation = arch_def.activation;
         let norm_type = arch_def.norm_type;
         let logit_softcap = arch_def.logit_softcap;
@@ -127,14 +131,17 @@ impl StandardTransformer {
         let has_ffn_norms = arch_def.has_ffn_norms;
         let has_qk_norm = arch_def.qk_norm;
         let has_v_norm = arch_def.v_norm;
-        
+
         let topo = parse_gguf_topology(gguf)?;
         let num_hidden_layers = topo.num_hidden_layers;
         let num_attention_heads = topo.num_attention_heads;
         let num_key_value_heads = topo.num_key_value_heads;
         let head_dim = topo.head_dim;
 
-        let hidden_size = gguf.metadata_u32_or(&format!("{prefix}.embedding_length"), (head_dim * num_attention_heads) as u32) as usize;
+        let hidden_size = gguf.metadata_u32_or(
+            &format!("{prefix}.embedding_length"),
+            (head_dim * num_attention_heads) as u32,
+        ) as usize;
 
         let mut embed_scale = None;
         if arch_def.embed_scale_from_hidden {
@@ -144,8 +151,10 @@ impl StandardTransformer {
         let rms_norm_eps = gguf
             .metadata_f32_or(&format!("{prefix}.attention.layer_norm_rms_epsilon"), 1e-5)
             as f64;
-        let rope_theta =
-            gguf.metadata_f32_or(&format!("{prefix}.rope.freq_base"), arch_def.default_rope_theta as f32) as f64;
+        let rope_theta = gguf.metadata_f32_or(
+            &format!("{prefix}.rope.freq_base"),
+            arch_def.default_rope_theta as f32,
+        ) as f64;
         let max_position_embeddings =
             gguf.metadata_u32_or(&format!("{prefix}.context_length"), 131072) as usize;
 
@@ -164,10 +173,14 @@ impl StandardTransformer {
 
         // Read query_pre_attn_scalar from GGUF if present (e.g. Gemma2 27B uses 224, not head_dim)
         let attention_scale = {
-            let scalar = gguf.metadata_f32_or(
-                &format!("{prefix}.attention.query_pre_attn_scalar"), 0.0,
-            ) as f64;
-            if scalar > 0.0 { Some(1.0 / scalar.sqrt()) } else { None }
+            let scalar = gguf
+                .metadata_f32_or(&format!("{prefix}.attention.query_pre_attn_scalar"), 0.0)
+                as f64;
+            if scalar > 0.0 {
+                Some(1.0 / scalar.sqrt())
+            } else {
+                None
+            }
         };
 
         let embed_qt = gguf
@@ -191,7 +204,8 @@ impl StandardTransformer {
             }
         };
 
-        let sliding_window_meta = gguf.metadata_u32_or(&format!("{prefix}.attention.sliding_window"), 0) as usize;
+        let sliding_window_meta =
+            gguf.metadata_u32_or(&format!("{prefix}.attention.sliding_window"), 0) as usize;
         let sliding_window = if sliding_window_meta > 0 {
             Some(sliding_window_meta)
         } else {
@@ -285,13 +299,31 @@ impl BatchModel for StandardTransformer {
         seq_caches: &mut [&mut [PagedKvCache]],
         token_counts: &[usize],
     ) -> Result<Tensor> {
-        run_transformer_layers_batch(self.components(), token_ids, position_ids, seq_caches, token_counts)
+        run_transformer_layers_batch(
+            self.components(),
+            token_ids,
+            position_ids,
+            seq_caches,
+            token_counts,
+        )
     }
 
-    fn vocab_size(&self) -> usize { self.vocab_size }
-    fn stop_token_ids(&self) -> &[u32] { &self.stop_token_ids }
-    fn max_seq_len(&self) -> usize { self.max_seq_len }
-    fn device(&self) -> &Device { &self.device }
-    fn num_layers(&self) -> usize { self.blocks.len() }
-    fn allocators(&self) -> &[SharedBlockAllocator] { &self.allocators }
+    fn vocab_size(&self) -> usize {
+        self.vocab_size
+    }
+    fn stop_token_ids(&self) -> &[u32] {
+        &self.stop_token_ids
+    }
+    fn max_seq_len(&self) -> usize {
+        self.max_seq_len
+    }
+    fn device(&self) -> &Device {
+        &self.device
+    }
+    fn num_layers(&self) -> usize {
+        self.blocks.len()
+    }
+    fn allocators(&self) -> &[SharedBlockAllocator] {
+        &self.allocators
+    }
 }

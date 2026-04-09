@@ -1,5 +1,3 @@
-use std::sync::{Arc, Mutex};
-use candle_core::{DType, Device};
 use crate::common::{
     block::TransformerBlock,
     config::StandardTransformerConfig,
@@ -7,13 +5,18 @@ use crate::common::{
     kv_quant::{self, KvQuantMode, KvQuantizer},
     linear::{AnyLinear, Embedding, Linear},
     norm::RMSNorm,
-    paged::{BlockAllocator, DEFAULT_BLOCK_SIZE, GlobalKvBudget, SharedBlockAllocator, SharedGlobalKvBudget},
+    paged::{
+        BlockAllocator, DEFAULT_BLOCK_SIZE, GlobalKvBudget, SharedBlockAllocator,
+        SharedGlobalKvBudget,
+    },
     rope::RotaryEmbedding,
     weights::ModelWeights,
 };
-use crate::models::traits::BatchModel;
 use crate::models::gguf_model::StandardTransformer;
 use crate::models::parsers::hf_parser;
+use crate::models::traits::BatchModel;
+use candle_core::{DType, Device};
+use std::sync::{Arc, Mutex};
 
 use std::path::{Path, PathBuf};
 
@@ -76,8 +79,15 @@ pub fn discover_models(models_dir: &Path) -> Vec<DiscoveredModel> {
                     .to_string_lossy()
                     .to_string();
                 let gguf_id = strip_gguf_split_suffix(&raw_stem).to_string();
-                let effective_id = if gguf_id.is_empty() { id.clone() } else { gguf_id };
-                if models.iter().any(|m: &DiscoveredModel| m.id == effective_id) {
+                let effective_id = if gguf_id.is_empty() {
+                    id.clone()
+                } else {
+                    gguf_id
+                };
+                if models
+                    .iter()
+                    .any(|m: &DiscoveredModel| m.id == effective_id)
+                {
                     continue;
                 }
                 if let Some(info) = discover_gguf_model(&effective_id, gguf_path) {
@@ -98,7 +108,7 @@ fn strip_gguf_split_suffix(stem: &str) -> &str {
         && parts[n - 1].chars().all(|c| c.is_ascii_digit())
         && parts[n - 3].chars().all(|c| c.is_ascii_digit())
     {
-        let trim = 1 + parts[n-1].len() + 1 + parts[n-2].len() + 1 + parts[n-3].len();
+        let trim = 1 + parts[n - 1].len() + 1 + parts[n - 2].len() + 1 + parts[n - 3].len();
         &stem[..stem.len() - trim]
     } else {
         stem
@@ -150,9 +160,9 @@ fn resolve_weight_paths(model_dir: &str) -> anyhow::Result<Vec<String>> {
         let mut seen = std::collections::HashSet::new();
         let mut files: Vec<String> = Vec::new();
         for filename in weight_map.values() {
-            let name = filename
-                .as_str()
-                .ok_or_else(|| anyhow::anyhow!("Expected string value in weight_map, got {:?}", filename))?;
+            let name = filename.as_str().ok_or_else(|| {
+                anyhow::anyhow!("Expected string value in weight_map, got {:?}", filename)
+            })?;
             if seen.insert(name.to_string()) {
                 files.push(format!("{}/{}", model_dir, name));
             }
@@ -177,17 +187,18 @@ fn resolve_weight_paths(model_dir: &str) -> anyhow::Result<Vec<String>> {
 pub fn find_gguf_files(dir: &Path) -> Option<Vec<std::path::PathBuf>> {
     let index_path = dir.join("gguf.index");
     if index_path.exists()
-        && let Ok(content) = std::fs::read_to_string(&index_path) {
-            let files: Vec<std::path::PathBuf> = content
-                .lines()
-                .map(|l| l.trim())
-                .filter(|l| !l.is_empty() && !l.starts_with('#'))
-                .map(|l| dir.join(l))
-                .collect();
-            if !files.is_empty() {
-                return Some(files);
-            }
+        && let Ok(content) = std::fs::read_to_string(&index_path)
+    {
+        let files: Vec<std::path::PathBuf> = content
+            .lines()
+            .map(|l| l.trim())
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .map(|l| dir.join(l))
+            .collect();
+        if !files.is_empty() {
+            return Some(files);
         }
+    }
     find_gguf_file(dir).map(|p| vec![p])
 }
 
@@ -195,13 +206,13 @@ pub fn find_gguf_file(dir: &Path) -> Option<std::path::PathBuf> {
     let index_path = dir.join("gguf.index");
     if index_path.exists()
         && let Ok(content) = std::fs::read_to_string(&index_path)
-            && let Some(first) = content
-                .lines()
-                .map(|l| l.trim())
-                .find(|l| !l.is_empty() && !l.starts_with('#'))
-            {
-                return Some(dir.join(first));
-            }
+        && let Some(first) = content
+            .lines()
+            .map(|l| l.trim())
+            .find(|l| !l.is_empty() && !l.starts_with('#'))
+    {
+        return Some(dir.join(first));
+    }
     let entries = std::fs::read_dir(dir).ok()?;
     for entry in entries.flatten() {
         let p = entry.path();
@@ -220,7 +231,8 @@ fn discover_gguf_model(id: &str, gguf_path: &Path) -> Option<DiscoveredModel> {
     let arch = content
         .metadata
         .get("general.architecture")
-        .and_then(|v| v.to_string().ok()).cloned()
+        .and_then(|v| v.to_string().ok())
+        .cloned()
         .unwrap_or_else(|| "unknown".to_string());
 
     let prefix = &arch;
@@ -291,42 +303,32 @@ pub fn select_device_at(_cuda_idx: usize) -> anyhow::Result<Device> {
     Ok(Device::Cpu)
 }
 
+#[derive(Clone, Copy)]
+pub struct LoadBatchOptions<'a> {
+    pub max_context_len: usize,
+    pub max_num_sequences: usize,
+    pub kv_budget: &'a SharedGlobalKvBudget,
+    pub kv_quant: KvQuantMode,
+    pub qjl_quantization: bool,
+}
+
 pub fn load_batch_model(
     model_dir: &str,
     model_id: &str,
     device: &Device,
-    max_context_len: usize,
-    max_num_sequences: usize,
-    kv_budget: &SharedGlobalKvBudget,
-    kv_quant: KvQuantMode,
-    qjl_quantization: bool,
+    opts: LoadBatchOptions<'_>,
 ) -> anyhow::Result<(Box<dyn BatchModel>, usize)> {
     if is_gguf_model(model_dir) {
-        return load_batch_model_gguf(
-            model_dir,
-            model_id,
-            device,
-            max_context_len,
-            max_num_sequences,
-            kv_budget,
-            kv_quant,
-            qjl_quantization,
-        );
+        return load_batch_model_gguf(model_dir, model_id, device, opts);
     }
 
-    let dtype = if matches!(device, Device::Cpu) { DType::F32 } else { DType::BF16 };
+    let dtype = if matches!(device, Device::Cpu) {
+        DType::F32
+    } else {
+        DType::BF16
+    };
     let cfg = hf_parser::parse(&format!("{}/config.json", model_dir))?;
-    load_standard_safetensors(
-        cfg,
-        model_dir,
-        device,
-        dtype,
-        max_context_len,
-        max_num_sequences,
-        kv_budget,
-        kv_quant,
-        qjl_quantization,
-    )
+    load_standard_safetensors(cfg, model_dir, device, dtype, opts)
 }
 
 fn load_standard_safetensors(
@@ -334,11 +336,7 @@ fn load_standard_safetensors(
     model_dir: &str,
     device: &Device,
     dtype: DType,
-    max_context_len: usize,
-    max_num_sequences: usize,
-    kv_budget: &SharedGlobalKvBudget,
-    kv_quant: KvQuantMode,
-    qjl_quantization: bool,
+    opts: LoadBatchOptions<'_>,
 ) -> anyhow::Result<(Box<dyn BatchModel>, usize)> {
     let weight_paths = resolve_weight_paths(model_dir)?;
     let weight_path_refs: Vec<&str> = weight_paths.iter().map(|s| s.as_str()).collect();
@@ -373,35 +371,46 @@ fn load_standard_safetensors(
         .zip(per_layer_head_dims.iter().copied())
         .collect();
 
-    let ctx = max_context_len.min(cfg.max_position_embeddings);
+    let ctx = opts.max_context_len.min(cfg.max_position_embeddings);
     let (num_blocks, acquired_kv_bytes) = compute_kv_blocks(
         &KvBlockParams {
             layer_kv_specs: layer_kv_specs.clone(),
             max_context_len: ctx,
-            max_num_sequences,
+            max_num_sequences: opts.max_num_sequences,
             dtype,
-            kv_quant,
-            qjl_quantization,
+            kv_quant: opts.kv_quant,
+            qjl_quantization: opts.qjl_quantization,
         },
-        kv_budget,
+        opts.kv_budget,
     )?;
 
-    let layer_quantizers: Vec<Option<Arc<KvQuantizer>>> = match kv_quant {
+    let layer_quantizers: Vec<Option<Arc<KvQuantizer>>> = match opts.kv_quant {
         KvQuantMode::Off => vec![None; num_layers],
         mode => per_layer_head_dims
             .iter()
-            .map(|&hd| Some(Arc::new(KvQuantizer::new_with_qjl(mode.bit_width(), hd, qjl_quantization))))
+            .map(|&hd| {
+                Some(Arc::new(KvQuantizer::new_with_qjl(
+                    mode.bit_width(),
+                    hd,
+                    opts.qjl_quantization,
+                )))
+            })
             .collect(),
     };
 
     let result = (|| -> anyhow::Result<(Box<dyn BatchModel>, usize)> {
-        let embed_weight = weights.get("model.embed_tokens.weight")
-            .map_err(|e| anyhow::anyhow!("{e}"))?.clone();
+        let embed_weight = weights
+            .get("model.embed_tokens.weight")
+            .map_err(|e| anyhow::anyhow!("{e}"))?
+            .clone();
         let lm_head = if cfg.tie_word_embeddings {
             AnyLinear::Float(Linear::new(embed_weight.clone(), None))
         } else {
             AnyLinear::Float(Linear::new(
-                weights.get("lm_head.weight").map_err(|e| anyhow::anyhow!("{e}"))?.clone(),
+                weights
+                    .get("lm_head.weight")
+                    .map_err(|e| anyhow::anyhow!("{e}"))?
+                    .clone(),
                 None,
             ))
         };
@@ -448,9 +457,15 @@ fn load_standard_safetensors(
 
         let has_per_layer_stream = cfg.per_layer_input_hidden_size.is_some()
             && cfg.per_layer_input_vocab_size.is_some()
-            && weights.try_get("model.embed_tokens_per_layer.weight").is_some()
-            && weights.try_get("model.per_layer_model_projection.weight").is_some()
-            && weights.try_get("model.per_layer_projection_norm.weight").is_some();
+            && weights
+                .try_get("model.embed_tokens_per_layer.weight")
+                .is_some()
+            && weights
+                .try_get("model.per_layer_model_projection.weight")
+                .is_some()
+            && weights
+                .try_get("model.per_layer_projection_norm.weight")
+                .is_some();
 
         let per_layer_input_embed = if has_per_layer_stream {
             Some(Embedding::new(
@@ -484,31 +499,34 @@ fn load_standard_safetensors(
             None
         };
 
-        Ok((Box::new(StandardTransformer {
-            embed_tokens,
-            blocks,
-            norm,
-            lm_head,
-            ropes,
-            allocators,
-            device: device.clone(),
-            stop_token_ids: cfg.eos_token_ids,
-            vocab_size: cfg.vocab_size,
-            max_seq_len: ctx,
-            embed_scale: cfg.embed_scale,
-            logit_softcap: cfg.logit_softcap,
-            per_layer_input_embed,
-            per_layer_input_embed_scale: cfg.per_layer_input_embed_scale,
-            per_layer_model_projection,
-            per_layer_model_projection_scale: cfg.per_layer_model_projection_scale,
-            per_layer_projection_norm,
-            per_layer_input_scale: cfg.per_layer_input_scale,
-            kv_shared_layer_map: cfg.kv_shared_layer_map.clone(),
-        }), weights_size))
+        Ok((
+            Box::new(StandardTransformer {
+                embed_tokens,
+                blocks,
+                norm,
+                lm_head,
+                ropes,
+                allocators,
+                device: device.clone(),
+                stop_token_ids: cfg.eos_token_ids,
+                vocab_size: cfg.vocab_size,
+                max_seq_len: ctx,
+                embed_scale: cfg.embed_scale,
+                logit_softcap: cfg.logit_softcap,
+                per_layer_input_embed,
+                per_layer_input_embed_scale: cfg.per_layer_input_embed_scale,
+                per_layer_model_projection,
+                per_layer_model_projection_scale: cfg.per_layer_model_projection_scale,
+                per_layer_projection_norm,
+                per_layer_input_scale: cfg.per_layer_input_scale,
+                kv_shared_layer_map: cfg.kv_shared_layer_map.clone(),
+            }),
+            weights_size,
+        ))
     })();
 
     if result.is_err() {
-        kv_budget.release(acquired_kv_bytes);
+        opts.kv_budget.release(acquired_kv_bytes);
     }
     result
 }
@@ -517,11 +535,7 @@ fn load_batch_model_gguf(
     model_dir: &str,
     model_id: &str,
     device: &Device,
-    max_context_len: usize,
-    max_num_sequences: usize,
-    kv_budget: &SharedGlobalKvBudget,
-    kv_quant: KvQuantMode,
-    qjl_quantization: bool,
+    opts: LoadBatchOptions<'_>,
 ) -> anyhow::Result<(Box<dyn BatchModel>, usize)> {
     let dir = Path::new(model_dir);
     let all_gguf_paths = find_gguf_files(dir)
@@ -541,7 +555,11 @@ fn load_batch_model_gguf(
         .cloned()
         .collect();
 
-    let gguf_paths = if gguf_paths.is_empty() { all_gguf_paths } else { gguf_paths };
+    let gguf_paths = if gguf_paths.is_empty() {
+        all_gguf_paths
+    } else {
+        gguf_paths
+    };
 
     if gguf_paths.len() == 1 {
         println!("Loading GGUF model from '{}'", gguf_paths[0].display());
@@ -570,34 +588,34 @@ fn load_batch_model_gguf(
     let weights_size = gguf.total_size_bytes();
 
     let topo = crate::models::gguf_model::parse_gguf_topology(&gguf)?;
-    let ctx = max_context_len.min(topo.context_length);
+    let ctx = opts.max_context_len.min(topo.context_length);
     let layer_kv_specs = vec![(topo.num_key_value_heads, topo.head_dim); topo.num_hidden_layers];
     let (num_blocks, acquired_kv_bytes) = compute_kv_blocks(
         &KvBlockParams {
             layer_kv_specs,
             max_context_len: ctx,
-            max_num_sequences,
+            max_num_sequences: opts.max_num_sequences,
             dtype,
-            kv_quant,
-            qjl_quantization,
+            kv_quant: opts.kv_quant,
+            qjl_quantization: opts.qjl_quantization,
         },
-        kv_budget,
+        opts.kv_budget,
     )?;
 
-    let quantizer: Option<Arc<KvQuantizer>> = match kv_quant {
+    let quantizer: Option<Arc<KvQuantizer>> = match opts.kv_quant {
         KvQuantMode::Off => None,
         mode => Some(Arc::new(KvQuantizer::new_with_qjl(
             mode.bit_width(),
             topo.head_dim,
-            qjl_quantization,
+            opts.qjl_quantization,
         ))),
     };
 
     let model = match StandardTransformer::load_gguf(&gguf, device, dtype, num_blocks, quantizer) {
         Ok(m) => m,
         Err(e) => {
-            kv_budget.release(acquired_kv_bytes);
-            return Err(e.into());
+            opts.kv_budget.release(acquired_kv_bytes);
+            return Err(e);
         }
     };
     Ok((Box::new(model), weights_size))
@@ -612,7 +630,10 @@ struct KvBlockParams {
     qjl_quantization: bool,
 }
 
-fn compute_kv_blocks(p: &KvBlockParams, kv_budget: &GlobalKvBudget) -> anyhow::Result<(usize, usize)> {
+fn compute_kv_blocks(
+    p: &KvBlockParams,
+    kv_budget: &GlobalKvBudget,
+) -> anyhow::Result<(usize, usize)> {
     let total_slots = p.max_num_sequences * p.max_context_len;
     let desired_blocks = total_slots.div_ceil(DEFAULT_BLOCK_SIZE);
     let min_blocks: usize = 256; // ~4 096 token minimum context
@@ -635,7 +656,8 @@ fn compute_kv_blocks(p: &KvBlockParams, kv_budget: &GlobalKvBudget) -> anyhow::R
                     mode.bit_width(),
                     p.qjl_quantization,
                 );
-                let value_bph = kv_quant::quantized_value_bytes_per_head(*head_dim, mode.bit_width());
+                let value_bph =
+                    kv_quant::quantized_value_bytes_per_head(*head_dim, mode.bit_width());
                 DEFAULT_BLOCK_SIZE * (*n_kv_heads) * (key_bph + value_bph)
             })
             .sum::<usize>(),

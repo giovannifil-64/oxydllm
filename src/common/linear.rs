@@ -1,6 +1,6 @@
-use std::sync::Arc;
 use candle_core::quantized::{QMatMul, QTensor};
 use candle_core::{DType, Device, Result, Tensor};
+use std::sync::Arc;
 
 pub struct Embedding {
     weight: Tensor,
@@ -40,7 +40,9 @@ impl Linear {
             let original_dims = x.dims().to_vec();
             let in_features = *original_dims.last().unwrap();
             let batch_flat: usize = original_dims[..original_dims.len() - 1].iter().product();
-            let o = x.reshape((batch_flat, in_features))?.matmul(&self.weight_t)?;
+            let o = x
+                .reshape((batch_flat, in_features))?
+                .matmul(&self.weight_t)?;
             let out_features = o.dim(1)?;
             let mut new_dims = original_dims;
             *new_dims.last_mut().unwrap() = out_features;
@@ -56,7 +58,6 @@ impl Linear {
     }
 }
 
-
 pub fn silu(x: &Tensor) -> Result<Tensor> {
     x.silu()
 }
@@ -68,7 +69,11 @@ pub fn gelu_tanh(x: &Tensor) -> Result<Tensor> {
 pub fn softmax_last_dim(x: &Tensor) -> Result<Tensor> {
     #[cfg(feature = "metal")]
     if x.device().is_metal() {
-        let x_c = if x.is_contiguous() { x.clone() } else { x.contiguous()? };
+        let x_c = if x.is_contiguous() {
+            x.clone()
+        } else {
+            x.contiguous()?
+        };
         return super::metal_ops::softmax_fused(&x_c);
     }
     let max = x.max_keepdim(candle_core::D::Minus1)?;
@@ -144,5 +149,4 @@ impl AnyLinear {
             Self::Quantized(q) => q.forward(x),
         }
     }
-
 }

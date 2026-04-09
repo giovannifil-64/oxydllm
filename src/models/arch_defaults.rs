@@ -54,8 +54,12 @@ pub fn known_unsupported_reason(arch: &str) -> Option<&'static str> {
         "Qwen3MoeForCausalLM"
         | "MixtralForCausalLM"
         | "DeepseekV2ForCausalLM"
-        | "DeepseekV3ForCausalLM" => Some("Mixture-of-Experts (MoE) architectures are not yet supported"),
-        "Qwen3_5ForConditionalGeneration" => Some("Hybrid linear+full attention models are not yet supported"),
+        | "DeepseekV3ForCausalLM" => {
+            Some("Mixture-of-Experts (MoE) architectures are not yet supported")
+        }
+        "Qwen3_5ForConditionalGeneration" => {
+            Some("Hybrid linear+full attention models are not yet supported")
+        }
         _ => None,
     }
 }
@@ -64,10 +68,12 @@ pub fn arch_defaults(arch: &str) -> Option<ArchDefaults> {
     match arch {
         "llama" | "LlamaForCausalLM" => Some(llama_defaults()),
 
-        "mistral" | "MistralForCausalLM" | "Mistral3ForConditionalGeneration" => Some(ArchDefaults {
-            extra_eos_ids: &[],
-            ..llama_defaults()
-        }),
+        "mistral" | "MistralForCausalLM" | "Mistral3ForConditionalGeneration" => {
+            Some(ArchDefaults {
+                extra_eos_ids: &[],
+                ..llama_defaults()
+            })
+        }
         "phi3" | "Phi3ForCausalLM" => Some(ArchDefaults {
             default_rope_theta: 10_000.0,
             extra_eos_ids: &[],

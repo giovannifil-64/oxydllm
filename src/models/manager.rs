@@ -1,6 +1,9 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::{Duration, Instant};
 
 use candle_core::Tensor;
@@ -8,12 +11,14 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc as tokio_mpsc, oneshot};
 
 use crate::common::kv_quant::KvQuantMode;
-use crate::common::paged::{detect_system_kv_budget, GlobalKvBudget, PagedKvCache, SharedGlobalKvBudget};
+use crate::common::paged::{
+    GlobalKvBudget, PagedKvCache, SharedGlobalKvBudget, detect_system_kv_budget,
+};
 use crate::engine::Engine;
 use crate::models::loader;
 use crate::models::traits::BatchModel;
 use crate::scheduler::SchedulerConfig;
-use crate::server::{engine_loop, IncomingRequest};
+use crate::server::{IncomingRequest, engine_loop};
 use crate::tokenizer::Tokenizer;
 
 #[derive(Clone)]
@@ -83,7 +88,6 @@ pub enum GetResult {
     Wait(oneshot::Receiver<Result<ReadyHandle, String>>),
 }
 
-
 pub fn registry_path(models_dir: &Path) -> PathBuf {
     models_dir.join(".rllm_registry.json")
 }
@@ -99,10 +103,10 @@ pub fn load_registry(models_dir: &Path) -> HashMap<String, RegistryEntry> {
 
 pub fn save_registry(models_dir: &Path, registry: &HashMap<String, RegistryEntry>) {
     let path = registry_path(models_dir);
-    if let Ok(json) = serde_json::to_string_pretty(registry) {
-        if let Err(e) = std::fs::write(&path, &json) {
-            eprintln!("[registry] Failed to save {}: {e}", path.display());
-        }
+    if let Ok(json) = serde_json::to_string_pretty(registry)
+        && let Err(e) = std::fs::write(&path, &json)
+    {
+        eprintln!("[registry] Failed to save {}: {e}", path.display());
     }
 }
 
@@ -132,7 +136,6 @@ pub fn estimate_model_size(model_dir: &Path) -> usize {
         .map(|m| m.len() as usize)
         .sum()
 }
-
 
 impl ModelManager {
     pub fn new(
@@ -170,7 +173,11 @@ impl ModelManager {
             println!("[kv-pool] KV cache quantization: {}", kv_quant.label());
             println!(
                 "[kv-pool] QJL key quantization: {}",
-                if qjl_quantization { "enabled" } else { "disabled" }
+                if qjl_quantization {
+                    "enabled"
+                } else {
+                    "disabled"
+                }
             );
         }
 
@@ -200,9 +207,11 @@ impl ModelManager {
         self.slots
             .values()
             .filter_map(|s| match s {
-                SlotState::Ready { weights_size_bytes, kv_cache_bytes, .. } => {
-                    Some(*weights_size_bytes + *kv_cache_bytes)
-                }
+                SlotState::Ready {
+                    weights_size_bytes,
+                    kv_cache_bytes,
+                    ..
+                } => Some(*weights_size_bytes + *kv_cache_bytes),
                 _ => None,
             })
             .sum()
@@ -246,9 +255,10 @@ impl ModelManager {
     fn projected_size_bytes(&self, model_id: &str, model_path: &Path) -> usize {
         // Case 1: previously loaded — use the real in-memory footprint (weights + kv).
         if let Some(entry) = self.registry.get(model_id)
-            && entry.size_bytes > 0 {
-                return entry.size_bytes + entry.kv_cache_bytes;
-            }
+            && entry.size_bytes > 0
+        {
+            return entry.size_bytes + entry.kv_cache_bytes;
+        }
 
         // Case 2: first-ever load — estimate from disk.
         // On GPU we load BF16 (≈ same size as on-disk BF16 safetensors).
@@ -261,7 +271,11 @@ impl ModelManager {
             "[memory] '{}' not in registry — disk estimate: {:.2} GB{}",
             model_id,
             corrected as f64 / 1_073_741_824.0,
-            if is_cpu { " (×2 for F32/CPU)" } else { " (BF16/GPU)" },
+            if is_cpu {
+                " (×2 for F32/CPU)"
+            } else {
+                " (BF16/GPU)"
+            },
         );
         corrected
     }
@@ -289,9 +303,16 @@ impl ModelManager {
             match lru_id {
                 Some(id) => {
                     let (freed, kv_bytes, shutdown) = match self.slots.get(&id) {
-                        Some(SlotState::Ready { weights_size_bytes, kv_cache_bytes, shutdown, .. }) => {
-                            (*weights_size_bytes + *kv_cache_bytes, *kv_cache_bytes, Some(Arc::clone(shutdown)))
-                        }
+                        Some(SlotState::Ready {
+                            weights_size_bytes,
+                            kv_cache_bytes,
+                            shutdown,
+                            ..
+                        }) => (
+                            *weights_size_bytes + *kv_cache_bytes,
+                            *kv_cache_bytes,
+                            Some(Arc::clone(shutdown)),
+                        ),
                         _ => (0, 0, None),
                     };
                     println!(
@@ -321,10 +342,8 @@ impl ModelManager {
         manager_handle: SharedModelManager,
         keep_alive_override: Option<Duration>,
     ) -> GetResult {
-        let model_path = match crate::models::loader::resolve_model_path(
-            &self.models_dir,
-            model_id,
-        ) {
+        let model_path = match crate::models::loader::resolve_model_path(&self.models_dir, model_id)
+        {
             Some(p) => p,
             None => {
                 let (tx, rx) = oneshot::channel();
@@ -372,22 +391,20 @@ impl ModelManager {
         let (tx, rx) = oneshot::channel();
         self.slots.insert(
             model_id.to_string(),
-            SlotState::Loading {
-                waiters: vec![tx],
-            },
+            SlotState::Loading { waiters: vec![tx] },
         );
 
-        spawn_load(
-            model_id.to_string(),
+        spawn_load(SpawnLoadParams {
+            model_id: model_id.to_string(),
             model_path,
-            manager_handle,
+            manager: manager_handle,
             effective_keep_alive,
-            self.cuda_devices.clone(),
-            self.max_context_len,
-            Arc::clone(&self.kv_budget),
-            self.kv_quant,
-            self.qjl_quantization,
-        );
+            cuda_devices: self.cuda_devices.clone(),
+            max_context_len: self.max_context_len,
+            kv_budget: Arc::clone(&self.kv_budget),
+            kv_quant: self.kv_quant,
+            qjl_quantization: self.qjl_quantization,
+        });
 
         GetResult::Wait(rx)
     }
@@ -398,20 +415,22 @@ impl ModelManager {
             .slots
             .iter()
             .filter_map(|(id, slot)| match slot {
-                SlotState::Ready { last_used, effective_keep_alive, .. }
-                    if now.duration_since(*last_used) > *effective_keep_alive =>
-                {
-                    Some(id.clone())
-                }
+                SlotState::Ready {
+                    last_used,
+                    effective_keep_alive,
+                    ..
+                } if now.duration_since(*last_used) > *effective_keep_alive => Some(id.clone()),
                 _ => None,
             })
             .collect();
 
         for id in &expired {
             let (kv_bytes, shutdown) = match self.slots.get(id) {
-                Some(SlotState::Ready { kv_cache_bytes, shutdown, .. }) => {
-                    (*kv_cache_bytes, Some(Arc::clone(shutdown)))
-                }
+                Some(SlotState::Ready {
+                    kv_cache_bytes,
+                    shutdown,
+                    ..
+                }) => (*kv_cache_bytes, Some(Arc::clone(shutdown))),
                 _ => (0, None),
             };
             println!("Evicting idle model '{}' (keep-alive expired)", id);
@@ -455,6 +474,18 @@ struct LoadResult {
     shutdown: Arc<AtomicBool>,
 }
 
+struct SpawnLoadParams {
+    model_id: String,
+    model_path: PathBuf,
+    manager: SharedModelManager,
+    effective_keep_alive: Duration,
+    cuda_devices: Vec<usize>,
+    max_context_len: usize,
+    kv_budget: SharedGlobalKvBudget,
+    kv_quant: KvQuantMode,
+    qjl_quantization: bool,
+}
+
 /// Runs dummy forward passes to force the device (Metal/CUDA) to JIT-compile
 /// GPU kernels for **both** prefill (multi-token) and decode (single-token) paths
 /// before the model is marked as Ready.  Without this, the very first real
@@ -481,11 +512,17 @@ fn warm_up_model(model: &dyn BatchModel) {
         let positions: Vec<u32> = (0..8).collect();
         let input = match Tensor::from_vec(dummy_tokens, (1, 8), device) {
             Ok(t) => t,
-            Err(e) => { eprintln!("[warmup] failed to create prefill tensor: {e}"); return; }
+            Err(e) => {
+                eprintln!("[warmup] failed to create prefill tensor: {e}");
+                return;
+            }
         };
         let position_ids = match Tensor::from_vec(positions, (8,), device) {
             Ok(t) => t,
-            Err(e) => { eprintln!("[warmup] failed to create position ids: {e}"); return; }
+            Err(e) => {
+                eprintln!("[warmup] failed to create position ids: {e}");
+                return;
+            }
         };
 
         let mut cache_slices: Vec<&mut [PagedKvCache]> = vec![caches.as_mut_slice()];
@@ -497,11 +534,17 @@ fn warm_up_model(model: &dyn BatchModel) {
     {
         let input = match Tensor::from_vec(vec![1u32], (1, 1), device) {
             Ok(t) => t,
-            Err(e) => { eprintln!("[warmup] failed to create decode tensor: {e}"); return; }
+            Err(e) => {
+                eprintln!("[warmup] failed to create decode tensor: {e}");
+                return;
+            }
         };
         let position_ids = match Tensor::from_vec(vec![8u32], (1,), device) {
             Ok(t) => t,
-            Err(e) => { eprintln!("[warmup] failed to create decode position ids: {e}"); return; }
+            Err(e) => {
+                eprintln!("[warmup] failed to create decode position ids: {e}");
+                return;
+            }
         };
 
         let mut cache_slices: Vec<&mut [PagedKvCache]> = vec![caches.as_mut_slice()];
@@ -521,17 +564,19 @@ fn warm_up_model(model: &dyn BatchModel) {
     }
 }
 
-fn spawn_load(
-    model_id: String,
-    model_path: PathBuf,
-    manager: SharedModelManager,
-    effective_keep_alive: Duration,
-    cuda_devices: Vec<usize>,
-    max_context_len: usize,
-    kv_budget: SharedGlobalKvBudget,
-    kv_quant: KvQuantMode,
-    qjl_quantization: bool,
-) {
+fn spawn_load(params: SpawnLoadParams) {
+    let SpawnLoadParams {
+        model_id,
+        model_path,
+        manager,
+        effective_keep_alive,
+        cuda_devices,
+        max_context_len,
+        kv_budget,
+        kv_quant,
+        qjl_quantization,
+    } = params;
+
     let (result_tx, result_rx) = oneshot::channel::<Result<LoadResult, String>>();
 
     let model_id_thread = model_id.clone();
@@ -563,11 +608,13 @@ fn spawn_load(
             &model_dir,
             &model_id_thread,
             &device,
-            max_context_len,
-            max_num_sequences,
-            &kv_budget,
-            kv_quant,
-            qjl_quantization,
+            loader::LoadBatchOptions {
+                max_context_len,
+                max_num_sequences,
+                kv_budget: &kv_budget,
+                kv_quant,
+                qjl_quantization,
+            },
         ) {
             Ok(m) => m,
             Err(e) => {
@@ -608,13 +655,21 @@ fn spawn_load(
             weights_size_bytes as f64 / 1_073_741_824.0,
             kv_cache_bytes as f64 / 1_073_741_824.0,
             total_bytes as f64 / 1_073_741_824.0,
-            if matches!(device, candle_core::Device::Cpu) { "F32/CPU" } else { "BF16/GPU" },
+            if matches!(device, candle_core::Device::Cpu) {
+                "F32/CPU"
+            } else {
+                "BF16/GPU"
+            },
         );
 
         println!("Warming up model '{}'...", model_id_thread);
         let t_warmup = std::time::Instant::now();
         warm_up_model(batch_model.as_ref());
-        println!("Model '{}' ready ({:.1}s warmup).", model_id_thread, t_warmup.elapsed().as_secs_f32());
+        println!(
+            "Model '{}' ready ({:.1}s warmup).",
+            model_id_thread,
+            t_warmup.elapsed().as_secs_f32()
+        );
 
         let (request_tx, request_rx) = tokio_mpsc::unbounded_channel();
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -696,9 +751,11 @@ fn spawn_load(
                             model_bytes as f64 / 1_073_741_824.0,
                         );
                         let (kv_bytes, shutdown) = match mgr.slots.get(&model_id) {
-                            Some(SlotState::Ready { kv_cache_bytes, shutdown, .. }) => {
-                                (*kv_cache_bytes, Some(Arc::clone(shutdown)))
-                            }
+                            Some(SlotState::Ready {
+                                kv_cache_bytes,
+                                shutdown,
+                                ..
+                            }) => (*kv_cache_bytes, Some(Arc::clone(shutdown))),
                             _ => (0, None),
                         };
                         mgr.kv_budget.release(kv_bytes);

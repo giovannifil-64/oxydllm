@@ -1,12 +1,12 @@
-use candle_core::{Result, Tensor, D};
-use std::cell::Cell;
 use super::config::{BlockConfig, NormType};
 use super::gguf_weights::GgufWeights;
-use super::paged::PagedKvCache;
-use super::linear::{softmax_last_dim, AnyLinear, Linear, QLinear};
+use super::linear::{AnyLinear, Linear, QLinear, softmax_last_dim};
 use super::norm::RMSNorm;
+use super::paged::PagedKvCache;
 use super::rope::RotaryEmbedding;
 use super::weights::ModelWeights;
+use candle_core::{D, Result, Tensor};
+use std::cell::Cell;
 
 thread_local! {
     static SDPA_FALLBACK_LOGGED: Cell<bool> = const { Cell::new(false) };
@@ -33,7 +33,11 @@ pub struct SegmentInfo<'a> {
 
 enum QkvProjection {
     Fused(Linear),
-    Separate { q: AnyLinear, k: AnyLinear, v: AnyLinear },
+    Separate {
+        q: AnyLinear,
+        k: AnyLinear,
+        v: AnyLinear,
+    },
 }
 
 pub struct Attention {
@@ -60,10 +64,11 @@ fn truncate_kv_window(
     window: Option<usize>,
     num_tokens: usize,
 ) -> Result<(candle_core::Tensor, candle_core::Tensor, usize)> {
-    if let Some(w) = window {
-        if num_tokens == 1 && kv_len > w {
-            return Ok((k.narrow(2, kv_len - w, w)?, v.narrow(2, kv_len - w, w)?, w));
-        }
+    if let Some(w) = window
+        && num_tokens == 1
+        && kv_len > w
+    {
+        return Ok((k.narrow(2, kv_len - w, w)?, v.narrow(2, kv_len - w, w)?, w));
     }
     if kv_len < k.dim(2)? {
         Ok((k.narrow(2, 0, kv_len)?, v.narrow(2, 0, kv_len)?, kv_len))
@@ -84,7 +89,9 @@ fn rms_norm_no_weight(x: &Tensor, eps: f64) -> Result<Tensor> {
     let dtype = x.dtype();
     let x_f32 = x.contiguous()?.to_dtype(candle_core::DType::F32)?;
     let variance = x_f32.sqr()?.mean_keepdim(D::Minus1)?;
-    x_f32.broadcast_div(&(variance + eps)?.sqrt()?)?.to_dtype(dtype)
+    x_f32
+        .broadcast_div(&(variance + eps)?.sqrt()?)?
+        .to_dtype(dtype)
 }
 
 #[cfg(feature = "metal")]
@@ -99,9 +106,7 @@ fn sdpa_softcap_prefill_chunked(
     let total_kv = k.dim(2)?;
     let old_kv = total_kv.saturating_sub(q_len);
     if old_kv != 0 {
-        candle_core::bail!(
-            "chunked softcap SDPA expects zero cached prefix, got old_kv={old_kv}"
-        );
+        candle_core::bail!("chunked softcap SDPA expects zero cached prefix, got old_kv={old_kv}");
     }
 
     let out = Tensor::zeros((b, n_heads, q_len, hd), q.dtype(), q.device())?;
@@ -112,15 +117,8 @@ fn sdpa_softcap_prefill_chunked(
         let kv_end = old_kv + start + len;
         let k_chunk = k.narrow(2, 0, kv_end)?.contiguous()?;
         let v_chunk = v.narrow(2, 0, kv_end)?.contiguous()?;
-        let o_chunk = super::metal_ops::sdpa(
-            &q_chunk,
-            &k_chunk,
-            &v_chunk,
-            None,
-            true,
-            scale,
-            softcap,
-        )?;
+        let o_chunk =
+            super::metal_ops::sdpa(&q_chunk, &k_chunk, &v_chunk, None, true, scale, softcap)?;
         out.slice_set(&o_chunk.contiguous()?, 2, start)?;
         start += len;
     }
@@ -178,7 +176,8 @@ impl Attention {
         Ok(Self {
             qkv: QkvProjection::Fused(qkv_proj),
             o_proj,
-            q_norm, k_norm,
+            q_norm,
+            k_norm,
             n_heads: cfg.n_heads,
             n_kv_heads: cfg.n_kv_heads,
             head_dim: hd,
@@ -208,13 +207,25 @@ impl Attention {
 
         let q_norm = if cfg.qk_norm {
             let qt = gguf.get(&format!("{prefix}.attn_q_norm.weight"))?;
-            Some(RMSNorm::from_qtensor(&qt, device, dtype, cfg.rms_norm_eps, cfg.norm_type)?)
+            Some(RMSNorm::from_qtensor(
+                &qt,
+                device,
+                dtype,
+                cfg.rms_norm_eps,
+                cfg.norm_type,
+            )?)
         } else {
             None
         };
         let k_norm = if cfg.qk_norm {
             let qt = gguf.get(&format!("{prefix}.attn_k_norm.weight"))?;
-            Some(RMSNorm::from_qtensor(&qt, device, dtype, cfg.rms_norm_eps, cfg.norm_type)?)
+            Some(RMSNorm::from_qtensor(
+                &qt,
+                device,
+                dtype,
+                cfg.rms_norm_eps,
+                cfg.norm_type,
+            )?)
         } else {
             None
         };
@@ -231,7 +242,8 @@ impl Attention {
                 v: AnyLinear::Quantized(v_proj),
             },
             o_proj: AnyLinear::Quantized(o_proj),
-            q_norm, k_norm,
+            q_norm,
+            k_norm,
             n_heads: cfg.n_heads,
             n_kv_heads: cfg.n_kv_heads,
             head_dim: hd,
@@ -293,9 +305,15 @@ impl Attention {
         let hd = self.head_dim;
 
         let (q_raw, k_raw, v_raw) = self.qkv_split(x)?;
-        let q = q_raw.reshape((b, total_seq, self.n_heads, hd))?.transpose(1, 2)?;
-        let k = k_raw.reshape((b, total_seq, self.n_kv_heads, hd))?.transpose(1, 2)?;
-        let v = v_raw.reshape((b, total_seq, self.n_kv_heads, hd))?.transpose(1, 2)?;
+        let q = q_raw
+            .reshape((b, total_seq, self.n_heads, hd))?
+            .transpose(1, 2)?;
+        let k = k_raw
+            .reshape((b, total_seq, self.n_kv_heads, hd))?
+            .transpose(1, 2)?;
+        let v = v_raw
+            .reshape((b, total_seq, self.n_kv_heads, hd))?
+            .transpose(1, 2)?;
 
         let q = match &self.q_norm {
             Some(norm) => norm.forward(&q)?,
@@ -312,7 +330,10 @@ impl Attention {
         };
 
         let (q, k) = if let Some((r, position_ids)) = rope {
-            (r.apply_with_positions(&q, position_ids)?, r.apply_with_positions(&k, position_ids)?)
+            (
+                r.apply_with_positions(&q, position_ids)?,
+                r.apply_with_positions(&k, position_ids)?,
+            )
         } else {
             (q, k)
         };
@@ -347,14 +368,18 @@ impl Attention {
         #[cfg(feature = "metal")]
         let use_sdpa = (self.attn_softcap.is_none() || all_vector)
             && super::metal_ops::sdpa_available(&q, self.head_dim)
-            && !kv_lengths.iter().zip(segments.iter()).any(|(&kv_len, seg)| {
-                seg.num_tokens > 1 && kv_len > seg.num_tokens
-            });
+            && !kv_lengths
+                .iter()
+                .zip(segments.iter())
+                .any(|(&kv_len, seg)| seg.num_tokens > 1 && kv_len > seg.num_tokens);
         #[cfg(not(feature = "metal"))]
         let use_sdpa = false;
 
         #[cfg(feature = "metal")]
-        if !use_sdpa && self.attn_softcap.is_none() && !super::metal_ops::sdpa_available(&q, self.head_dim) {
+        if !use_sdpa
+            && self.attn_softcap.is_none()
+            && !super::metal_ops::sdpa_available(&q, self.head_dim)
+        {
             log_sdpa_fallback_once(self.head_dim, q.dtype());
         }
 
@@ -363,8 +388,11 @@ impl Attention {
             for (i, seg) in segments.iter().enumerate() {
                 let q_seg = q.narrow(2, q_offset, seg.num_tokens)?;
                 let (k_seg, v_seg, _) = truncate_kv_window(
-                    k_parts[i].clone(), v_parts[i].clone(),
-                    kv_lengths[i], self.sliding_window, seg.num_tokens,
+                    k_parts[i].clone(),
+                    v_parts[i].clone(),
+                    kv_lengths[i],
+                    self.sliding_window,
+                    seg.num_tokens,
                 )?;
 
                 // SDPA handles GQA natively — no repeat_kv needed.
@@ -390,8 +418,11 @@ impl Attention {
             for (i, seg) in segments.iter().enumerate() {
                 let q_seg = q.narrow(2, q_offset, seg.num_tokens)?;
                 let (k_seg, v_seg, kv_len) = truncate_kv_window(
-                    k_parts[i].clone(), v_parts[i].clone(),
-                    kv_lengths[i], self.sliding_window, seg.num_tokens,
+                    k_parts[i].clone(),
+                    v_parts[i].clone(),
+                    kv_lengths[i],
+                    self.sliding_window,
+                    seg.num_tokens,
                 )?;
 
                 #[cfg(feature = "metal")]
@@ -433,14 +464,18 @@ impl Attention {
                 let k_seg = self.repeat_kv(k_seg)?;
                 let v_seg = self.repeat_kv(v_seg)?;
 
-                let mut scores = q_seg.matmul(&k_seg.transpose(D::Minus1, D::Minus2)?)?.affine(self.scale, 0.)?;
+                let mut scores = q_seg
+                    .matmul(&k_seg.transpose(D::Minus1, D::Minus2)?)?
+                    .affine(self.scale, 0.)?;
 
                 if let Some(softcap) = self.attn_softcap {
                     scores = (scores / softcap)?.tanh()?.affine(softcap, 0.)?;
                 }
 
                 let scores = if let Some(m) = mask {
-                    let seg_mask = m.narrow(2, q_offset, seg.num_tokens)?.narrow(3, 0, kv_len)?;
+                    let seg_mask = m
+                        .narrow(2, q_offset, seg.num_tokens)?
+                        .narrow(3, 0, kv_len)?;
                     scores.broadcast_add(&seg_mask.to_dtype(scores.dtype())?)?
                 } else if seg.num_tokens > 1 {
                     let cm = super::mask::causal_mask_cached(seg.num_tokens, device)?;
@@ -466,7 +501,9 @@ impl Attention {
             }
         }
 
-        let out = out_buf.transpose(1, 2)?.reshape((b, total_seq, self.n_heads * hd))?;
+        let out = out_buf
+            .transpose(1, 2)?
+            .reshape((b, total_seq, self.n_heads * hd))?;
         self.o_proj.forward(&out)
     }
 }

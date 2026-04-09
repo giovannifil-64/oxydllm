@@ -8,6 +8,10 @@ default = ["metal"]
 cuda  = ["candle-core/cuda"]
 metal = ["candle-core/metal", "dep:candle-metal-kernels", "dep:objc2-metal"]
 
+[[bin]]
+name = "rllm"
+path = "src/main.rs"
+
 [dependencies]
 anyhow = "1.0.102"
 reqwest = { version = "0.13.2", features = ["blocking", "json"] }
@@ -25,3 +29,9 @@ minijinja-contrib = { version = "2.16.0", features = ["pycompat"] }
 chrono = "0.4.44"
 rustc-hash = "2.1.1"
 lru = "0.16.3"
+
+[dev-dependencies]
+tokio = { version = "1.49.0", features = ["rt-multi-thread", "macros", "time"] }
+reqwest = { version = "0.13.2", features = ["json"] }
+serde_json = "1.0.149"
+tempfile = "3.27.0"

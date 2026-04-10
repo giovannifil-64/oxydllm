@@ -299,6 +299,9 @@ pub fn select_device_at(_cuda_idx: usize) -> anyhow::Result<Device> {
         Err(e) => eprintln!("Metal not available: {e}"),
     }
 
+    eprintln!(
+        "[WARNING] GPU not available; falling back to CPU. Inference performance may be severely degraded."
+    );
     println!("Device: CPU");
     Ok(Device::Cpu)
 }

@@ -556,6 +556,12 @@ impl PagedKvCache {
         let skip_pool_write = self.contig_len > 0 && new_seq == 1;
 
         let prev_tokens = self.table.num_tokens;
+        debug_assert!(
+            self.contig_len == 0 || self.contig_len == prev_tokens,
+            "contig_len ({}) must match table tokens ({}) when buffer exists",
+            self.contig_len,
+            prev_tokens
+        );
         let mut written = 0;
 
         while written < new_seq {
@@ -595,14 +601,14 @@ impl PagedKvCache {
             written += n;
         }
 
-        let total_needed = self.contig_len + new_seq;
+        let total_needed = prev_tokens + new_seq;
 
         match (self.contig_k.take(), self.contig_v.take()) {
             (Some(k_buf), Some(v_buf)) => {
                 let cap = k_buf.dim(2)?;
                 if total_needed <= cap {
-                    k_buf.slice_set(new_k, 2, self.contig_len)?;
-                    v_buf.slice_set(new_v, 2, self.contig_len)?;
+                    k_buf.slice_set(new_k, 2, prev_tokens)?;
+                    v_buf.slice_set(new_v, 2, prev_tokens)?;
                     self.contig_k = Some(k_buf);
                     self.contig_v = Some(v_buf);
                 } else {
@@ -618,8 +624,8 @@ impl PagedKvCache {
                         new_k_buf.slice_set(&old_k, 2, 0)?;
                         new_v_buf.slice_set(&old_v, 2, 0)?;
                     }
-                    new_k_buf.slice_set(new_k, 2, self.contig_len)?;
-                    new_v_buf.slice_set(new_v, 2, self.contig_len)?;
+                    new_k_buf.slice_set(new_k, 2, prev_tokens)?;
+                    new_v_buf.slice_set(new_v, 2, prev_tokens)?;
                     self.contig_k = Some(new_k_buf);
                     self.contig_v = Some(new_v_buf);
                 }
@@ -639,8 +645,8 @@ impl PagedKvCache {
                     k_buf.slice_set(&pk.contiguous()?, 2, 0)?;
                     v_buf.slice_set(&pv.contiguous()?, 2, 0)?;
                 }
-                k_buf.slice_set(new_k, 2, self.contig_len)?;
-                v_buf.slice_set(new_v, 2, self.contig_len)?;
+                k_buf.slice_set(new_k, 2, prev_tokens)?;
+                v_buf.slice_set(new_v, 2, prev_tokens)?;
                 self.contig_k = Some(k_buf);
                 self.contig_v = Some(v_buf);
             }
@@ -939,6 +945,56 @@ mod tests {
             assert!(dv < 1e-6, "decode V mismatch: diff={dv}");
         }
         assert_eq!(k_out.device().location(), dev.location());
+    }
+
+    #[test]
+    fn prepopulated_prefix_is_preserved_on_first_append() {
+        let alloc = make_allocator(8, 2);
+        let dev = Device::Cpu;
+
+        let mut source = PagedKvCache::new(Arc::clone(&alloc));
+        let prefix_k =
+            Tensor::from_vec((0..16).map(|x| x as f32).collect(), (1, 2, 2, 4), &dev).unwrap();
+        let prefix_v =
+            Tensor::from_vec((100..116).map(|x| x as f32).collect(), (1, 2, 2, 4), &dev).unwrap();
+        let _ = source.append(&prefix_k, &prefix_v).unwrap();
+        let prefix_block_id = source.block_id_at(0).unwrap();
+
+        let mut cache = PagedKvCache::new(Arc::clone(&alloc));
+        cache.prepopulate_block(prefix_block_id);
+        cache.set_num_tokens(2);
+
+        let new_k =
+            Tensor::from_vec((200..208).map(|x| x as f32).collect(), (1, 2, 1, 4), &dev).unwrap();
+        let new_v =
+            Tensor::from_vec((300..308).map(|x| x as f32).collect(), (1, 2, 1, 4), &dev).unwrap();
+
+        let (k_out, v_out) = cache.append(&new_k, &new_v).unwrap();
+        assert_eq!(k_out.dims(), &[1, 2, 3, 4]);
+        assert_eq!(v_out.dims(), &[1, 2, 3, 4]);
+
+        let expected_k = Tensor::cat(&[&prefix_k, &new_k], 2).unwrap();
+        let expected_v = Tensor::cat(&[&prefix_v, &new_v], 2).unwrap();
+
+        let dk = (&k_out - &expected_k)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .sum_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        let dv = (&v_out - &expected_v)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .sum_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+
+        assert!(dk < 1e-4, "prefix K corrupted after append: {dk}");
+        assert!(dv < 1e-4, "prefix V corrupted after append: {dv}");
     }
 
     #[test]

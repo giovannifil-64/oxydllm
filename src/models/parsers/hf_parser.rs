@@ -16,12 +16,12 @@ pub fn parse(config_path: &str) -> Result<StandardTransformerConfig> {
         .with_context(|| format!("Cannot parse JSON from {config_path}"))?;
 
     // For multimodal models the LLM parameters are nested under "text_config".
-    // Merge those fields into the root so the rest of the parser is uniform.
+    // text_config should override root fields when both exist.
     let v = if let Some(text_cfg) = v.get("text_config").and_then(|tc| tc.as_object()) {
         let mut merged = v.clone();
         let root = merged.as_object_mut().unwrap();
         for (k, val) in text_cfg {
-            root.entry(k.clone()).or_insert_with(|| val.clone());
+            root.insert(k.clone(), val.clone());
         }
         merged
     } else {
@@ -382,6 +382,39 @@ fn parse_rope_factor(v: &Value, default: f64) -> Vec<f64> {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::fs;
+    use tempfile::tempdir;
+
+    #[test]
+    fn text_config_overrides_root_fields() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("config.json");
+
+        let config = json!({
+            "architectures": ["Mistral3ForConditionalGeneration"],
+            "hidden_size": 4096,
+            "num_hidden_layers": 6,
+            "num_attention_heads": 16,
+            "vocab_size": 32000,
+            "text_config": {
+                "hidden_size": 3072,
+                "num_hidden_layers": 24,
+                "num_attention_heads": 24,
+                "num_key_value_heads": 8,
+                "vocab_size": 128256
+            }
+        });
+
+        fs::write(&config_path, serde_json::to_string_pretty(&config).unwrap()).unwrap();
+
+        let cfg = parse(config_path.to_string_lossy().as_ref()).unwrap();
+
+        assert_eq!(cfg.num_hidden_layers, 24);
+        assert_eq!(cfg.num_attention_heads, 24);
+        assert_eq!(cfg.num_key_value_heads, 8);
+        assert_eq!(cfg.vocab_size, 128256);
+        assert_eq!(cfg.head_dim, 128);
+    }
 
     #[test]
     fn parse_longrope_scaling_from_config() {

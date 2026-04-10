@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use candle_core::{Device, Result, Tensor};
 
-use crate::common::paged::{DEFAULT_BLOCK_SIZE, SharedBlockAllocator};
+use crate::common::paged::{DEFAULT_BLOCK_SIZE, PagedKvCache, SharedBlockAllocator};
 use crate::common::prefix_cache::PrefixCache;
 use crate::models::traits::BatchModel;
 use crate::sampling::{self, SamplingParams};
@@ -20,6 +20,89 @@ pub struct NewToken {
 pub struct StepOutput {
     pub new_tokens: Vec<NewToken>,
     pub completed: Vec<CompletedSequence>,
+}
+
+struct CacheRestoreGuard<'a> {
+    scheduler: &'a mut Scheduler,
+    prefill_ids: Vec<SequenceId>,
+    decode_ids: Vec<SequenceId>,
+    cache_vecs: Vec<Vec<PagedKvCache>>,
+    restored: bool,
+}
+
+impl<'a> CacheRestoreGuard<'a> {
+    fn new(
+        scheduler: &'a mut Scheduler,
+        prefill_ids: &[SequenceId],
+        decode_ids: &[SequenceId],
+    ) -> Self {
+        let mut cache_vecs: Vec<Vec<PagedKvCache>> =
+            Vec::with_capacity(prefill_ids.len() + decode_ids.len());
+
+        for &seq_id in prefill_ids {
+            let seq = scheduler.get_running_mut(seq_id).unwrap();
+            cache_vecs.push(std::mem::take(&mut seq.caches));
+        }
+        for &seq_id in decode_ids {
+            let seq = scheduler.get_running_mut(seq_id).unwrap();
+            cache_vecs.push(std::mem::take(&mut seq.caches));
+        }
+
+        Self {
+            scheduler,
+            prefill_ids: prefill_ids.to_vec(),
+            decode_ids: decode_ids.to_vec(),
+            cache_vecs,
+            restored: false,
+        }
+    }
+
+    fn cache_slices(&mut self) -> Vec<&mut [PagedKvCache]> {
+        self.cache_vecs
+            .iter_mut()
+            .map(|v| v.as_mut_slice())
+            .collect()
+    }
+
+    fn restore_inner(&mut self) {
+        if self.restored {
+            return;
+        }
+
+        for (i, &seq_id) in self.prefill_ids.iter().enumerate() {
+            if let Some(seq) = self.scheduler.get_running_mut(seq_id) {
+                seq.caches = std::mem::take(&mut self.cache_vecs[i]);
+            } else {
+                debug_assert!(
+                    false,
+                    "missing prefill sequence {seq_id} while restoring caches"
+                );
+            }
+        }
+        let offset = self.prefill_ids.len();
+        for (i, &seq_id) in self.decode_ids.iter().enumerate() {
+            if let Some(seq) = self.scheduler.get_running_mut(seq_id) {
+                seq.caches = std::mem::take(&mut self.cache_vecs[offset + i]);
+            } else {
+                debug_assert!(
+                    false,
+                    "missing decode sequence {seq_id} while restoring caches"
+                );
+            }
+        }
+
+        self.restored = true;
+    }
+
+    fn restore(mut self) {
+        self.restore_inner();
+    }
+}
+
+impl Drop for CacheRestoreGuard<'_> {
+    fn drop(&mut self) {
+        self.restore_inner();
+    }
 }
 
 pub struct Engine {
@@ -206,37 +289,19 @@ impl Engine {
             });
         }
 
-        let num_seqs = prefill_infos.len() + decode_ids.len();
-        let mut cache_vecs: Vec<Vec<_>> = Vec::with_capacity(num_seqs);
-
-        for info in &prefill_infos {
-            let seq = scheduler.get_running_mut(info.seq_id).unwrap();
-            cache_vecs.push(std::mem::take(&mut seq.caches));
-        }
-        for &seq_id in &decode_ids {
-            let seq = scheduler.get_running_mut(seq_id).unwrap();
-            cache_vecs.push(std::mem::take(&mut seq.caches));
-        }
-
-        let mut cache_slices: Vec<&mut [_]> =
-            cache_vecs.iter_mut().map(|v| v.as_mut_slice()).collect();
-
         let input = Tensor::from_vec(all_token_ids, (1, total_tokens), device)?;
         let position_ids = Tensor::from_vec(all_positions, (total_tokens,), device)?;
 
-        let logits_result =
-            model.forward_batch(&input, &position_ids, &mut cache_slices, &token_counts);
-
-        for (i, info) in prefill_infos.iter().enumerate() {
-            let seq = scheduler.get_running_mut(info.seq_id).unwrap();
-            seq.caches = std::mem::take(&mut cache_vecs[i]);
-        }
-        for (i, &seq_id) in decode_ids.iter().enumerate() {
-            let seq = scheduler.get_running_mut(seq_id).unwrap();
-            seq.caches = std::mem::take(&mut cache_vecs[prefill_infos.len() + i]);
-        }
-
-        let logits = logits_result?;
+        // Ensure sequence caches are restored even if forward_batch panics.
+        let logits = {
+            let mut cache_guard = CacheRestoreGuard::new(scheduler, &prefill_ids, &decode_ids);
+            let mut cache_slices = cache_guard.cache_slices();
+            let logits_result =
+                model.forward_batch(&input, &position_ids, &mut cache_slices, &token_counts);
+            drop(cache_slices);
+            cache_guard.restore();
+            logits_result?
+        };
 
         let batch_logits = logits.squeeze(0)?;
 

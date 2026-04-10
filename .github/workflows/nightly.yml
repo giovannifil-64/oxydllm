@@ -79,7 +79,8 @@ jobs:
 
   release-nightly:
     name: Update nightly release
-    needs: build
+    needs: [check-changes, build]
+    if: ${{ always() && needs.check-changes.outputs.should_build == 'true' && needs.build.result != 'cancelled' }}
     runs-on: ubuntu-22.04
     permissions:
       contents: write
@@ -94,6 +95,14 @@ jobs:
 
       - name: List artifacts
         run: ls -lh dist/
+
+      - name: Ensure at least one packaged binary exists
+        run: |
+          COUNT=$(find dist -maxdepth 1 -type f -name '*.tar.gz' | wc -l | tr -d ' ')
+          if [ "$COUNT" -eq 0 ]; then
+            echo "No packaged binaries found; keeping previous nightly release unchanged."
+            exit 1
+          fi
 
       - name: Get short SHA and date
         id: meta
@@ -120,6 +129,9 @@ jobs:
             ## Nightly build
 
             Built from `main` at commit `${{ steps.meta.outputs.sha_short }}` on ${{ steps.meta.outputs.date }}.
+            Build workflow result: `${{ needs.build.result }}`.
+
+            Some targets may be missing when one or more build jobs fail.
 
             > **Warning**: Nightly builds are untested and may contain breaking changes.
             > Use a tagged release for production.

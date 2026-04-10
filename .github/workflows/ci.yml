@@ -114,7 +114,7 @@ jobs:
     needs: fmt
     runs-on: ubuntu-22.04
     container:
-      image: nvidia/cuda:12.9.0-runtime-ubuntu22.04
+      image: nvidia/cuda:12.9.0-devel-ubuntu22.04
       options: --user root
     steps:
       - uses: actions/checkout@v6

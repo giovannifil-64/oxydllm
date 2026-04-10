@@ -11,7 +11,7 @@
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── Stage 1: build ───────────────────────────────────────────────────────────
-FROM nvidia/cuda:12.9.0-runtime-ubuntu22.04 AS builder
+FROM nvidia/cuda:12.9.0-devel-ubuntu22.04 AS builder
 
 ARG CUDA_ARCH=89
 
@@ -43,8 +43,8 @@ RUN touch src/main.rs \
     && cargo build --release --no-default-features --features cuda
 
 # ── Stage 2: runtime ─────────────────────────────────────────────────────────
-# Same Ubuntu version as builder → glibc is guaranteed compatible.
-FROM nvidia/cuda:12.6.2-runtime-ubuntu24.04
+# Same CUDA + Ubuntu version as builder to minimize runtime compatibility risk.
+FROM nvidia/cuda:12.9.0-runtime-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \

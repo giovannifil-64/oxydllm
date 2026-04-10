@@ -113,6 +113,8 @@ jobs:
     name: Check · Linux x86_64 (CUDA compile)
     needs: fmt
     runs-on: ubuntu-22.04
+    env:
+      CUDA_COMPUTE_CAP: "89"
     container:
       image: nvidia/cuda:12.9.0-devel-ubuntu22.04
       options: --user root

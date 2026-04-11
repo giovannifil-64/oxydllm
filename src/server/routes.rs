@@ -17,7 +17,9 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 
 use crate::chat_template;
 use crate::engine::Engine;
-use crate::models::manager::{self, GetResult, ModelManager, SharedModelManager};
+use crate::models::manager::{
+    self, GetResult, ModelManager, ModelManagerConfig, SharedModelManager,
+};
 use crate::sampling::SamplingParams;
 use crate::scheduler::sequence::SequenceId;
 use crate::tokenizer::Tokenizer;
@@ -1729,6 +1731,7 @@ pub struct StartServerArgs {
     pub max_context_len: usize,
     pub kv_quant: crate::common::kv_quant::KvQuantMode,
     pub qjl_quantization: bool,
+    pub require_gpu: bool,
 }
 
 pub fn start_server(args: StartServerArgs) -> anyhow::Result<()> {
@@ -1741,6 +1744,7 @@ pub fn start_server(args: StartServerArgs) -> anyhow::Result<()> {
         max_context_len,
         kv_quant,
         qjl_quantization,
+        require_gpu,
     } = args;
 
     if !models_dir.exists() {
@@ -1763,13 +1767,16 @@ pub fn start_server(args: StartServerArgs) -> anyhow::Result<()> {
     }
 
     let manager = Arc::new(tokio::sync::Mutex::new(ModelManager::new(
-        models_dir,
-        keep_alive,
-        memory_budget_bytes,
-        cuda_devices,
-        max_context_len,
-        kv_quant,
-        qjl_quantization,
+        ModelManagerConfig {
+            models_dir,
+            keep_alive,
+            memory_budget_bytes,
+            cuda_devices,
+            max_context_len,
+            kv_quant,
+            qjl_quantization,
+            require_gpu,
+        },
     )));
 
     let state = Arc::new(AppState {

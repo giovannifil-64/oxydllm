@@ -285,7 +285,7 @@ pub fn pull(config: &PullConfig) -> anyhow::Result<()> {
                     }
                     if *expected_size > 0 {
                         let actual = path.metadata().map(|m| m.len()).unwrap_or(0);
-                        actual + 1024 >= *expected_size
+                        actual >= *expected_size
                     } else {
                         true
                     }

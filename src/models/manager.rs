@@ -79,6 +79,7 @@ pub struct ModelManager {
     kv_budget: SharedGlobalKvBudget,
     kv_quant: KvQuantMode,
     qjl_quantization: bool,
+    require_gpu: bool,
 }
 
 pub type SharedModelManager = Arc<tokio::sync::Mutex<ModelManager>>;
@@ -137,16 +138,29 @@ pub fn estimate_model_size(model_dir: &Path) -> usize {
         .sum()
 }
 
+pub struct ModelManagerConfig {
+    pub models_dir: PathBuf,
+    pub keep_alive: Duration,
+    pub memory_budget_bytes: Option<usize>,
+    pub cuda_devices: Vec<usize>,
+    pub max_context_len: usize,
+    pub kv_quant: KvQuantMode,
+    pub qjl_quantization: bool,
+    pub require_gpu: bool,
+}
+
 impl ModelManager {
-    pub fn new(
-        models_dir: PathBuf,
-        keep_alive: Duration,
-        memory_budget_bytes: Option<usize>,
-        cuda_devices: Vec<usize>,
-        max_context_len: usize,
-        kv_quant: KvQuantMode,
-        qjl_quantization: bool,
-    ) -> Self {
+    pub fn new(config: ModelManagerConfig) -> Self {
+        let ModelManagerConfig {
+            models_dir,
+            keep_alive,
+            memory_budget_bytes,
+            cuda_devices,
+            max_context_len,
+            kv_quant,
+            qjl_quantization,
+            require_gpu,
+        } = config;
         let mut registry = load_registry(&models_dir);
         // Remove registry entries whose model directory no longer exists.
         let valid_ids: std::collections::HashSet<String> = loader::discover_models(&models_dir)
@@ -192,6 +206,7 @@ impl ModelManager {
             kv_budget,
             kv_quant,
             qjl_quantization,
+            require_gpu,
         }
     }
 
@@ -404,6 +419,7 @@ impl ModelManager {
             kv_budget: Arc::clone(&self.kv_budget),
             kv_quant: self.kv_quant,
             qjl_quantization: self.qjl_quantization,
+            require_gpu: self.require_gpu,
         });
 
         GetResult::Wait(rx)
@@ -484,6 +500,7 @@ struct SpawnLoadParams {
     kv_budget: SharedGlobalKvBudget,
     kv_quant: KvQuantMode,
     qjl_quantization: bool,
+    require_gpu: bool,
 }
 
 /// Runs dummy forward passes to force the device (Metal/CUDA) to JIT-compile
@@ -575,6 +592,7 @@ fn spawn_load(params: SpawnLoadParams) {
         kv_budget,
         kv_quant,
         qjl_quantization,
+        require_gpu,
     } = params;
 
     let (result_tx, result_rx) = oneshot::channel::<Result<LoadResult, String>>();
@@ -582,6 +600,7 @@ fn spawn_load(params: SpawnLoadParams) {
     let model_id_thread = model_id.clone();
     let model_path_thread = model_path.clone();
     let cuda_devices_thread = cuda_devices;
+    let require_gpu_thread = require_gpu;
     std::thread::spawn(move || {
         let model_dir = model_path_thread.to_string_lossy().to_string();
 
@@ -594,7 +613,7 @@ fn spawn_load(params: SpawnLoadParams) {
         };
 
         let cuda_idx = cuda_devices_thread.first().copied().unwrap_or(0);
-        let device = match loader::select_device_at(cuda_idx) {
+        let device = match loader::select_device_at(cuda_idx, require_gpu_thread) {
             Ok(d) => d,
             Err(e) => {
                 let _ = result_tx.send(Err(format!("Failed to select device: {e}")));

@@ -280,7 +280,7 @@ pub fn is_gguf_model(model_dir: &str) -> bool {
     find_gguf_file(dir).is_some()
 }
 
-pub fn select_device_at(_cuda_idx: usize) -> anyhow::Result<Device> {
+pub fn select_device_at(_cuda_idx: usize, require_gpu: bool) -> anyhow::Result<Device> {
     #[cfg(feature = "cuda")]
     match Device::new_cuda(_cuda_idx) {
         Ok(d) => {
@@ -297,6 +297,12 @@ pub fn select_device_at(_cuda_idx: usize) -> anyhow::Result<Device> {
             return Ok(d);
         }
         Err(e) => eprintln!("Metal not available: {e}"),
+    }
+
+    if require_gpu {
+        return Err(anyhow::anyhow!(
+            "[FATAL] No GPU device available and --require-gpu was specified. Exiting."
+        ));
     }
 
     eprintln!(
@@ -575,8 +581,11 @@ fn load_batch_model_gguf(
     }
     let gguf_path_strs: Vec<&str> = gguf_paths
         .iter()
-        .map(|p| p.to_str().expect("non-UTF8 path"))
-        .collect();
+        .map(|p| {
+            p.to_str()
+                .ok_or_else(|| anyhow::anyhow!("non-UTF8 GGUF path: {}", p.display()))
+        })
+        .collect::<anyhow::Result<Vec<&str>>>()?;
     let gguf = GgufWeights::load_shards(&gguf_path_strs, device)?;
 
     let arch = gguf.architecture()?;

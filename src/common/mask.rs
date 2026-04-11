@@ -16,6 +16,20 @@ pub fn causal_mask(seq_len: usize, device: &Device) -> Result<Tensor> {
     upper.affine(-1e30, 0.0)?.reshape((1, 1, seq_len, seq_len))
 }
 
+pub fn causal_mask_prefixed(query_len: usize, kv_len: usize, device: &Device) -> Result<Tensor> {
+    debug_assert!(kv_len >= query_len);
+    let prefix_len = kv_len.saturating_sub(query_len);
+
+    let row: Vec<f32> = (0..query_len).map(|i| (prefix_len + i) as f32).collect();
+    let col: Vec<f32> = (0..kv_len).map(|i| i as f32).collect();
+    let rows = Tensor::from_vec(row, (query_len, 1), device)?;
+    let cols = Tensor::from_vec(col, (1, kv_len), device)?;
+    let diff = cols.broadcast_sub(&rows)?;
+    let step = diff.affine(1000.0, -500.0)?.tanh()?;
+    let upper = step.affine(0.5, 0.5)?;
+    upper.affine(-1e30, 0.0)?.reshape((1, 1, query_len, kv_len))
+}
+
 fn device_discriminant(device: &Device) -> u8 {
     if device.is_cpu() {
         0
@@ -29,6 +43,8 @@ fn device_discriminant(device: &Device) -> u8 {
 thread_local! {
     static MASK_CACHE: RefCell<LruCache<(usize, u8), Tensor>> =
         RefCell::new(LruCache::new(NonZeroUsize::new(MASK_CACHE_CAP).unwrap()));
+    static PREFIX_MASK_CACHE: RefCell<LruCache<(usize, usize, u8), Tensor>> =
+        RefCell::new(LruCache::new(NonZeroUsize::new(MASK_CACHE_CAP).unwrap()));
 }
 
 pub fn causal_mask_cached(seq_len: usize, device: &Device) -> Result<Tensor> {
@@ -39,6 +55,23 @@ pub fn causal_mask_cached(seq_len: usize, device: &Device) -> Result<Tensor> {
             return Ok(t.clone());
         }
         let mask = causal_mask(seq_len, device)?;
+        map.push(key, mask.clone());
+        Ok(mask)
+    })
+}
+
+pub fn causal_mask_prefixed_cached(
+    query_len: usize,
+    kv_len: usize,
+    device: &Device,
+) -> Result<Tensor> {
+    let key = (query_len, kv_len, device_discriminant(device));
+    PREFIX_MASK_CACHE.with(|cache| {
+        let mut map = cache.borrow_mut();
+        if let Some(t) = map.get(&key) {
+            return Ok(t.clone());
+        }
+        let mask = causal_mask_prefixed(query_len, kv_len, device)?;
         map.push(key, mask.clone());
         Ok(mask)
     })

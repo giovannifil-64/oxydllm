@@ -414,3 +414,198 @@ impl Engine {
         self.scheduler.has_pending_work()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::common::paged::BlockAllocator;
+    use candle_core::DType;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct FakeModel {
+        device: Device,
+        vocab_size: usize,
+        stop_tokens: Vec<u32>,
+        allocators: Vec<SharedBlockAllocator>,
+        num_layers: usize,
+        forced_token: u32,
+        forward_calls: Arc<AtomicUsize>,
+    }
+
+    impl FakeModel {
+        fn new(
+            stop_tokens: Vec<u32>,
+            forced_token: u32,
+            allocators: Vec<SharedBlockAllocator>,
+        ) -> (Self, Arc<AtomicUsize>) {
+            let forward_calls = Arc::new(AtomicUsize::new(0));
+            (
+                Self {
+                    device: Device::Cpu,
+                    vocab_size: 32,
+                    stop_tokens,
+                    num_layers: allocators.len(),
+                    allocators,
+                    forced_token,
+                    forward_calls: Arc::clone(&forward_calls),
+                },
+                forward_calls,
+            )
+        }
+    }
+
+    impl BatchModel for FakeModel {
+        fn forward_batch(
+            &self,
+            token_ids: &Tensor,
+            _position_ids: &Tensor,
+            _seq_caches: &mut [&mut [PagedKvCache]],
+            _token_counts: &[usize],
+        ) -> Result<Tensor> {
+            self.forward_calls.fetch_add(1, Ordering::Relaxed);
+            let (_, total_tokens) = token_ids.dims2()?;
+            let forced = (self.forced_token as usize).min(self.vocab_size.saturating_sub(1));
+            let mut logits = vec![0f32; total_tokens * self.vocab_size];
+            for i in 0..total_tokens {
+                logits[i * self.vocab_size + forced] = 1.0;
+            }
+            Tensor::from_vec(logits, (1, total_tokens, self.vocab_size), &self.device)
+        }
+
+        fn vocab_size(&self) -> usize {
+            self.vocab_size
+        }
+
+        fn stop_token_ids(&self) -> &[u32] {
+            &self.stop_tokens
+        }
+
+        fn max_seq_len(&self) -> usize {
+            1024
+        }
+
+        fn device(&self) -> &Device {
+            &self.device
+        }
+
+        fn num_layers(&self) -> usize {
+            self.num_layers
+        }
+
+        fn allocators(&self) -> &[SharedBlockAllocator] {
+            &self.allocators
+        }
+    }
+
+    fn make_allocators(num_layers: usize, num_blocks: usize) -> Vec<SharedBlockAllocator> {
+        (0..num_layers)
+            .map(|_| {
+                Arc::new(Mutex::new(
+                    BlockAllocator::new(
+                        num_blocks,
+                        DEFAULT_BLOCK_SIZE,
+                        1,
+                        8,
+                        DType::F32,
+                        &Device::Cpu,
+                        None,
+                    )
+                    .unwrap(),
+                ))
+            })
+            .collect()
+    }
+
+    fn test_scheduler_config() -> SchedulerConfig {
+        SchedulerConfig {
+            max_num_sequences: 4,
+            max_tokens_per_step: 1024,
+        }
+    }
+
+    #[test]
+    fn new_with_stop_tokens_merges_and_deduplicates() {
+        let allocators = make_allocators(1, 8);
+        let (model, _) = FakeModel::new(vec![2, 4], 0, allocators);
+        let engine =
+            Engine::new_with_stop_tokens(Box::new(model), test_scheduler_config(), &[4, 9]);
+
+        assert!(engine.stop_token_ids.contains(&2));
+        assert!(engine.stop_token_ids.contains(&4));
+        assert!(engine.stop_token_ids.contains(&9));
+        assert_eq!(engine.stop_token_ids.len(), 3);
+    }
+
+    #[test]
+    fn add_request_and_abort_all_clears_pending_work() {
+        let allocators = make_allocators(1, 8);
+        let (model, _) = FakeModel::new(vec![2], 3, allocators);
+        let mut engine =
+            Engine::new_with_stop_tokens(Box::new(model), test_scheduler_config(), &[]);
+
+        let id0 = engine.add_request(vec![10, 11], SamplingParams::default(), 4);
+        let id1 =
+            engine.add_request_with_stop(vec![12, 13], SamplingParams::default(), 4, vec![99]);
+
+        assert!(engine.has_pending_work());
+        let mut ids = engine.abort_all();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![id0, id1]);
+        assert!(!engine.has_pending_work());
+    }
+
+    #[test]
+    fn step_without_work_returns_empty_and_skips_forward() {
+        let allocators = make_allocators(1, 8);
+        let (model, forward_calls) = FakeModel::new(vec![2], 3, allocators);
+        let mut engine =
+            Engine::new_with_stop_tokens(Box::new(model), test_scheduler_config(), &[]);
+
+        let out = engine.step().unwrap();
+        assert!(out.new_tokens.is_empty());
+        assert!(out.completed.is_empty());
+        assert_eq!(forward_calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn step_completes_sequence_when_model_stop_token_is_sampled() {
+        let allocators = make_allocators(1, 8);
+        let forced_stop = 7;
+        let (model, forward_calls) = FakeModel::new(vec![forced_stop], forced_stop, allocators);
+        let mut engine =
+            Engine::new_with_stop_tokens(Box::new(model), test_scheduler_config(), &[]);
+
+        let seq_id = engine.add_request(vec![1, 2, 3], SamplingParams::default(), 4);
+        let out = engine.step().unwrap();
+
+        assert_eq!(forward_calls.load(Ordering::Relaxed), 1);
+        assert!(out.new_tokens.is_empty());
+        assert_eq!(out.completed.len(), 1);
+        assert_eq!(out.completed[0].id, seq_id);
+        assert_eq!(out.completed[0].finish_reason.as_deref(), Some("stop"));
+        assert!(!engine.has_pending_work());
+    }
+
+    #[test]
+    fn step_respects_request_specific_stop_tokens() {
+        let allocators = make_allocators(1, 8);
+        let forced_token = 11;
+        let (model, _) = FakeModel::new(Vec::new(), forced_token, allocators);
+        let mut engine =
+            Engine::new_with_stop_tokens(Box::new(model), test_scheduler_config(), &[]);
+
+        let seq_id = engine.add_request_with_stop(
+            vec![21, 22],
+            SamplingParams::default(),
+            4,
+            vec![forced_token],
+        );
+        let out = engine.step().unwrap();
+
+        assert!(out.new_tokens.is_empty());
+        assert_eq!(out.completed.len(), 1);
+        assert_eq!(out.completed[0].id, seq_id);
+        assert_eq!(out.completed[0].finish_reason.as_deref(), Some("stop"));
+    }
+}

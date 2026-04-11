@@ -396,14 +396,32 @@ impl Attention {
                 )?;
 
                 // SDPA handles GQA natively — no repeat_kv needed.
-                let q_c = q_seg.contiguous()?;
-                let k_c = k_seg.contiguous()?;
-                let v_c = v_seg.contiguous()?;
+                let q_c_owned;
+                let q_c = if q_seg.is_contiguous() {
+                    &q_seg
+                } else {
+                    q_c_owned = q_seg.contiguous()?;
+                    &q_c_owned
+                };
+                let k_c_owned;
+                let k_c = if k_seg.is_contiguous() {
+                    &k_seg
+                } else {
+                    k_c_owned = k_seg.contiguous()?;
+                    &k_c_owned
+                };
+                let v_c_owned;
+                let v_c = if v_seg.is_contiguous() {
+                    &v_seg
+                } else {
+                    v_c_owned = v_seg.contiguous()?;
+                    &v_c_owned
+                };
 
                 let seg_out = super::metal_ops::sdpa(
-                    &q_c,
-                    &k_c,
-                    &v_c,
+                    q_c,
+                    k_c,
+                    v_c,
                     None,
                     seg.num_tokens > 1, // causal for prefill segments
                     self.scale as f32,
@@ -478,18 +496,12 @@ impl Attention {
                         .narrow(3, 0, kv_len)?;
                     scores.broadcast_add(&seg_mask.to_dtype(scores.dtype())?)?
                 } else if seg.num_tokens > 1 {
-                    let cm = super::mask::causal_mask_cached(seg.num_tokens, device)?;
-                    if kv_len > seg.num_tokens {
-                        let visible = Tensor::zeros(
-                            (1, 1, seg.num_tokens, kv_len - seg.num_tokens),
-                            candle_core::DType::F32,
-                            device,
-                        )?;
-                        let full_mask = Tensor::cat(&[&visible, &cm], 3)?;
-                        scores.broadcast_add(&full_mask.to_dtype(scores.dtype())?)?
+                    let cm = if kv_len > seg.num_tokens {
+                        super::mask::causal_mask_prefixed_cached(seg.num_tokens, kv_len, device)?
                     } else {
-                        scores.broadcast_add(&cm.to_dtype(scores.dtype())?)?
-                    }
+                        super::mask::causal_mask_cached(seg.num_tokens, device)?
+                    };
+                    scores.broadcast_add(&cm.to_dtype(scores.dtype())?)?
                 } else {
                     scores
                 };
@@ -505,5 +517,107 @@ impl Attention {
             .transpose(1, 2)?
             .reshape((b, total_seq, self.n_heads * hd))?;
         self.o_proj.forward(&out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::common::config::Activation;
+    use candle_core::Device;
+
+    fn test_block_cfg(norm_type: NormType, sliding_window: Option<usize>) -> BlockConfig {
+        BlockConfig {
+            n_heads: 4,
+            n_kv_heads: 2,
+            head_dim: 8,
+            rms_norm_eps: 1e-5,
+            qk_norm: false,
+            attention_scale: None,
+            activation: Activation::SiLU,
+            norm_type,
+            attn_softcap: None,
+            v_norm: false,
+            has_ffn_norms: false,
+            sliding_window,
+        }
+    }
+
+    fn make_kv_tensors(seq_len: usize, head_dim: usize) -> Result<(Tensor, Tensor)> {
+        let total = seq_len * head_dim;
+        let k_data: Vec<f32> = (0..total).map(|v| v as f32).collect();
+        let v_data: Vec<f32> = (0..total).map(|v| 1000.0 + v as f32).collect();
+        let k = Tensor::from_vec(k_data, (1, 1, seq_len, head_dim), &Device::Cpu)?;
+        let v = Tensor::from_vec(v_data, (1, 1, seq_len, head_dim), &Device::Cpu)?;
+        Ok((k, v))
+    }
+
+    #[test]
+    fn compute_sliding_window_disables_odd_gemma_layers() {
+        let cfg = test_block_cfg(NormType::Gemma, Some(128));
+        assert_eq!(compute_sliding_window(&cfg, 0), Some(128));
+        assert_eq!(compute_sliding_window(&cfg, 1), None);
+        assert_eq!(compute_sliding_window(&cfg, 2), Some(128));
+    }
+
+    #[test]
+    fn compute_sliding_window_keeps_standard_setting() {
+        let cfg = test_block_cfg(NormType::Standard, Some(256));
+        assert_eq!(compute_sliding_window(&cfg, 0), Some(256));
+        assert_eq!(compute_sliding_window(&cfg, 1), Some(256));
+    }
+
+    #[test]
+    fn truncate_kv_window_uses_tail_for_decode_window() -> Result<()> {
+        let (k, v) = make_kv_tensors(10, 2)?;
+        let (k2, v2, kv_len) = truncate_kv_window(k, v, 10, Some(4), 1)?;
+
+        assert_eq!(kv_len, 4);
+        assert_eq!(k2.dims4()?, (1, 1, 4, 2));
+        assert_eq!(v2.dims4()?, (1, 1, 4, 2));
+
+        let k_flat: Vec<f32> = k2.flatten_all()?.to_vec1()?;
+        let v_flat: Vec<f32> = v2.flatten_all()?.to_vec1()?;
+        assert_eq!(k_flat[0], 12.0);
+        assert_eq!(k_flat[1], 13.0);
+        assert_eq!(v_flat[0], 1012.0);
+        assert_eq!(v_flat[1], 1013.0);
+        Ok(())
+    }
+
+    #[test]
+    fn truncate_kv_window_clamps_to_kv_len_when_cache_is_shorter() -> Result<()> {
+        let (k, v) = make_kv_tensors(8, 2)?;
+        let (k2, v2, kv_len) = truncate_kv_window(k, v, 5, None, 1)?;
+
+        assert_eq!(kv_len, 5);
+        assert_eq!(k2.dims4()?, (1, 1, 5, 2));
+        assert_eq!(v2.dims4()?, (1, 1, 5, 2));
+        Ok(())
+    }
+
+    #[test]
+    fn truncate_kv_window_keeps_full_prefill_even_with_window() -> Result<()> {
+        let (k, v) = make_kv_tensors(10, 2)?;
+        let (k2, v2, kv_len) = truncate_kv_window(k, v, 10, Some(4), 3)?;
+
+        assert_eq!(kv_len, 10);
+        assert_eq!(k2.dims4()?, (1, 1, 10, 2));
+        assert_eq!(v2.dims4()?, (1, 1, 10, 2));
+        Ok(())
+    }
+
+    #[test]
+    fn rms_norm_no_weight_normalizes_last_dimension() -> Result<()> {
+        let x = Tensor::from_vec(vec![3f32, 4f32, 0f32, 5f32], (2, 2), &Device::Cpu)?;
+        let y = rms_norm_no_weight(&x, 1e-6)?;
+        assert_eq!(y.dtype(), x.dtype());
+
+        let rows: Vec<Vec<f32>> = y.to_vec2()?;
+        for row in rows {
+            let rms = ((row[0] * row[0] + row[1] * row[1]) / 2.0).sqrt();
+            assert!((rms - 1.0).abs() < 1e-3);
+        }
+        Ok(())
     }
 }

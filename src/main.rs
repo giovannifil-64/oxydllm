@@ -41,6 +41,7 @@ struct StartArgs {
     max_context_len: usize,
     kv_quant: common::kv_quant::KvQuantMode,
     qjl_quantization: bool,
+    require_gpu: bool,
 }
 
 struct RunArgs {
@@ -51,6 +52,7 @@ struct RunArgs {
     max_context_len: usize,
     kv_quant: common::kv_quant::KvQuantMode,
     qjl_quantization: bool,
+    require_gpu: bool,
 }
 
 struct RmArgs {
@@ -130,6 +132,7 @@ Server options (start):
                             balanced: 3-bit, near-identical quality (~4.9x compression)
                             aggressive: 2-bit, maximum compression (~7x compression)
   --qjl-quantization        Enable Stage-2 QJL key residual quantization (default: disabled)
+  --require-gpu             Fail startup if no GPU device available (default: disabled)
 
 Chat options (run):
   --models-dir <DIR>        Models directory (default: ~/.rllm/models/)
@@ -137,6 +140,7 @@ Chat options (run):
   --max-context-len <N>     Max tokens per sequence for KV cache (default: 4096)
   --kv-quant <MODE>         KV cache quantization: off, lossless, balanced, aggressive
   --qjl-quantization        Enable Stage-2 QJL key residual quantization (default: disabled)
+  --require-gpu             Fail startup if no GPU device available (default: disabled)
   --temperature <T>         Sampling temperature (default: 0.7)
   --top-k <K>               Top-k filtering (default: 0, disabled)
   --top-p <P>               Nucleus sampling (default: 1.0)
@@ -365,6 +369,7 @@ fn parse_start_args(args: &[String]) -> Result<StartArgs, String> {
     let mut max_context_len: usize = 4096;
     let mut kv_quant = common::kv_quant::KvQuantMode::Off;
     let mut qjl_quantization = false;
+    let mut require_gpu = false;
     let mut i = 0;
 
     while i < args.len() {
@@ -423,6 +428,9 @@ fn parse_start_args(args: &[String]) -> Result<StartArgs, String> {
             "--qjl-quantization" => {
                 qjl_quantization = true;
             }
+            "--require-gpu" => {
+                require_gpu = true;
+            }
             other => return Err(format!("Unknown option: {}", other)),
         }
         i += 1;
@@ -437,6 +445,7 @@ fn parse_start_args(args: &[String]) -> Result<StartArgs, String> {
         max_context_len,
         kv_quant,
         qjl_quantization,
+        require_gpu,
     })
 }
 
@@ -447,6 +456,7 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
     let mut max_context_len: usize = 4096;
     let mut kv_quant = common::kv_quant::KvQuantMode::Off;
     let mut qjl_quantization = false;
+    let mut require_gpu = false;
     let mut params = SamplingParams {
         temperature: 0.7,
         ..SamplingParams::default()
@@ -532,6 +542,9 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
             "--qjl-quantization" => {
                 qjl_quantization = true;
             }
+            "--require-gpu" => {
+                require_gpu = true;
+            }
             _ if !args[i].starts_with('-') && model_name.is_empty() => {
                 model_name = args[i].clone();
             }
@@ -562,6 +575,7 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
         max_context_len,
         kv_quant,
         qjl_quantization,
+        require_gpu,
     })
 }
 
@@ -569,7 +583,7 @@ fn run_interactive(args: &RunArgs) -> anyhow::Result<()> {
     use std::io::{BufRead, Write};
 
     let cuda_idx = args.cuda_device.unwrap_or(0);
-    let device = models::loader::select_device_at(cuda_idx)?;
+    let device = models::loader::select_device_at(cuda_idx, args.require_gpu)?;
 
     let tokenizer = Tokenizer::from_dir(&args.model_dir)?;
     println!("Tokenizer loaded.");
@@ -747,7 +761,8 @@ fn main() -> anyhow::Result<()> {
                 max_context_len: start_args.max_context_len,
                 kv_quant: start_args.kv_quant,
                 qjl_quantization: start_args.qjl_quantization,
-            })?;
+                require_gpu: start_args.require_gpu,
+            })?
         }
         "run" => {
             let run_args = parse_run_args(&args[2..]).unwrap_or_else(|e| {

@@ -378,7 +378,17 @@ fn parse_geometry_from_json(json: &serde_json::Value) -> Option<ModelGeometry> {
 }
 
 fn kv_cache_bytes(g: &ModelGeometry, ctx_len: usize, num_seqs: usize) -> usize {
-    2 * g.num_layers * g.num_kv_heads * g.head_dim * 2 * ctx_len * num_seqs
+    let bytes = 2u128
+        .checked_mul(g.num_layers as u128)
+        .and_then(|v| v.checked_mul(g.num_kv_heads as u128))
+        .and_then(|v| v.checked_mul(g.head_dim as u128))
+        .and_then(|v| v.checked_mul(2))
+        .and_then(|v| v.checked_mul(ctx_len as u128))
+        .and_then(|v| v.checked_mul(num_seqs as u128));
+
+    bytes
+        .and_then(|v| usize::try_from(v).ok())
+        .unwrap_or(usize::MAX)
 }
 
 fn print_weights_kv_total(

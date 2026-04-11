@@ -66,6 +66,10 @@ Here you can find a list of models that have been tested with rLLM, divided by a
 ### Gemma4ForConditionalGeneration (Stable with issues)
 - `gemma-4-E2B-it` - Known edge cases on some checkpoints/configurations
 
+### Phi3ForCausalLM
+- `Phi-3-mini-4k-instruct-gguf`
+- `Phi-3.5-mini-instruct`
+
 ## Unsupported Model Families
 The following model families are not currently supported:
 - Mixture-of-Experts models (Mixtral, Deepseek-V2/V3)

@@ -203,8 +203,15 @@ impl RotaryEmbedding {
         k: &Tensor,
         position_ids: &Tensor,
     ) -> Result<(Tensor, Tensor)> {
+        #[cfg(feature = "metal")]
         let (bq, qh, tq, d_q) = q.dims4()?;
+        #[cfg(not(feature = "metal"))]
+        let (_, _, _, d_q) = q.dims4()?;
+
+        #[cfg(feature = "metal")]
         let (bk, kh, tk, d_k) = k.dims4()?;
+        #[cfg(not(feature = "metal"))]
+        let (_, _, _, d_k) = k.dims4()?;
 
         if d_q != d_k {
             candle_core::bail!("RoPE q/k head_dim mismatch: q={d_q}, k={d_k}");

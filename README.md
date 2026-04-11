@@ -59,6 +59,9 @@ Here you can find a list of models that have been tested with rLLM, divided by a
 ### GemmaForCausalLM (Stable)
 - `gemma-2b-it`
 
+### Gemma2ForCausalLM (Stable)
+- `gemma-2-2b-it`
+
 ### Gemma3ForCausalLM (Stable)
 - `gemma-3-270m-it`
 - `gemma-3-1b-it`

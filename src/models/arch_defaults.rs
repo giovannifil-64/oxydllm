@@ -101,6 +101,7 @@ pub fn arch_defaults(arch: &str) -> Option<ArchDefaults> {
         "gemma2" | "gemma-2" | "Gemma2ForCausalLM" => Some(ArchDefaults {
             activation: Activation::GeLUTanh,
             norm_type: NormType::Gemma,
+            has_ffn_norms: true,
             embed_scale_from_hidden: true,
             attn_softcap: Some(50.0),
             logit_softcap: Some(30.0),

@@ -57,6 +57,9 @@ jobs:
       - name: Build (Metal, release)
         run: cargo build --release
 
+      - name: Strip binary (macOS release artifact)
+        run: strip -x target/release/rllm
+
       - name: Package binary
         run: |
           cd target/release
@@ -101,6 +104,9 @@ jobs:
 
       - name: Build (CPU-only, release)
         run: cargo build --release --no-default-features
+
+      - name: Strip binary (Linux CPU release artifact)
+        run: strip --strip-unneeded target/release/rllm
 
       - name: Package binary
         run: |
@@ -155,6 +161,9 @@ jobs:
         env:
           CUDA_COMPUTE_CAP: ${{ env.CUDA_ARCH }}
         run: cargo build --release --no-default-features --features cuda
+
+      - name: Strip binary (Linux CUDA release artifact)
+        run: strip --strip-unneeded target/release/rllm
 
       - name: Package binary
         run: |

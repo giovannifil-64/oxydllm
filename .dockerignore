@@ -1,0 +1,12 @@
+# Keep Docker build context minimal for the current Dockerfiles.
+# They only need Cargo manifests and Rust sources.
+**
+!Cargo.toml
+!Cargo.lock
+!src/
+!src/**
+!.cargo/
+!.cargo/**
+!rust-toolchain.toml
+!Dockerfile
+!Dockerfile.cpu

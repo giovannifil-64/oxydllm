@@ -75,10 +75,21 @@ pub(crate) fn parse_gguf_topology(gguf: &GgufWeights) -> anyhow::Result<GgufTopo
         if from_meta > 0 {
             from_meta
         } else {
-            let q0 = gguf
-                .get("blk.0.attn_q.weight")
-                .map_err(|e| anyhow::anyhow!("Cannot determine head_dim: {e}"))?;
-            q0.shape().dims()[0] / num_attention_heads
+            if let Some(q0) = gguf.try_get("blk.0.attn_q.weight") {
+                q0.shape().dims()[0] / num_attention_heads
+            } else if let Some(qkv0) = gguf.try_get("blk.0.attn_qkv.weight") {
+                let denom = num_attention_heads + 2 * num_key_value_heads;
+                if denom == 0 {
+                    anyhow::bail!(
+                        "Cannot determine head_dim: invalid attention heads metadata (denom=0)"
+                    );
+                }
+                qkv0.shape().dims()[0] / denom
+            } else {
+                anyhow::bail!(
+                    "Cannot determine head_dim: neither blk.0.attn_q.weight nor blk.0.attn_qkv.weight found"
+                );
+            }
         }
     };
     let context_length = gguf.metadata_u32_or(&format!("{prefix}.context_length"), 131072) as usize;
@@ -164,10 +175,17 @@ impl StandardTransformer {
             if from_meta > 0 {
                 from_meta
             } else {
-                let qt = gguf
-                    .get("blk.0.ffn_gate.weight")
-                    .map_err(|e| anyhow::anyhow!("Cannot determine intermediate_size: {e}"))?;
-                qt.shape().dims()[0]
+                if let Some(qt) = gguf.try_get("blk.0.ffn_down.weight") {
+                    qt.shape().dims()[1]
+                } else if let Some(qt) = gguf.try_get("blk.0.ffn_gate.weight") {
+                    qt.shape().dims()[0]
+                } else if let Some(qt) = gguf.try_get("blk.0.ffn_up.weight") {
+                    qt.shape().dims()[0]
+                } else {
+                    anyhow::bail!(
+                        "Cannot determine intermediate_size: none of blk.0.ffn_down.weight, blk.0.ffn_gate.weight, blk.0.ffn_up.weight found"
+                    );
+                }
             }
         };
 

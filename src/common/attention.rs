@@ -32,7 +32,7 @@ pub struct SegmentInfo<'a> {
 }
 
 enum QkvProjection {
-    Fused(Linear),
+    Fused(AnyLinear),
     Separate {
         q: AnyLinear,
         k: AnyLinear,
@@ -129,20 +129,41 @@ impl Attention {
     pub fn load(cfg: &BlockConfig, layer_idx: usize, weights: &ModelWeights) -> Result<Self> {
         let p = format!("model.layers.{}.self_attn", layer_idx);
         let hd = cfg.head_dim;
+        let q_dim = cfg.n_heads * hd;
+        let kv_dim = cfg.n_kv_heads * hd;
 
-        let q_w = weights.get(&format!("{}.q_proj.weight", p))?;
-        let k_w = weights.get(&format!("{}.k_proj.weight", p))?;
-        let v_w = weights.get(&format!("{}.v_proj.weight", p))?;
-        let qkv_w = Tensor::cat(&[q_w, k_w, v_w], 0)?;
-        let qkv_bias = match (
-            weights.try_get(&format!("{}.q_proj.bias", p)),
-            weights.try_get(&format!("{}.k_proj.bias", p)),
-            weights.try_get(&format!("{}.v_proj.bias", p)),
-        ) {
-            (Some(qb), Some(kb), Some(vb)) => Some(Tensor::cat(&[qb, kb, vb], 0)?),
-            _ => None,
-        };
-        let qkv_proj = Linear::new(qkv_w, qkv_bias);
+        let (qkv_w, qkv_bias) =
+            if let Some(qkv_w) = weights.try_get(&format!("{}.qkv_proj.weight", p)) {
+                let expected = q_dim + 2 * kv_dim;
+                let got = qkv_w.dim(0)?;
+                if got != expected {
+                    candle_core::bail!(
+                        "qkv_proj shape mismatch at {}: expected dim0={}, got {}",
+                        p,
+                        expected,
+                        got
+                    );
+                }
+                (
+                    qkv_w.clone(),
+                    weights.try_get(&format!("{}.qkv_proj.bias", p)).cloned(),
+                )
+            } else {
+                let q_w = weights.get(&format!("{}.q_proj.weight", p))?;
+                let k_w = weights.get(&format!("{}.k_proj.weight", p))?;
+                let v_w = weights.get(&format!("{}.v_proj.weight", p))?;
+                let qkv_w = Tensor::cat(&[q_w, k_w, v_w], 0)?;
+                let qkv_bias = match (
+                    weights.try_get(&format!("{}.q_proj.bias", p)),
+                    weights.try_get(&format!("{}.k_proj.bias", p)),
+                    weights.try_get(&format!("{}.v_proj.bias", p)),
+                ) {
+                    (Some(qb), Some(kb), Some(vb)) => Some(Tensor::cat(&[qb, kb, vb], 0)?),
+                    _ => None,
+                };
+                (qkv_w, qkv_bias)
+            };
+        let qkv_proj = AnyLinear::Float(Linear::new(qkv_w, qkv_bias));
 
         let o_proj = AnyLinear::Float(Linear::new(
             weights.get(&format!("{}.o_proj.weight", p))?.clone(),
@@ -167,9 +188,6 @@ impl Attention {
         } else {
             None
         };
-
-        let q_dim = cfg.n_heads * hd;
-        let kv_dim = cfg.n_kv_heads * hd;
 
         let actual_window = compute_sliding_window(cfg, layer_idx);
 
@@ -200,9 +218,30 @@ impl Attention {
     ) -> Result<Self> {
         let prefix = format!("blk.{}", layer_idx);
         let hd = cfg.head_dim;
-        let q_proj = QLinear::from_arc(gguf.get(&format!("{prefix}.attn_q.weight"))?, dtype)?;
-        let k_proj = QLinear::from_arc(gguf.get(&format!("{prefix}.attn_k.weight"))?, dtype)?;
-        let v_proj = QLinear::from_arc(gguf.get(&format!("{prefix}.attn_v.weight"))?, dtype)?;
+        let qkv = if let Some(qkv_qt) = gguf.try_get(&format!("{prefix}.attn_qkv.weight")) {
+            let q_dim = cfg.n_heads * hd;
+            let kv_dim = cfg.n_kv_heads * hd;
+            let expected = q_dim + 2 * kv_dim;
+            let got = qkv_qt.shape().dims()[0];
+            if got != expected {
+                candle_core::bail!(
+                    "GGUF attn_qkv shape mismatch at {}: expected dim0={}, got {}",
+                    prefix,
+                    expected,
+                    got
+                );
+            }
+            QkvProjection::Fused(AnyLinear::Quantized(QLinear::from_arc(qkv_qt, dtype)?))
+        } else {
+            let q_proj = QLinear::from_arc(gguf.get(&format!("{prefix}.attn_q.weight"))?, dtype)?;
+            let k_proj = QLinear::from_arc(gguf.get(&format!("{prefix}.attn_k.weight"))?, dtype)?;
+            let v_proj = QLinear::from_arc(gguf.get(&format!("{prefix}.attn_v.weight"))?, dtype)?;
+            QkvProjection::Separate {
+                q: AnyLinear::Quantized(q_proj),
+                k: AnyLinear::Quantized(k_proj),
+                v: AnyLinear::Quantized(v_proj),
+            }
+        };
         let o_proj = QLinear::from_arc(gguf.get(&format!("{prefix}.attn_output.weight"))?, dtype)?;
 
         let q_norm = if cfg.qk_norm {
@@ -236,11 +275,7 @@ impl Attention {
         let actual_window = compute_sliding_window(cfg, layer_idx);
 
         Ok(Self {
-            qkv: QkvProjection::Separate {
-                q: AnyLinear::Quantized(q_proj),
-                k: AnyLinear::Quantized(k_proj),
-                v: AnyLinear::Quantized(v_proj),
-            },
+            qkv,
             o_proj: AnyLinear::Quantized(o_proj),
             q_norm,
             k_norm,

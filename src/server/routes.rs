@@ -300,6 +300,7 @@ const TOKEN_DECODE_CACHE_CAP: usize = 8192;
 struct DecodedToken {
     text: String,
     bytes: Vec<u8>,
+    piece: Option<String>,
 }
 
 struct TokenDecodeCache {
@@ -318,9 +319,11 @@ impl TokenDecodeCache {
             return hit.clone();
         }
         let text = tokenizer.decode(&[token_id]).unwrap_or_default();
+        let piece = tokenizer.id_to_token(token_id);
         let decoded = DecodedToken {
             bytes: text.as_bytes().to_vec(),
             text,
+            piece,
         };
         self.entries.push(token_id, decoded.clone());
         decoded
@@ -596,8 +599,30 @@ fn prefix_decode_token(
     decoded_len: &mut usize,
     token: u32,
 ) -> Option<String> {
-    let single = decode_cache.decode_token(tokenizer, token).text;
+    let decoded = decode_cache.decode_token(tokenizer, token);
+    let mut single = decoded.text;
     if !single.is_empty() && !single.contains('\u{FFFD}') {
+        let has_leading_ws = single
+            .chars()
+            .next()
+            .map(char::is_whitespace)
+            .unwrap_or(false);
+
+        // Some tokenizers (e.g. SentencePiece) keep word-boundary markers in
+        // vocab entries and drop them when decoding a single token. Reinsert
+        // a leading space for non-initial tokens to keep incremental decoding
+        // consistent with full-sequence decoding.
+        if *decoded_len > 0
+            && !has_leading_ws
+            && decoded
+                .piece
+                .as_deref()
+                .map(|p| p.starts_with('▁') || p.starts_with('Ġ'))
+                .unwrap_or(false)
+        {
+            single.insert(0, ' ');
+        }
+
         *decoded_len += single.len();
         return Some(single);
     }

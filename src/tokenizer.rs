@@ -19,13 +19,104 @@ impl Tokenizer {
         }
 
         if let Some(gguf_path) = crate::models::loader::find_gguf_file(dir) {
-            return Self::from_gguf_file(gguf_path.to_str().unwrap());
+            let gguf_path_str = gguf_path
+                .to_str()
+                .ok_or_else(|| anyhow::anyhow!("Non-UTF8 GGUF path: {}", gguf_path.display()))?;
+
+            match Self::from_gguf_file(gguf_path_str) {
+                Ok(tok) => return Ok(tok),
+                Err(gguf_err) => {
+                    for fallback_dir in Self::gguf_fallback_tokenizer_dirs(dir) {
+                        let Some(fallback_str) = fallback_dir.to_str() else {
+                            continue;
+                        };
+                        match Self::from_tokenizer_json(fallback_str) {
+                            Ok(tok) => {
+                                eprintln!(
+                                    "[gguf] GGUF tokenizer unsupported, using tokenizer.json fallback from '{}'",
+                                    fallback_dir.display()
+                                );
+                                return Ok(tok);
+                            }
+                            Err(_) => continue,
+                        }
+                    }
+
+                    return Err(gguf_err).with_context(|| {
+                        format!(
+                            "Failed to load tokenizer from GGUF in '{}', and no tokenizer.json fallback was usable",
+                            dir.display()
+                        )
+                    });
+                }
+            }
         }
 
         anyhow::bail!(
             "No tokenizer found in '{}': expected tokenizer.json or a .gguf file",
             model_dir
         )
+    }
+
+    fn strip_gguf_suffix(name: &str) -> &str {
+        let lower = name.to_ascii_lowercase();
+        for suffix in ["-gguf", "_gguf", ".gguf", "gguf"] {
+            if lower.ends_with(suffix) {
+                let cut = name.len() - suffix.len();
+                return &name[..cut];
+            }
+        }
+        name
+    }
+
+    fn gguf_fallback_tokenizer_dirs(model_dir: &Path) -> Vec<std::path::PathBuf> {
+        let mut exact = Vec::new();
+        let mut related = Vec::new();
+
+        let Some(parent) = model_dir.parent() else {
+            return Vec::new();
+        };
+
+        let base_name = model_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(Self::strip_gguf_suffix)
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+
+        let entries = match std::fs::read_dir(parent) {
+            Ok(e) => e,
+            Err(_) => return Vec::new(),
+        };
+
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p == model_dir || !p.is_dir() {
+                continue;
+            }
+            if !p.join("tokenizer.json").exists() {
+                continue;
+            }
+
+            let name = p
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(|s| s.to_ascii_lowercase())
+                .unwrap_or_default();
+
+            if !base_name.is_empty() && name == base_name {
+                exact.push(p);
+            } else if !base_name.is_empty()
+                && (name.starts_with(&base_name)
+                    || base_name.starts_with(&name)
+                    || (name.contains("phi-3") && base_name.contains("phi-3")))
+            {
+                related.push(p);
+            }
+        }
+
+        exact.extend(related);
+        exact
     }
 
     fn from_tokenizer_json(model_dir: &str) -> Result<Self> {
@@ -242,6 +333,10 @@ impl Tokenizer {
 
     pub fn special_token_id(&self, content: &str) -> Option<u32> {
         self.special_token_ids.get(content).copied()
+    }
+
+    pub fn id_to_token(&self, token_id: u32) -> Option<String> {
+        self.inner.id_to_token(token_id)
     }
 
     pub fn has_thinking_support(&self) -> bool {

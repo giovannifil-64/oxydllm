@@ -406,6 +406,10 @@ impl Engine {
         self.scheduler.abort_all_running()
     }
 
+    pub fn abort_sequence(&mut self, seq_id: SequenceId) -> bool {
+        self.scheduler.abort_sequence(seq_id)
+    }
+
     pub fn abort_all(&mut self) -> Vec<SequenceId> {
         self.scheduler.abort_all()
     }
@@ -553,6 +557,23 @@ mod tests {
         ids.sort_unstable();
         assert_eq!(ids, vec![id0, id1]);
         assert!(!engine.has_pending_work());
+    }
+
+    #[test]
+    fn abort_sequence_clears_specific_request() {
+        let allocators = make_allocators(1, 8);
+        let (model, _) = FakeModel::new(vec![2], 3, allocators);
+        let mut engine =
+            Engine::new_with_stop_tokens(Box::new(model), test_scheduler_config(), &[]);
+
+        let id0 = engine.add_request(vec![10, 11], SamplingParams::default(), 4);
+        let id1 = engine.add_request(vec![20, 21], SamplingParams::default(), 4);
+
+        assert!(engine.abort_sequence(id0));
+        assert!(engine.has_pending_work());
+        assert!(engine.abort_sequence(id1));
+        assert!(!engine.has_pending_work());
+        assert!(!engine.abort_sequence(999_999));
     }
 
     #[test]

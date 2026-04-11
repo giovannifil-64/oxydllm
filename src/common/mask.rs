@@ -1,4 +1,4 @@
-use candle_core::{Device, Result, Tensor};
+use candle_core::{DType, Device, Result, Tensor};
 use lru::LruCache;
 use std::cell::RefCell;
 use std::num::NonZeroUsize;
@@ -40,38 +40,64 @@ fn device_discriminant(device: &Device) -> u8 {
     }
 }
 
+fn dtype_discriminant(dtype: DType) -> u8 {
+    match dtype {
+        DType::F16 => 1,
+        DType::BF16 => 2,
+        DType::F32 => 3,
+        DType::F64 => 4,
+        _ => 0,
+    }
+}
+
 thread_local! {
-    static MASK_CACHE: RefCell<LruCache<(usize, u8), Tensor>> =
+    static MASK_CACHE: RefCell<LruCache<(usize, u8, u8), Tensor>> =
         RefCell::new(LruCache::new(NonZeroUsize::new(MASK_CACHE_CAP).unwrap()));
-    static PREFIX_MASK_CACHE: RefCell<LruCache<(usize, usize, u8), Tensor>> =
+    static PREFIX_MASK_CACHE: RefCell<LruCache<(usize, usize, u8, u8), Tensor>> =
         RefCell::new(LruCache::new(NonZeroUsize::new(MASK_CACHE_CAP).unwrap()));
 }
 
-pub fn causal_mask_cached(seq_len: usize, device: &Device) -> Result<Tensor> {
-    let key = (seq_len, device_discriminant(device));
+pub fn causal_mask_cached_dtype(seq_len: usize, dtype: DType, device: &Device) -> Result<Tensor> {
+    let key = (
+        seq_len,
+        device_discriminant(device),
+        dtype_discriminant(dtype),
+    );
     MASK_CACHE.with(|cache| {
         let mut map = cache.borrow_mut();
         if let Some(t) = map.get(&key) {
             return Ok(t.clone());
         }
-        let mask = causal_mask(seq_len, device)?;
+        let mut mask = causal_mask(seq_len, device)?;
+        if mask.dtype() != dtype {
+            mask = mask.to_dtype(dtype)?;
+        }
         map.push(key, mask.clone());
         Ok(mask)
     })
 }
 
-pub fn causal_mask_prefixed_cached(
+pub fn causal_mask_prefixed_cached_dtype(
     query_len: usize,
     kv_len: usize,
+    dtype: DType,
     device: &Device,
 ) -> Result<Tensor> {
-    let key = (query_len, kv_len, device_discriminant(device));
+    let key = (
+        query_len,
+        kv_len,
+        device_discriminant(device),
+        dtype_discriminant(dtype),
+    );
     PREFIX_MASK_CACHE.with(|cache| {
         let mut map = cache.borrow_mut();
         if let Some(t) = map.get(&key) {
             return Ok(t.clone());
         }
-        let mask = causal_mask_prefixed(query_len, kv_len, device)?;
+        let mut mask = causal_mask_prefixed(query_len, kv_len, device)?;
+        if mask.dtype() != dtype {
+            mask = mask.to_dtype(dtype)?;
+        }
         map.push(key, mask.clone());
         Ok(mask)
     })

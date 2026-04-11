@@ -196,6 +196,58 @@ impl RotaryEmbedding {
 
         Tensor::cat(&[&out1, &out2], D::Minus1)
     }
+
+    pub fn apply_qk_with_positions(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        position_ids: &Tensor,
+    ) -> Result<(Tensor, Tensor)> {
+        let (bq, qh, tq, d_q) = q.dims4()?;
+        let (bk, kh, tk, d_k) = k.dims4()?;
+
+        if d_q != d_k {
+            candle_core::bail!("RoPE q/k head_dim mismatch: q={d_q}, k={d_k}");
+        }
+
+        #[cfg(feature = "metal")]
+        if q.device().is_metal()
+            && k.device().is_metal()
+            && q.dtype() == k.dtype()
+            && bq == bk
+            && tq == tk
+        {
+            let cos = self.cos.index_select(position_ids, 0)?;
+            let sin = self.sin.index_select(position_ids, 0)?;
+
+            let qk = Tensor::cat(&[q, k], 1)?;
+            let qk_c = if qk.is_contiguous() {
+                qk
+            } else {
+                qk.contiguous()?
+            };
+            let cos_c = if cos.is_contiguous() {
+                cos
+            } else {
+                cos.contiguous()?
+            };
+            let sin_c = if sin.is_contiguous() {
+                sin
+            } else {
+                sin.contiguous()?
+            };
+
+            let rotated = super::metal_ops::rope_fused(&qk_c, &cos_c, &sin_c)?;
+            let q_rot = rotated.narrow(1, 0, qh)?;
+            let k_rot = rotated.narrow(1, qh, kh)?;
+            return Ok((q_rot, k_rot));
+        }
+
+        Ok((
+            self.apply_with_positions(q, position_ids)?,
+            self.apply_with_positions(k, position_ids)?,
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -272,5 +324,37 @@ mod tests {
         // At position=1, dim=0 has frequency 1.0 in baseline and 0.5 in the longrope case.
         // Therefore cos should be larger in the longrope case (cos(0.5) > cos(1.0)).
         assert!(long_cos[1][0] > base_cos[1][0]);
+    }
+
+    #[test]
+    fn apply_qk_with_positions_matches_individual_cpu() -> Result<()> {
+        let device = Device::Cpu;
+        let rope = RotaryEmbedding::new(8, 16, 10_000.0, DType::F32, &device)?;
+
+        let q_data: Vec<f32> = (0..(4 * 3 * 8)).map(|v| v as f32 * 0.01).collect();
+        let k_data: Vec<f32> = (0..(2 * 3 * 8)).map(|v| 1.0 + v as f32 * 0.02).collect();
+        let q = Tensor::from_vec(q_data, (1, 4, 3, 8), &device)?;
+        let k = Tensor::from_vec(k_data, (1, 2, 3, 8), &device)?;
+        let position_ids = Tensor::from_vec(vec![0u32, 1, 2], (3,), &device)?;
+
+        let (q_pair, k_pair) = rope.apply_qk_with_positions(&q, &k, &position_ids)?;
+        let q_single = rope.apply_with_positions(&q, &position_ids)?;
+        let k_single = rope.apply_with_positions(&k, &position_ids)?;
+
+        let q_pair_v: Vec<f32> = q_pair.flatten_all()?.to_vec1()?;
+        let q_single_v: Vec<f32> = q_single.flatten_all()?.to_vec1()?;
+        let k_pair_v: Vec<f32> = k_pair.flatten_all()?.to_vec1()?;
+        let k_single_v: Vec<f32> = k_single.flatten_all()?.to_vec1()?;
+
+        assert_eq!(q_pair_v.len(), q_single_v.len());
+        assert_eq!(k_pair_v.len(), k_single_v.len());
+        for (a, b) in q_pair_v.iter().zip(q_single_v.iter()) {
+            assert!((a - b).abs() < 1e-5);
+        }
+        for (a, b) in k_pair_v.iter().zip(k_single_v.iter()) {
+            assert!((a - b).abs() < 1e-5);
+        }
+
+        Ok(())
     }
 }

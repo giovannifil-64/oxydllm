@@ -272,6 +272,27 @@ impl Scheduler {
         ids
     }
 
+    pub fn abort_sequence(&mut self, seq_id: SequenceId) -> bool {
+        if let Some(&idx) = self.running_index.get(&seq_id) {
+            let mut seq = self.remove_from_running(idx);
+            for cache in &mut seq.caches {
+                cache.clear();
+            }
+            return true;
+        }
+
+        if let Some(wait_idx) = self.waiting.iter().position(|s| s.id == seq_id)
+            && let Some(mut seq) = self.waiting.remove(wait_idx)
+        {
+            for cache in &mut seq.caches {
+                cache.clear();
+            }
+            return true;
+        }
+
+        false
+    }
+
     pub fn abort_all(&mut self) -> Vec<SequenceId> {
         let mut ids = self.abort_all_running();
         for mut seq in self.waiting.drain(..) {
@@ -424,5 +445,27 @@ mod tests {
 
         let final_free = allocators[0].lock().unwrap().num_free();
         assert_eq!(final_free, initial_free);
+    }
+
+    #[test]
+    fn abort_sequence_removes_from_running_and_waiting() {
+        let allocators = make_allocators(2, 32);
+        let config = SchedulerConfig {
+            max_num_sequences: 4,
+            max_tokens_per_step: 1024,
+        };
+        let mut sched = Scheduler::new(config, allocators, 2);
+
+        let running_id = sched.add_request(vec![1, 2, 3], SamplingParams::default(), 8);
+        let waiting_id = sched.add_request(vec![4, 5, 6], SamplingParams::default(), 8);
+        let _ = sched.schedule(None);
+
+        assert!(sched.get_running(running_id).is_some());
+        assert!(sched.abort_sequence(running_id));
+        assert!(sched.get_running(running_id).is_none());
+
+        assert!(sched.abort_sequence(waiting_id));
+        assert!(!sched.abort_sequence(999_999));
+        assert!(!sched.has_pending_work());
     }
 }

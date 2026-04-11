@@ -531,6 +531,24 @@ struct SeqTracker {
     pending_raw_lps: Vec<PendingRawLogprob>,
 }
 
+fn abort_sequences(
+    engine: &mut Engine,
+    trackers: &mut HashMap<SequenceId, SeqTracker>,
+    mut seq_ids: Vec<SequenceId>,
+    reason: &str,
+) {
+    seq_ids.sort_unstable();
+    seq_ids.dedup();
+    for seq_id in seq_ids {
+        let model_id = trackers.remove(&seq_id).map(|t| t.model_id);
+        let _ = engine.abort_sequence(seq_id);
+        match model_id {
+            Some(model_id) => eprintln!("[req] {} seq={} aborted ({reason})", model_id, seq_id),
+            None => eprintln!("[req] seq={} aborted ({reason})", seq_id),
+        }
+    }
+}
+
 fn enqueue_request(
     req: IncomingRequest,
     engine: &mut Engine,
@@ -626,6 +644,21 @@ pub fn engine_loop(
             }
         }
 
+        if !trackers.is_empty() {
+            let disconnected_ids: Vec<SequenceId> = trackers
+                .iter()
+                .filter_map(|(&seq_id, tracker)| tracker.tx.is_closed().then_some(seq_id))
+                .collect();
+            if !disconnected_ids.is_empty() {
+                abort_sequences(
+                    &mut engine,
+                    &mut trackers,
+                    disconnected_ids,
+                    "response channel closed",
+                );
+            }
+        }
+
         if engine.has_pending_work() {
             let step_result = {
                 let lock = crate::gpu_lock::gpu_lock();
@@ -635,7 +668,9 @@ pub fn engine_loop(
             match step_result {
                 Ok(step) => {
                     consecutive_errors = 0;
+                    let mut disconnected_ids: Vec<SequenceId> = Vec::new();
                     for tok in &step.new_tokens {
+                        let mut disconnected = false;
                         if let Some(tracker) = trackers.get_mut(&tok.seq_id) {
                             if tracker.first_token_at.is_none() {
                                 let ttft_ms = tracker.enqueued_at.elapsed().as_secs_f64() * 1000.0;
@@ -675,8 +710,9 @@ pub fn engine_loop(
                                     &tracker.thinking_ids,
                                     &mut tracker.thinking_decoded_len,
                                     tok.token,
-                                ) {
-                                    let _ = tracker.tx.send(EngineEvent::ReasoningToken(text));
+                                ) && tracker.tx.send(EngineEvent::ReasoningToken(text)).is_err()
+                                {
+                                    disconnected = true;
                                 }
                             } else {
                                 // Buffer logprob raw data (if logprobs were requested).
@@ -707,14 +743,33 @@ pub fn engine_loop(
                                             top,
                                         ));
                                     }
-                                    let _ = tracker.tx.send(EngineEvent::Token {
-                                        text,
-                                        logprob_entries,
-                                    });
+                                    if tracker
+                                        .tx
+                                        .send(EngineEvent::Token {
+                                            text,
+                                            logprob_entries,
+                                        })
+                                        .is_err()
+                                    {
+                                        disconnected = true;
+                                    }
                                 }
                             }
                         }
+                        if disconnected {
+                            disconnected_ids.push(tok.seq_id);
+                        }
                     }
+
+                    if !disconnected_ids.is_empty() {
+                        abort_sequences(
+                            &mut engine,
+                            &mut trackers,
+                            disconnected_ids,
+                            "client disconnected",
+                        );
+                    }
+
                     for completed in &step.completed {
                         if let Some(mut tracker) = trackers.remove(&completed.id) {
                             // Flush any remaining buffered text.
@@ -1305,9 +1360,14 @@ async fn chat_completions(
                     usage: None,
                     system_fingerprint: Some(fp.clone()),
                 };
-                let _ = sse_tx.send(Ok(
-                    Event::default().data(serde_json::to_string(&role_chunk).unwrap())
-                ));
+                if sse_tx
+                    .send(Ok(
+                        Event::default().data(serde_json::to_string(&role_chunk).unwrap())
+                    ))
+                    .is_err()
+                {
+                    return;
+                }
 
                 while let Some(event) = response_rx.recv().await {
                     match event {
@@ -1346,10 +1406,14 @@ async fn chat_completions(
                                 usage: None,
                                 system_fingerprint: Some(fp.clone()),
                             };
-                            let _ =
-                                sse_tx
-                                    .send(Ok(Event::default()
-                                        .data(serde_json::to_string(&chunk).unwrap())));
+                            if sse_tx
+                                .send(Ok(
+                                    Event::default().data(serde_json::to_string(&chunk).unwrap())
+                                ))
+                                .is_err()
+                            {
+                                break;
+                            }
                         }
                         EngineEvent::ReasoningToken(text) => {
                             let chunk = ChatCompletionChunk {
@@ -1370,10 +1434,14 @@ async fn chat_completions(
                                 usage: None,
                                 system_fingerprint: Some(fp.clone()),
                             };
-                            let _ =
-                                sse_tx
-                                    .send(Ok(Event::default()
-                                        .data(serde_json::to_string(&chunk).unwrap())));
+                            if sse_tx
+                                .send(Ok(
+                                    Event::default().data(serde_json::to_string(&chunk).unwrap())
+                                ))
+                                .is_err()
+                            {
+                                break;
+                            }
                         }
                         EngineEvent::Finish {
                             finish_reason,
@@ -1397,10 +1465,14 @@ async fn chat_completions(
                                 usage: None,
                                 system_fingerprint: Some(fp.clone()),
                             };
-                            let _ =
-                                sse_tx
-                                    .send(Ok(Event::default()
-                                        .data(serde_json::to_string(&chunk).unwrap())));
+                            if sse_tx
+                                .send(Ok(
+                                    Event::default().data(serde_json::to_string(&chunk).unwrap())
+                                ))
+                                .is_err()
+                            {
+                                break;
+                            }
 
                             if include_usage {
                                 let usage_chunk = ChatCompletionChunk {
@@ -1417,21 +1489,33 @@ async fn chat_completions(
                                     }),
                                     system_fingerprint: Some(fp.clone()),
                                 };
-                                let _ = sse_tx.send(Ok(Event::default()
-                                    .data(serde_json::to_string(&usage_chunk).unwrap())));
+                                if sse_tx
+                                    .send(Ok(Event::default()
+                                        .data(serde_json::to_string(&usage_chunk).unwrap())))
+                                    .is_err()
+                                {
+                                    break;
+                                }
                             }
                         }
                         EngineEvent::StreamEnd => {
-                            let _ = sse_tx.send(Ok(Event::default().data("[DONE]")));
+                            if sse_tx.send(Ok(Event::default().data("[DONE]"))).is_err() {
+                                break;
+                            }
                             break;
                         }
                         EngineEvent::Error(msg) => {
                             let err = serde_json::json!({
                                 "error": { "message": msg, "type": "server_error", "param": null, "code": null }
                             });
-                            let _ = sse_tx.send(Ok(
-                                Event::default().data(serde_json::to_string(&err).unwrap())
-                            ));
+                            if sse_tx
+                                .send(Ok(
+                                    Event::default().data(serde_json::to_string(&err).unwrap())
+                                ))
+                                .is_err()
+                            {
+                                break;
+                            }
                         }
                     }
                 }
@@ -1475,9 +1559,14 @@ async fn chat_completions(
                         usage: None,
                         system_fingerprint: Some(fp.clone()),
                     };
-                    let _ = sse_tx.send(Ok(
-                        Event::default().data(serde_json::to_string(&role_chunk).unwrap())
-                    ));
+                    if sse_tx
+                        .send(Ok(
+                            Event::default().data(serde_json::to_string(&role_chunk).unwrap())
+                        ))
+                        .is_err()
+                    {
+                        return;
+                    }
                 }
 
                 let mut rx = merged_rx;
@@ -1521,10 +1610,14 @@ async fn chat_completions(
                                 usage: None,
                                 system_fingerprint: Some(fp.clone()),
                             };
-                            let _ =
-                                sse_tx
-                                    .send(Ok(Event::default()
-                                        .data(serde_json::to_string(&chunk).unwrap())));
+                            if sse_tx
+                                .send(Ok(
+                                    Event::default().data(serde_json::to_string(&chunk).unwrap())
+                                ))
+                                .is_err()
+                            {
+                                break;
+                            }
                         }
                         EngineEvent::ReasoningToken(text) => {
                             let chunk = ChatCompletionChunk {
@@ -1545,10 +1638,14 @@ async fn chat_completions(
                                 usage: None,
                                 system_fingerprint: Some(fp.clone()),
                             };
-                            let _ =
-                                sse_tx
-                                    .send(Ok(Event::default()
-                                        .data(serde_json::to_string(&chunk).unwrap())));
+                            if sse_tx
+                                .send(Ok(
+                                    Event::default().data(serde_json::to_string(&chunk).unwrap())
+                                ))
+                                .is_err()
+                            {
+                                break;
+                            }
                         }
                         EngineEvent::Finish {
                             finish_reason,
@@ -1573,10 +1670,14 @@ async fn chat_completions(
                                 usage: None,
                                 system_fingerprint: Some(fp.clone()),
                             };
-                            let _ =
-                                sse_tx
-                                    .send(Ok(Event::default()
-                                        .data(serde_json::to_string(&chunk).unwrap())));
+                            if sse_tx
+                                .send(Ok(
+                                    Event::default().data(serde_json::to_string(&chunk).unwrap())
+                                ))
+                                .is_err()
+                            {
+                                break;
+                            }
                         }
                         EngineEvent::StreamEnd => {
                             stream_ends += 1;
@@ -1596,10 +1697,17 @@ async fn chat_completions(
                                         }),
                                         system_fingerprint: Some(fp.clone()),
                                     };
-                                    let _ = sse_tx.send(Ok(Event::default()
-                                        .data(serde_json::to_string(&usage_chunk).unwrap())));
+                                    if sse_tx
+                                        .send(Ok(Event::default()
+                                            .data(serde_json::to_string(&usage_chunk).unwrap())))
+                                        .is_err()
+                                    {
+                                        break;
+                                    }
                                 }
-                                let _ = sse_tx.send(Ok(Event::default().data("[DONE]")));
+                                if sse_tx.send(Ok(Event::default().data("[DONE]"))).is_err() {
+                                    break;
+                                }
                                 break;
                             }
                         }
@@ -1607,9 +1715,14 @@ async fn chat_completions(
                             let err = serde_json::json!({
                                 "error": { "message": msg, "type": "server_error", "param": null, "code": null }
                             });
-                            let _ = sse_tx.send(Ok(
-                                Event::default().data(serde_json::to_string(&err).unwrap())
-                            ));
+                            if sse_tx
+                                .send(Ok(
+                                    Event::default().data(serde_json::to_string(&err).unwrap())
+                                ))
+                                .is_err()
+                            {
+                                break;
+                            }
                         }
                     }
                 }

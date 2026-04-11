@@ -330,10 +330,7 @@ impl Attention {
         };
 
         let (q, k) = if let Some((r, position_ids)) = rope {
-            (
-                r.apply_with_positions(&q, position_ids)?,
-                r.apply_with_positions(&k, position_ids)?,
-            )
+            r.apply_qk_with_positions(&q, &k, position_ids)?
         } else {
             (q, k)
         };
@@ -497,11 +494,20 @@ impl Attention {
                     scores.broadcast_add(&seg_mask.to_dtype(scores.dtype())?)?
                 } else if seg.num_tokens > 1 {
                     let cm = if kv_len > seg.num_tokens {
-                        super::mask::causal_mask_prefixed_cached(seg.num_tokens, kv_len, device)?
+                        super::mask::causal_mask_prefixed_cached_dtype(
+                            seg.num_tokens,
+                            kv_len,
+                            scores.dtype(),
+                            device,
+                        )?
                     } else {
-                        super::mask::causal_mask_cached(seg.num_tokens, device)?
+                        super::mask::causal_mask_cached_dtype(
+                            seg.num_tokens,
+                            scores.dtype(),
+                            device,
+                        )?
                     };
-                    scores.broadcast_add(&cm.to_dtype(scores.dtype())?)?
+                    scores.broadcast_add(&cm)?
                 } else {
                     scores
                 };

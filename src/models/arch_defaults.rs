@@ -70,8 +70,8 @@ pub fn arch_defaults(arch: &str) -> Option<ArchDefaults> {
 
         "mistral" | "MistralForCausalLM" | "Mistral3ForConditionalGeneration" => {
             Some(ArchDefaults {
-                extra_eos_ids: &[],
-                ..llama_defaults()
+                default_rope_theta: 10_000.0,
+                ..Default::default()
             })
         }
         "phi3" | "Phi3ForCausalLM" => Some(ArchDefaults {

@@ -110,16 +110,25 @@ pub struct Engine {
     scheduler: Scheduler,
     device: Device,
     stop_token_ids: HashSet<u32>,
+    stop_token_sequences: Vec<Vec<u32>>,
     allocators: Vec<SharedBlockAllocator>,
     prefix_cache: PrefixCache,
     block_size: usize,
 }
 
+fn has_matching_stop_sequence(tokens: &[u32], stop_sequences: &[Vec<u32>]) -> bool {
+    stop_sequences.iter().any(|seq| {
+        let n = seq.len();
+        n > 0 && tokens.len() >= n && tokens[tokens.len() - n..] == seq[..]
+    })
+}
+
 impl Engine {
-    pub fn new_with_stop_tokens(
+    pub fn new_with_stop_controls(
         model: Box<dyn BatchModel>,
         config: SchedulerConfig,
         extra_stop_ids: &[u32],
+        extra_stop_sequences: &[Vec<u32>],
     ) -> Self {
         let allocators: Vec<SharedBlockAllocator> =
             model.allocators().iter().map(Arc::clone).collect();
@@ -134,6 +143,12 @@ impl Engine {
         for &id in extra_stop_ids {
             stop_token_ids.insert(id);
         }
+        let mut stop_token_sequences: Vec<Vec<u32>> = Vec::new();
+        for seq in extra_stop_sequences {
+            if !seq.is_empty() && !stop_token_sequences.contains(seq) {
+                stop_token_sequences.push(seq.clone());
+            }
+        }
         let scheduler_allocators: Vec<SharedBlockAllocator> =
             allocators.iter().map(Arc::clone).collect();
         let scheduler = Scheduler::new(config, scheduler_allocators, num_layers);
@@ -143,6 +158,7 @@ impl Engine {
             scheduler,
             device,
             stop_token_ids,
+            stop_token_sequences,
             allocators,
             prefix_cache,
             block_size,
@@ -180,6 +196,7 @@ impl Engine {
             scheduler,
             device,
             stop_token_ids,
+            stop_token_sequences,
             allocators,
             prefix_cache,
             block_size,
@@ -321,16 +338,14 @@ impl Engine {
                 )?
             };
             let next_token = sample_out.token;
-            let is_stop = stop_token_ids.contains(&next_token) || {
-                let seq = scheduler.get_running(info.seq_id).unwrap();
-                seq.extra_stop_token_ids.contains(&next_token)
-            };
-
             let emit = {
                 let seq = scheduler.get_running_mut(info.seq_id).unwrap();
                 seq.append_token(next_token);
                 seq.num_processed_tokens = seq.all_tokens.len() - 1;
                 seq.phase = SequencePhase::Decode;
+                let is_stop = stop_token_ids.contains(&next_token)
+                    || seq.extra_stop_token_ids.contains(&next_token)
+                    || has_matching_stop_sequence(&seq.all_tokens, stop_token_sequences);
                 seq.apply_token(next_token, is_stop)
             };
 
@@ -379,11 +394,11 @@ impl Engine {
             };
             let next_token = sample_out.token;
             let seq = scheduler.get_running_mut(seq_id).unwrap();
-            let is_stop = stop_token_ids.contains(&next_token)
-                || seq.extra_stop_token_ids.contains(&next_token);
-
             seq.append_token(next_token);
             seq.num_processed_tokens = seq.all_tokens.len() - 1;
+            let is_stop = stop_token_ids.contains(&next_token)
+                || seq.extra_stop_token_ids.contains(&next_token)
+                || has_matching_stop_sequence(&seq.all_tokens, stop_token_sequences);
 
             if seq.apply_token(next_token, is_stop) {
                 new_tokens.push(NewToken {
@@ -533,7 +548,7 @@ mod tests {
         let allocators = make_allocators(1, 8);
         let (model, _) = FakeModel::new(vec![2, 4], 0, allocators);
         let engine =
-            Engine::new_with_stop_tokens(Box::new(model), test_scheduler_config(), &[4, 9]);
+            Engine::new_with_stop_controls(Box::new(model), test_scheduler_config(), &[4, 9], &[]);
 
         assert!(engine.stop_token_ids.contains(&2));
         assert!(engine.stop_token_ids.contains(&4));
@@ -546,7 +561,7 @@ mod tests {
         let allocators = make_allocators(1, 8);
         let (model, _) = FakeModel::new(vec![2], 3, allocators);
         let mut engine =
-            Engine::new_with_stop_tokens(Box::new(model), test_scheduler_config(), &[]);
+            Engine::new_with_stop_controls(Box::new(model), test_scheduler_config(), &[], &[]);
 
         let id0 = engine.add_request(vec![10, 11], SamplingParams::default(), 4);
         let id1 =
@@ -564,7 +579,7 @@ mod tests {
         let allocators = make_allocators(1, 8);
         let (model, _) = FakeModel::new(vec![2], 3, allocators);
         let mut engine =
-            Engine::new_with_stop_tokens(Box::new(model), test_scheduler_config(), &[]);
+            Engine::new_with_stop_controls(Box::new(model), test_scheduler_config(), &[], &[]);
 
         let id0 = engine.add_request(vec![10, 11], SamplingParams::default(), 4);
         let id1 = engine.add_request(vec![20, 21], SamplingParams::default(), 4);
@@ -581,7 +596,7 @@ mod tests {
         let allocators = make_allocators(1, 8);
         let (model, forward_calls) = FakeModel::new(vec![2], 3, allocators);
         let mut engine =
-            Engine::new_with_stop_tokens(Box::new(model), test_scheduler_config(), &[]);
+            Engine::new_with_stop_controls(Box::new(model), test_scheduler_config(), &[], &[]);
 
         let out = engine.step().unwrap();
         assert!(out.new_tokens.is_empty());
@@ -595,7 +610,7 @@ mod tests {
         let forced_stop = 7;
         let (model, forward_calls) = FakeModel::new(vec![forced_stop], forced_stop, allocators);
         let mut engine =
-            Engine::new_with_stop_tokens(Box::new(model), test_scheduler_config(), &[]);
+            Engine::new_with_stop_controls(Box::new(model), test_scheduler_config(), &[], &[]);
 
         let seq_id = engine.add_request(vec![1, 2, 3], SamplingParams::default(), 4);
         let out = engine.step().unwrap();
@@ -614,7 +629,7 @@ mod tests {
         let forced_token = 11;
         let (model, _) = FakeModel::new(Vec::new(), forced_token, allocators);
         let mut engine =
-            Engine::new_with_stop_tokens(Box::new(model), test_scheduler_config(), &[]);
+            Engine::new_with_stop_controls(Box::new(model), test_scheduler_config(), &[], &[]);
 
         let seq_id = engine.add_request_with_stop(
             vec![21, 22],
@@ -622,6 +637,34 @@ mod tests {
             4,
             vec![forced_token],
         );
+        let out = engine.step().unwrap();
+
+        assert!(out.new_tokens.is_empty());
+        assert_eq!(out.completed.len(), 1);
+        assert_eq!(out.completed[0].id, seq_id);
+        assert_eq!(out.completed[0].finish_reason.as_deref(), Some("stop"));
+    }
+
+    #[test]
+    fn stop_sequence_matches_suffix_only() {
+        assert!(has_matching_stop_sequence(&[1, 2, 3, 4], &[vec![3, 4]]));
+        assert!(!has_matching_stop_sequence(&[1, 2, 3, 4], &[vec![2, 3]]));
+        assert!(!has_matching_stop_sequence(&[1, 2], &[vec![1, 2, 3]]));
+    }
+
+    #[test]
+    fn step_respects_engine_stop_sequences() {
+        let allocators = make_allocators(1, 8);
+        let forced_token = 11;
+        let (model, _) = FakeModel::new(Vec::new(), forced_token, allocators);
+        let mut engine = Engine::new_with_stop_controls(
+            Box::new(model),
+            test_scheduler_config(),
+            &[],
+            &[vec![forced_token]],
+        );
+
+        let seq_id = engine.add_request(vec![21, 22], SamplingParams::default(), 4);
         let out = engine.step().unwrap();
 
         assert!(out.new_tokens.is_empty());

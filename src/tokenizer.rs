@@ -332,7 +332,10 @@ impl Tokenizer {
     }
 
     pub fn special_token_id(&self, content: &str) -> Option<u32> {
-        self.special_token_ids.get(content).copied()
+        self.special_token_ids
+            .get(content)
+            .copied()
+            .or_else(|| self.inner.token_to_id(content))
     }
 
     pub fn id_to_token(&self, token_id: u32) -> Option<String> {
@@ -381,5 +384,63 @@ impl Tokenizer {
             }
         }
         ids
+    }
+
+    pub fn stop_text_markers(&self) -> Vec<String> {
+        let mut markers: Vec<String> = Vec::new();
+
+        for key in &["eot_token", "eom_token", "end_of_turn_token"] {
+            if let Some(content) = self.special_tokens.get(*key)
+                && !markers.contains(content)
+            {
+                markers.push(content.clone());
+            }
+        }
+
+        for content in &[
+            "<|eot_id|>",
+            "<|eom_id|>",
+            "<|end_of_text|>",
+            "<|im_end|>",
+            "<|im_start|>",
+            "<|endoftext|>",
+            "<turn|>",
+            "<end_of_turn>",
+        ] {
+            if !markers.iter().any(|m| m == content) {
+                markers.push((*content).to_string());
+            }
+        }
+
+        markers
+    }
+
+    pub fn stop_token_sequences(&self) -> Vec<Vec<u32>> {
+        fn push_sequence(tok: &Tokenizer, out: &mut Vec<Vec<u32>>, content: &str) {
+            let Ok(ids) = tok.encode(content) else {
+                return;
+            };
+            if ids.is_empty() {
+                return;
+            }
+            if let Ok(roundtrip) = tok.decode_with_special(&ids)
+                && roundtrip != content
+            {
+                return;
+            }
+            if !out.contains(&ids) {
+                out.push(ids);
+            }
+        }
+
+        let mut seqs: Vec<Vec<u32>> = Vec::new();
+
+        for content in self.stop_text_markers() {
+            push_sequence(self, &mut seqs, &content);
+            let with_newline = format!("{}\n", content);
+            push_sequence(self, &mut seqs, &with_newline);
+        }
+
+        seqs
     }
 }

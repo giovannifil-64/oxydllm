@@ -579,6 +579,27 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
     })
 }
 
+fn clamp_to_char_boundary(s: &str, idx: usize) -> usize {
+    let mut i = idx.min(s.len());
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+fn find_first_stop_marker(text: &str, stop_markers: &[String]) -> Option<usize> {
+    stop_markers
+        .iter()
+        .filter_map(|marker| {
+            if marker.is_empty() {
+                None
+            } else {
+                text.find(marker)
+            }
+        })
+        .min()
+}
+
 fn run_interactive(args: &RunArgs) -> anyhow::Result<()> {
     use std::io::{BufRead, Write};
 
@@ -622,13 +643,26 @@ fn run_interactive(args: &RunArgs) -> anyhow::Result<()> {
         max_tokens_per_step: 4096,
     };
     let extra_stop_ids = tokenizer.stop_token_ids();
-    let mut engine = engine::Engine::new_with_stop_tokens(batch_model, config, &extra_stop_ids);
+    let extra_stop_sequences = tokenizer.stop_token_sequences();
+    let mut engine = engine::Engine::new_with_stop_controls(
+        batch_model,
+        config,
+        &extra_stop_ids,
+        &extra_stop_sequences,
+    );
 
     let mut messages: Vec<ChatMessage> = vec![ChatMessage {
         role: "system".to_string(),
         content: "You are a helpful assistant.".to_string(),
         reasoning_content: None,
     }];
+    let stop_markers = tokenizer.stop_text_markers();
+    let hold_back_bytes = stop_markers
+        .iter()
+        .map(|m| m.len())
+        .max()
+        .unwrap_or(0)
+        .saturating_sub(1);
 
     println!("\nType your message (/exit to quit).\n");
 
@@ -694,7 +728,9 @@ fn run_interactive(args: &RunArgs) -> anyhow::Result<()> {
         let mut response_text = String::new();
         let mut output_ids: Vec<u32> = Vec::new();
         let mut decoded_len: usize = 0;
-        while engine.has_pending_work() {
+        let mut stream_buffer = String::new();
+        let mut hit_text_stop = false;
+        while engine.has_pending_work() && !hit_text_stop {
             let step = engine.step().map_err(|e| anyhow::anyhow!("{}", e))?;
             for tok in &step.new_tokens {
                 output_ids.push(tok.token);
@@ -712,18 +748,60 @@ fn run_interactive(args: &RunArgs) -> anyhow::Result<()> {
                     decoded_len += trimmed.len();
                     trimmed.to_string()
                 };
-                print!("{}", emit);
-                std::io::stdout().flush()?;
-                response_text.push_str(&emit);
+
+                stream_buffer.push_str(&emit);
+
+                if let Some(stop_idx) = find_first_stop_marker(&stream_buffer, &stop_markers) {
+                    let safe_idx = clamp_to_char_boundary(&stream_buffer, stop_idx);
+                    if safe_idx > 0 {
+                        let safe = &stream_buffer[..safe_idx];
+                        print!("{}", safe);
+                        std::io::stdout().flush()?;
+                        response_text.push_str(safe);
+                    }
+                    hit_text_stop = true;
+                    break;
+                }
+
+                if hold_back_bytes == 0 {
+                    if !stream_buffer.is_empty() {
+                        print!("{}", stream_buffer);
+                        std::io::stdout().flush()?;
+                        response_text.push_str(&stream_buffer);
+                        stream_buffer.clear();
+                    }
+                } else if stream_buffer.len() > hold_back_bytes {
+                    let flush_idx = clamp_to_char_boundary(
+                        &stream_buffer,
+                        stream_buffer.len() - hold_back_bytes,
+                    );
+                    if flush_idx > 0 {
+                        let safe = &stream_buffer[..flush_idx];
+                        print!("{}", safe);
+                        std::io::stdout().flush()?;
+                        response_text.push_str(safe);
+                        stream_buffer = stream_buffer[flush_idx..].to_string();
+                    }
+                }
             }
         }
-        if !output_ids.is_empty() {
+
+        if hit_text_stop {
+            let _ = engine.abort_all();
+        }
+
+        if !hit_text_stop && !output_ids.is_empty() {
             let full = tokenizer.decode(&output_ids)?;
             if decoded_len < full.len() {
-                let rest = &full[decoded_len..];
-                print!("{}", rest);
-                response_text.push_str(rest);
+                let start = clamp_to_char_boundary(&full, decoded_len);
+                let rest = &full[start..];
+                stream_buffer.push_str(rest);
             }
+        }
+
+        if !hit_text_stop && !stream_buffer.is_empty() {
+            print!("{}", stream_buffer);
+            response_text.push_str(&stream_buffer);
         }
         println!("\n");
 

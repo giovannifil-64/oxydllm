@@ -39,13 +39,16 @@ KV cache quantization uses TurboQuant with MSE-based quantization during the dec
 ## Tested Models
 Here you can find a list of models that have been tested with rLLM, divided by architecture. Status indicates production readiness. This is not an exhaustive list of compatible models.
 
-### LlamaForCausalLM (Stable)
+### LlamaForCausalLM
 - `Llama-3.2-1B-Instruct`
 
-### Qwen2ForCausalLM (Stable)
+### Mistral3ForConditionalGeneration
+- `Ministral-3-3B-Instruct-2512`
+
+### Qwen2ForCausalLM
 - `Qwen2.5-1.5B-Instruct`
 
-### Qwen3ForCausalLM (Stable)
+### Qwen3ForCausalLM
 
 > [!NOTE]
 > All Qwen3 models have been tested with and without thinking mode.
@@ -56,17 +59,17 @@ Here you can find a list of models that have been tested with rLLM, divided by a
 - `Qwen3-4B-Q4_K_M`
 - `Qwen3-4B-Q5_0`
 
-### GemmaForCausalLM (Stable)
+### GemmaForCausalLM
 - `gemma-2b-it`
 
-### Gemma2ForCausalLM (Stable)
+### Gemma2ForCausalLM
 - `gemma-2-2b-it`
 
-### Gemma3ForCausalLM (Stable)
+### Gemma3ForCausalLM
 - `gemma-3-270m-it`
 - `gemma-3-1b-it`
 
-### Gemma4ForConditionalGeneration (Stable with issues)
+### Gemma4ForConditionalGeneration (Minor issues)
 - `gemma-4-E2B-it` - Known edge cases on some checkpoints/configurations
 
 ### Phi3ForCausalLM

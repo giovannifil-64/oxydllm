@@ -711,7 +711,13 @@ fn spawn_load(params: SpawnLoadParams) {
             max_tokens_per_step: 4096,
         };
         let extra_stop_ids = tokenizer.stop_token_ids();
-        let engine = Engine::new_with_stop_tokens(batch_model, config, &extra_stop_ids);
+        let extra_stop_sequences = tokenizer.stop_token_sequences();
+        let engine = Engine::new_with_stop_controls(
+            batch_model,
+            config,
+            &extra_stop_ids,
+            &extra_stop_sequences,
+        );
         engine_loop(engine, tokenizer, request_rx, shutdown);
     });
 

@@ -119,6 +119,7 @@ pub struct KvQuantizer {
     bit_width: u8,
     key_mse_bit_width: u8,
     qjl_quantization: bool,
+    use_hadamard: bool,
     head_dim: usize,
     mse_signs: Vec<f32>,
     qjl_signs: Vec<f32>,
@@ -133,13 +134,17 @@ pub struct KvQuantizer {
 impl KvQuantizer {
     pub fn new_with_qjl(bit_width: u8, head_dim: usize, qjl_quantization: bool) -> Self {
         assert!(
-            head_dim.is_power_of_two(),
-            "KV quantization requires power-of-2 head_dim, got {head_dim}"
-        );
-        assert!(
             (2..=4).contains(&bit_width),
             "Unsupported KV quant bit_width: {bit_width}"
         );
+
+        let use_hadamard = head_dim.is_power_of_two();
+        if !use_hadamard {
+            eprintln!(
+                "[kv-quant] head_dim={} is not power-of-two; using sign-only rotation fallback",
+                head_dim
+            );
+        }
 
         let value_centroids: &[f32] = match bit_width {
             2 => CENTROIDS_2BIT,
@@ -168,6 +173,7 @@ impl KvQuantizer {
             bit_width,
             key_mse_bit_width,
             qjl_quantization,
+            use_hadamard,
             head_dim,
             mse_signs: generate_signs(head_dim),
             qjl_signs: generate_qjl_signs(head_dim),
@@ -270,7 +276,9 @@ impl KvQuantizer {
         for (r, &sign) in residual.iter_mut().zip(self.qjl_signs.iter()) {
             *r *= sign;
         }
-        wht_inplace(&mut residual);
+        if self.use_hadamard {
+            wht_inplace(&mut residual);
+        }
 
         let mut qjl_bits = vec![0u8; self.head_dim];
         for (bit, &res) in qjl_bits.iter_mut().zip(residual.iter()) {
@@ -315,7 +323,9 @@ impl KvQuantizer {
         }
 
         // x_qjl = gamma * sqrt(pi/2) / d * S^T sign(Sr), with S approximated by HD.
-        wht_inplace(&mut qjl);
+        if self.use_hadamard {
+            wht_inplace(&mut qjl);
+        }
         let scale = residual_norm * self.qjl_scale;
         for ((out_i, &q), &sign) in out.iter_mut().zip(qjl.iter()).zip(self.qjl_signs.iter()) {
             *out_i += scale * q * sign;
@@ -355,9 +365,11 @@ impl KvQuantizer {
         for (yv, &sign) in y.iter_mut().zip(self.mse_signs.iter()) {
             *yv *= sign;
         }
-        wht_inplace(&mut y);
-        for v in y.iter_mut() {
-            *v *= self.inv_sqrt_d;
+        if self.use_hadamard {
+            wht_inplace(&mut y);
+            for v in y.iter_mut() {
+                *v *= self.inv_sqrt_d;
+            }
         }
 
         let mut indices = vec![0u8; self.head_dim];
@@ -391,9 +403,15 @@ impl KvQuantizer {
             y.push(centroids[indices[j] as usize]);
         }
 
-        wht_inplace(&mut y);
-        for (yv, &sign) in y.iter_mut().zip(self.mse_signs.iter()) {
-            *yv *= self.inv_sqrt_d * sign * norm;
+        if self.use_hadamard {
+            wht_inplace(&mut y);
+            for (yv, &sign) in y.iter_mut().zip(self.mse_signs.iter()) {
+                *yv *= self.inv_sqrt_d * sign * norm;
+            }
+        } else {
+            for (yv, &sign) in y.iter_mut().zip(self.mse_signs.iter()) {
+                *yv *= sign * norm;
+            }
         }
 
         y
@@ -631,6 +649,26 @@ mod tests {
         let var: f32 = x.iter().map(|v| v * v).sum::<f32>() / 64.0;
         let nmse = mse / var;
         assert!(nmse < 0.08, "4-bit d=64 NMSE too high: {nmse}");
+    }
+
+    #[test]
+    fn quantize_dequantize_4bit_d96_non_power_of_two() {
+        // Phi-family models can use head_dim=96; ensure KV quantization does not panic.
+        let q = KvQuantizer::new_with_qjl(4, 96, false);
+        let x: Vec<f32> = (0..96)
+            .map(|i| (i as f32 * 0.27 + 0.4).sin() * 1.9)
+            .collect();
+        let (packed, norm) = q.quantize(&x);
+        let y = q.dequantize(&packed, norm);
+        let mse: f32 = x
+            .iter()
+            .zip(y.iter())
+            .map(|(a, b)| (a - b).powi(2))
+            .sum::<f32>()
+            / 96.0;
+        let var: f32 = x.iter().map(|v| v * v).sum::<f32>() / 96.0;
+        let nmse = mse / var;
+        assert!(nmse < 0.35, "4-bit d=96 NMSE too high: {nmse}");
     }
 
     #[test]

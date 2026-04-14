@@ -14,6 +14,7 @@ use std::time::Duration;
 use sampling::SamplingParams;
 use server::ChatMessage;
 use tokenizer::Tokenizer;
+use tracing_subscriber::EnvFilter;
 
 struct EstimateArgs {
     model: String,
@@ -94,10 +95,21 @@ fn resolve_devices(explicit: Option<Vec<usize>>) -> Vec<usize> {
     {
         match parse_devices(&env) {
             Ok(d) => return d,
-            Err(e) => eprintln!("Warning: RLLM_DEVICES ignored — {}", e),
+            Err(e) => tracing::warn!(error = %e, "RLLM_DEVICES ignored"),
         }
     }
     vec![]
+}
+
+fn init_tracing() {
+    let env_filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("rllm=info,hyper=warn,tower=warn"));
+
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(env_filter)
+        .with_target(false)
+        .compact()
+        .try_init();
 }
 
 fn print_usage() {
@@ -703,20 +715,19 @@ fn run_interactive(args: &RunArgs) -> anyhow::Result<()> {
             }
             prompt = server::apply_chat_template(&tokenizer, &messages, false);
             prompt_tokens = tokenizer.encode(&prompt)?;
-            eprintln!(
-                "[context] Truncated oldest messages ({} → {} tokens, max {})",
-                prev_len,
-                prompt_tokens.len(),
-                max_seq_len,
+            tracing::warn!(
+                previous_tokens = prev_len,
+                current_tokens = prompt_tokens.len(),
+                max_context_len = max_seq_len,
+                "truncated oldest messages to fit context window"
             );
         }
 
         if prompt_tokens.len() >= max_seq_len {
-            eprintln!(
-                "[warning] Context full ({} tokens >= {} max) — cannot generate. \
-                 Start a new conversation with /exit.",
-                prompt_tokens.len(),
-                max_seq_len,
+            tracing::warn!(
+                prompt_tokens = prompt_tokens.len(),
+                max_context_len = max_seq_len,
+                "context full, cannot generate; start a new conversation with /exit"
             );
             messages.pop();
             continue;
@@ -816,6 +827,8 @@ fn run_interactive(args: &RunArgs) -> anyhow::Result<()> {
 }
 
 fn main() -> anyhow::Result<()> {
+    init_tracing();
+
     let args: Vec<String> = std::env::args().collect();
 
     if args.len() < 2 {

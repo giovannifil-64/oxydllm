@@ -179,9 +179,9 @@ impl Scheduler {
             } else {
                 let idx = *self.running_index.get(&seq_id).unwrap();
                 let mut seq = self.remove_from_running(idx);
-                eprintln!(
-                    "[scheduler] seq={} preempted (memory pressure) — KV cache cleared, re-queued for prefill",
-                    seq.id
+                tracing::warn!(
+                    seq_id = seq.id,
+                    "sequence preempted due to memory pressure; KV cache cleared and re-queued"
                 );
                 for cache in &mut seq.caches {
                     cache.clear();

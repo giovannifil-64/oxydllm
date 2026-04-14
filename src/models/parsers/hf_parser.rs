@@ -358,8 +358,9 @@ fn parse_rope_scaling(v: &Value) -> RopeScaling {
         }
         _ => {
             if !rope_type.is_empty() {
-                eprintln!(
-                    "[rope] Unknown rope_scaling type '{rope_type}', falling back to no scaling"
+                tracing::warn!(
+                    rope_type = %rope_type,
+                    "unknown rope_scaling type, falling back to no scaling"
                 );
             }
             RopeScaling::None

@@ -107,7 +107,7 @@ pub fn save_registry(models_dir: &Path, registry: &HashMap<String, RegistryEntry
     if let Ok(json) = serde_json::to_string_pretty(registry)
         && let Err(e) = std::fs::write(&path, &json)
     {
-        eprintln!("[registry] Failed to save {}: {e}", path.display());
+        tracing::warn!(path = %path.display(), error = %e, "failed to save model registry");
     }
 }
 
@@ -116,6 +116,20 @@ fn now_unix_secs() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+const BYTES_PER_GB: f64 = 1_073_741_824.0;
+
+fn gb(bytes: usize) -> f64 {
+    bytes as f64 / BYTES_PER_GB
+}
+
+fn round_2(v: f64) -> f64 {
+    (v * 100.0).round() / 100.0
+}
+
+fn round_1(v: f64) -> f64 {
+    (v * 10.0).round() / 10.0
 }
 
 /// Returns the best available size estimate for `model_id` before it is loaded.
@@ -170,29 +184,22 @@ impl ModelManager {
         let before = registry.len();
         registry.retain(|id, _| valid_ids.contains(id));
         if registry.len() < before {
-            println!(
-                "[registry] Removed {} stale entries (models no longer on disk).",
-                before - registry.len()
+            tracing::info!(
+                removed_entries = before - registry.len(),
+                "removed stale registry entries"
             );
             save_registry(&models_dir, &registry);
         }
         let is_cpu = cuda_devices.is_empty();
         let kv_total = detect_system_kv_budget(memory_budget_bytes, is_cpu);
-        println!(
-            "[kv-pool] Global KV cache budget: {:.2} GB",
-            kv_total as f64 / 1_073_741_824.0,
+        tracing::info!(
+            kv_cache_budget_gb = round_2(gb(kv_total)),
+            "global KV cache budget configured"
         );
         let kv_budget = Arc::new(GlobalKvBudget::new(kv_total));
         if kv_quant != KvQuantMode::Off {
-            println!("[kv-pool] KV cache quantization: {}", kv_quant.label());
-            println!(
-                "[kv-pool] QJL key quantization: {}",
-                if qjl_quantization {
-                    "enabled"
-                } else {
-                    "disabled"
-                }
-            );
+            tracing::info!(mode = %kv_quant.label(), "KV cache quantization enabled");
+            tracing::info!(qjl_quantization, "QJL key quantization configuration");
         }
 
         Self {
@@ -282,15 +289,12 @@ impl ModelManager {
         let is_cpu = self.cuda_devices.is_empty();
         let corrected = if is_cpu { disk_bytes * 2 } else { disk_bytes };
 
-        println!(
-            "[memory] '{}' not in registry — disk estimate: {:.2} GB{}",
+        tracing::info!(
             model_id,
-            corrected as f64 / 1_073_741_824.0,
-            if is_cpu {
-                " (×2 for F32/CPU)"
-            } else {
-                " (BF16/GPU)"
-            },
+            projected_gb = round_2(gb(corrected)),
+            estimate_source = "disk",
+            corrected_for_cpu_f32 = is_cpu,
+            "model not in registry, using projected memory size"
         );
         corrected
     }
@@ -330,13 +334,13 @@ impl ModelManager {
                         ),
                         _ => (0, 0, None),
                     };
-                    println!(
-                        "[memory pressure] Evicting LRU model '{}' ({:.2} GB) — need {:.2} GB, budget {:.2} GB, used {:.2} GB",
-                        id,
-                        freed as f64 / 1_073_741_824.0,
-                        needed_bytes as f64 / 1_073_741_824.0,
-                        budget as f64 / 1_073_741_824.0,
-                        used as f64 / 1_073_741_824.0,
+                    tracing::warn!(
+                        model_id = %id,
+                        evicted_gb = round_2(gb(freed)),
+                        needed_gb = round_2(gb(needed_bytes)),
+                        budget_gb = round_2(gb(budget)),
+                        used_gb = round_2(gb(used)),
+                        "evicting LRU model due to memory pressure"
                     );
                     self.kv_budget.release(kv_bytes);
                     self.slots.remove(&id);
@@ -449,7 +453,7 @@ impl ModelManager {
                 }) => (*kv_cache_bytes, Some(Arc::clone(shutdown))),
                 _ => (0, None),
             };
-            println!("Evicting idle model '{}' (keep-alive expired)", id);
+            tracing::info!(model_id = %id, "evicting idle model (keep-alive expired)");
             self.kv_budget.release(kv_bytes);
             self.slots.remove(id);
             if let Some(s) = shutdown {
@@ -530,21 +534,21 @@ fn warm_up_model(model: &dyn BatchModel) {
         let input = match Tensor::from_vec(dummy_tokens, (1, 8), device) {
             Ok(t) => t,
             Err(e) => {
-                eprintln!("[warmup] failed to create prefill tensor: {e}");
+                tracing::warn!(error = %e, "warmup failed to create prefill tensor");
                 return;
             }
         };
         let position_ids = match Tensor::from_vec(positions, (8,), device) {
             Ok(t) => t,
             Err(e) => {
-                eprintln!("[warmup] failed to create position ids: {e}");
+                tracing::warn!(error = %e, "warmup failed to create prefill position ids");
                 return;
             }
         };
 
         let mut cache_slices: Vec<&mut [PagedKvCache]> = vec![caches.as_mut_slice()];
         if let Err(e) = model.forward_batch(&input, &position_ids, &mut cache_slices, &[8]) {
-            eprintln!("[warmup] prefill forward failed (non-fatal): {e}");
+            tracing::warn!(error = %e, "warmup prefill forward failed (non-fatal)");
         }
     }
 
@@ -552,21 +556,21 @@ fn warm_up_model(model: &dyn BatchModel) {
         let input = match Tensor::from_vec(vec![1u32], (1, 1), device) {
             Ok(t) => t,
             Err(e) => {
-                eprintln!("[warmup] failed to create decode tensor: {e}");
+                tracing::warn!(error = %e, "warmup failed to create decode tensor");
                 return;
             }
         };
         let position_ids = match Tensor::from_vec(vec![8u32], (1,), device) {
             Ok(t) => t,
             Err(e) => {
-                eprintln!("[warmup] failed to create decode position ids: {e}");
+                tracing::warn!(error = %e, "warmup failed to create decode position ids");
                 return;
             }
         };
 
         let mut cache_slices: Vec<&mut [PagedKvCache]> = vec![caches.as_mut_slice()];
         if let Err(e) = model.forward_batch(&input, &position_ids, &mut cache_slices, &[1]) {
-            eprintln!("[warmup] decode forward failed (non-fatal): {e}");
+            tracing::warn!(error = %e, "warmup decode forward failed (non-fatal)");
         }
     }
 
@@ -621,7 +625,7 @@ fn spawn_load(params: SpawnLoadParams) {
             }
         };
 
-        println!("\nLoading model '{}'...", model_id_thread);
+        tracing::info!(model_id = %model_id_thread, "loading model");
         let max_num_sequences: usize = 8;
         let (batch_model, weights_size_bytes) = match loader::load_batch_model(
             &model_dir,
@@ -665,29 +669,29 @@ fn spawn_load(params: SpawnLoadParams) {
         // On GPU: BF16 = 2 bytes/param → roughly half the on-disk F32 safetensors size.
         // On CPU: F32 = 4 bytes/param → matches or slightly exceeds on-disk size.
         let total_bytes = weights_size_bytes + kv_cache_bytes;
-        println!(
-            "Model '{}' loaded. vocab_size={}, max_seq_len={}, num_layers={}, size={:.2} GB (weights) + {:.2} GB (KV cache) = {:.2} GB total ({})",
-            model_id_thread,
+        tracing::info!(
+            model_id = %model_id_thread,
             vocab_size,
             max_seq_len,
             num_layers,
-            weights_size_bytes as f64 / 1_073_741_824.0,
-            kv_cache_bytes as f64 / 1_073_741_824.0,
-            total_bytes as f64 / 1_073_741_824.0,
-            if matches!(device, candle_core::Device::Cpu) {
+            weights_gb = round_2(gb(weights_size_bytes)),
+            kv_cache_gb = round_2(gb(kv_cache_bytes)),
+            total_gb = round_2(gb(total_bytes)),
+            precision_profile = if matches!(device, candle_core::Device::Cpu) {
                 "F32/CPU"
             } else {
                 "BF16/GPU"
             },
+            "model loaded"
         );
 
-        println!("Warming up model '{}'...", model_id_thread);
+        tracing::info!(model_id = %model_id_thread, "warming up model");
         let t_warmup = std::time::Instant::now();
         warm_up_model(batch_model.as_ref());
-        println!(
-            "Model '{}' ready ({:.1}s warmup).",
-            model_id_thread,
-            t_warmup.elapsed().as_secs_f32()
+        tracing::info!(
+            model_id = %model_id_thread,
+            warmup_s = round_1(t_warmup.elapsed().as_secs_f64()),
+            "model ready"
         );
 
         let (request_tx, request_rx) = tokio_mpsc::unbounded_channel();
@@ -767,13 +771,12 @@ fn spawn_load(params: SpawnLoadParams) {
                     let total = mgr.total_loaded_bytes();
                     if total > budget {
                         let model_bytes = result.weights_size_bytes + result.kv_cache_bytes;
-                        println!(
-                            "[memory] Post-load budget exceeded: {:.2} GB used / {:.2} GB budget \
-                             — unloading '{}' ({:.2} GB)",
-                            total as f64 / 1_073_741_824.0,
-                            budget as f64 / 1_073_741_824.0,
-                            model_id,
-                            model_bytes as f64 / 1_073_741_824.0,
+                        tracing::warn!(
+                            model_id = %model_id,
+                            used_gb = round_2(gb(total)),
+                            budget_gb = round_2(gb(budget)),
+                            model_gb = round_2(gb(model_bytes)),
+                            "post-load memory budget exceeded, unloading model"
                         );
                         let (kv_bytes, shutdown) = match mgr.slots.get(&model_id) {
                             Some(SlotState::Ready {
@@ -797,7 +800,7 @@ fn spawn_load(params: SpawnLoadParams) {
                             model_bytes as f64 / 1_073_741_824.0,
                             budget as f64 / 1_073_741_824.0,
                         );
-                        eprintln!("{}", err);
+                        tracing::error!(model_id = %model_id, error = %err, "loaded model exceeds memory budget");
                         for waiter in waiters {
                             let _ = waiter.send(Err(err.clone()));
                         }
@@ -820,7 +823,7 @@ fn spawn_load(params: SpawnLoadParams) {
                 };
                 drop(mgr);
 
-                eprintln!("Failed to load model '{}': {}", model_id, err);
+                tracing::error!(model_id = %model_id, error = %err, "failed to load model");
                 for waiter in waiters {
                     let _ = waiter.send(Err(err.clone()));
                 }
@@ -835,7 +838,7 @@ fn spawn_load(params: SpawnLoadParams) {
                 drop(mgr);
 
                 let err = format!("Model '{}' loader thread panicked", model_id);
-                eprintln!("{}", err);
+                tracing::error!(model_id = %model_id, error = %err, "model loader thread panicked");
                 for waiter in waiters {
                     let _ = waiter.send(Err(err.clone()));
                 }

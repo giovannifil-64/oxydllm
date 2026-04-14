@@ -252,12 +252,12 @@ impl Engine {
                 for cache in caches.iter_mut() {
                     cache.set_num_tokens(num_cached_tokens);
                 }
-                eprintln!(
-                    "[prefix_cache] seq={} hit {}/{} blocks ({} tokens skipped)",
+                tracing::debug!(
                     seq_id,
-                    num_cached_blocks,
-                    seq_len / block_size,
-                    num_cached_tokens
+                    cached_blocks = num_cached_blocks,
+                    total_blocks = seq_len / block_size,
+                    skipped_tokens = num_cached_tokens,
+                    "prefix cache hit"
                 );
             }
 

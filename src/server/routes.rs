@@ -497,15 +497,16 @@ pub fn apply_chat_template(
             if without_system.len() < messages.len() {
                 let msgs_ref: Vec<ChatMessage> = without_system.into_iter().cloned().collect();
                 if let Ok(prompt) = try_render(&msgs_ref) {
-                    eprintln!(
-                        "Warning: system role not supported by this model's template — retrying without system message."
+                    tracing::warn!(
+                        "system role not supported by this model template; retrying without system message"
                     );
                     return prompt;
                 }
             }
 
-            eprintln!(
-                "Warning: chat template rendering failed: {e:#}. Falling back to plain text."
+            tracing::warn!(
+                error = ?e,
+                "chat template rendering failed, falling back to plain text"
             );
             chat_template::format_plain_chat(messages)
         }
@@ -546,8 +547,18 @@ fn abort_sequences(
         let model_id = trackers.remove(&seq_id).map(|t| t.model_id);
         let _ = engine.abort_sequence(seq_id);
         match model_id {
-            Some(model_id) => eprintln!("[req] {} seq={} aborted ({reason})", model_id, seq_id),
-            None => eprintln!("[req] seq={} aborted ({reason})", seq_id),
+            Some(model_id) => {
+                tracing::debug!(
+                    model_id = %model_id,
+                    request_id = seq_id,
+                    seq_id,
+                    reason = %reason,
+                    "request aborted"
+                )
+            }
+            None => {
+                tracing::debug!(request_id = seq_id, seq_id, reason = %reason, "request aborted")
+            }
         }
     }
 }
@@ -565,7 +576,7 @@ fn enqueue_request(
         req.max_tokens,
         req.extra_stop_token_ids,
     );
-    eprintln!("[req] {} seq={} enqueued", model_id, seq_id);
+    tracing::debug!(model_id = %model_id, request_id = seq_id, seq_id, "request enqueued");
     trackers.insert(
         seq_id,
         SeqTracker {
@@ -699,9 +710,13 @@ pub fn engine_loop(
                         if let Some(tracker) = trackers.get_mut(&tok.seq_id) {
                             if tracker.first_token_at.is_none() {
                                 let ttft_ms = tracker.enqueued_at.elapsed().as_secs_f64() * 1000.0;
-                                eprintln!(
-                                    "[timing] {} seq={} TTFT: {:.1}ms",
-                                    tracker.model_id, tok.seq_id, ttft_ms
+                                let ttft_ms = (ttft_ms * 10.0).round() / 10.0;
+                                tracing::info!(
+                                    model_id = %tracker.model_id,
+                                    request_id = tok.seq_id,
+                                    seq_id = tok.seq_id,
+                                    ttft_ms,
+                                    "first token emitted"
                                 );
                                 tracker.first_token_at = Some(std::time::Instant::now());
                             }
@@ -860,14 +875,18 @@ pub fn engine_loop(
                                 .map(|t| t.elapsed().as_secs_f64())
                                 .unwrap_or(0.001);
                             let tps = tracker.token_count as f64 / decode_s.max(0.001);
-                            eprintln!(
-                                "[timing] {} seq={} done: {} tokens, total={:.1}ms, decode={:.1}ms ({:.1} tok/s)",
-                                tracker.model_id,
-                                completed.id,
-                                tracker.token_count,
+                            let total_ms = (total_ms * 10.0).round() / 10.0;
+                            let decode_ms = ((decode_s * 1000.0) * 10.0).round() / 10.0;
+                            let tps = (tps * 100.0).round() / 100.0;
+                            tracing::info!(
+                                model_id = %tracker.model_id,
+                                request_id = completed.id,
+                                seq_id = completed.id,
+                                completion_tokens = tracker.token_count,
                                 total_ms,
-                                decode_s * 1000.0,
-                                tps,
+                                decode_ms,
+                                tokens_per_second = tps,
+                                "request completed"
                             );
                             let _ = tracker.tx.send(EngineEvent::Finish {
                                 finish_reason: completed
@@ -883,11 +902,17 @@ pub fn engine_loop(
                 }
                 Err(e) => {
                     consecutive_errors += 1;
-                    eprintln!("Engine error ({consecutive_errors}/{MAX_CONSECUTIVE_ERRORS}): {e}");
+                    tracing::error!(
+                        consecutive_errors,
+                        max_consecutive_errors = MAX_CONSECUTIVE_ERRORS,
+                        error = %e,
+                        "engine step failed"
+                    );
 
                     if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
-                        eprintln!(
-                            "[CRITICAL] {consecutive_errors} consecutive engine errors — aborting all sequences"
+                        tracing::error!(
+                            consecutive_errors,
+                            "too many consecutive engine errors, aborting all sequences"
                         );
                         let aborted_ids = engine.abort_all();
                         for id in aborted_ids {
@@ -1158,10 +1183,10 @@ async fn chat_completions(
 
     let handle = match get_result {
         GetResult::Ready(h) => {
-            eprintln!(
-                "[timing] {} manager lock+ready: {:.1}ms",
-                model_id,
-                t_after_lock.as_secs_f64() * 1000.0
+            tracing::debug!(
+                model_id = %model_id,
+                manager_ready_ms = t_after_lock.as_secs_f64() * 1000.0,
+                "model manager returned ready handle"
             );
             h
         }
@@ -1181,10 +1206,10 @@ async fn chat_completions(
                 };
                 error_response(status, e, "server_error")
             })?;
-            eprintln!(
-                "[timing] {} load completed: {:.1}ms",
-                model_id,
-                t_request.elapsed().as_secs_f64() * 1000.0
+            tracing::debug!(
+                model_id = %model_id,
+                load_completed_ms = t_request.elapsed().as_secs_f64() * 1000.0,
+                "model load completed"
             );
             h
         }
@@ -1239,13 +1264,13 @@ async fn chat_completions(
     let encode_ms = t_encode.elapsed().as_secs_f64() * 1000.0;
     let prompt_len = prompt_tokens.len();
 
-    eprintln!(
-        "[timing] {} template: {:.1}ms, encode: {:.1}ms ({} tokens), total pre-engine: {:.1}ms",
-        model_id,
+    tracing::debug!(
+        model_id = %model_id,
         template_ms,
         encode_ms,
-        prompt_len,
-        t_request.elapsed().as_secs_f64() * 1000.0
+        prompt_tokens = prompt_len,
+        pre_engine_total_ms = t_request.elapsed().as_secs_f64() * 1000.0,
+        "prompt preparation timings"
     );
 
     // Parse stop strings into token IDs (single-token stops only).
@@ -1887,21 +1912,16 @@ pub fn start_server(args: StartServerArgs) -> anyhow::Result<()> {
 
     if !models_dir.exists() {
         std::fs::create_dir_all(&models_dir)?;
-        println!("Created models directory: {}", models_dir.display());
+        tracing::info!(path = %models_dir.display(), "created models directory");
     }
     let available = crate::models::loader::discover_models(&models_dir);
-    println!("Models directory: {}", models_dir.display());
-    println!(
-        "Discovered {} {}:",
-        available.len(),
-        if available.len() == 1 {
-            "model"
-        } else {
-            "models"
-        }
+    tracing::info!(path = %models_dir.display(), "models directory");
+    tracing::info!(
+        discovered_models = available.len(),
+        "discovered local models"
     );
     for m in &available {
-        println!("  - {} ({})", m.id, m.architecture);
+        tracing::info!(model_id = %m.id, architecture = %m.architecture, "discovered model");
     }
 
     let manager = Arc::new(tokio::sync::Mutex::new(ModelManager::new(
@@ -1934,31 +1954,34 @@ pub fn start_server(args: StartServerArgs) -> anyhow::Result<()> {
         manager::spawn_eviction_task(manager);
 
         let addr = format!("0.0.0.0:{}", port);
-        println!("\nServer listening on http://{}", addr);
-        println!(
-            "API endpoint:   POST http://localhost:{}/v1/chat/completions",
-            port
+        let api_endpoint = format!("http://localhost:{port}/v1/chat/completions");
+        let models_endpoint = format!("http://localhost:{port}/v1/models");
+        let running_models_endpoint = format!("http://localhost:{port}/v1/models/running");
+        let health_endpoint = format!("http://localhost:{port}/health");
+
+        tracing::info!(address = %addr, "server listening");
+        tracing::info!(method = "POST", endpoint = %api_endpoint, "API endpoint");
+        tracing::info!(method = "GET", endpoint = %models_endpoint, "models endpoint");
+        tracing::info!(
+            method = "GET",
+            endpoint = %running_models_endpoint,
+            "running models endpoint"
         );
-        println!("Models:         GET  http://localhost:{}/v1/models", port);
-        println!(
-            "Running models: GET  http://localhost:{}/v1/models/running",
-            port
-        );
-        println!("Health check:   GET  http://localhost:{}/health", port);
-        println!(
-            "\nKeep-alive: {}s (models evicted after idle timeout)",
-            keep_alive.as_secs()
+        tracing::info!(method = "GET", endpoint = %health_endpoint, "health endpoint");
+        tracing::info!(
+            keep_alive_s = keep_alive.as_secs(),
+            "models evicted after keep-alive timeout"
         );
         match memory_budget_bytes {
-            Some(b) => println!(
-                "Memory budget: {:.1} GB (LRU eviction when exceeded)",
-                b as f64 / 1_073_741_824.0
+            Some(b) => tracing::info!(
+                memory_budget_gb = ((b as f64 / 1_073_741_824.0) * 10.0).round() / 10.0,
+                "memory budget configured (LRU eviction when exceeded)"
             ),
-            None => println!("Memory budget: unlimited"),
+            None => tracing::info!("memory budget: unlimited"),
         }
-        println!(
-            "Max context length: {} tokens per sequence\n",
-            max_context_len
+        tracing::info!(
+            max_context_len,
+            "max context length configured (tokens per sequence)"
         );
 
         let listener = tokio::net::TcpListener::bind(&addr).await?;

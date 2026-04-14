@@ -140,9 +140,9 @@ impl KvQuantizer {
 
         let use_hadamard = head_dim.is_power_of_two();
         if !use_hadamard {
-            eprintln!(
-                "[kv-quant] head_dim={} is not power-of-two; using sign-only rotation fallback",
-                head_dim
+            tracing::warn!(
+                head_dim,
+                "head_dim is not power-of-two; using sign-only rotation fallback"
             );
         }
 

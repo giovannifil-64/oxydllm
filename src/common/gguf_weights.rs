@@ -19,10 +19,10 @@ impl GgufWeights {
         let content = gguf_file::Content::read(&mut file)
             .map_err(|e| anyhow::anyhow!("Failed to parse GGUF header: {}", e))?;
 
-        println!(
-            "[gguf] Parsed {} tensors, {} metadata entries",
-            content.tensor_infos.len(),
-            content.metadata.len(),
+        tracing::info!(
+            tensors = content.tensor_infos.len(),
+            metadata_entries = content.metadata.len(),
+            "GGUF metadata parsed"
         );
 
         let mut tensors = FxHashMap::default();
@@ -112,18 +112,19 @@ impl GgufWeights {
                 .map_err(|e| anyhow::anyhow!("Failed to parse GGUF shard '{}': {}", path, e))?;
             if shard_idx == 0 {
                 metadata = content.metadata.clone();
-                println!(
-                    "[gguf] Shard 1/{}: {} tensors, {} metadata entries",
+                tracing::info!(
+                    shard = shard_idx + 1,
                     total_shards,
-                    content.tensor_infos.len(),
-                    content.metadata.len(),
+                    tensors = content.tensor_infos.len(),
+                    metadata_entries = content.metadata.len(),
+                    "GGUF shard parsed"
                 );
             } else {
-                println!(
-                    "[gguf] Shard {}/{}: {} tensors",
-                    shard_idx + 1,
+                tracing::info!(
+                    shard = shard_idx + 1,
                     total_shards,
-                    content.tensor_infos.len(),
+                    tensors = content.tensor_infos.len(),
+                    "GGUF shard parsed"
                 );
             }
             total_tensors += content.tensor_infos.len();
@@ -139,9 +140,10 @@ impl GgufWeights {
                 tensors.insert(name.clone(), Arc::new(qt));
             }
         }
-        println!(
-            "[gguf] {} tensors loaded from {} shards",
-            total_tensors, total_shards
+        tracing::info!(
+            total_tensors,
+            total_shards,
+            "GGUF tensors loaded from shards"
         );
         Ok(Self { tensors, metadata })
     }

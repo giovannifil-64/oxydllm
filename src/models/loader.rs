@@ -168,7 +168,10 @@ fn resolve_weight_paths(model_dir: &str) -> anyhow::Result<Vec<String>> {
             }
         }
         files.sort();
-        println!("Total shared weight files: {}", files.len());
+        tracing::info!(
+            shared_weight_files = files.len(),
+            "resolved shared weight files"
+        );
         Ok(files)
     } else {
         // No index file: try the standard single-file names in order.
@@ -285,19 +288,19 @@ pub fn select_device_at(_cuda_idx: usize, require_gpu: bool) -> anyhow::Result<D
     #[cfg(feature = "cuda")]
     match Device::new_cuda(_cuda_idx) {
         Ok(d) => {
-            println!("Device: CUDA:{}", _cuda_idx);
+            tracing::info!(device = %format!("CUDA:{}", _cuda_idx), "device selected");
             return Ok(d);
         }
-        Err(e) => eprintln!("CUDA:{} not available: {e}", _cuda_idx),
+        Err(e) => tracing::warn!(cuda_device = _cuda_idx, error = %e, "CUDA device not available"),
     }
 
     #[cfg(feature = "metal")]
     match Device::new_metal(0) {
         Ok(d) => {
-            println!("Device: Metal");
+            tracing::info!(device = "Metal", "device selected");
             return Ok(d);
         }
-        Err(e) => eprintln!("Metal not available: {e}"),
+        Err(e) => tracing::warn!(error = %e, "Metal device not available"),
     }
 
     if require_gpu {
@@ -306,10 +309,10 @@ pub fn select_device_at(_cuda_idx: usize, require_gpu: bool) -> anyhow::Result<D
         ));
     }
 
-    eprintln!(
-        "[WARNING] GPU not available; falling back to CPU. Inference performance may be severely degraded."
+    tracing::warn!(
+        "GPU not available; falling back to CPU. Inference performance may be severely degraded"
     );
-    println!("Device: CPU");
+    tracing::info!(device = "CPU", "device selected");
     Ok(Device::Cpu)
 }
 
@@ -572,12 +575,12 @@ fn load_batch_model_gguf(
     };
 
     if gguf_paths.len() == 1 {
-        println!("Loading GGUF model from '{}'", gguf_paths[0].display());
+        tracing::info!(path = %gguf_paths[0].display(), "loading GGUF model");
     } else {
-        println!(
-            "Loading GGUF model from '{}' ({} shards)",
-            gguf_paths[0].display(),
-            gguf_paths.len()
+        tracing::info!(
+            first_shard = %gguf_paths[0].display(),
+            shards = gguf_paths.len(),
+            "loading sharded GGUF model"
         );
     }
     let gguf_path_strs: Vec<&str> = gguf_paths
@@ -590,7 +593,7 @@ fn load_batch_model_gguf(
     let gguf = GgufWeights::load_shards(&gguf_path_strs, device)?;
 
     let arch = gguf.architecture()?;
-    println!("[gguf] Architecture: {}", arch);
+    tracing::info!(architecture = %arch, "GGUF architecture detected");
 
     let dtype = if matches!(device, Device::Cpu) {
         DType::F32
@@ -697,14 +700,22 @@ fn compute_kv_blocks(
     }
 
     if granted_blocks < desired_blocks {
-        println!(
-            "[kv-pool] KV cache capped: {} → {} blocks ({:.2} → {:.2} GB), \
-             pool remaining: {:.2} GB",
+        let desired_gb =
+            ((desired_blocks as f64 * per_block_bytes as f64 / 1_073_741_824.0) * 100.0).round()
+                / 100.0;
+        let granted_gb =
+            ((granted_blocks as f64 * per_block_bytes as f64 / 1_073_741_824.0) * 100.0).round()
+                / 100.0;
+        let remaining_pool_gb =
+            ((kv_budget.available_bytes() as f64 / 1_073_741_824.0) * 100.0).round() / 100.0;
+
+        tracing::warn!(
             desired_blocks,
             granted_blocks,
-            desired_blocks as f64 * per_block_bytes as f64 / 1_073_741_824.0,
-            granted_blocks as f64 * per_block_bytes as f64 / 1_073_741_824.0,
-            kv_budget.available_bytes() as f64 / 1_073_741_824.0,
+            desired_gb,
+            granted_gb,
+            remaining_pool_gb,
+            "KV cache capped by global budget"
         );
     }
 

@@ -29,6 +29,8 @@ minijinja-contrib = { version = "2.16.0", features = ["pycompat"] }
 chrono = "0.4.44"
 rustc-hash = "2.1.1"
 lru = "0.16.3"
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.20", features = ["env-filter", "fmt"] }
 
 [dev-dependencies]
 tokio = { version = "1.49.0", features = ["rt-multi-thread", "macros", "time"] }

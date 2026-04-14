@@ -32,9 +32,9 @@ impl Tokenizer {
                         };
                         match Self::from_tokenizer_json(fallback_str) {
                             Ok(tok) => {
-                                eprintln!(
-                                    "[gguf] GGUF tokenizer unsupported, using tokenizer.json fallback from '{}'",
-                                    fallback_dir.display()
+                                tracing::warn!(
+                                    fallback_dir = %fallback_dir.display(),
+                                    "GGUF tokenizer unsupported, using tokenizer.json fallback"
                                 );
                                 return Ok(tok);
                             }
@@ -285,10 +285,10 @@ impl Tokenizer {
             }
         }
 
-        println!(
-            "[gguf] Tokenizer loaded from GGUF ({} tokens, template={})",
-            tokens_arr.len(),
-            if chat_template.is_some() { "yes" } else { "no" },
+        tracing::info!(
+            tokens = tokens_arr.len(),
+            has_template = chat_template.is_some(),
+            "tokenizer loaded from GGUF"
         );
 
         Ok(Self {

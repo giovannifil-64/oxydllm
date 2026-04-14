@@ -383,7 +383,7 @@ pub fn pull(config: &PullConfig) -> anyhow::Result<()> {
         ) {
             Ok(()) => downloaded_files.push(filename.clone()),
             Err(e) => {
-                eprintln!("\nError downloading '{}': {}", filename, e);
+                tracing::error!(filename = %filename, error = %e, "error downloading model file");
                 download_ok = false;
                 break;
             }
@@ -391,7 +391,7 @@ pub fn pull(config: &PullConfig) -> anyhow::Result<()> {
     }
 
     if !download_ok {
-        eprintln!("Cleaning up partial download...");
+        tracing::warn!("cleaning up partial download");
         for f in &downloaded_files {
             let _ = std::fs::remove_file(dest.join(f));
         }

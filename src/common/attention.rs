@@ -16,9 +16,10 @@ thread_local! {
 fn log_sdpa_fallback_once(head_dim: usize, dtype: candle_core::DType) {
     SDPA_FALLBACK_LOGGED.with(|logged| {
         if !logged.get() {
-            eprintln!(
-                "[attention] Metal SDPA unavailable (head_dim={}, dtype={:?}) — using standard attention",
-                head_dim, dtype
+            tracing::warn!(
+                head_dim,
+                dtype = ?dtype,
+                "Metal SDPA unavailable, using standard attention"
             );
             logged.set(true);
         }

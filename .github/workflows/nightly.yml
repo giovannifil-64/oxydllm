@@ -17,8 +17,7 @@ name: Nightly
 on:
   schedule:
     # 03:00 UTC every day
-    - cron: "0 4 * * *"
-      timezone: "Europe/London"
+    - cron: "0 3 * * *"
   workflow_dispatch:
 
 permissions:
@@ -168,3 +167,16 @@ jobs:
               -v ~/.rllm/models:/root/.rllm/models \
               ghcr.io/${{ github.repository }}:nightly-cpu start
             ```
+  cleanup-ghcr:
+    name: Cleanup untagged GHCR images
+    needs: [release-nightly]
+    runs-on: ubuntu-22.04
+    permissions:
+      packages: write
+    steps:
+      - uses: actions/delete-package-versions@v5
+        with:
+          package-name: rllm
+          package-type: container
+          min-versions-to-keep: 0
+          delete-only-untagged-versions: true

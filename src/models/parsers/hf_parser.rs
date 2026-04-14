@@ -161,20 +161,23 @@ pub fn parse(config_path: &str) -> Result<StandardTransformerConfig> {
             .collect::<Vec<_>>()
     });
 
-    let per_layer_sliding_windows = layer_types.as_ref().and_then(|types| {
-        sliding_window.map(|w| {
-            types
-                .iter()
-                .map(|layer_type| {
-                    if layer_type == "full_attention" {
-                        None
-                    } else {
-                        Some(w)
-                    }
-                })
-                .collect::<Vec<_>>()
+    let per_layer_sliding_windows = layer_types
+        .as_ref()
+        .and_then(|types| {
+            sliding_window.map(|w| {
+                types
+                    .iter()
+                    .map(|layer_type| {
+                        if layer_type == "full_attention" {
+                            None
+                        } else {
+                            Some(w)
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            })
         })
-    });
+        .or_else(|| arch_def.per_layer_sliding_windows(sliding_window, num_hidden_layers));
 
     let per_layer_rope_thetas = layer_types.as_ref().map(|types| {
         types
@@ -447,5 +450,52 @@ mod tests {
             "factor": 2.0
         });
         assert!(matches!(parse_rope_scaling(&v), RopeScaling::None));
+    }
+
+    #[test]
+    fn gemma2_has_alternating_sliding_windows_without_layer_types() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("config.json");
+
+        let config = json!({
+            "architectures": ["Gemma2ForCausalLM"],
+            "hidden_size": 2048,
+            "num_hidden_layers": 4,
+            "num_attention_heads": 16,
+            "vocab_size": 256000,
+            "sliding_window": 4096
+        });
+
+        fs::write(&config_path, serde_json::to_string_pretty(&config).unwrap()).unwrap();
+
+        let cfg = parse(config_path.to_string_lossy().as_ref()).unwrap();
+
+        assert_eq!(cfg.sliding_window, Some(4096));
+        assert_eq!(
+            cfg.per_layer_sliding_windows,
+            Some(vec![Some(4096), None, Some(4096), None])
+        );
+    }
+
+    #[test]
+    fn gemma3_does_not_force_alternating_sliding_windows() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("config.json");
+
+        let config = json!({
+            "architectures": ["Gemma3ForCausalLM"],
+            "hidden_size": 2048,
+            "num_hidden_layers": 4,
+            "num_attention_heads": 16,
+            "vocab_size": 256000,
+            "sliding_window": 4096
+        });
+
+        fs::write(&config_path, serde_json::to_string_pretty(&config).unwrap()).unwrap();
+
+        let cfg = parse(config_path.to_string_lossy().as_ref()).unwrap();
+
+        assert_eq!(cfg.sliding_window, Some(4096));
+        assert!(cfg.per_layer_sliding_windows.is_none());
     }
 }

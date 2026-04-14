@@ -230,23 +230,22 @@ impl StandardTransformer {
             arch_def.default_sliding_window
         };
 
-        let block_cfg = BlockConfig {
-            n_heads: num_attention_heads,
-            n_kv_heads: num_key_value_heads,
-            head_dim,
-            rms_norm_eps,
-            qk_norm: has_qk_norm,
-            attention_scale,
-            activation,
-            norm_type,
-            attn_softcap,
-            v_norm: has_v_norm,
-            has_ffn_norms,
-            sliding_window,
-        };
-
         let blocks = (0..num_hidden_layers)
             .map(|i| {
+                let block_cfg = BlockConfig {
+                    n_heads: num_attention_heads,
+                    n_kv_heads: num_key_value_heads,
+                    head_dim,
+                    rms_norm_eps,
+                    qk_norm: has_qk_norm,
+                    attention_scale,
+                    activation,
+                    norm_type,
+                    attn_softcap,
+                    v_norm: has_v_norm,
+                    has_ffn_norms,
+                    sliding_window: arch_def.resolve_sliding_window_for_layer(sliding_window, i),
+                };
                 TransformerBlock::load_gguf(&block_cfg, i, gguf, device, dtype, intermediate_size)
             })
             .collect::<Result<Vec<_>>>()

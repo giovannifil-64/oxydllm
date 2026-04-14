@@ -12,6 +12,36 @@ pub struct ArchDefaults {
     pub default_rope_theta: f64,
     pub extra_eos_ids: &'static [u32],
     pub default_sliding_window: Option<usize>,
+    pub alternating_sliding_window: bool,
+}
+
+impl ArchDefaults {
+    pub fn resolve_sliding_window_for_layer(
+        &self,
+        sliding_window: Option<usize>,
+        layer_idx: usize,
+    ) -> Option<usize> {
+        if self.alternating_sliding_window && layer_idx % 2 == 1 {
+            None
+        } else {
+            sliding_window
+        }
+    }
+
+    pub fn per_layer_sliding_windows(
+        &self,
+        sliding_window: Option<usize>,
+        num_layers: usize,
+    ) -> Option<Vec<Option<usize>>> {
+        if !self.alternating_sliding_window {
+            return None;
+        }
+        sliding_window.map(|_| {
+            (0..num_layers)
+                .map(|layer_idx| self.resolve_sliding_window_for_layer(sliding_window, layer_idx))
+                .collect()
+        })
+    }
 }
 
 impl Default for ArchDefaults {
@@ -28,6 +58,7 @@ impl Default for ArchDefaults {
             default_rope_theta: 10_000.0,
             extra_eos_ids: &[],
             default_sliding_window: None,
+            alternating_sliding_window: false,
         }
     }
 }
@@ -45,6 +76,7 @@ pub fn llama_defaults() -> ArchDefaults {
         default_rope_theta: 500_000.0,
         extra_eos_ids: &[128009, 128008],
         default_sliding_window: None,
+        alternating_sliding_window: false,
     }
 }
 
@@ -106,6 +138,7 @@ pub fn arch_defaults(arch: &str) -> Option<ArchDefaults> {
             attn_softcap: Some(50.0),
             logit_softcap: Some(30.0),
             default_sliding_window: Some(4096),
+            alternating_sliding_window: true,
             ..Default::default()
         }),
         "gemma3" | "gemma-3" | "Gemma3ForCausalLM" => Some(ArchDefaults {

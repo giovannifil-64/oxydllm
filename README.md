@@ -189,6 +189,7 @@ curl http://localhost:11313/v1/chat/completions \
 - **Byte-level tokenizers**: Streaming decode uses incremental buffering; occasional model-specific Unicode artifacts can still appear.
 - **Function calling/tools**: `tools` and `tool_choice` request fields are accepted but not executed server-side yet.
 - **Gemma4 edge cases**: Some checkpoints may require architecture-specific tuning.
+- **Metal softcap SDPA policy**: The Metal SDPA path with attention softcap is currently hard-disabled in runtime (no experimental toggle) and falls back to the standard attention path.
 - **CUDA optimization**: Support exists but is not optimized for production use.
 
 ## CUDA Status

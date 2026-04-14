@@ -1,4 +1,4 @@
-use super::config::{BlockConfig, NormType};
+use super::config::BlockConfig;
 use super::gguf_weights::GgufWeights;
 use super::linear::{AnyLinear, Linear, QLinear, softmax_last_dim};
 use super::norm::RMSNorm;
@@ -23,6 +23,14 @@ fn log_sdpa_fallback_once(head_dim: usize, dtype: candle_core::DType) {
             );
             logged.set(true);
         }
+    });
+}
+
+#[cfg(feature = "metal")]
+fn log_softcap_sdpa_policy_once() {
+    static LOGGED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    LOGGED.get_or_init(|| {
+        tracing::warn!("Metal SDPA softcap path disabled; using standard attention fallback");
     });
 }
 
@@ -78,12 +86,8 @@ fn truncate_kv_window(
     }
 }
 
-fn compute_sliding_window(cfg: &BlockConfig, layer_idx: usize) -> Option<usize> {
-    if cfg.norm_type == NormType::Gemma && layer_idx % 2 == 1 {
-        None
-    } else {
-        cfg.sliding_window
-    }
+fn compute_sliding_window(cfg: &BlockConfig) -> Option<usize> {
+    cfg.sliding_window
 }
 
 fn rms_norm_no_weight(x: &Tensor, eps: f64) -> Result<Tensor> {
@@ -93,37 +97,6 @@ fn rms_norm_no_weight(x: &Tensor, eps: f64) -> Result<Tensor> {
     x_f32
         .broadcast_div(&(variance + eps)?.sqrt()?)?
         .to_dtype(dtype)
-}
-
-#[cfg(feature = "metal")]
-fn sdpa_softcap_prefill_chunked(
-    q: &Tensor,
-    k: &Tensor,
-    v: &Tensor,
-    scale: f32,
-    softcap: f32,
-) -> Result<Tensor> {
-    let (b, n_heads, q_len, hd) = q.dims4()?;
-    let total_kv = k.dim(2)?;
-    let old_kv = total_kv.saturating_sub(q_len);
-    if old_kv != 0 {
-        candle_core::bail!("chunked softcap SDPA expects zero cached prefix, got old_kv={old_kv}");
-    }
-
-    let out = Tensor::zeros((b, n_heads, q_len, hd), q.dtype(), q.device())?;
-    let mut start = 0usize;
-    while start < q_len {
-        let len = (q_len - start).min(8);
-        let q_chunk = q.narrow(2, start, len)?.contiguous()?;
-        let kv_end = old_kv + start + len;
-        let k_chunk = k.narrow(2, 0, kv_end)?.contiguous()?;
-        let v_chunk = v.narrow(2, 0, kv_end)?.contiguous()?;
-        let o_chunk =
-            super::metal_ops::sdpa(&q_chunk, &k_chunk, &v_chunk, None, true, scale, softcap)?;
-        out.slice_set(&o_chunk.contiguous()?, 2, start)?;
-        start += len;
-    }
-    Ok(out)
 }
 
 impl Attention {
@@ -190,7 +163,7 @@ impl Attention {
             None
         };
 
-        let actual_window = compute_sliding_window(cfg, layer_idx);
+        let actual_window = compute_sliding_window(cfg);
 
         Ok(Self {
             qkv: QkvProjection::Fused(qkv_proj),
@@ -273,7 +246,7 @@ impl Attention {
         let q_dim = cfg.n_heads * hd;
         let kv_dim = cfg.n_kv_heads * hd;
 
-        let actual_window = compute_sliding_window(cfg, layer_idx);
+        let actual_window = compute_sliding_window(cfg);
 
         Ok(Self {
             qkv,
@@ -397,9 +370,11 @@ impl Attention {
 
         // ── Metal SDPA path for batch ────────────────────────────────
         #[cfg(feature = "metal")]
-        let all_vector = segments.iter().all(|seg| seg.num_tokens <= 8);
+        if self.attn_softcap.is_some() {
+            log_softcap_sdpa_policy_once();
+        }
         #[cfg(feature = "metal")]
-        let use_sdpa = (self.attn_softcap.is_none() || all_vector)
+        let use_sdpa = self.attn_softcap.is_none()
             && super::metal_ops::sdpa_available(&q, self.head_dim)
             && !kv_lengths
                 .iter()
@@ -476,42 +451,6 @@ impl Attention {
                     seg.num_tokens,
                 )?;
 
-                #[cfg(feature = "metal")]
-                if let Some(softcap) = self.attn_softcap {
-                    // Softcapped SDPA full path is unavailable on Metal.
-                    // For prefill without cached prefix, we can still use the
-                    // vector path by chunking q into slices of <= 8 tokens.
-                    let old_kv = kv_len.saturating_sub(seg.num_tokens);
-                    let can_use_segment_sdpa = mask.is_none()
-                        && old_kv == 0
-                        && super::metal_ops::sdpa_available(&q_seg, self.head_dim);
-
-                    if can_use_segment_sdpa {
-                        let seg_out = if seg.num_tokens <= 8 {
-                            super::metal_ops::sdpa(
-                                &q_seg.contiguous()?,
-                                &k_seg.contiguous()?,
-                                &v_seg.contiguous()?,
-                                None,
-                                seg.num_tokens > 1,
-                                self.scale as f32,
-                                softcap as f32,
-                            )?
-                        } else {
-                            sdpa_softcap_prefill_chunked(
-                                &q_seg,
-                                &k_seg,
-                                &v_seg,
-                                self.scale as f32,
-                                softcap as f32,
-                            )?
-                        };
-                        out_buf.slice_set(&seg_out.contiguous()?, 2, q_offset)?;
-                        q_offset += seg.num_tokens;
-                        continue;
-                    }
-                }
-
                 let k_seg = self.repeat_kv(k_seg)?;
                 let v_seg = self.repeat_kv(v_seg)?;
 
@@ -565,7 +504,7 @@ impl Attention {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::common::config::Activation;
+    use crate::common::config::{Activation, NormType};
     use candle_core::Device;
 
     fn test_block_cfg(norm_type: NormType, sliding_window: Option<usize>) -> BlockConfig {
@@ -595,18 +534,15 @@ mod tests {
     }
 
     #[test]
-    fn compute_sliding_window_disables_odd_gemma_layers() {
+    fn compute_sliding_window_uses_config_even_for_gemma_norm() {
         let cfg = test_block_cfg(NormType::Gemma, Some(128));
-        assert_eq!(compute_sliding_window(&cfg, 0), Some(128));
-        assert_eq!(compute_sliding_window(&cfg, 1), None);
-        assert_eq!(compute_sliding_window(&cfg, 2), Some(128));
+        assert_eq!(compute_sliding_window(&cfg), Some(128));
     }
 
     #[test]
     fn compute_sliding_window_keeps_standard_setting() {
         let cfg = test_block_cfg(NormType::Standard, Some(256));
-        assert_eq!(compute_sliding_window(&cfg, 0), Some(256));
-        assert_eq!(compute_sliding_window(&cfg, 1), Some(256));
+        assert_eq!(compute_sliding_window(&cfg), Some(256));
     }
 
     #[test]

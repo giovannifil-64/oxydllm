@@ -6,3 +6,6 @@ pub mod loader;
 pub mod manager;
 pub mod parsers;
 pub mod traits;
+
+#[cfg(test)]
+mod arch_regression;

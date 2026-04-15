@@ -154,3 +154,12 @@ impl ModelWeights {
             .sum()
     }
 }
+
+#[cfg(test)]
+impl ModelWeights {
+    /// Build ModelWeights from a pre-built tensor map (test-only).
+    /// Allows regression tests to construct synthetic models without safetensors files.
+    pub fn from_tensors(tensors: FxHashMap<String, Tensor>) -> Self {
+        Self { tensors }
+    }
+}

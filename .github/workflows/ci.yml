@@ -3,8 +3,6 @@
 #
 # Does NOT build Docker images or publish artifacts (those happen in
 # release.yml and nightly.yml).
-#
-# Rust toolchain is read from rust-toolchain.toml (single source of truth).
 # ─────────────────────────────────────────────────────────────────────────────
 
 name: CI
@@ -17,6 +15,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  RUST_TOOLCHAIN: 1.94.1
 
 # Cancel superseded runs for the same PR / branch
 concurrency:
@@ -30,12 +29,9 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v6
-      - name: Read Rust toolchain version
-        id: toolchain
-        run: echo "version=$(grep '^channel' rust-toolchain.toml | cut -d'\"' -f2)" >> "$GITHUB_OUTPUT"
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: ${{ steps.toolchain.outputs.version }}
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: rustfmt
       - run: cargo fmt --check
 
@@ -47,14 +43,10 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Read Rust toolchain version
-        id: toolchain
-        run: echo "version=$(grep '^channel' rust-toolchain.toml | cut -d'\"' -f2)" >> "$GITHUB_OUTPUT"
-
-      - name: Install Rust
+      - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: ${{ steps.toolchain.outputs.version }}
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: clippy
 
       - name: Cache Cargo
@@ -85,14 +77,10 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Read Rust toolchain version
-        id: toolchain
-        run: echo "version=$(grep '^channel' rust-toolchain.toml | cut -d'\"' -f2)" >> "$GITHUB_OUTPUT"
-
-      - name: Install Rust
+      - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: ${{ steps.toolchain.outputs.version }}
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: clippy
 
       - name: Cache Cargo
@@ -139,11 +127,10 @@ jobs:
           apt-get install -y --no-install-recommends \
             curl build-essential pkg-config libssl-dev git ca-certificates
 
-      - name: Install Rust (from rust-toolchain.toml)
+      - name: Install Rust stable
         run: |
-          TOOLCHAIN=$(grep '^channel' rust-toolchain.toml | cut -d'"' -f2)
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-            | sh -s -- -y --default-toolchain "$TOOLCHAIN" --profile minimal
+            | sh -s -- -y --default-toolchain "$RUST_TOOLCHAIN" --profile minimal
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
       - name: Cache Cargo

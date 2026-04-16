@@ -7,6 +7,9 @@
 #
 # Override the image tag:
 #   RLLM_TAG=v0.1.0 docker compose up rllm-cuda
+#
+# Override the image registry (e.g. for forks or private registries):
+#   RLLM_IMAGE=ghcr.io/myorg/rllm docker compose up rllm-cuda
 # ─────────────────────────────────────────────────────────────────────────────
 
 name: rllm
@@ -29,7 +32,7 @@ x-common: &common
 services:
   rllm-cuda:
     <<: *common
-    image: ghcr.io/giovannifil-64/rllm:${RLLM_TAG:-latest}
+    image: ${RLLM_IMAGE:-ghcr.io/giovannifil-64/rllm}:${RLLM_TAG:-latest}
     deploy:
       resources:
         reservations:
@@ -49,7 +52,7 @@ services:
 
   rllm-cpu:
     <<: *common
-    image: ghcr.io/giovannifil-64/rllm:${RLLM_TAG:-cpu}
+    image: ${RLLM_IMAGE:-ghcr.io/giovannifil-64/rllm}:${RLLM_TAG:-cpu}
     command:
       - start
       - --models-dir

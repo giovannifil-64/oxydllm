@@ -19,8 +19,53 @@ permissions:
   packages: write
 
 jobs:
+  verify-ci:
+    name: Verify CI passed on tagged commit
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Check CI conclusion for this commit
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          SHA="${{ github.sha }}"
+          echo "Release tag: ${{ github.ref_name }}"
+          echo "Commit:      $SHA"
+
+          # Poll for up to 20 minutes in case CI has not yet completed for this
+          # SHA (e.g. tag pushed immediately after merge).
+          for i in $(seq 1 40); do
+            PAYLOAD=$(gh run list \
+              --commit "$SHA" \
+              --workflow ci.yml \
+              --limit 1 \
+              --json status,conclusion,url 2>/dev/null || echo "[]")
+
+            STATUS=$(echo "$PAYLOAD" | jq -r '.[0].status // empty')
+            CONCLUSION=$(echo "$PAYLOAD" | jq -r '.[0].conclusion // empty')
+            RUN_URL=$(echo "$PAYLOAD" | jq -r '.[0].url // empty')
+
+            echo "[attempt $i/40] status=${STATUS:-<none>} conclusion=${CONCLUSION:-<none>}"
+
+            if [ "$STATUS" = "completed" ]; then
+              if [ "$CONCLUSION" = "success" ]; then
+                echo "CI passed for $SHA ✓ ($RUN_URL)"
+                exit 0
+              fi
+              echo "::error::CI conclusion is '$CONCLUSION' for $SHA. Release aborted."
+              echo "::error::See: $RUN_URL"
+              exit 1
+            fi
+
+            sleep 30
+          done
+
+          echo "::error::CI did not complete within 20 minutes for $SHA."
+          echo "::error::Either CI was never triggered (push the commit to main first) or it is stuck."
+          exit 1
+
   build:
     name: Build all targets
+    needs: verify-ci
     uses: ./.github/workflows/build.yml
     with:
       channel: release

@@ -15,7 +15,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  RUST_TOOLCHAIN: 1.94.0
+  RUST_TOOLCHAIN: 1.94.1
 
 # Cancel superseded runs for the same PR / branch
 concurrency:
@@ -108,7 +108,7 @@ jobs:
       - name: Unit tests (CPU-only)
         run: cargo test --release --no-default-features -- --test-threads=4
 
-  # ── Linux CUDA: compile check only (no GPU on runner) ───────────────────────
+  # ── Linux CUDA: compile + architecture tests (no GPU on runner) ─────────────
   check-linux-cuda:
     name: Check · Linux x86_64 (CUDA compile)
     needs: fmt
@@ -146,3 +146,6 @@ jobs:
 
       - name: Check (CUDA)
         run: cargo check --no-default-features --features cuda
+
+      - name: Architecture regression tests (CUDA feature)
+        run: cargo test --release --no-default-features --features cuda -- --test-threads=4 arch_

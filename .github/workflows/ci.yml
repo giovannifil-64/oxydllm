@@ -147,5 +147,13 @@ jobs:
       - name: Check (CUDA)
         run: cargo check --no-default-features --features cuda
 
+      - name: Prepare CUDA driver stubs for test runtime
+        run: |
+          test -f /usr/local/cuda/lib64/stubs/libcuda.so
+          mkdir -p /tmp/cuda-stubs
+          ln -sf /usr/local/cuda/lib64/stubs/libcuda.so /tmp/cuda-stubs/libcuda.so.1
+
       - name: Architecture regression tests (CUDA feature)
-        run: cargo test --release --no-default-features --features cuda -- --test-threads=4 arch_
+        run: |
+          export LD_LIBRARY_PATH="/tmp/cuda-stubs:/usr/local/cuda/lib64/stubs:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}"
+          cargo test --release --no-default-features --features cuda -- --test-threads=4 arch_

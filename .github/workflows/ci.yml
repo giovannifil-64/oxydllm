@@ -110,11 +110,15 @@ jobs:
 
   # ── Linux CUDA: compile + architecture tests (no GPU on runner) ─────────────
   check-linux-cuda:
-    name: Check · Linux x86_64 (CUDA compile)
+    name: Check · Linux x86_64 (CUDA sm_${{ matrix.cuda_arch }})
     needs: fmt
     runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        cuda_arch: ["89", "90", "100", "120"]
     env:
-      CUDA_COMPUTE_CAP: "89"
+      CUDA_COMPUTE_CAP: ${{ matrix.cuda_arch }}
     container:
       image: nvidia/cuda:12.9.0-devel-ubuntu22.04
       options: --user root
@@ -141,8 +145,8 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-          key: linux-x86_64-cuda-ci-${{ hashFiles('Cargo.lock') }}
-          restore-keys: linux-x86_64-cuda-ci-
+          key: linux-x86_64-cuda-ci-sm${{ matrix.cuda_arch }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: linux-x86_64-cuda-ci-sm${{ matrix.cuda_arch }}-
 
       - name: Check (CUDA)
         run: cargo check --no-default-features --features cuda
@@ -153,7 +157,8 @@ jobs:
           mkdir -p /tmp/cuda-stubs
           ln -sf /usr/local/cuda/lib64/stubs/libcuda.so /tmp/cuda-stubs/libcuda.so.1
 
-      - name: Architecture regression tests (CUDA feature)
+      - name: Architecture regression tests (CUDA feature, sm_89 baseline)
+        if: matrix.cuda_arch == '89'
         run: |
           export LD_LIBRARY_PATH="/tmp/cuda-stubs:/usr/local/cuda/lib64/stubs:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}"
           cargo test --release --no-default-features --features cuda -- --test-threads=4 arch_

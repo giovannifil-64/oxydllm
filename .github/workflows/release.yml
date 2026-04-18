@@ -109,10 +109,12 @@ jobs:
             curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/main/install.sh | sh
             ```
 
-            **Linux (CUDA — Ada Lovelace+)**
+            **Linux (CUDA — Ada / Hopper / Blackwell datacenter / Blackwell consumer)**
             ```bash
             curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/main/install.sh | sh
             ```
+
+            Installer auto-selects `cuda-ada`, `cuda-hopper`, `cuda-blackwell`, or `cuda-blackwell-consumer` binary archives based on detected GPU compute capability.
 
             **Linux (CPU only)**
             ```bash
@@ -125,6 +127,8 @@ jobs:
               -v ~/.rllm/models:/root/.rllm/models \
               ghcr.io/${{ github.repository }}:latest start
             ```
+
+            For explicit CUDA targets, use `:cuda-ada`, `:cuda-hopper`, `:cuda-blackwell`, or `:cuda-blackwell-consumer`.
 
             **Docker (CPU)**
             ```bash

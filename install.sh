@@ -11,6 +11,7 @@
 #   RLLM_CHANNEL     - stable (default) or nightly
 #   RLLM_VERSION     - install a specific version tag, e.g. v0.1.0 (ignored for nightly)
 #   RLLM_NO_GPU      - set to 1 to force CPU binary on Linux
+#   RLLM_CUDA_TARGET - auto (default), ada, hopper, blackwell, blackwell-consumer (Linux x86_64)
 #   RLLM_INSTALL_DIR - destination directory (default: /usr/local/bin)
 
 main() {
@@ -23,6 +24,8 @@ GITHUB_RELEASES="https://github.com/${REPO}/releases"
 INSTALL_DIR="${RLLM_INSTALL_DIR:-/usr/local/bin}"
 CHANNEL="${RLLM_CHANNEL:-stable}"
 NO_GPU="${RLLM_NO_GPU:-0}"
+CUDA_TARGET_OVERRIDE="${RLLM_CUDA_TARGET:-auto}"
+CUDA_TARGET=""
 
 say() {
     printf '>>> %s\n' "$*" >&2
@@ -65,6 +68,76 @@ resolve_home_for_user() {
         return
     fi
     awk -F: -v u="${_user}" '$1==u {print $6; exit}' /etc/passwd 2>/dev/null || true
+}
+
+detect_cuda_target() {
+    if ! available nvidia-smi; then
+        return 1
+    fi
+
+    CAP_RAW="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d '[:space:]')"
+    case "${CAP_RAW}" in
+        ""|N/A|n/a)
+            return 1
+            ;;
+        *[!0-9.]* )
+            return 1
+            ;;
+    esac
+
+    CAP_MAJOR="$(printf '%s' "${CAP_RAW}" | cut -d. -f1)"
+    CAP_MINOR="$(printf '%s' "${CAP_RAW}" | cut -d. -f2)"
+
+    case "${CAP_MAJOR}" in
+        ""|*[!0-9]*)
+            return 1
+            ;;
+    esac
+
+    case "${CAP_MINOR}" in
+        ""|*[!0-9]*)
+            CAP_MINOR=0
+            ;;
+    esac
+
+    # Blackwell datacenter (B100/B200) = sm_100 = compute cap 10.x
+    # Only 10.x is currently built. 11.x future datacenter revs would need
+    # a dedicated target if they break SASS compatibility with sm_100.
+    if [ "${CAP_MAJOR}" -eq 10 ]; then
+        printf '%s\n' "blackwell"
+        return 0
+    fi
+
+    # Hopper = sm_90 = compute cap 9.x
+    if [ "${CAP_MAJOR}" -eq 9 ]; then
+        printf '%s\n' "hopper"
+        return 0
+    fi
+
+    # Ada Lovelace = sm_89 = compute cap 8.9
+    # Ampere (8.0, 8.6) and earlier are not supported (no FP8 silicon).
+    if [ "${CAP_MAJOR}" -eq 8 ] && [ "${CAP_MINOR}" -ge 9 ]; then
+        printf '%s\n' "ada"
+        return 0
+    fi
+
+    # Blackwell consumer (RTX 50xx) = sm_120 = compute cap 12.x
+    # Dedicated build target — sm_120 SASS is architecture-specific and will
+    # not run on sm_100 datacenter binaries.
+    if [ "${CAP_MAJOR}" -eq 12 ]; then
+        printf '%s\n' "blackwell-consumer"
+        return 0
+    fi
+
+    # Future architectures (cap 11.x, 13.x+) are unknown. Report explicitly
+    # so the caller can decide to bail or force a target.
+    if [ "${CAP_MAJOR}" -ge 11 ]; then
+        printf '%s\n' "unsupported-future"
+        return 0
+    fi
+
+    printf '%s\n' "unsupported"
+    return 0
 }
 
 install_systemd_service() {
@@ -227,7 +300,46 @@ case "${OS}" in
                 elif available nvidia-smi; then
                     DRIVER_MAJOR="$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -1 | cut -d. -f1)"
                     if [ -n "${DRIVER_MAJOR}" ] && [ "${DRIVER_MAJOR}" -ge 525 ] 2>/dev/null; then
-                        PLATFORM="linux-x86_64-cuda"
+                        case "${CUDA_TARGET_OVERRIDE}" in
+                            auto)
+                                CUDA_TARGET="$(detect_cuda_target || true)"
+                                ;;
+                            ada|hopper|blackwell|blackwell-consumer)
+                                CUDA_TARGET="${CUDA_TARGET_OVERRIDE}"
+                                ;;
+                            *)
+                                warn "Invalid RLLM_CUDA_TARGET='${CUDA_TARGET_OVERRIDE}'. Using auto detection."
+                                CUDA_TARGET="$(detect_cuda_target || true)"
+                                ;;
+                        esac
+
+                        case "${CUDA_TARGET}" in
+                            ada|hopper|blackwell|blackwell-consumer)
+                                PLATFORM="linux-x86_64-cuda-${CUDA_TARGET}"
+                                ;;
+                            unsupported)
+                                warn "NVIDIA GPU compute capability is below 8.9 (Ada). Falling back to CPU build."
+                                PLATFORM="linux-x86_64-cpu"
+                                ;;
+                            unsupported-future)
+                                warn "NVIDIA GPU compute capability (${CAP_RAW:-unknown}) is newer than the"
+                                warn "supported targets (Ada 8.9 / Hopper 9.x / Blackwell 10.x datacenter / 12.x consumer)."
+                                warn "Falling back to CPU build."
+                                warn "Override with RLLM_CUDA_TARGET=<ada|hopper|blackwell|blackwell-consumer>"
+                                warn "at your own risk, or build from source with CUDA_COMPUTE_CAP=<target>."
+                                PLATFORM="linux-x86_64-cpu"
+                                ;;
+                            "")
+                                warn "Could not detect NVIDIA compute capability. Defaulting to Ada CUDA build."
+                                CUDA_TARGET="ada"
+                                PLATFORM="linux-x86_64-cuda-ada"
+                                ;;
+                            *)
+                                warn "Unknown compute capability mapping ('${CUDA_TARGET}'). Defaulting to Ada CUDA build."
+                                CUDA_TARGET="ada"
+                                PLATFORM="linux-x86_64-cuda-ada"
+                                ;;
+                        esac
                     else
                         warn "NVIDIA driver found but < 525. Falling back to CPU build."
                         PLATFORM="linux-x86_64-cpu"
@@ -273,9 +385,33 @@ case "${CHANNEL}" in
         ;;
 esac
 
-TARBALL="rllm-${PLATFORM}.tar.gz"
-CHECKSUM="${TARBALL}.sha256"
 BASE_URL="${GITHUB_RELEASES}/download/${RLLM_VERSION}"
+
+case "${PLATFORM}" in
+    linux-x86_64-cuda-ada)
+        # Legacy archive (rllm-linux-x86_64-cuda.tar.gz) is built from the same
+        # sm_89 sources as cuda-ada, so it is safe as a fallback.
+        CANDIDATE_TARBALLS="rllm-linux-x86_64-cuda-ada.tar.gz rllm-linux-x86_64-cuda.tar.gz"
+        ;;
+    linux-x86_64-cuda-hopper)
+        # No cross-generation fallback: sm_89 SASS does NOT reliably run on
+        # sm_90 hardware without PTX embedding, which candle-kernels omits.
+        CANDIDATE_TARBALLS="rllm-linux-x86_64-cuda-hopper.tar.gz"
+        ;;
+    linux-x86_64-cuda-blackwell)
+        # Same reasoning: sm_90/sm_89 SASS is not guaranteed on sm_100.
+        CANDIDATE_TARBALLS="rllm-linux-x86_64-cuda-blackwell.tar.gz"
+        ;;
+    linux-x86_64-cuda-blackwell-consumer)
+        # sm_120 is architecture-specific and not guaranteed on any other target.
+        CANDIDATE_TARBALLS="rllm-linux-x86_64-cuda-blackwell-consumer.tar.gz"
+        ;;
+    *)
+        CANDIDATE_TARBALLS="rllm-${PLATFORM}.tar.gz"
+        ;;
+esac
+
+PRIMARY_TARBALL="$(printf '%s' "${CANDIDATE_TARBALLS}" | awk '{print $1}')"
 
 TMPDIR="$(mktemp -d)"
 cleanup() {
@@ -283,8 +419,51 @@ cleanup() {
 }
 trap cleanup EXIT
 
-say "Downloading ${TARBALL}..."
-curl -fsSL --progress-bar "${BASE_URL}/${TARBALL}" -o "${TMPDIR}/${TARBALL}"
+TARBALL=""
+for CANDIDATE in ${CANDIDATE_TARBALLS}; do
+    say "Trying ${CANDIDATE}..."
+    if curl -fsSL --progress-bar "${BASE_URL}/${CANDIDATE}" -o "${TMPDIR}/${CANDIDATE}"; then
+        TARBALL="${CANDIDATE}"
+        break
+    fi
+done
+
+if [ -z "${TARBALL}" ]; then
+    case "${PLATFORM}" in
+        linux-x86_64-cuda-hopper)
+            BUILD_CAP=90
+            ;;
+        linux-x86_64-cuda-blackwell)
+            BUILD_CAP=100
+            ;;
+        linux-x86_64-cuda-blackwell-consumer)
+            BUILD_CAP=120
+            ;;
+        *)
+            BUILD_CAP=""
+            ;;
+    esac
+
+    case "${PLATFORM}" in
+        linux-x86_64-cuda-hopper|linux-x86_64-cuda-blackwell|linux-x86_64-cuda-blackwell-consumer)
+            err "No compatible binary for ${PLATFORM} in release ${RLLM_VERSION}.
+This release may predate multi-architecture CUDA builds.
+Options:
+  - Try a newer release: RLLM_VERSION=<newer-tag> ... install.sh
+  - Use the nightly channel: RLLM_CHANNEL=nightly ... install.sh
+  - Build from source with CUDA_COMPUTE_CAP=${BUILD_CAP}"
+            ;;
+        *)
+            err "Could not download a compatible binary archive for ${PLATFORM}."
+            ;;
+    esac
+fi
+
+if [ "${TARBALL}" != "${PRIMARY_TARBALL}" ]; then
+    warn "Preferred archive ${PRIMARY_TARBALL} not found; using fallback ${TARBALL}."
+fi
+
+CHECKSUM="${TARBALL}.sha256"
 curl -fsSL "${BASE_URL}/${CHECKSUM}" -o "${TMPDIR}/${CHECKSUM}"
 
 say "Verifying checksum..."
@@ -346,6 +525,7 @@ echo "Binary  : ${DEST}"
 echo "Version : ${INSTALLED_VER}"
 echo "Channel : ${CHANNEL}"
 echo "Backend : ${PLATFORM}"
+[ -n "${CUDA_TARGET}" ] && echo "CUDA target : ${CUDA_TARGET}"
 echo ""
 
 if [ "${OS}" = "Linux" ] && available systemctl; then

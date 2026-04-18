@@ -29,7 +29,6 @@ env:
   IMAGE_NAME: ${{ github.repository }}
   CARGO_TERM_COLOR: always
   RUST_TOOLCHAIN: 1.94.1
-  CUDA_ARCH: "89"
 
 jobs:
   # ── macOS Apple Silicon (Metal) ─────────────────────────────────────────────
@@ -130,8 +129,28 @@ jobs:
 
   # ── Linux CUDA ──────────────────────────────────────────────────────────────
   build-linux-cuda:
-    name: Build · Linux x86_64 (CUDA)
+    name: Build · Linux x86_64 (CUDA ${{ matrix.variant.label }})
     runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        variant:
+          - label: sm_89 (Ada)
+            arch: "89"
+            tar_suffix: cuda-ada
+            legacy_alias: true
+          - label: sm_90 (Hopper)
+            arch: "90"
+            tar_suffix: cuda-hopper
+            legacy_alias: false
+          - label: sm_100 (Blackwell datacenter)
+            arch: "100"
+            tar_suffix: cuda-blackwell
+            legacy_alias: false
+          - label: sm_120 (Blackwell consumer, RTX 50xx)
+            arch: "120"
+            tar_suffix: cuda-blackwell-consumer
+            legacy_alias: false
     container:
       image: nvidia/cuda:12.9.0-devel-ubuntu22.04
       options: --user root
@@ -158,12 +177,12 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-          key: linux-x86_64-cuda-${{ hashFiles('Cargo.lock') }}
-          restore-keys: linux-x86_64-cuda-
+          key: linux-x86_64-cuda-sm${{ matrix.variant.arch }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: linux-x86_64-cuda-sm${{ matrix.variant.arch }}-
 
       - name: Build (CUDA, release)
         env:
-          CUDA_COMPUTE_CAP: ${{ env.CUDA_ARCH }}
+          CUDA_COMPUTE_CAP: ${{ matrix.variant.arch }}
         run: cargo build --release --no-default-features --features cuda
 
       - name: Strip binary (Linux CUDA release artifact)
@@ -172,11 +191,27 @@ jobs:
       - name: Package binary
         run: |
           cd target/release
-          tar -czf ../../rllm-linux-x86_64-cuda.tar.gz rllm
+          TAR_NAME="rllm-linux-x86_64-${{ matrix.variant.tar_suffix }}.tar.gz"
+          tar -czf ../../"${TAR_NAME}" rllm
           cd ../..
-          sha256sum rllm-linux-x86_64-cuda.tar.gz > rllm-linux-x86_64-cuda.tar.gz.sha256
+          sha256sum "${TAR_NAME}" > "${TAR_NAME}.sha256"
 
-      - name: Upload artifact
+          if [ "${{ matrix.variant.legacy_alias }}" = "true" ]; then
+            cp "${TAR_NAME}" rllm-linux-x86_64-cuda.tar.gz
+            sha256sum rllm-linux-x86_64-cuda.tar.gz > rllm-linux-x86_64-cuda.tar.gz.sha256
+          fi
+
+      - name: Upload CUDA target artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: rllm-linux-x86_64-${{ matrix.variant.tar_suffix }}
+          path: |
+            rllm-linux-x86_64-${{ matrix.variant.tar_suffix }}.tar.gz
+            rllm-linux-x86_64-${{ matrix.variant.tar_suffix }}.tar.gz.sha256
+          retention-days: 7
+
+      - name: Upload CUDA legacy artifact alias (sm_89)
+        if: matrix.variant.legacy_alias
         uses: actions/upload-artifact@v7
         with:
           name: rllm-linux-x86_64-cuda
@@ -329,9 +364,29 @@ jobs:
 
   # ── Docker CUDA ─────────────────────────────────────────────────────────────
   docker-cuda:
-    name: Docker · CUDA
+    name: Docker · CUDA (${{ matrix.variant.label }})
     if: ${{ inputs.push_docker }}
     runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        variant:
+          - label: Ada (sm_89)
+            arch: "89"
+            tag: cuda-ada
+            default_aliases: true
+          - label: Hopper (sm_90)
+            arch: "90"
+            tag: cuda-hopper
+            default_aliases: false
+          - label: Blackwell datacenter (sm_100)
+            arch: "100"
+            tag: cuda-blackwell
+            default_aliases: false
+          - label: Blackwell consumer (sm_120, RTX 50xx)
+            arch: "120"
+            tag: cuda-blackwell-consumer
+            default_aliases: false
     permissions:
       contents: read
       packages: write
@@ -358,13 +413,21 @@ jobs:
           IMAGE=$(echo "$IMAGE" | tr '[:upper:]' '[:lower:]')
           CHANNEL="${{ inputs.channel }}"
           TAG="${{ inputs.version_tag }}"
+          ARCH_TAG="${{ matrix.variant.tag }}"
           if [ "$CHANNEL" = "nightly" ]; then
-            echo "tags=${IMAGE}:nightly,${IMAGE}:nightly-cuda" >> "$GITHUB_OUTPUT"
+            TAGS="${IMAGE}:nightly-${ARCH_TAG}"
+            if [ "${{ matrix.variant.default_aliases }}" = "true" ]; then
+              TAGS="${TAGS},${IMAGE}:nightly,${IMAGE}:nightly-cuda"
+            fi
           else
             VER="${TAG#v}"
             MAJOR_MINOR="${VER%.*}"
-            echo "tags=${IMAGE}:${VER},${IMAGE}:${VER}-cuda,${IMAGE}:${MAJOR_MINOR},${IMAGE}:cuda,${IMAGE}:latest" >> "$GITHUB_OUTPUT"
+            TAGS="${IMAGE}:${VER}-${ARCH_TAG},${IMAGE}:${MAJOR_MINOR}-${ARCH_TAG},${IMAGE}:${ARCH_TAG}"
+            if [ "${{ matrix.variant.default_aliases }}" = "true" ]; then
+              TAGS="${TAGS},${IMAGE}:${VER},${IMAGE}:${VER}-cuda,${IMAGE}:${MAJOR_MINOR},${IMAGE}:cuda,${IMAGE}:latest"
+            fi
           fi
+          echo "tags=${TAGS}" >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
@@ -377,7 +440,7 @@ jobs:
           push: true
           tags: ${{ steps.tags.outputs.tags }}
           build-args: |
-            CUDA_ARCH=${{ env.CUDA_ARCH }}
+            CUDA_ARCH=${{ matrix.variant.arch }}
           provenance: false
-          cache-from: type=gha,scope=cuda
-          cache-to: type=gha,mode=max,scope=cuda
+          cache-from: type=gha,scope=cuda-${{ matrix.variant.arch }}
+          cache-to: type=gha,mode=max,scope=cuda-${{ matrix.variant.arch }}

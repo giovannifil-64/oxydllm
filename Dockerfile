@@ -1,8 +1,10 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# rLLM — CUDA image (Linux x86_64, NVIDIA Ada Lovelace+)
+# rLLM — CUDA image (Linux x86_64, NVIDIA Ada/Hopper/Blackwell)
 #
 # Build:
-#   docker build -t rllm:cuda --build-arg CUDA_ARCH=89 .
+#   docker build -t rllm:cuda-ada --build-arg CUDA_ARCH=89 .
+#   docker build -t rllm:cuda-hopper --build-arg CUDA_ARCH=90 .
+#   docker build -t rllm:cuda-blackwell --build-arg CUDA_ARCH=100 .
 #
 # Run:
 #   docker run --gpus all -p 11313:11313 \
@@ -22,11 +24,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl build-essential pkg-config libssl-dev git ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-    | sh -s -- -y --default-toolchain stable --profile minimal
-ENV PATH="/root/.cargo/bin:${PATH}"
-
 WORKDIR /app
+
+# Pin the Rust toolchain to the same version used by CI (single source of truth:
+# rust-toolchain.toml). Copy it BEFORE Cargo manifests so the toolchain-install
+# layer is cached independently of dependency/source changes.
+COPY rust-toolchain.toml ./
+RUN TOOLCHAIN=$(grep '^channel' rust-toolchain.toml | cut -d'"' -f2) && \
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+    | sh -s -- -y --default-toolchain "$TOOLCHAIN" --profile minimal
+ENV PATH="/root/.cargo/bin:${PATH}"
 
 # Copy manifests first for dependency-layer caching
 COPY Cargo.toml Cargo.lock ./

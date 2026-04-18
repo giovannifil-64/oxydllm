@@ -149,6 +149,8 @@ jobs:
             curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/main/install.sh | RLLM_CHANNEL=nightly sh
             ```
 
+            Installer auto-selects CUDA binary target (`ada`, `hopper`, `blackwell`, or `blackwell-consumer`) from detected GPU compute capability. You can override with `RLLM_CUDA_TARGET`.
+
             **Linux (CPU)**
             ```bash
             curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/main/install.sh | RLLM_CHANNEL=nightly RLLM_NO_GPU=1 sh
@@ -160,6 +162,8 @@ jobs:
               -v ~/.rllm/models:/root/.rllm/models \
               ghcr.io/${{ github.repository }}:nightly start
             ```
+
+            Per-architecture nightlies are available as `:nightly-cuda-ada`, `:nightly-cuda-hopper`, `:nightly-cuda-blackwell`, and `:nightly-cuda-blackwell-consumer`.
 
             **Docker (CPU)**
             ```bash

@@ -94,8 +94,29 @@ cd rllm
 Build the project (requires [Rust toolchain](https://rust-lang.org/tools/install/))
 
 ```bash
-cargo build --release --features metal   # Apple Silicon
-cargo build --release --features cuda    # NVIDIA
+cargo build --release --features metal
+
+# NVIDIA CUDA (set the target compute capability explicitly)
+CUDA_COMPUTE_CAP=89  cargo build --release --features cuda  # Ada (RTX 4090/L40S)
+CUDA_COMPUTE_CAP=90  cargo build --release --features cuda  # Hopper (H100/H200)
+CUDA_COMPUTE_CAP=100 cargo build --release --features cuda  # Blackwell datacenter (B100/B200)
+CUDA_COMPUTE_CAP=120 cargo build --release --features cuda  # Blackwell consumer (RTX 50xx)
+```
+
+> [!NOTE]
+> `CUDA_COMPUTE_CAP` is consumed by Candle's CUDA kernel build scripts (`candle-kernels`), not by a direct `rllm` build flag. If not set, Candle tries to auto-detect compute capability from `nvidia-smi`.
+
+Linux installer (`install.sh`) auto-selects CUDA binaries by detected compute capability:
+
+- `rllm-linux-x86_64-cuda-ada.tar.gz` for Ada (sm_89, compute 8.9)
+- `rllm-linux-x86_64-cuda-hopper.tar.gz` for Hopper (sm_90, compute 9.x)
+- `rllm-linux-x86_64-cuda-blackwell.tar.gz` for Blackwell datacenter (sm_100, compute 10.x)
+- `rllm-linux-x86_64-cuda-blackwell-consumer.tar.gz` for Blackwell consumer (sm_120, compute 12.x, RTX 50xx)
+
+Optional override:
+
+```bash
+RLLM_CUDA_TARGET=ada|hopper|blackwell|blackwell-consumer sh install.sh
 ```
 
 Enable local pre-commit checks (recommended for contributors)
@@ -200,6 +221,20 @@ CUDA is currently a functional compatibility path, not a performance-tuned backe
 - Core model execution works, but the CUDA path currently relies mostly on Candle generic kernels.
 - Metal has additional fused kernels in this project (attention/RMSNorm/RoPE/softmax), so CUDA throughput can be lower than specialized CUDA stacks.
 - Performance claims for NVIDIA should be treated as hardware-dependent until validated on target GPUs.
+
+### Official CUDA Docker tags
+
+| Tag | Compute capability | Target architecture |
+|---|---:|---|
+| `cuda-ada` | 89 | Ada Lovelace (RTX 4090, L40S) |
+| `cuda-hopper` | 90 | Hopper (H100, H200) |
+| `cuda-blackwell` | 100 | Blackwell datacenter (B100, B200) |
+| `cuda-blackwell-consumer` | 120 | Blackwell consumer (RTX 50xx) |
+
+- `latest` and `cuda` point to `cuda-ada` (stable default — widest compatibility).
+- `nightly` and `nightly-cuda` point to nightly `cuda-ada`.
+- For other architectures use the explicit tag, e.g. `:cuda-hopper`, `:cuda-blackwell`, `:cuda-blackwell-consumer`, or nightly variants `:nightly-cuda-hopper`, `:nightly-cuda-blackwell`, `:nightly-cuda-blackwell-consumer`.
+- Cross-generation SASS is **not** compatible: a Hopper binary will not run on Blackwell and vice versa. Pick the tag that matches your GPU.
 
 ## License
 The code in this repository is made available under the Apache 2.0 license. See [LICENSE](LICENSE) for details.

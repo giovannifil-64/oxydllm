@@ -22,7 +22,7 @@ use crate::common::{
     config::BlockConfig,
     gguf_weights::GgufWeights,
     kv_quant::KvQuantizer,
-    linear::{AnyLinear, Embedding, Linear, QLinear},
+    linear::{AnyLinear, Embedding, QLinear},
     norm::RMSNorm,
     paged::{BlockAllocator, DEFAULT_BLOCK_SIZE, PagedKvCache, SharedBlockAllocator},
     rope::RotaryEmbedding,
@@ -47,7 +47,7 @@ pub struct StandardTransformer {
     pub(crate) logit_softcap: Option<f64>,
     pub(crate) per_layer_input_embed: Option<Embedding>,
     pub(crate) per_layer_input_embed_scale: Option<f64>,
-    pub(crate) per_layer_model_projection: Option<Linear>,
+    pub(crate) per_layer_model_projection: Option<AnyLinear>,
     pub(crate) per_layer_model_projection_scale: Option<f64>,
     pub(crate) per_layer_projection_norm: Option<RMSNorm>,
     pub(crate) per_layer_input_scale: Option<f64>,
@@ -218,7 +218,7 @@ impl StandardTransformer {
                     .map_err(|e| anyhow::anyhow!("dequantize embed for tie: {e}"))?
                     .to_dtype(dtype)
                     .map_err(|e| anyhow::anyhow!("dtype cast: {e}"))?;
-                AnyLinear::Float(Linear::new(w, None))
+                AnyLinear::from_weight(w, None)
             }
         };
 

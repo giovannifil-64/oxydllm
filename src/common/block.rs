@@ -9,6 +9,7 @@ use super::{
     rope::RotaryEmbedding,
     weights::ModelWeights,
 };
+use candle_core::DType;
 use candle_core::Result;
 use candle_core::Tensor;
 
@@ -79,12 +80,41 @@ impl TransformerBlock {
             )?);
         }
 
-        let per_layer_input_gate = weights
-            .try_get(&format!("{}.per_layer_input_gate.weight", p))
-            .map(|w| AnyLinear::Float(super::linear::Linear::new(w.clone(), None)));
-        let per_layer_projection = weights
-            .try_get(&format!("{}.per_layer_projection.weight", p))
-            .map(|w| AnyLinear::Float(super::linear::Linear::new(w.clone(), None)));
+        let per_layer_input_gate_name = format!("{}.per_layer_input_gate.weight", p);
+        let per_layer_input_gate = if let Some(w) = weights.try_get(&per_layer_input_gate_name) {
+            let w = w.clone();
+            let scale_inv = weights
+                .try_get_scale_inv(&per_layer_input_gate_name)
+                .cloned();
+            if w.dtype() == DType::F8E4M3 && scale_inv.is_none() {
+                candle_core::bail!(
+                    "missing '{}' required by FP8 tensor '{}'",
+                    format!("{}_scale_inv", per_layer_input_gate_name),
+                    per_layer_input_gate_name
+                );
+            }
+            Some(AnyLinear::from_weight_with_scale_inv(w, scale_inv, None))
+        } else {
+            None
+        };
+
+        let per_layer_projection_name = format!("{}.per_layer_projection.weight", p);
+        let per_layer_projection = if let Some(w) = weights.try_get(&per_layer_projection_name) {
+            let w = w.clone();
+            let scale_inv = weights
+                .try_get_scale_inv(&per_layer_projection_name)
+                .cloned();
+            if w.dtype() == DType::F8E4M3 && scale_inv.is_none() {
+                candle_core::bail!(
+                    "missing '{}' required by FP8 tensor '{}'",
+                    format!("{}_scale_inv", per_layer_projection_name),
+                    per_layer_projection_name
+                );
+            }
+            Some(AnyLinear::from_weight_with_scale_inv(w, scale_inv, None))
+        } else {
+            None
+        };
         let post_per_layer_input_norm =
             if per_layer_input_gate.is_some() && per_layer_projection.is_some() {
                 Some(RMSNorm::load(
@@ -237,7 +267,7 @@ pub struct TransformerComponents<'a> {
     pub logit_softcap: Option<f64>,
     pub per_layer_input_embed: Option<&'a Embedding>,
     pub per_layer_input_embed_scale: Option<f64>,
-    pub per_layer_model_projection: Option<&'a super::linear::Linear>,
+    pub per_layer_model_projection: Option<&'a AnyLinear>,
     pub per_layer_model_projection_scale: Option<f64>,
     pub per_layer_projection_norm: Option<&'a RMSNorm>,
     pub per_layer_input_scale: Option<f64>,

@@ -3,7 +3,7 @@ use crate::common::{
     config::StandardTransformerConfig,
     gguf_weights::GgufWeights,
     kv_quant::{self, KvQuantMode, KvQuantizer},
-    linear::{AnyLinear, Embedding, Linear},
+    linear::{AnyLinear, Embedding},
     norm::RMSNorm,
     paged::{
         BlockAllocator, DEFAULT_BLOCK_SIZE, GlobalKvBudget, SharedBlockAllocator,
@@ -412,20 +412,30 @@ fn load_standard_safetensors(
     };
 
     let result = (|| -> anyhow::Result<(Box<dyn BatchModel>, usize)> {
+        let embed_weight_name = "model.embed_tokens.weight";
         let embed_weight = weights
-            .get("model.embed_tokens.weight")
+            .get(embed_weight_name)
             .map_err(|e| anyhow::anyhow!("{e}"))?
             .clone();
-        let lm_head = if cfg.tie_word_embeddings {
-            AnyLinear::Float(Linear::new(embed_weight.clone(), None))
+
+        let lm_head_weight_name = "lm_head.weight";
+        let lm_head_scale_inv = if cfg.tie_word_embeddings {
+            weights.try_get_scale_inv(embed_weight_name).cloned()
         } else {
-            AnyLinear::Float(Linear::new(
+            weights.try_get_scale_inv(lm_head_weight_name).cloned()
+        };
+
+        let lm_head = if cfg.tie_word_embeddings {
+            AnyLinear::from_weight_with_scale_inv(embed_weight.clone(), lm_head_scale_inv, None)
+        } else {
+            AnyLinear::from_weight_with_scale_inv(
                 weights
-                    .get("lm_head.weight")
+                    .get(lm_head_weight_name)
                     .map_err(|e| anyhow::anyhow!("{e}"))?
                     .clone(),
+                lm_head_scale_inv,
                 None,
-            ))
+            )
         };
         let embed_tokens = Embedding::new(embed_weight);
 
@@ -491,11 +501,13 @@ fn load_standard_safetensors(
             None
         };
         let per_layer_model_projection = if has_per_layer_stream {
-            Some(Linear::new(
+            let per_layer_proj_name = "model.per_layer_model_projection.weight";
+            Some(AnyLinear::from_weight_with_scale_inv(
                 weights
-                    .get("model.per_layer_model_projection.weight")
+                    .get(per_layer_proj_name)
                     .map_err(|e| anyhow::anyhow!("{e}"))?
                     .clone(),
+                weights.try_get_scale_inv(per_layer_proj_name).cloned(),
                 None,
             ))
         } else {

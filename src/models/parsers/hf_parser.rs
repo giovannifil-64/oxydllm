@@ -29,6 +29,7 @@ pub fn parse(config_path: &str) -> Result<StandardTransformerConfig> {
     };
 
     let arch = v["architectures"][0].as_str().unwrap_or("Unknown");
+    maybe_log_torch_dtype(&v);
 
     if let Some(reason) = crate::models::arch_defaults::known_unsupported_reason(arch) {
         anyhow::bail!("Architecture '{arch}' is not supported: {reason}");
@@ -308,6 +309,19 @@ fn parse_generation_eos(config_path: &str) -> Vec<u32> {
     parse_eos(&v["eos_token_id"])
 }
 
+fn maybe_log_torch_dtype(v: &Value) {
+    let Some(torch_dtype) = v["torch_dtype"].as_str() else {
+        return;
+    };
+
+    if torch_dtype.eq_ignore_ascii_case("float8_e4m3fn") {
+        tracing::info!(
+            torch_dtype,
+            "FP8 checkpoint detected; weights will be dequantized at runtime using *_scale_inv tensors"
+        );
+    }
+}
+
 fn parse_rope_scaling(v: &Value) -> RopeScaling {
     if v.is_null() {
         return RopeScaling::None;
@@ -497,5 +511,29 @@ mod tests {
 
         assert_eq!(cfg.sliding_window, Some(4096));
         assert!(cfg.per_layer_sliding_windows.is_none());
+    }
+
+    #[test]
+    fn parse_accepts_fp8_torch_dtype() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("config.json");
+
+        let config = json!({
+            "architectures": ["Mistral3ForConditionalGeneration"],
+            "hidden_size": 3072,
+            "num_hidden_layers": 24,
+            "num_attention_heads": 24,
+            "num_key_value_heads": 8,
+            "vocab_size": 128256,
+            "torch_dtype": "float8_e4m3fn"
+        });
+
+        fs::write(&config_path, serde_json::to_string_pretty(&config).unwrap()).unwrap();
+
+        let cfg = parse(config_path.to_string_lossy().as_ref()).unwrap();
+
+        assert_eq!(cfg.num_hidden_layers, 24);
+        assert_eq!(cfg.num_attention_heads, 24);
+        assert_eq!(cfg.num_key_value_heads, 8);
     }
 }

@@ -11,12 +11,35 @@ fn load_tensor_with_dtype(
     name: &str,
     device: &Device,
     dtype: DType,
+    preserve_fp8_weight: bool,
+    force_f32: bool,
 ) -> Result<Tensor> {
     let t = mmap
         .load(name, device)
         .with_context(|| format!("Failed to load tensor {}", name))?;
 
-    match t.to_dtype(dtype) {
+    if preserve_fp8_weight && t.dtype() == DType::F8E4M3 {
+        // Level-2 FP8 path: keep FP8 weights resident and dequantize on-the-fly in linear layers.
+        return Ok(t);
+    }
+
+    let target_dtype = if force_f32 { DType::F32 } else { dtype };
+
+    if t.dtype() == DType::F8E4M3 {
+        // Some backends fail or produce unstable results on direct FP8 -> BF16 casts.
+        // Route through F32 explicitly for consistent checkpoint compatibility.
+        return t
+            .to_dtype(DType::F32)
+            .and_then(|t| t.to_dtype(target_dtype))
+            .with_context(|| {
+                format!(
+                    "Failed to cast FP8 tensor {} to {:?} via F32 conversion path",
+                    name, target_dtype
+                )
+            });
+    }
+
+    match t.to_dtype(target_dtype) {
         Ok(t) => Ok(t),
         Err(device_cast_err) => {
             let t_cpu = mmap
@@ -35,10 +58,10 @@ fn load_tensor_with_dtype(
                     name
                 )
             })?;
-            t_on_device.to_dtype(dtype).with_context(|| {
+            t_on_device.to_dtype(target_dtype).with_context(|| {
                 format!(
                     "Failed to cast tensor {} to {:?} after CPU fallback (original error: {})",
-                    name, dtype, device_cast_err
+                    name, target_dtype, device_cast_err
                 )
             })
         }
@@ -61,6 +84,11 @@ fn apply_weight_scale_inv(tensors: &mut FxHashMap<String, Tensor>) -> Result<()>
             continue;
         };
 
+        if weight.dtype() == DType::F8E4M3 {
+            // Level-2 FP8 path keeps quantized weights + scales for runtime dequantization.
+            continue;
+        }
+
         // FP8 checkpoints (e.g. Mistral/Ministral variants) store
         // per-weight inverse scales next to quantized matrices.
         let scaled = weight.broadcast_mul(&scale_inv).with_context(|| {
@@ -82,11 +110,26 @@ impl ModelWeights {
         };
 
         let names: Vec<String> = mmap.tensors().into_iter().map(|(n, _)| n).collect();
+        let scale_inv_names: std::collections::HashSet<String> = names
+            .iter()
+            .filter(|name| name.ends_with(".weight_scale_inv"))
+            .cloned()
+            .collect();
 
         let mut tensors: FxHashMap<String, Tensor> = names
             .iter()
             .map(|name| {
-                let t = load_tensor_with_dtype(&mmap, name, device, dtype)?;
+                let preserve_fp8_weight = name.ends_with(".weight")
+                    && scale_inv_names.contains(&format!("{}_scale_inv", name));
+                let force_f32 = name.ends_with(".weight_scale_inv");
+                let t = load_tensor_with_dtype(
+                    &mmap,
+                    name,
+                    device,
+                    dtype,
+                    preserve_fp8_weight,
+                    force_f32,
+                )?;
                 Ok((name.clone(), t))
             })
             .collect::<Result<_>>()?;
@@ -132,6 +175,20 @@ impl ModelWeights {
             }
         }
 
+        if name == "lm_head.weight_scale_inv" {
+            for alias in [
+                "model.lm_head.weight_scale_inv",
+                "model.language_model.lm_head.weight_scale_inv",
+                "model.language_model.model.lm_head.weight_scale_inv",
+                "language_model.lm_head.weight_scale_inv",
+                "language_model.model.lm_head.weight_scale_inv",
+            ] {
+                if let Some(t) = self.tensors.get(alias) {
+                    return Some(t);
+                }
+            }
+        }
+
         None
     }
 
@@ -142,6 +199,10 @@ impl ModelWeights {
 
     pub fn try_get(&self, name: &str) -> Option<&Tensor> {
         self.resolve_name(name)
+    }
+
+    pub fn try_get_scale_inv(&self, weight_name: &str) -> Option<&Tensor> {
+        self.try_get(&format!("{}_scale_inv", weight_name))
     }
 
     /// Returns the actual memory footprint of all loaded tensors in bytes.
@@ -161,5 +222,61 @@ impl ModelWeights {
     /// Allows regression tests to construct synthetic models without safetensors files.
     pub fn from_tensors(tensors: FxHashMap<String, Tensor>) -> Self {
         Self { tensors }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn apply_weight_scale_inv_scales_non_fp8_weights() -> Result<()> {
+        let device = Device::Cpu;
+        let mut tensors = FxHashMap::default();
+
+        tensors.insert(
+            "layer.weight".to_string(),
+            Tensor::from_vec(vec![1.0f32, 2.0, 3.0, 4.0], (2, 2), &device)?,
+        );
+        tensors.insert(
+            "layer.weight_scale_inv".to_string(),
+            Tensor::from_vec(vec![2.0f32, 0.5], (2, 1), &device)?,
+        );
+
+        apply_weight_scale_inv(&mut tensors)?;
+
+        let scaled = tensors
+            .get("layer.weight")
+            .expect("scaled tensor should exist")
+            .to_vec2::<f32>()?;
+        assert_eq!(scaled, vec![vec![2.0, 4.0], vec![1.5, 2.0]]);
+        Ok(())
+    }
+
+    #[test]
+    fn apply_weight_scale_inv_skips_fp8_weights() -> Result<()> {
+        let device = Device::Cpu;
+        let mut tensors = FxHashMap::default();
+
+        let weight_fp8 = Tensor::from_vec(vec![1.0f32, -2.0, 3.0, -4.0], (2, 2), &device)?
+            .to_dtype(DType::F8E4M3)?;
+        let before = weight_fp8.to_dtype(DType::F32)?.to_vec2::<f32>()?;
+
+        tensors.insert("layer.weight".to_string(), weight_fp8);
+        tensors.insert(
+            "layer.weight_scale_inv".to_string(),
+            Tensor::from_vec(vec![10.0f32, 10.0], (2, 1), &device)?,
+        );
+
+        apply_weight_scale_inv(&mut tensors)?;
+
+        let after_weight = tensors
+            .get("layer.weight")
+            .expect("fp8 tensor should exist after scaling pass");
+        assert_eq!(after_weight.dtype(), DType::F8E4M3);
+
+        let after = after_weight.to_dtype(DType::F32)?.to_vec2::<f32>()?;
+        assert_eq!(before, after);
+        Ok(())
     }
 }

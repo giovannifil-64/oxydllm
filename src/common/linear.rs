@@ -29,6 +29,26 @@ pub struct Linear {
     bias: Option<Tensor>,
 }
 
+fn matmul_with_bias(x: &Tensor, weight_t: &Tensor, bias: Option<&Tensor>) -> Result<Tensor> {
+    let out = if x.rank() > 2 {
+        let original_dims = x.dims().to_vec();
+        let in_features = *original_dims.last().unwrap();
+        let batch_flat: usize = original_dims[..original_dims.len() - 1].iter().product();
+        let o = x.reshape((batch_flat, in_features))?.matmul(weight_t)?;
+        let out_features = o.dim(1)?;
+        let mut new_dims = original_dims;
+        *new_dims.last_mut().unwrap() = out_features;
+        o.reshape(new_dims)?
+    } else {
+        x.matmul(weight_t)?
+    };
+
+    match bias {
+        Some(b) => out.broadcast_add(b),
+        None => Ok(out),
+    }
+}
+
 impl Linear {
     pub fn new(weight: Tensor, bias: Option<Tensor>) -> Self {
         let weight_t = weight.t().expect("Linear weight must be 2D");
@@ -36,25 +56,70 @@ impl Linear {
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let out = if x.rank() > 2 {
-            let original_dims = x.dims().to_vec();
-            let in_features = *original_dims.last().unwrap();
-            let batch_flat: usize = original_dims[..original_dims.len() - 1].iter().product();
-            let o = x
-                .reshape((batch_flat, in_features))?
-                .matmul(&self.weight_t)?;
-            let out_features = o.dim(1)?;
-            let mut new_dims = original_dims;
-            *new_dims.last_mut().unwrap() = out_features;
-            o.reshape(new_dims)?
-        } else {
-            x.matmul(&self.weight_t)?
-        };
+        matmul_with_bias(x, &self.weight_t, self.bias.as_ref())
+    }
+}
 
-        match &self.bias {
-            Some(b) => out.broadcast_add(b),
-            None => Ok(out),
+pub struct Fp8Linear {
+    weight: Tensor,
+    scale_inv: Option<Tensor>,
+    bias: Option<Tensor>,
+}
+
+impl Fp8Linear {
+    pub fn new(weight: Tensor, scale_inv: Option<Tensor>, bias: Option<Tensor>) -> Self {
+        Self {
+            weight,
+            scale_inv,
+            bias,
         }
+    }
+
+    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        // Level-2 FP8 path: dequantize on-the-fly right before matmul.
+        // Compute remains in runtime dtype (BF16 on GPU, F32 on CPU).
+        let mut weight_f32 = self.weight.to_dtype(DType::F32)?;
+
+        if let Some(scale_inv) = &self.scale_inv {
+            let scale_inv_f32 = if scale_inv.dtype() == DType::F32 {
+                scale_inv.clone()
+            } else {
+                scale_inv.to_dtype(DType::F32)?
+            };
+
+            let scale_for_mul = match scale_inv_f32.rank() {
+                // Common checkpoints store per-output scales as [out_features, 1].
+                2 => scale_inv_f32,
+                // Some checkpoints may encode scales as [out_features] or [1].
+                1 => {
+                    let out_features = weight_f32.dim(0)?;
+                    let n = scale_inv_f32.dim(0)?;
+                    if n == out_features {
+                        scale_inv_f32.reshape((out_features, 1))?
+                    } else if n == 1 {
+                        scale_inv_f32.reshape((1, 1))?
+                    } else {
+                        candle_core::bail!(
+                            "invalid FP8 scale_inv shape {:?}: expected [out_features, 1], [out_features], or scalar",
+                            scale_inv_f32.shape().dims()
+                        )
+                    }
+                }
+                // Scalar scale_inv also works via broadcasting.
+                0 => scale_inv_f32,
+                _ => {
+                    candle_core::bail!(
+                        "invalid FP8 scale_inv rank {}: expected rank 0, 1, or 2",
+                        scale_inv_f32.rank()
+                    )
+                }
+            };
+
+            weight_f32 = weight_f32.broadcast_mul(&scale_for_mul)?;
+        }
+
+        let weight_t = weight_f32.to_dtype(x.dtype())?.t()?;
+        matmul_with_bias(x, &weight_t, self.bias.as_ref())
     }
 }
 
@@ -139,14 +204,164 @@ impl QLinear {
 
 pub enum AnyLinear {
     Float(Linear),
+    Fp8(Fp8Linear),
     Quantized(QLinear),
 }
 
 impl AnyLinear {
+    pub fn from_weight(weight: Tensor, bias: Option<Tensor>) -> Self {
+        Self::from_weight_with_scale_inv(weight, None, bias)
+    }
+
+    pub fn from_weight_with_scale_inv(
+        weight: Tensor,
+        scale_inv: Option<Tensor>,
+        bias: Option<Tensor>,
+    ) -> Self {
+        if weight.dtype() == DType::F8E4M3 {
+            Self::Fp8(Fp8Linear::new(weight, scale_inv, bias))
+        } else {
+            Self::Float(Linear::new(weight, bias))
+        }
+    }
+
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         match self {
             Self::Float(l) => l.forward(x),
+            Self::Fp8(l) => l.forward(x),
             Self::Quantized(q) => q.forward(x),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn any_linear_selects_fp8_variant_for_fp8_weights() -> Result<()> {
+        let device = Device::Cpu;
+        let weight = Tensor::from_vec(vec![0.5f32, -1.0, 1.5, 0.25], (2, 2), &device)?
+            .to_dtype(DType::F8E4M3)?;
+
+        let linear = AnyLinear::from_weight(weight, None);
+        assert!(matches!(linear, AnyLinear::Fp8(_)));
+        Ok(())
+    }
+
+    #[test]
+    fn fp8_linear_matches_reference_dequant_path() -> Result<()> {
+        let device = Device::Cpu;
+
+        let weight_fp8 =
+            Tensor::from_vec(vec![1.0f32, -2.0, 3.0, 0.5, -0.25, 2.5], (2, 3), &device)?
+                .to_dtype(DType::F8E4M3)?;
+        let scale_inv = Tensor::from_vec(vec![0.5f32, 2.0], (2, 1), &device)?;
+        let bias = Tensor::from_vec(vec![0.1f32, -0.2], (2,), &device)?;
+        let x = Tensor::from_vec(vec![0.75f32, -1.0, 0.25, 1.5, 0.5, -0.5], (2, 3), &device)?;
+
+        let out = AnyLinear::from_weight_with_scale_inv(
+            weight_fp8.clone(),
+            Some(scale_inv.clone()),
+            Some(bias.clone()),
+        )
+        .forward(&x)?;
+
+        let ref_weight = weight_fp8.to_dtype(DType::F32)?.broadcast_mul(&scale_inv)?;
+        let expected = Linear::new(ref_weight, Some(bias)).forward(&x)?;
+
+        let out_vals = out.to_vec2::<f32>()?;
+        let expected_vals = expected.to_vec2::<f32>()?;
+
+        for (out_row, exp_row) in out_vals.iter().zip(expected_vals.iter()) {
+            for (o, e) in out_row.iter().zip(exp_row.iter()) {
+                assert!((o - e).abs() < 1e-5, "o={o}, e={e}");
+            }
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn fp8_linear_accepts_rank1_per_row_scale_inv() -> Result<()> {
+        let device = Device::Cpu;
+
+        let weight_fp8 = Tensor::from_vec(vec![1.0f32, 2.0, 3.0, 4.0], (2, 2), &device)?
+            .to_dtype(DType::F8E4M3)?;
+        let scale_inv_rank1 = Tensor::from_vec(vec![0.5f32, 2.0], (2,), &device)?;
+        let x = Tensor::from_vec(vec![1.0f32, -1.0, 0.5, 2.0], (2, 2), &device)?;
+
+        let out = AnyLinear::from_weight_with_scale_inv(
+            weight_fp8.clone(),
+            Some(scale_inv_rank1.clone()),
+            None,
+        )
+        .forward(&x)?;
+
+        let ref_scale = scale_inv_rank1.reshape((2, 1))?;
+        let ref_weight = weight_fp8.to_dtype(DType::F32)?.broadcast_mul(&ref_scale)?;
+        let expected = Linear::new(ref_weight, None).forward(&x)?;
+
+        let out_vals = out.to_vec2::<f32>()?;
+        let expected_vals = expected.to_vec2::<f32>()?;
+        for (out_row, exp_row) in out_vals.iter().zip(expected_vals.iter()) {
+            for (o, e) in out_row.iter().zip(exp_row.iter()) {
+                assert!((o - e).abs() < 1e-5, "o={o}, e={e}");
+            }
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn fp8_linear_accepts_scalar_scale_inv() -> Result<()> {
+        let device = Device::Cpu;
+
+        let weight_fp8 = Tensor::from_vec(vec![1.0f32, -2.0, 0.25, 4.0], (2, 2), &device)?
+            .to_dtype(DType::F8E4M3)?;
+        let scalar_scale_inv = Tensor::from_vec(vec![0.5f32], (1,), &device)?;
+        let x = Tensor::from_vec(vec![1.0f32, 2.0, -1.0, 0.5], (2, 2), &device)?;
+
+        let out = AnyLinear::from_weight_with_scale_inv(
+            weight_fp8.clone(),
+            Some(scalar_scale_inv.clone()),
+            None,
+        )
+        .forward(&x)?;
+
+        let ref_weight = weight_fp8
+            .to_dtype(DType::F32)?
+            .broadcast_mul(&scalar_scale_inv)?;
+        let expected = Linear::new(ref_weight, None).forward(&x)?;
+
+        let out_vals = out.to_vec2::<f32>()?;
+        let expected_vals = expected.to_vec2::<f32>()?;
+        for (out_row, exp_row) in out_vals.iter().zip(expected_vals.iter()) {
+            for (o, e) in out_row.iter().zip(exp_row.iter()) {
+                assert!((o - e).abs() < 1e-5, "o={o}, e={e}");
+            }
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn fp8_linear_rejects_invalid_rank1_scale_inv_shape() -> Result<()> {
+        let device = Device::Cpu;
+
+        let weight_fp8 = Tensor::from_vec(vec![1.0f32, -2.0, 0.25, 4.0], (2, 2), &device)?
+            .to_dtype(DType::F8E4M3)?;
+        let invalid_scale_inv = Tensor::from_vec(vec![0.5f32, 1.0, 2.0], (3,), &device)?;
+        let x = Tensor::from_vec(vec![1.0f32, 2.0, -1.0, 0.5], (2, 2), &device)?;
+
+        let err = AnyLinear::from_weight_with_scale_inv(weight_fp8, Some(invalid_scale_inv), None)
+            .forward(&x)
+            .expect_err("expected invalid rank-1 scale_inv shape to fail");
+        assert!(
+            err.to_string().contains("invalid FP8 scale_inv shape"),
+            "unexpected error: {err}"
+        );
+
+        Ok(())
     }
 }

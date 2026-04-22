@@ -1,11 +1,11 @@
 use super::config::BlockConfig;
 use super::gguf_weights::GgufWeights;
-use super::linear::{AnyLinear, Linear, QLinear, softmax_last_dim};
+use super::linear::{AnyLinear, QLinear, softmax_last_dim};
 use super::norm::RMSNorm;
 use super::paged::PagedKvCache;
 use super::rope::RotaryEmbedding;
 use super::weights::ModelWeights;
-use candle_core::{D, Result, Tensor};
+use candle_core::{D, DType, Result, Tensor};
 use std::cell::Cell;
 
 thread_local! {
@@ -105,44 +105,86 @@ impl Attention {
         let hd = cfg.head_dim;
         let q_dim = cfg.n_heads * hd;
         let kv_dim = cfg.n_kv_heads * hd;
+        let qkv_weight_name = format!("{}.qkv_proj.weight", p);
+        let q_weight_name = format!("{}.q_proj.weight", p);
+        let k_weight_name = format!("{}.k_proj.weight", p);
+        let v_weight_name = format!("{}.v_proj.weight", p);
+        let o_weight_name = format!("{}.o_proj.weight", p);
 
-        let (qkv_w, qkv_bias) =
-            if let Some(qkv_w) = weights.try_get(&format!("{}.qkv_proj.weight", p)) {
-                let expected = q_dim + 2 * kv_dim;
-                let got = qkv_w.dim(0)?;
-                if got != expected {
-                    candle_core::bail!(
-                        "qkv_proj shape mismatch at {}: expected dim0={}, got {}",
-                        p,
-                        expected,
-                        got
-                    );
-                }
-                (
-                    qkv_w.clone(),
-                    weights.try_get(&format!("{}.qkv_proj.bias", p)).cloned(),
-                )
-            } else {
-                let q_w = weights.get(&format!("{}.q_proj.weight", p))?;
-                let k_w = weights.get(&format!("{}.k_proj.weight", p))?;
-                let v_w = weights.get(&format!("{}.v_proj.weight", p))?;
-                let qkv_w = Tensor::cat(&[q_w, k_w, v_w], 0)?;
-                let qkv_bias = match (
-                    weights.try_get(&format!("{}.q_proj.bias", p)),
-                    weights.try_get(&format!("{}.k_proj.bias", p)),
-                    weights.try_get(&format!("{}.v_proj.bias", p)),
-                ) {
-                    (Some(qb), Some(kb), Some(vb)) => Some(Tensor::cat(&[qb, kb, vb], 0)?),
-                    _ => None,
-                };
-                (qkv_w, qkv_bias)
+        let (qkv_w, qkv_scale_inv, qkv_bias) = if let Some(qkv_w) =
+            weights.try_get(&qkv_weight_name)
+        {
+            let expected = q_dim + 2 * kv_dim;
+            let got = qkv_w.dim(0)?;
+            if got != expected {
+                candle_core::bail!(
+                    "qkv_proj shape mismatch at {}: expected dim0={}, got {}",
+                    p,
+                    expected,
+                    got
+                );
+            }
+            (
+                qkv_w.clone(),
+                weights.try_get_scale_inv(&qkv_weight_name).cloned(),
+                weights.try_get(&format!("{}.qkv_proj.bias", p)).cloned(),
+            )
+        } else {
+            let q_w = weights.get(&q_weight_name)?;
+            let k_w = weights.get(&k_weight_name)?;
+            let v_w = weights.get(&v_weight_name)?;
+            let qkv_w = Tensor::cat(&[q_w, k_w, v_w], 0)?;
+            let qkv_bias = match (
+                weights.try_get(&format!("{}.q_proj.bias", p)),
+                weights.try_get(&format!("{}.k_proj.bias", p)),
+                weights.try_get(&format!("{}.v_proj.bias", p)),
+            ) {
+                (Some(qb), Some(kb), Some(vb)) => Some(Tensor::cat(&[qb, kb, vb], 0)?),
+                _ => None,
             };
-        let qkv_proj = AnyLinear::Float(Linear::new(qkv_w, qkv_bias));
+            let q_is_fp8 = q_w.dtype() == DType::F8E4M3;
+            let k_is_fp8 = k_w.dtype() == DType::F8E4M3;
+            let v_is_fp8 = v_w.dtype() == DType::F8E4M3;
 
-        let o_proj = AnyLinear::Float(Linear::new(
-            weights.get(&format!("{}.o_proj.weight", p))?.clone(),
-            None,
-        ));
+            let qkv_scale_inv = if q_is_fp8 || k_is_fp8 || v_is_fp8 {
+                let q_scale = weights.try_get_scale_inv(&q_weight_name).cloned();
+                let k_scale = weights.try_get_scale_inv(&k_weight_name).cloned();
+                let v_scale = weights.try_get_scale_inv(&v_weight_name).cloned();
+
+                match (q_scale, k_scale, v_scale) {
+                    (Some(qs), Some(ks), Some(vs)) => Some(Tensor::cat(&[&qs, &ks, &vs], 0)?),
+                    _ => {
+                        candle_core::bail!(
+                            "missing q/k/v *_scale_inv tensors required by FP8 projections at {}",
+                            p
+                        )
+                    }
+                }
+            } else {
+                None
+            };
+
+            (qkv_w, qkv_scale_inv, qkv_bias)
+        };
+        if qkv_w.dtype() == DType::F8E4M3 && qkv_scale_inv.is_none() {
+            candle_core::bail!(
+                "missing '{}' required by FP8 tensor '{}'",
+                format!("{}_scale_inv", qkv_weight_name),
+                qkv_weight_name
+            );
+        }
+        let qkv_proj = AnyLinear::from_weight_with_scale_inv(qkv_w, qkv_scale_inv, qkv_bias);
+
+        let o_weight = weights.get(&o_weight_name)?.clone();
+        let o_scale_inv = weights.try_get_scale_inv(&o_weight_name).cloned();
+        if o_weight.dtype() == DType::F8E4M3 && o_scale_inv.is_none() {
+            candle_core::bail!(
+                "missing '{}' required by FP8 tensor '{}'",
+                format!("{}_scale_inv", o_weight_name),
+                o_weight_name
+            );
+        }
+        let o_proj = AnyLinear::from_weight_with_scale_inv(o_weight, o_scale_inv, None);
 
         let q_norm = if cfg.qk_norm {
             Some(RMSNorm::new(

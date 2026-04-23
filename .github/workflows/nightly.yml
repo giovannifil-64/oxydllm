@@ -144,12 +144,18 @@ jobs:
             curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/main/install.sh | RLLM_CHANNEL=nightly sh
             ```
 
-            **Linux (CUDA)**
+            **Linux x86_64 (CUDA)**
             ```bash
             curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/main/install.sh | RLLM_CHANNEL=nightly sh
             ```
 
-            Installer auto-selects CUDA binary target (`ada`, `hopper`, `blackwell`, or `blackwell-consumer`) from detected GPU compute capability. You can override with `RLLM_CUDA_TARGET`.
+            **Linux arm64 (CUDA — GH200 / DGX Spark / GB300 / Jetson Thor)**
+            ```bash
+            curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/main/install.sh | RLLM_CHANNEL=nightly sh
+            ```
+
+            Installer auto-selects the right CUDA target from detected GPU compute capability.
+            Override with `RLLM_CUDA_TARGET`: x86_64 values: `ada`, `hopper`, `blackwell`, `blackwell-ultra`, `blackwell-consumer`; arm64 values: `hopper`, `blackwell`, `blackwell-ultra`, `thor`.
 
             **Linux (CPU)**
             ```bash
@@ -163,7 +169,8 @@ jobs:
               ghcr.io/${{ github.repository }}:nightly start
             ```
 
-            Per-architecture nightlies are available as `:nightly-cuda-ada`, `:nightly-cuda-hopper`, `:nightly-cuda-blackwell`, and `:nightly-cuda-blackwell-consumer`.
+            x86_64 per-arch nightlies: `:nightly-cuda-ada`, `:nightly-cuda-hopper`, `:nightly-cuda-blackwell`, `:nightly-cuda-blackwell-ultra`, `:nightly-cuda-blackwell-consumer`.
+            ARM64 per-arch nightlies: `:nightly-cuda-hopper-arm64`, `:nightly-cuda-blackwell-arm64`, `:nightly-cuda-blackwell-ultra-arm64`, `:nightly-cuda-thor-arm64`.
 
             **Docker (CPU)**
             ```bash

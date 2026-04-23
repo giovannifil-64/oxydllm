@@ -1,10 +1,16 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# rLLM — CUDA image (Linux x86_64, NVIDIA Ada/Hopper/Blackwell)
+# rLLM — CUDA image (Linux x86_64 + arm64, Ada / Hopper / Blackwell / Thor)
 #
-# Build:
+# Build (x86_64):
 #   docker build -t rllm:cuda-ada --build-arg CUDA_ARCH=89 .
 #   docker build -t rllm:cuda-hopper --build-arg CUDA_ARCH=90 .
 #   docker build -t rllm:cuda-blackwell --build-arg CUDA_ARCH=100 .
+#   docker build -t rllm:cuda-blackwell-ultra --build-arg CUDA_ARCH=103 .
+#   docker build -t rllm:cuda-blackwell-consumer --build-arg CUDA_ARCH=120 .
+#
+# Build (arm64 — DGX Spark / GH200 / GB300 / Jetson Thor):
+#   docker buildx build --platform linux/arm64 -t rllm:cuda-blackwell-arm64 --build-arg CUDA_ARCH=100 .
+#   docker buildx build --platform linux/arm64 -t rllm:cuda-thor-arm64 --build-arg CUDA_ARCH=110 .
 #
 # Run:
 #   docker run --gpus all -p 11313:11313 \
@@ -13,7 +19,7 @@
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── Stage 1: build ───────────────────────────────────────────────────────────
-FROM nvidia/cuda:12.9.0-devel-ubuntu22.04 AS builder
+FROM nvidia/cuda:13.2.1-devel-ubuntu22.04 AS builder
 
 ARG CUDA_ARCH=89
 
@@ -51,7 +57,7 @@ RUN touch src/main.rs \
 
 # ── Stage 2: runtime ─────────────────────────────────────────────────────────
 # Same CUDA + Ubuntu version as builder to minimize runtime compatibility risk.
-FROM nvidia/cuda:12.9.0-runtime-ubuntu22.04
+FROM nvidia/cuda:13.2.1-runtime-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \

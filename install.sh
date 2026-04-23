@@ -11,7 +11,8 @@
 #   RLLM_CHANNEL     - stable (default) or nightly
 #   RLLM_VERSION     - install a specific version tag, e.g. v0.1.0 (ignored for nightly)
 #   RLLM_NO_GPU      - set to 1 to force CPU binary on Linux
-#   RLLM_CUDA_TARGET - auto (default), ada, hopper, blackwell, blackwell-consumer (Linux x86_64)
+#   RLLM_CUDA_TARGET - auto (default), ada, hopper, blackwell, blackwell-ultra, blackwell-consumer (Linux x86_64);
+#                      hopper, blackwell, blackwell-ultra, thor (Linux arm64)
 #   RLLM_INSTALL_DIR - destination directory (default: /usr/local/bin)
 
 main() {
@@ -100,9 +101,13 @@ detect_cuda_target() {
             ;;
     esac
 
-    # Blackwell datacenter (B100/B200) = sm_100 = compute cap 10.x
-    # Only 10.x is currently built. 11.x future datacenter revs would need
-    # a dedicated target if they break SASS compatibility with sm_100.
+    # Blackwell Ultra datacenter (B300/GB300) = sm_103 = compute cap 10.3+
+    if [ "${CAP_MAJOR}" -eq 10 ] && [ "${CAP_MINOR}" -ge 3 ]; then
+        printf '%s\n' "blackwell-ultra"
+        return 0
+    fi
+
+    # Blackwell datacenter (B100/B200/DGX Spark) = sm_100 = compute cap 10.x
     if [ "${CAP_MAJOR}" -eq 10 ]; then
         printf '%s\n' "blackwell"
         return 0
@@ -129,9 +134,15 @@ detect_cuda_target() {
         return 0
     fi
 
-    # Future architectures (cap 11.x, 13.x+) are unknown. Report explicitly
+    # Thor / Jetson Thor (sm_110) = compute cap 11.x
+    if [ "${CAP_MAJOR}" -eq 11 ]; then
+        printf '%s\n' "thor"
+        return 0
+    fi
+
+    # Future architectures (cap 13.x+) are unknown. Report explicitly
     # so the caller can decide to bail or force a target.
-    if [ "${CAP_MAJOR}" -ge 11 ]; then
+    if [ "${CAP_MAJOR}" -ge 13 ]; then
         printf '%s\n' "unsupported-future"
         return 0
     fi
@@ -299,12 +310,12 @@ case "${OS}" in
                     PLATFORM="linux-x86_64-cpu"
                 elif available nvidia-smi; then
                     DRIVER_MAJOR="$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -1 | cut -d. -f1)"
-                    if [ -n "${DRIVER_MAJOR}" ] && [ "${DRIVER_MAJOR}" -ge 525 ] 2>/dev/null; then
+                    if [ -n "${DRIVER_MAJOR}" ] && [ "${DRIVER_MAJOR}" -ge 570 ] 2>/dev/null; then
                         case "${CUDA_TARGET_OVERRIDE}" in
                             auto)
                                 CUDA_TARGET="$(detect_cuda_target || true)"
                                 ;;
-                            ada|hopper|blackwell|blackwell-consumer)
+                            ada|hopper|blackwell|blackwell-ultra|blackwell-consumer)
                                 CUDA_TARGET="${CUDA_TARGET_OVERRIDE}"
                                 ;;
                             *)
@@ -314,8 +325,12 @@ case "${OS}" in
                         esac
 
                         case "${CUDA_TARGET}" in
-                            ada|hopper|blackwell|blackwell-consumer)
+                            ada|hopper|blackwell|blackwell-ultra|blackwell-consumer)
                                 PLATFORM="linux-x86_64-cuda-${CUDA_TARGET}"
+                                ;;
+                            thor)
+                                warn "Thor (sm_110) is ARM64-only. Falling back to CPU build."
+                                PLATFORM="linux-x86_64-cpu"
                                 ;;
                             unsupported)
                                 warn "NVIDIA GPU compute capability is below 8.9 (Ada). Falling back to CPU build."
@@ -323,9 +338,9 @@ case "${OS}" in
                                 ;;
                             unsupported-future)
                                 warn "NVIDIA GPU compute capability (${CAP_RAW:-unknown}) is newer than the"
-                                warn "supported targets (Ada 8.9 / Hopper 9.x / Blackwell 10.x datacenter / 12.x consumer)."
+                                warn "supported x86_64 targets (Ada 8.9 / Hopper 9.x / Blackwell 10.x / Ultra 10.3+ / 12.x consumer)."
                                 warn "Falling back to CPU build."
-                                warn "Override with RLLM_CUDA_TARGET=<ada|hopper|blackwell|blackwell-consumer>"
+                                warn "Override with RLLM_CUDA_TARGET=<ada|hopper|blackwell|blackwell-ultra|blackwell-consumer>"
                                 warn "at your own risk, or build from source with CUDA_COMPUTE_CAP=<target>."
                                 PLATFORM="linux-x86_64-cpu"
                                 ;;
@@ -341,7 +356,7 @@ case "${OS}" in
                                 ;;
                         esac
                     else
-                        warn "NVIDIA driver found but < 525. Falling back to CPU build."
+                        warn "NVIDIA driver found but < 570 (required for CUDA 13.x). Falling back to CPU build."
                         PLATFORM="linux-x86_64-cpu"
                     fi
                 else
@@ -349,7 +364,60 @@ case "${OS}" in
                 fi
                 ;;
             aarch64|arm64)
-                err "Linux ARM is not supported yet."
+                if [ "${NO_GPU}" = "1" ]; then
+                    PLATFORM="linux-arm64-cpu"
+                elif available nvidia-smi; then
+                    DRIVER_MAJOR="$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -1 | cut -d. -f1)"
+                    if [ -n "${DRIVER_MAJOR}" ] && [ "${DRIVER_MAJOR}" -ge 570 ] 2>/dev/null; then
+                        case "${CUDA_TARGET_OVERRIDE}" in
+                            auto)
+                                CUDA_TARGET="$(detect_cuda_target || true)"
+                                ;;
+                            hopper|blackwell|blackwell-ultra|thor)
+                                CUDA_TARGET="${CUDA_TARGET_OVERRIDE}"
+                                ;;
+                            *)
+                                warn "Invalid RLLM_CUDA_TARGET='${CUDA_TARGET_OVERRIDE}' for ARM64. Using auto detection."
+                                warn "Valid ARM64 CUDA targets: hopper, blackwell, blackwell-ultra, thor"
+                                CUDA_TARGET="$(detect_cuda_target || true)"
+                                ;;
+                        esac
+
+                        case "${CUDA_TARGET}" in
+                            hopper|blackwell|blackwell-ultra|thor)
+                                PLATFORM="linux-arm64-cuda-${CUDA_TARGET}"
+                                ;;
+                            unsupported)
+                                warn "NVIDIA GPU compute capability is below sm_90 (Hopper). Falling back to CPU build."
+                                PLATFORM="linux-arm64-cpu"
+                                ;;
+                            unsupported-future)
+                                warn "NVIDIA GPU compute capability (${CAP_RAW:-unknown}) is newer than the"
+                                warn "supported ARM64 targets (Hopper 9.x / Blackwell 10.x / Ultra 10.3+ / Thor 11.x)."
+                                warn "Falling back to CPU build."
+                                warn "Override with RLLM_CUDA_TARGET=<hopper|blackwell|blackwell-ultra|thor>"
+                                warn "at your own risk, or build from source with CUDA_COMPUTE_CAP=<target>."
+                                PLATFORM="linux-arm64-cpu"
+                                ;;
+                            "")
+                                warn "Could not detect NVIDIA compute capability. Defaulting to Blackwell ARM64 build."
+                                CUDA_TARGET="blackwell"
+                                PLATFORM="linux-arm64-cuda-blackwell"
+                                ;;
+                            *)
+                                warn "No ARM64 build for detected target '${CUDA_TARGET}'. Falling back to CPU build."
+                                warn "Supported ARM64 CUDA targets: hopper, blackwell, blackwell-ultra, thor"
+                                warn "Override with RLLM_CUDA_TARGET=<hopper|blackwell|blackwell-ultra|thor>"
+                                PLATFORM="linux-arm64-cpu"
+                                ;;
+                        esac
+                    else
+                        warn "NVIDIA driver not found or < 570 (required for CUDA 13.x). Falling back to CPU build."
+                        PLATFORM="linux-arm64-cpu"
+                    fi
+                else
+                    PLATFORM="linux-arm64-cpu"
+                fi
                 ;;
             *)
                 err "Unsupported architecture: ${ARCH}"
@@ -402,9 +470,25 @@ case "${PLATFORM}" in
         # Same reasoning: sm_90/sm_89 SASS is not guaranteed on sm_100.
         CANDIDATE_TARBALLS="rllm-linux-x86_64-cuda-blackwell.tar.gz"
         ;;
+    linux-x86_64-cuda-blackwell-ultra)
+        # sm_103 SASS is not guaranteed on sm_100 hardware.
+        CANDIDATE_TARBALLS="rllm-linux-x86_64-cuda-blackwell-ultra.tar.gz"
+        ;;
     linux-x86_64-cuda-blackwell-consumer)
         # sm_120 is architecture-specific and not guaranteed on any other target.
         CANDIDATE_TARBALLS="rllm-linux-x86_64-cuda-blackwell-consumer.tar.gz"
+        ;;
+    linux-arm64-cuda-hopper)
+        CANDIDATE_TARBALLS="rllm-linux-arm64-cuda-hopper.tar.gz"
+        ;;
+    linux-arm64-cuda-blackwell)
+        CANDIDATE_TARBALLS="rllm-linux-arm64-cuda-blackwell.tar.gz"
+        ;;
+    linux-arm64-cuda-blackwell-ultra)
+        CANDIDATE_TARBALLS="rllm-linux-arm64-cuda-blackwell-ultra.tar.gz"
+        ;;
+    linux-arm64-cuda-thor)
+        CANDIDATE_TARBALLS="rllm-linux-arm64-cuda-thor.tar.gz"
         ;;
     *)
         CANDIDATE_TARBALLS="rllm-${PLATFORM}.tar.gz"
@@ -436,8 +520,23 @@ if [ -z "${TARBALL}" ]; then
         linux-x86_64-cuda-blackwell)
             BUILD_CAP=100
             ;;
+        linux-x86_64-cuda-blackwell-ultra)
+            BUILD_CAP=103
+            ;;
         linux-x86_64-cuda-blackwell-consumer)
             BUILD_CAP=120
+            ;;
+        linux-arm64-cuda-hopper)
+            BUILD_CAP=90
+            ;;
+        linux-arm64-cuda-blackwell)
+            BUILD_CAP=100
+            ;;
+        linux-arm64-cuda-blackwell-ultra)
+            BUILD_CAP=103
+            ;;
+        linux-arm64-cuda-thor)
+            BUILD_CAP=110
             ;;
         *)
             BUILD_CAP=""
@@ -445,7 +544,7 @@ if [ -z "${TARBALL}" ]; then
     esac
 
     case "${PLATFORM}" in
-        linux-x86_64-cuda-hopper|linux-x86_64-cuda-blackwell|linux-x86_64-cuda-blackwell-consumer)
+        linux-x86_64-cuda-hopper|linux-x86_64-cuda-blackwell|linux-x86_64-cuda-blackwell-ultra|linux-x86_64-cuda-blackwell-consumer|linux-arm64-cuda-hopper|linux-arm64-cuda-blackwell|linux-arm64-cuda-blackwell-ultra|linux-arm64-cuda-thor)
             err "No compatible binary for ${PLATFORM} in release ${RLLM_VERSION}.
 This release may predate multi-architecture CUDA builds.
 Options:

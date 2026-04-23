@@ -147,12 +147,16 @@ jobs:
             arch: "100"
             tar_suffix: cuda-blackwell
             legacy_alias: false
+          - label: sm_103 (Blackwell Ultra)
+            arch: "103"
+            tar_suffix: cuda-blackwell-ultra
+            legacy_alias: false
           - label: sm_120 (Blackwell consumer, RTX 50xx)
             arch: "120"
             tar_suffix: cuda-blackwell-consumer
             legacy_alias: false
     container:
-      image: nvidia/cuda:12.9.0-devel-ubuntu22.04
+      image: nvidia/cuda:13.2.1-devel-ubuntu22.04
       options: --user root
     steps:
       - uses: actions/checkout@v6
@@ -218,6 +222,128 @@ jobs:
           path: |
             rllm-linux-x86_64-cuda.tar.gz
             rllm-linux-x86_64-cuda.tar.gz.sha256
+          retention-days: 7
+
+  # ── Linux arm64 CPU ─────────────────────────────────────────────────────────
+  build-linux-arm64-cpu:
+    name: Build · Linux arm64 (CPU)
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - name: Cache Cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: linux-arm64-cpu-${{ hashFiles('Cargo.lock') }}
+          restore-keys: linux-arm64-cpu-
+
+      - name: Install system deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends pkg-config libssl-dev
+
+      - name: Build (CPU-only, release)
+        run: cargo build --release --no-default-features
+
+      - name: Strip binary (Linux arm64 CPU release artifact)
+        run: strip --strip-unneeded target/release/rllm
+
+      - name: Package binary
+        run: |
+          cd target/release
+          tar -czf ../../rllm-linux-arm64-cpu.tar.gz rllm
+          cd ../..
+          sha256sum rllm-linux-arm64-cpu.tar.gz > rllm-linux-arm64-cpu.tar.gz.sha256
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: rllm-linux-arm64-cpu
+          path: |
+            rllm-linux-arm64-cpu.tar.gz
+            rllm-linux-arm64-cpu.tar.gz.sha256
+          retention-days: 7
+
+  # ── Linux arm64 CUDA ────────────────────────────────────────────────────────
+  build-linux-arm64-cuda:
+    name: Build · Linux arm64 (CUDA ${{ matrix.variant.label }})
+    runs-on: ubuntu-24.04-arm
+    strategy:
+      fail-fast: false
+      matrix:
+        variant:
+          - label: sm_90 (Hopper / GH200)
+            arch: "90"
+            tar_suffix: cuda-hopper
+          - label: sm_100 (Blackwell datacenter / DGX Spark)
+            arch: "100"
+            tar_suffix: cuda-blackwell
+          - label: sm_103 (Blackwell Ultra / GB300)
+            arch: "103"
+            tar_suffix: cuda-blackwell-ultra
+          - label: sm_110 (Thor / Jetson)
+            arch: "110"
+            tar_suffix: cuda-thor
+    container:
+      image: nvidia/cuda:13.2.1-devel-ubuntu22.04
+      options: --user root
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install build deps
+        run: |
+          apt-get update -qq
+          apt-get install -y --no-install-recommends \
+            curl build-essential pkg-config libssl-dev git ca-certificates
+
+      - name: Install Rust stable
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --default-toolchain "$RUST_TOOLCHAIN" --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Cache Cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: linux-arm64-cuda-sm${{ matrix.variant.arch }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: linux-arm64-cuda-sm${{ matrix.variant.arch }}-
+
+      - name: Build (CUDA, release)
+        env:
+          CUDA_COMPUTE_CAP: ${{ matrix.variant.arch }}
+        run: cargo build --release --no-default-features --features cuda
+
+      - name: Strip binary (Linux arm64 CUDA release artifact)
+        run: strip --strip-unneeded target/release/rllm
+
+      - name: Package binary
+        run: |
+          TAR_NAME="rllm-linux-arm64-${{ matrix.variant.tar_suffix }}.tar.gz"
+          cd target/release && tar -czf ../../"${TAR_NAME}" rllm && cd ../..
+          sha256sum "${TAR_NAME}" > "${TAR_NAME}.sha256"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: rllm-linux-arm64-${{ matrix.variant.tar_suffix }}
+          path: |
+            rllm-linux-arm64-${{ matrix.variant.tar_suffix }}.tar.gz
+            rllm-linux-arm64-${{ matrix.variant.tar_suffix }}.tar.gz.sha256
           retention-days: 7
 
   # ── Docker CPU ──────────────────────────────────────────────────────────────
@@ -411,6 +537,10 @@ jobs:
             arch: "100"
             tag: cuda-blackwell
             default_aliases: false
+          - label: Blackwell Ultra (sm_103)
+            arch: "103"
+            tag: cuda-blackwell-ultra
+            default_aliases: false
           - label: Blackwell consumer (sm_120, RTX 50xx)
             arch: "120"
             tag: cuda-blackwell-consumer
@@ -484,6 +614,98 @@ jobs:
           context: .
           file: Dockerfile
           push: true
+          tags: ${{ steps.tags.outputs.tags }}
+          build-args: |
+            CUDA_ARCH=${{ matrix.variant.arch }}
+          provenance: false
+          no-cache: true
+
+  # ── Docker CUDA (arm64) ─────────────────────────────────────────────────────
+  docker-cuda-arm64:
+    name: Docker · CUDA arm64 (${{ matrix.variant.label }})
+    if: ${{ inputs.push_docker }}
+    runs-on: ubuntu-24.04-arm
+    strategy:
+      fail-fast: false
+      matrix:
+        variant:
+          - label: Hopper (sm_90)
+            arch: "90"
+            tag: cuda-hopper
+          - label: Blackwell datacenter (sm_100)
+            arch: "100"
+            tag: cuda-blackwell
+          - label: Blackwell Ultra (sm_103)
+            arch: "103"
+            tag: cuda-blackwell-ultra
+          - label: Thor (sm_110)
+            arch: "110"
+            tag: cuda-thor
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android
+          sudo docker image prune -af
+          df -h
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute Docker tags
+        id: tags
+        run: |
+          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
+          IMAGE=$(echo "$IMAGE" | tr '[:upper:]' '[:lower:]')
+          CHANNEL="${{ inputs.channel }}"
+          TAG="${{ inputs.version_tag }}"
+          ARCH_TAG="${{ matrix.variant.tag }}"
+          if [ "$CHANNEL" = "nightly" ]; then
+            TAGS="${IMAGE}:nightly-${ARCH_TAG}-arm64"
+          else
+            VER="${TAG#v}"
+            MAJOR_MINOR="${VER%.*}"
+            TAGS="${IMAGE}:${VER}-${ARCH_TAG}-arm64,${IMAGE}:${MAJOR_MINOR}-${ARCH_TAG}-arm64,${IMAGE}:${ARCH_TAG}-arm64"
+          fi
+          echo "tags=${TAGS}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build and push CUDA arm64 image
+        id: docker_build
+        continue-on-error: true
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: Dockerfile
+          push: true
+          platforms: linux/arm64
+          tags: ${{ steps.tags.outputs.tags }}
+          build-args: |
+            CUDA_ARCH=${{ matrix.variant.arch }}
+          provenance: false
+          cache-from: |
+            type=gha,scope=cuda-arm64-${{ matrix.variant.arch }}
+            type=gha
+          cache-to: type=gha,mode=max,scope=cuda-arm64-${{ matrix.variant.arch }}
+
+      - name: Rebuild CUDA arm64 image without cache (fallback on cache failure)
+        if: steps.docker_build.outcome == 'failure'
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: Dockerfile
+          push: true
+          platforms: linux/arm64
           tags: ${{ steps.tags.outputs.tags }}
           build-args: |
             CUDA_ARCH=${{ matrix.variant.arch }}

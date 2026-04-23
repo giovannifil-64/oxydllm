@@ -118,11 +118,11 @@ fn print_usage() {
 Usage: rllm <command> [options]
 
 Commands:
-  pull     <user/model>   Download a model from HuggingFace
-  rm       <model-name>   Remove a model and its files from disk
-  start                   Start the HTTP inference server
-  run      <model-name>   Interactive chat in terminal
-  estimate <model>        Estimate memory footprint and accuracy
+  pull     <user/model>     Download a model from HuggingFace
+  rm       <model-name>     Remove a model and its files from disk
+  start                     Start the HTTP inference server
+  run      <model-name>     Interactive chat in terminal
+  estimate <model>          Estimate memory footprint and accuracy
 
 Download options (pull):
   --models-dir <DIR>        Destination directory (default: ~/.rllm/models/)

@@ -116,11 +116,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        cuda_arch: ["89", "90", "100", "120"]
+        cuda_arch: ["89", "90", "100", "103", "120"]
     env:
       CUDA_COMPUTE_CAP: ${{ matrix.cuda_arch }}
     container:
-      image: nvidia/cuda:12.9.0-devel-ubuntu22.04
+      image: nvidia/cuda:13.2.1-devel-ubuntu22.04
       options: --user root
     steps:
       - uses: actions/checkout@v6
@@ -162,3 +162,82 @@ jobs:
         run: |
           export LD_LIBRARY_PATH="/tmp/cuda-stubs:/usr/local/cuda/lib64/stubs:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}"
           cargo test --release --no-default-features --features cuda -- --test-threads=4 arch_
+
+  # ── Linux arm64 CPU: check + clippy ─────────────────────────────────────────
+  check-linux-arm64-cpu:
+    name: Check · Linux arm64 (CPU)
+    needs: fmt
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: clippy
+
+      - name: Cache Cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: linux-arm64-cpu-ci-${{ hashFiles('Cargo.lock') }}
+          restore-keys: linux-arm64-cpu-ci-
+
+      - name: Install system deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends pkg-config libssl-dev
+
+      - name: Check (CPU-only)
+        run: cargo check --release --no-default-features
+
+      - name: Clippy (CPU-only)
+        run: cargo clippy --release --no-default-features -- -D warnings
+
+  # ── Linux arm64 CUDA: compile check (no GPU on runner) ──────────────────────
+  check-linux-arm64-cuda:
+    name: Check · Linux arm64 (CUDA sm_${{ matrix.cuda_arch }})
+    needs: fmt
+    runs-on: ubuntu-24.04-arm
+    strategy:
+      fail-fast: false
+      matrix:
+        cuda_arch: ["90", "100", "103", "110"]
+    env:
+      CUDA_COMPUTE_CAP: ${{ matrix.cuda_arch }}
+    container:
+      image: nvidia/cuda:13.2.1-devel-ubuntu22.04
+      options: --user root
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install build deps
+        run: |
+          apt-get update -qq
+          apt-get install -y --no-install-recommends \
+            curl build-essential pkg-config libssl-dev git ca-certificates
+
+      - name: Install Rust stable
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --default-toolchain "$RUST_TOOLCHAIN" --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Cache Cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: linux-arm64-cuda-ci-sm${{ matrix.cuda_arch }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: linux-arm64-cuda-ci-sm${{ matrix.cuda_arch }}-
+
+      - name: Check (CUDA)
+        run: cargo check --no-default-features --features cuda

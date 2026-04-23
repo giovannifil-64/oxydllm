@@ -109,12 +109,19 @@ jobs:
             curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/main/install.sh | sh
             ```
 
-            **Linux (CUDA — Ada / Hopper / Blackwell datacenter / Blackwell consumer)**
+            **Linux x86_64 (CUDA — Ada / Hopper / Blackwell / Blackwell Ultra / Blackwell consumer)**
             ```bash
             curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/main/install.sh | sh
             ```
 
-            Installer auto-selects `cuda-ada`, `cuda-hopper`, `cuda-blackwell`, or `cuda-blackwell-consumer` binary archives based on detected GPU compute capability.
+            **Linux arm64 (CUDA — GH200 / DGX Spark / GB300 / Jetson Thor)**
+            ```bash
+            curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/main/install.sh | sh
+            ```
+
+            Installer auto-selects the right binary from detected GPU compute capability.
+            Override with `RLLM_CUDA_TARGET=<ada|hopper|blackwell|blackwell-ultra|blackwell-consumer>` (x86_64)
+            or `RLLM_CUDA_TARGET=<hopper|blackwell|blackwell-ultra|thor>` (arm64).
 
             **Linux (CPU only)**
             ```bash
@@ -128,7 +135,8 @@ jobs:
               ghcr.io/${{ github.repository }}:latest start
             ```
 
-            For explicit CUDA targets, use `:cuda-ada`, `:cuda-hopper`, `:cuda-blackwell`, or `:cuda-blackwell-consumer`.
+            x86_64 explicit CUDA tags: `:cuda-ada`, `:cuda-hopper`, `:cuda-blackwell`, `:cuda-blackwell-ultra`, `:cuda-blackwell-consumer`.
+            ARM64 explicit CUDA tags: `:cuda-hopper-arm64`, `:cuda-blackwell-arm64`, `:cuda-blackwell-ultra-arm64`, `:cuda-thor-arm64`.
 
             **Docker (CPU)**
             ```bash

@@ -656,6 +656,7 @@ pub fn engine_loop(
     mut request_rx: tokio_mpsc::UnboundedReceiver<IncomingRequest>,
     shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) {
+    let gpu_lock = crate::gpu_lock::gpu_lock_for(engine.device());
     let mut trackers: HashMap<SequenceId, SeqTracker> = HashMap::new();
     let mut consecutive_errors: u32 = 0;
     const MAX_CONSECUTIVE_ERRORS: u32 = 3;
@@ -697,8 +698,7 @@ pub fn engine_loop(
 
         if engine.has_pending_work() {
             let step_result = {
-                let lock = crate::gpu_lock::gpu_lock();
-                let _gpu = lock.acquire();
+                let _gpu = gpu_lock.acquire();
                 engine.step()
             };
             match step_result {

@@ -168,8 +168,17 @@ mod tests {
     // Model builder
     fn build_model(spec: ArchSpec) -> Result<StandardTransformer> {
         let dev = Device::Cpu;
-        let dtype = DType::F32;
         let tensors = build_weights(&spec, &dev);
+        build_model_from_tensors(&spec, tensors, None)
+    }
+
+    fn build_model_from_tensors(
+        spec: &ArchSpec,
+        tensors: rustc_hash::FxHashMap<String, Tensor>,
+        kv_quantizer: Option<Arc<crate::common::kv_quant::KvQuantizer>>,
+    ) -> Result<StandardTransformer> {
+        let dev = Device::Cpu;
+        let dtype = DType::F32;
         let weights = crate::common::weights::ModelWeights::from_tensors(tensors);
 
         let block_cfg = BlockConfig {
@@ -213,7 +222,7 @@ mod tests {
                     HEAD_DIM,
                     dtype,
                     &dev,
-                    None,
+                    kv_quantizer.clone(),
                 )?)))
             })
             .collect::<Result<Vec<_>>>()?;
@@ -510,5 +519,114 @@ mod tests {
             name: "Minimal",
             ..Default::default()
         });
+    }
+
+    // ── KV cache quantization regression ─────────────────────────────────────
+    //
+    // Build two identical models from the same weights: one with no KV
+    // quantization, one with 4-bit (Lossless) quantization.  After a shared
+    // prefill, run one decode step on each and verify:
+    //   1. Both produce finite, non-zero logits.
+    //   2. The softmax L1 distance between the two outputs is < 0.5.
+    //      (4-bit quantization on HEAD_DIM=8 vectors introduces bounded error;
+    //       the threshold is generous to avoid flakiness with random weights
+    //       while still catching catastrophic numerical failures.)
+    //
+    // This test exercises the full TurboQuant write→read round-trip through
+    // BlockAllocator::append / flush_pending / gather, catching bugs that
+    // pure unit-level quantize/dequantize tests cannot reach.
+
+    fn softmax_l1(a: &[f32], b: &[f32]) -> f32 {
+        fn softmax(v: &[f32]) -> Vec<f32> {
+            let max = v.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let e: Vec<f32> = v.iter().map(|x| (x - max).exp()).collect();
+            let s: f32 = e.iter().sum();
+            e.iter().map(|x| x / s).collect()
+        }
+        softmax(a)
+            .iter()
+            .zip(softmax(b))
+            .map(|(x, y)| (x - y).abs())
+            .sum()
+    }
+
+    #[test]
+    fn kv_quant_lossless_finite_and_close() {
+        use crate::common::kv_quant::KvQuantizer;
+
+        let spec = ArchSpec {
+            name: "kv_quant_lossless",
+            ..Default::default()
+        };
+        let dev = Device::Cpu;
+
+        // Build weights once; clone (cheap Arc increments) for the second model.
+        let tensors = build_weights(&spec, &dev);
+        let tensors2: rustc_hash::FxHashMap<String, Tensor> = tensors
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+
+        let model_off = build_model_from_tensors(&spec, tensors, None)
+            .expect("kv_quant: failed to build unquantized model");
+
+        let quantizer = Arc::new(KvQuantizer::new_with_qjl(4, HEAD_DIM, true));
+        let model_quant = build_model_from_tensors(&spec, tensors2, Some(quantizer))
+            .expect("kv_quant: failed to build quantized model");
+
+        let mut caches_off = make_caches(&model_off);
+        let mut caches_quant = make_caches(&model_quant);
+
+        // Prefill with identical token sequence on both models.
+        run_prefill(&model_off, &mut caches_off, 8).expect("kv_quant: prefill failed (off)");
+        run_prefill(&model_quant, &mut caches_quant, 8)
+            .expect("kv_quant: prefill failed (lossless)");
+
+        // Single decode step — this reads the (possibly quantized) KV cache.
+        let off_logits =
+            run_decode(&model_off, &mut caches_off, 8).expect("kv_quant: decode failed (off)");
+        let quant_logits = run_decode(&model_quant, &mut caches_quant, 8)
+            .expect("kv_quant: decode failed (lossless)");
+
+        assert_logits_ok(&off_logits, 1, "kv_quant/off");
+        assert_logits_ok(&quant_logits, 1, "kv_quant/lossless");
+
+        let off_flat: Vec<f32> = off_logits.flatten_all().unwrap().to_vec1().unwrap();
+        let quant_flat: Vec<f32> = quant_logits.flatten_all().unwrap().to_vec1().unwrap();
+        let l1 = softmax_l1(&off_flat, &quant_flat);
+
+        assert!(
+            l1 < 0.5,
+            "kv_quant/lossless: softmax L1 distance {l1:.4} exceeds threshold 0.5 — \
+             quantization is introducing excessive error in the KV read-back path"
+        );
+    }
+
+    #[test]
+    fn kv_quant_balanced_finite() {
+        use crate::common::kv_quant::KvQuantizer;
+
+        let spec = ArchSpec {
+            name: "kv_quant_balanced",
+            ..Default::default()
+        };
+        let dev = Device::Cpu;
+        let tensors = build_weights(&spec, &dev);
+
+        let quantizer = Arc::new(KvQuantizer::new_with_qjl(3, HEAD_DIM, true));
+        let model_quant = build_model_from_tensors(&spec, tensors, Some(quantizer))
+            .expect("kv_quant/balanced: failed to build model");
+
+        let mut caches = make_caches(&model_quant);
+
+        let prefill_logits =
+            run_prefill(&model_quant, &mut caches, 8).expect("kv_quant/balanced: prefill failed");
+        assert_logits_ok(&prefill_logits, 8, "kv_quant/balanced/prefill");
+
+        for step in 0..3 {
+            let decode_logits = run_decode(&model_quant, &mut caches, 8 + step)
+                .unwrap_or_else(|e| panic!("kv_quant/balanced: decode step {step} failed: {e}"));
+            assert_logits_ok(&decode_logits, 1, "kv_quant/balanced/decode");
+        }
     }
 }

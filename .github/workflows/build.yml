@@ -516,6 +516,52 @@ jobs:
               "${tag}-arm64"
           done
 
+  # ── Docker CUDA latest manifest ────────────────────────────────────────────
+  # Policy: :latest = multi-arch CUDA image, Ada (amd64) + Hopper (arm64).
+  # This is the recommended tag for production deployments on NVIDIA hardware.
+  # Architecture-specific tags (:cuda-ada, :cuda-hopper, :cuda-blackwell, …)
+  # remain available for deployments that require a precise compute capability.
+  docker-cuda-latest-manifest:
+    name: Docker · CUDA latest manifest (amd64+arm64)
+    if: ${{ inputs.push_docker && inputs.channel == 'release' }}
+    needs: [docker-cuda, docker-cuda-arm64]
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create and push :latest and :cuda multi-arch manifests
+        run: |
+          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
+          IMAGE=$(echo "$IMAGE" | tr '[:upper:]' '[:lower:]')
+          TAG="${{ inputs.version_tag }}"
+          VER="${TAG#v}"
+          MAJOR_MINOR="${VER%.*}"
+
+          # Sources: Ada amd64 (best single-GPU for x86) + Hopper arm64 (GH200/DGX)
+          ADA_AMD64="${IMAGE}:cuda-ada"
+          HOPPER_ARM64="${IMAGE}:cuda-hopper-arm64"
+
+          for manifest_tag in \
+            "${IMAGE}:latest" \
+            "${IMAGE}:cuda" \
+            "${IMAGE}:${VER}" \
+            "${IMAGE}:${VER}-cuda" \
+            "${IMAGE}:${MAJOR_MINOR}" \
+            "${IMAGE}:${MAJOR_MINOR}-cuda"; do
+            docker buildx imagetools create \
+              --tag "$manifest_tag" \
+              "$ADA_AMD64" \
+              "$HOPPER_ARM64"
+          done
+
   # ── Docker CUDA ─────────────────────────────────────────────────────────────
   docker-cuda:
     name: Docker · CUDA (${{ matrix.variant.label }})
@@ -575,15 +621,17 @@ jobs:
           if [ "$CHANNEL" = "nightly" ]; then
             TAGS="${IMAGE}:nightly-${ARCH_TAG}"
             if [ "${{ matrix.variant.default_aliases }}" = "true" ]; then
+              # :nightly and :nightly-cuda point to Ada amd64 for nightly builds.
+              # For release builds, :latest/:cuda are set by docker-cuda-latest-manifest
+              # as a proper multi-arch manifest (Ada amd64 + Hopper arm64).
               TAGS="${TAGS},${IMAGE}:nightly,${IMAGE}:nightly-cuda"
             fi
           else
             VER="${TAG#v}"
             MAJOR_MINOR="${VER%.*}"
+            # Arch-specific tags only — version aliases (:latest, :cuda, :{VER}, :{MAJOR_MINOR})
+            # are created as multi-arch manifests by docker-cuda-latest-manifest.
             TAGS="${IMAGE}:${VER}-${ARCH_TAG},${IMAGE}:${MAJOR_MINOR}-${ARCH_TAG},${IMAGE}:${ARCH_TAG}"
-            if [ "${{ matrix.variant.default_aliases }}" = "true" ]; then
-              TAGS="${TAGS},${IMAGE}:${VER},${IMAGE}:${VER}-cuda,${IMAGE}:${MAJOR_MINOR},${IMAGE}:cuda,${IMAGE}:latest"
-            fi
           fi
           echo "tags=${TAGS}" >> "$GITHUB_OUTPUT"
 

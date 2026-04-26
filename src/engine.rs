@@ -165,6 +165,10 @@ impl Engine {
         }
     }
 
+    pub fn device(&self) -> &Device {
+        &self.device
+    }
+
     pub fn add_request(
         &mut self,
         prompt_tokens: Vec<u32>,

@@ -35,6 +35,16 @@ jobs:
           components: rustfmt
       - run: cargo fmt --check
 
+  # ── Security audit ──────────────────────────────────────────────────────────
+  audit:
+    name: Security audit
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
   # ── macOS: check + clippy + test with Metal feature ─────────────────────────
   check-macos:
     name: Check · macOS arm64 (Metal)

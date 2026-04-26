@@ -17,7 +17,7 @@
 // portion is the actual GPU compute.
 // ─────────────────────────────────────────────────────────────────────────────
 
-use candle_core::Device;
+use candle_core::{Device, DeviceLocation};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock};
 
@@ -41,14 +41,10 @@ impl GpuLock {
 /// - CUDA ordinal N       → (1 << 32) | N
 /// - Metal (single GPU)   → 2 << 32
 fn device_key(device: &Device) -> u64 {
-    match device {
-        Device::Cpu => 0,
-        // ordinal() is only available when the cuda feature is enabled.
-        #[cfg(feature = "cuda")]
-        Device::Cuda(d) => (1u64 << 32) | d.ordinal() as u64,
-        #[cfg(not(feature = "cuda"))]
-        Device::Cuda(_) => 1u64 << 32,
-        Device::Metal(_) => 2u64 << 32,
+    match device.location() {
+        DeviceLocation::Cpu => 0,
+        DeviceLocation::Cuda { gpu_id } => (1u64 << 32) | gpu_id as u64,
+        DeviceLocation::Metal { gpu_id } => (2u64 << 32) | gpu_id as u64,
     }
 }
 

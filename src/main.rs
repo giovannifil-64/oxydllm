@@ -751,12 +751,13 @@ fn run_interactive(args: &RunArgs) -> anyhow::Result<()> {
                     single
                 } else {
                     let full = tokenizer.decode(&output_ids)?;
-                    let new_text = &full[decoded_len..];
+                    let start = clamp_to_char_boundary(&full, decoded_len);
+                    let new_text = &full[start..];
                     let trimmed = new_text.trim_end_matches('\u{FFFD}');
                     if trimmed.is_empty() {
                         continue;
                     }
-                    decoded_len += trimmed.len();
+                    decoded_len = start + trimmed.len();
                     trimmed.to_string()
                 };
 

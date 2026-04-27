@@ -4,8 +4,8 @@ set -eu
 echo "[pre-commit] cargo fmt --check"
 cargo fmt --check
 
-echo "[pre-commit] cargo clippy --release -- -D warnings"
-cargo clippy --release -- -D warnings
+echo "[pre-commit] cargo clippy -- -D warnings"
+cargo clippy -- -D warnings
 
-echo "[pre-commit] cargo test --release arch_ edge_ (architecture regression tests)"
-cargo test --release -- --test-threads=4 arch_ edge_
+echo "[pre-commit] cargo audit"
+cargo audit

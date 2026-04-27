@@ -1,0 +1,5 @@
+#!/usr/bin/env sh
+set -eu
+
+echo "[pre-push] cargo test --release arch_ edge_ (architecture regression tests)"
+cargo test --release -- --test-threads=4 arch_ edge_

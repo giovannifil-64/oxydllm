@@ -28,6 +28,72 @@ pub struct ResponseFormat {
     pub json_schema: Option<JsonSchemaSpec>,
 }
 
+// ---------------------------------------------------------------------------
+// Tool / function-calling types
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize, Serialize, Clone, Debug)]
+pub struct FunctionDefinition {
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub parameters: Option<serde_json::Value>,
+    #[serde(default)]
+    pub strict: Option<bool>,
+}
+
+#[derive(Deserialize, Serialize, Clone, Debug)]
+pub struct ToolDefinition {
+    #[serde(rename = "type", default)]
+    pub tool_type: String,
+    pub function: FunctionDefinition,
+}
+
+#[derive(Deserialize, Serialize, Clone, Debug)]
+pub struct ToolCallFunction {
+    pub name: String,
+    pub arguments: String,
+}
+
+#[derive(Deserialize, Serialize, Clone, Debug)]
+pub struct ToolCall {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub call_type: String,
+    pub function: ToolCallFunction,
+}
+
+// ---------------------------------------------------------------------------
+// Chat message (used for both incoming requests and template rendering)
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize, Serialize, Clone, Debug)]
+pub struct ChatMessage {
+    pub role: String,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
+    // For assistant messages that contain tool calls (incoming multi-turn)
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCall>>,
+    // For role="tool" messages
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Request
+// ---------------------------------------------------------------------------
+
 #[derive(Deserialize)]
 pub struct ChatCompletionRequest {
     #[serde(default)]
@@ -78,11 +144,14 @@ pub struct ChatCompletionRequest {
     #[serde(default)]
     pub response_format: Option<ResponseFormat>,
     #[serde(default)]
+    #[allow(dead_code)]
     pub user: Option<String>,
     #[serde(default)]
-    pub tools: Option<serde_json::Value>,
+    pub tools: Option<Vec<ToolDefinition>>,
     #[serde(default)]
     pub tool_choice: Option<serde_json::Value>,
+    #[serde(default)]
+    pub parallel_tool_calls: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -90,15 +159,6 @@ pub struct ChatCompletionRequest {
 pub enum StopParam {
     Single(String),
     Multiple(Vec<String>),
-}
-
-#[derive(Deserialize, Serialize, Clone, Debug)]
-pub struct ChatMessage {
-    pub role: String,
-    pub content: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(default)]
-    pub reasoning_content: Option<String>,
 }
 
 /// Pre-decoded logprob entry for a single generated token.

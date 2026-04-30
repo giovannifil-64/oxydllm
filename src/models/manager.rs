@@ -462,6 +462,26 @@ impl ModelManager {
         }
     }
 
+    #[cfg(test)]
+    pub fn insert_ready_for_tests(&mut self, model_id: &str, handle: ReadyHandle) {
+        self.slots.insert(
+            model_id.to_string(),
+            SlotState::Ready {
+                request_tx: handle.request_tx,
+                tokenizer: handle.tokenizer,
+                max_seq_len: handle.max_seq_len,
+                architecture: "TestArchitecture".to_string(),
+                vocab_size: 0,
+                num_layers: 0,
+                last_used: Instant::now(),
+                effective_keep_alive: self.keep_alive,
+                weights_size_bytes: 0,
+                kv_cache_bytes: 0,
+                shutdown: Arc::new(AtomicBool::new(false)),
+            },
+        );
+    }
+
     pub fn update_registry(
         &mut self,
         model_id: &str,

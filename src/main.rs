@@ -665,8 +665,11 @@ fn run_interactive(args: &RunArgs) -> anyhow::Result<()> {
 
     let mut messages: Vec<ChatMessage> = vec![ChatMessage {
         role: "system".to_string(),
-        content: "You are a helpful assistant.".to_string(),
+        content: Some("You are a helpful assistant.".to_string()),
         reasoning_content: None,
+        tool_calls: None,
+        tool_call_id: None,
+        name: None,
     }];
     let stop_markers = tokenizer.stop_text_markers();
     let hold_back_bytes = stop_markers
@@ -700,11 +703,14 @@ fn run_interactive(args: &RunArgs) -> anyhow::Result<()> {
 
         messages.push(ChatMessage {
             role: "user".to_string(),
-            content: input,
+            content: Some(input),
             reasoning_content: None,
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
         });
 
-        let mut prompt = server::apply_chat_template(&tokenizer, &messages, false);
+        let mut prompt = server::apply_chat_template(&tokenizer, &messages, false, None);
         let mut prompt_tokens = tokenizer.encode(&prompt)?;
 
         while prompt_tokens.len() >= max_seq_len && messages.len() > 2 {
@@ -713,7 +719,7 @@ fn run_interactive(args: &RunArgs) -> anyhow::Result<()> {
             if messages.len() > 1 && messages[1].role == "assistant" {
                 messages.remove(1);
             }
-            prompt = server::apply_chat_template(&tokenizer, &messages, false);
+            prompt = server::apply_chat_template(&tokenizer, &messages, false, None);
             prompt_tokens = tokenizer.encode(&prompt)?;
             tracing::warn!(
                 previous_tokens = prev_len,
@@ -819,8 +825,11 @@ fn run_interactive(args: &RunArgs) -> anyhow::Result<()> {
 
         messages.push(ChatMessage {
             role: "assistant".to_string(),
-            content: response_text,
+            content: Some(response_text),
             reasoning_content: None,
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
         });
     }
 

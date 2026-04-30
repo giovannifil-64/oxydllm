@@ -13,12 +13,14 @@ pub fn apply_chat_template(
     eos_token: Option<&str>,
     add_generation_prompt: bool,
     enable_thinking: bool,
+    tools: Option<serde_json::Value>,
 ) -> Result<String> {
     let template = preprocess_template(template);
 
     let mut env = Environment::new();
 
     env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
+    env.add_filter("tojson", tojson_filter);
     env.add_function("raise_exception", raise_exception);
     env.add_function("strftime_now", strftime_now);
     env.add_function("namespace", minijinja::functions::namespace);
@@ -32,13 +34,20 @@ pub fn apply_chat_template(
             .iter()
             .map(|m| TemplateMessage {
                 role: &m.role,
-                content: &m.content,
+                content: m.content.as_deref().unwrap_or(""),
+                tool_calls: m
+                    .tool_calls
+                    .as_ref()
+                    .and_then(|tc| serde_json::to_value(tc).ok()),
+                tool_call_id: m.tool_call_id.as_deref(),
+                name: m.name.as_deref(),
             })
             .collect(),
         bos_token: bos_token.unwrap_or(""),
         eos_token: eos_token.unwrap_or(""),
         add_generation_prompt,
         enable_thinking,
+        tools,
     };
 
     let rendered = tmpl
@@ -51,20 +60,33 @@ pub fn apply_chat_template(
 pub fn format_plain_chat(messages: &[ChatMessage]) -> String {
     let mut prompt = String::new();
     for msg in messages {
+        let content = msg.content.as_deref().unwrap_or("");
         match msg.role.as_str() {
             "system" => {
                 prompt.push_str("System: ");
-                prompt.push_str(&msg.content);
+                prompt.push_str(content);
                 prompt.push('\n');
             }
             "assistant" => {
-                prompt.push_str("Assistant: ");
-                prompt.push_str(&msg.content);
-                prompt.push('\n');
+                if let Some(tc) = &msg.tool_calls {
+                    prompt.push_str("Assistant (tool call): ");
+                    if let Ok(s) = serde_json::to_string(tc) {
+                        prompt.push_str(&s);
+                    }
+                    prompt.push('\n');
+                } else {
+                    prompt.push_str("Assistant: ");
+                    prompt.push_str(content);
+                    prompt.push('\n');
+                }
+            }
+            "tool" => {
+                let id = msg.tool_call_id.as_deref().unwrap_or("");
+                prompt.push_str(&format!("Tool result [{}]: {}\n", id, content));
             }
             _ => {
                 prompt.push_str("User: ");
-                prompt.push_str(&msg.content);
+                prompt.push_str(content);
                 prompt.push('\n');
             }
         }
@@ -99,7 +121,8 @@ pub fn format_turn_chat(
             prompt.push_str("<|think|>");
         }
         if first_is_system {
-            prompt.push_str(messages[0].content.trim());
+            let content = messages[0].content.as_deref().unwrap_or("").trim();
+            prompt.push_str(content);
             start_idx = 1;
         }
         prompt.push_str(end_turn_token);
@@ -107,16 +130,32 @@ pub fn format_turn_chat(
     }
 
     for message in &messages[start_idx..] {
-        let role = if message.role == "assistant" {
-            "model"
-        } else {
-            message.role.as_str()
+        let role = match message.role.as_str() {
+            "assistant" => "model",
+            "tool" => "tool",
+            other => other,
         };
 
         prompt.push_str(start_turn_token);
         prompt.push_str(role);
         prompt.push('\n');
-        prompt.push_str(message.content.trim());
+
+        if message.role == "assistant" {
+            if let Some(tc) = &message.tool_calls {
+                if let Ok(s) = serde_json::to_string(tc) {
+                    prompt.push_str(&s);
+                }
+            } else {
+                prompt.push_str(message.content.as_deref().unwrap_or("").trim());
+            }
+        } else if message.role == "tool" {
+            let id = message.tool_call_id.as_deref().unwrap_or("");
+            let content = message.content.as_deref().unwrap_or("");
+            prompt.push_str(&format!("[{}]: {}", id, content));
+        } else {
+            prompt.push_str(message.content.as_deref().unwrap_or("").trim());
+        }
+
         prompt.push_str(end_turn_token);
         prompt.push('\n');
     }
@@ -142,12 +181,56 @@ struct TemplateContext<'a> {
     eos_token: &'a str,
     add_generation_prompt: bool,
     enable_thinking: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<serde_json::Value>,
 }
 
 #[derive(Serialize)]
 struct TemplateMessage<'a> {
     role: &'a str,
     content: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_calls: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_call_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<&'a str>,
+}
+
+fn tojson_filter(
+    value: Value,
+    kwargs: minijinja::value::Kwargs,
+) -> std::result::Result<Value, minijinja::Error> {
+    let indent: Option<u32> = kwargs.get("indent")?;
+    kwargs.assert_all_used()?;
+    let json_string = serde_json::to_string(&value).map_err(|e| {
+        minijinja::Error::new(
+            minijinja::ErrorKind::InvalidOperation,
+            format!("tojson serialization failed: {e}"),
+        )
+    })?;
+    let result = if let Some(n) = indent {
+        let parsed: serde_json::Value = serde_json::from_str(&json_string).map_err(|e| {
+            minijinja::Error::new(
+                minijinja::ErrorKind::InvalidOperation,
+                format!("tojson re-parse failed: {e}"),
+            )
+        })?;
+        let indent_str = " ".repeat(n as usize);
+        let fmt = serde_json::ser::PrettyFormatter::with_indent(indent_str.as_bytes());
+        let mut buf = Vec::new();
+        let mut ser = serde_json::Serializer::with_formatter(&mut buf, fmt);
+        serde::Serialize::serialize(&parsed, &mut ser).map_err(|e| {
+            minijinja::Error::new(
+                minijinja::ErrorKind::InvalidOperation,
+                format!("tojson pretty-print failed: {e}"),
+            )
+        })?;
+        String::from_utf8(buf).unwrap_or(json_string)
+    } else {
+        json_string
+    };
+    Ok(Value::from(result))
 }
 
 fn raise_exception(msg: String) -> Result<Value, minijinja::Error> {
@@ -184,8 +267,11 @@ mod tests {
     fn apply_chat_template_renders_basic_template() {
         let messages = vec![ChatMessage {
             role: "user".to_string(),
-            content: "hello".to_string(),
+            content: Some("hello".to_string()),
             reasoning_content: None,
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
         }];
 
         let rendered = apply_chat_template(
@@ -195,6 +281,7 @@ mod tests {
             None,
             false,
             false,
+            None,
         )
         .expect("template should render");
 
@@ -221,7 +308,7 @@ mod tests {
     fn apply_chat_template_fails_on_invalid_strftime_format() {
         let fmt = "x".repeat(MAX_STRFTIME_FMT_LEN + 1);
         let template = format!("{{{{ strftime_now(\"{}\") }}}}", fmt);
-        let result = apply_chat_template(&template, &[], None, None, false, false);
+        let result = apply_chat_template(&template, &[], None, None, false, false, None);
         assert!(result.is_err());
     }
 }

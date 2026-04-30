@@ -1,6 +1,8 @@
 mod chat;
 mod engine_loop;
 mod handlers;
+#[cfg(test)]
+mod http_compat_tests;
 mod types;
 
 pub use chat::apply_chat_template;
@@ -20,6 +22,16 @@ use crate::models::manager::{self, ModelManager, ModelManagerConfig, SharedModel
 
 struct AppState {
     manager: SharedModelManager,
+}
+
+fn build_router(state: Arc<AppState>) -> Router {
+    Router::new()
+        .route("/health", get(handlers::health))
+        .route("/v1/models", get(handlers::list_models))
+        .route("/v1/models/running", get(handlers::list_running_models))
+        .route("/v1/models/{model_id}", get(handlers::get_model))
+        .route("/v1/chat/completions", post(chat::chat_completions))
+        .with_state(state)
 }
 
 fn error_response(
@@ -96,13 +108,7 @@ pub fn start_server(args: StartServerArgs) -> anyhow::Result<()> {
         manager: Arc::clone(&manager),
     });
 
-    let app = Router::new()
-        .route("/health", get(handlers::health))
-        .route("/v1/models", get(handlers::list_models))
-        .route("/v1/models/running", get(handlers::list_running_models))
-        .route("/v1/models/{model_id}", get(handlers::get_model))
-        .route("/v1/chat/completions", post(chat::chat_completions))
-        .with_state(state);
+    let app = build_router(state);
 
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {

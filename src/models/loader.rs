@@ -123,12 +123,16 @@ pub fn resolve_model_path(models_dir: &Path, model_id: &str) -> Option<PathBuf> 
             return Some(direct);
         }
     }
-    let entries = std::fs::read_dir(models_dir).ok()?;
-    for entry in entries.flatten() {
+    let needle = model_id.to_ascii_lowercase();
+    let entries: Vec<_> = std::fs::read_dir(models_dir)
+        .ok()?
+        .flatten()
+        .filter(|e| e.path().is_dir())
+        .collect();
+
+    // GGUF stem exact match
+    for entry in &entries {
         let path = entry.path();
-        if !path.is_dir() {
-            continue;
-        }
         if let Some(gguf_paths) = find_gguf_files(&path) {
             for gguf_path in &gguf_paths {
                 let raw_stem = gguf_path
@@ -143,7 +147,37 @@ pub fn resolve_model_path(models_dir: &Path, model_id: &str) -> Option<PathBuf> 
             }
         }
     }
-    None
+
+    // Case-insensitive prefix match on directory names (e.g. "Ministral-3B" → "Ministral-3B-Instruct-2512")
+    let mut prefix_match: Option<PathBuf> = None;
+    for entry in &entries {
+        let path = entry.path();
+        let dir_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|s| s.to_ascii_lowercase())
+            .unwrap_or_default();
+        if dir_name.starts_with(&needle) || needle.starts_with(&dir_name) {
+            let valid = path.join("config.json").exists() || find_gguf_file(&path).is_some();
+            if valid {
+                // Prefer the shorter name to avoid ambiguous over-matches
+                let better = prefix_match
+                    .as_ref()
+                    .map(|p| {
+                        p.file_name()
+                            .and_then(|n| n.to_str())
+                            .map(|s| s.len())
+                            .unwrap_or(usize::MAX)
+                            > dir_name.len()
+                    })
+                    .unwrap_or(true);
+                if better {
+                    prefix_match = Some(path);
+                }
+            }
+        }
+    }
+    prefix_match
 }
 
 fn resolve_weight_paths(model_dir: &str) -> anyhow::Result<Vec<String>> {

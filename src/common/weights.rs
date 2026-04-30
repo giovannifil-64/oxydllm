@@ -18,25 +18,41 @@ fn load_tensor_with_dtype(
         .load(name, device)
         .with_context(|| format!("Failed to load tensor {}", name))?;
 
-    if preserve_fp8_weight && t.dtype() == DType::F8E4M3 {
-        // Level-2 FP8 path: keep FP8 weights resident and dequantize on-the-fly in linear layers.
-        return Ok(t);
-    }
-
     let target_dtype = if force_f32 { DType::F32 } else { dtype };
 
     if t.dtype() == DType::F8E4M3 {
-        // Some backends fail or produce unstable results on direct FP8 -> BF16 casts.
-        // Route through F32 explicitly for consistent checkpoint compatibility.
-        return t
-            .to_dtype(DType::F32)
-            .and_then(|t| t.to_dtype(target_dtype))
-            .with_context(|| {
-                format!(
-                    "Failed to cast FP8 tensor {} to {:?} via F32 conversion path",
-                    name, target_dtype
-                )
-            });
+        // Metal has no F8E4M3 compute kernels (not even type conversion), so the on-the-fly
+        // dequant path used by Fp8Linear is unavailable. Always dequantize at load time on
+        // CPU and move the result to the device.
+        let use_cpu_path = matches!(device, Device::Metal(_));
+
+        if preserve_fp8_weight && !use_cpu_path {
+            // Level-2 FP8 path: keep FP8 weights resident and dequantize on-the-fly in linear layers.
+            return Ok(t);
+        }
+
+        let t_f32 = if use_cpu_path {
+            mmap.load(name, &Device::Cpu)
+                .with_context(|| format!("Failed to reload FP8 tensor {} on CPU", name))?
+                .to_dtype(DType::F32)
+                .with_context(|| format!("Failed to convert FP8 tensor {} to F32 on CPU", name))?
+                .to_device(device)
+                .with_context(|| {
+                    format!(
+                        "Failed to move tensor {} to device after CPU conversion",
+                        name
+                    )
+                })?
+        } else {
+            t.to_dtype(DType::F32)
+                .with_context(|| format!("Failed to cast FP8 tensor {} to F32", name))?
+        };
+        return t_f32.to_dtype(target_dtype).with_context(|| {
+            format!(
+                "Failed to cast FP8 tensor {} from F32 to {:?}",
+                name, target_dtype
+            )
+        });
     }
 
     match t.to_dtype(target_dtype) {
@@ -91,6 +107,10 @@ fn apply_weight_scale_inv(tensors: &mut FxHashMap<String, Tensor>) -> Result<()>
 
         // FP8 checkpoints (e.g. Mistral/Ministral variants) store
         // per-weight inverse scales next to quantized matrices.
+        // scale_inv is always loaded as F32; cast to weight dtype before multiplying.
+        let scale_inv = scale_inv
+            .to_dtype(weight.dtype())
+            .with_context(|| format!("Failed to cast '{}' to {:?}", scale_name, weight.dtype()))?;
         let scaled = weight.broadcast_mul(&scale_inv).with_context(|| {
             format!(
                 "Failed to apply '{}' dequantization factor to '{}'",

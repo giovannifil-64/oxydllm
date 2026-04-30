@@ -751,8 +751,23 @@ fn run_interactive(args: &RunArgs) -> anyhow::Result<()> {
             let step = engine.step().map_err(|e| anyhow::anyhow!("{}", e))?;
             for tok in &step.new_tokens {
                 output_ids.push(tok.token);
-                let single = tokenizer.decode(&[tok.token])?;
+                let mut single = tokenizer.decode(&[tok.token])?;
                 let emit = if !single.is_empty() && !single.contains('\u{FFFD}') {
+                    let has_leading_ws = single
+                        .chars()
+                        .next()
+                        .map(char::is_whitespace)
+                        .unwrap_or(false);
+                    if decoded_len > 0
+                        && !has_leading_ws
+                        && tokenizer
+                            .id_to_token(tok.token)
+                            .as_deref()
+                            .map(|p| p.starts_with('▁') || p.starts_with('Ġ'))
+                            .unwrap_or(false)
+                    {
+                        single.insert(0, ' ');
+                    }
                     decoded_len += single.len();
                     single
                 } else {

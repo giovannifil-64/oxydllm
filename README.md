@@ -288,10 +288,13 @@ The following options are shared between `start` and `run`:
 ## CUDA Status
 CUDA is currently a functional compatibility path, not a performance-tuned backend.
 
+> [!WARNING]
+> The CUDA path has not been tested on real NVIDIA hardware. Builds are CI-verified (compile + CPU tests only). Runtime correctness and performance on actual GPUs are unvalidated.
+
 - Build/runtime support is available via `--features cuda`.
 - Core model execution works, but the CUDA path currently relies mostly on Candle generic kernels.
-- Metal has additional fused kernels in this project (attention/RMSNorm/RoPE/softmax), so CUDA throughput can be lower than specialized CUDA stacks.
-- Performance claims for NVIDIA should be treated as hardware-dependent until validated on target GPUs.
+- Metal has additional fused kernels in this project (attention/RMSNorm/RoPE/softmax), so CUDA throughput will be lower than specialized CUDA stacks.
+- Contributions and testing reports from NVIDIA hardware owners are welcome.
 
 ### Official CUDA Docker tags
 | Tag | Compute capability | Platform | Target |
@@ -309,7 +312,7 @@ CUDA is currently a functional compatibility path, not a performance-tuned backe
 - `latest` and `cuda` point to `cuda-ada` (stable default — widest x86_64 compatibility).
 - `nightly` and `nightly-cuda` point to nightly `cuda-ada`.
 - Cross-generation SASS is **not** compatible: a Hopper binary will not run on Blackwell and vice versa. Pick the tag that matches your GPU.
-- `cuda-blackwell` and `cuda-blackwell-consumer` targets have not been validated on real hardware yet.
+- No CUDA target has been validated on real hardware — all targets carry the same caveat.
 
 
 ## Contributing

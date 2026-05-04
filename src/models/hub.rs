@@ -636,3 +636,162 @@ fn check_status(status: u16, repo_id: &str) -> anyhow::Result<()> {
         code => anyhow::bail!("HuggingFace returned HTTP {}.", code),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strip_split_suffix_removes_shard_numbers() {
+        assert_eq!(
+            strip_split_suffix("model-Q4_K_M-00001-of-00003"),
+            "model-Q4_K_M"
+        );
+    }
+
+    #[test]
+    fn strip_split_suffix_keeps_non_shard_name() {
+        assert_eq!(strip_split_suffix("model-Q4_K_M"), "model-Q4_K_M");
+    }
+
+    #[test]
+    fn strip_split_suffix_keeps_partial_pattern() {
+        assert_eq!(strip_split_suffix("model-00001"), "model-00001");
+    }
+
+    #[test]
+    fn has_split_suffix_detects_shard_gguf() {
+        assert!(has_split_suffix("model-Q4_K_M-00001-of-00002.gguf"));
+    }
+
+    #[test]
+    fn has_split_suffix_rejects_plain_gguf() {
+        assert!(!has_split_suffix("model-Q4_K_M.gguf"));
+    }
+
+    #[test]
+    fn is_relevant_file_accepts_standard_formats() {
+        assert!(is_relevant_file("config.json"));
+        assert!(is_relevant_file("model.safetensors"));
+        assert!(is_relevant_file("model.gguf"));
+        assert!(is_relevant_file("tokenizer.model"));
+    }
+
+    #[test]
+    fn is_relevant_file_rejects_binaries_and_nested_paths() {
+        assert!(!is_relevant_file("model.bin"));
+        assert!(!is_relevant_file("model.pt"));
+        assert!(!is_relevant_file("model.pth"));
+        assert!(!is_relevant_file("sub/config.json")); // nested
+        assert!(!is_relevant_file(".hidden.json")); // dotfile
+        assert!(!is_relevant_file("consolidated.safetensors")); // excluded by name
+    }
+
+    #[test]
+    fn group_gguf_variants_merges_shards_into_one_variant() {
+        let files = vec![
+            ("model-Q4_K_M-00001-of-00002.gguf".to_string(), 100u64),
+            ("model-Q4_K_M-00002-of-00002.gguf".to_string(), 80u64),
+            ("model-Q8_0.gguf".to_string(), 200u64),
+        ];
+        let variants = group_gguf_variants(&files);
+        assert_eq!(
+            variants.len(),
+            2,
+            "expected 2 variants: Q4_K_M (sharded) and Q8_0"
+        );
+        let q4 = variants
+            .iter()
+            .find(|v| v.is_split())
+            .expect("sharded variant");
+        assert_eq!(q4.files.len(), 2);
+        assert_eq!(q4.total_size(), 180);
+    }
+
+    #[test]
+    fn group_gguf_variants_single_file_is_not_split() {
+        let files = vec![("model-Q4_K_M.gguf".to_string(), 500u64)];
+        let variants = group_gguf_variants(&files);
+        assert_eq!(variants.len(), 1);
+        assert!(!variants[0].is_split());
+    }
+
+    #[test]
+    fn best_variant_idx_prefers_q4_k_m() {
+        let v1 = GgufVariant {
+            quant_name: "Q8_0".to_string(),
+            files: vec![],
+        };
+        let v2 = GgufVariant {
+            quant_name: "Q4_K_M".to_string(),
+            files: vec![],
+        };
+        let refs = vec![&v1, &v2];
+        assert_eq!(best_variant_idx(&refs), Some(1));
+    }
+
+    #[test]
+    fn best_variant_idx_fallback_to_q4_k_s_when_no_q4_k_m() {
+        let v1 = GgufVariant {
+            quant_name: "Q2_K".to_string(),
+            files: vec![],
+        };
+        let v2 = GgufVariant {
+            quant_name: "Q4_K_S".to_string(),
+            files: vec![],
+        };
+        let refs = vec![&v1, &v2];
+        assert_eq!(best_variant_idx(&refs), Some(1));
+    }
+
+    #[test]
+    fn best_variant_idx_returns_none_for_unrecognised_variants() {
+        let v = GgufVariant {
+            quant_name: "UNKNOWN_FORMAT".to_string(),
+            files: vec![],
+        };
+        assert_eq!(best_variant_idx(&[&v]), None);
+    }
+
+    #[test]
+    fn truncate_label_keeps_short_string() {
+        assert_eq!(truncate_label("short", 20), "short");
+    }
+
+    #[test]
+    fn truncate_label_truncates_long_string_with_ellipsis() {
+        let label = truncate_label("this-is-a-very-long-filename.gguf", 20);
+        assert_eq!(label.len(), 20);
+        assert!(label.starts_with("..."));
+    }
+
+    #[test]
+    fn fmt_size_formats_bytes_kb_mb_gb() {
+        assert_eq!(fmt_size(512), "512B");
+        assert_eq!(fmt_size(1024), "1KB");
+        assert_eq!(fmt_size(1024 * 1024), "1.0MB");
+        assert!(fmt_size(2 * 1024 * 1024 * 1024).contains("GB"));
+    }
+
+    #[test]
+    fn is_incomplete_download_returns_true_for_missing_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("nonexistent");
+        assert!(is_incomplete_download(&missing));
+    }
+
+    #[test]
+    fn is_incomplete_download_returns_true_when_config_but_no_weights() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("config.json"), "{}").unwrap();
+        assert!(is_incomplete_download(tmp.path()));
+    }
+
+    #[test]
+    fn is_incomplete_download_returns_false_when_config_and_weights_present() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("config.json"), "{}").unwrap();
+        std::fs::write(tmp.path().join("model.safetensors"), b"weights").unwrap();
+        assert!(!is_incomplete_download(tmp.path()));
+    }
+}

@@ -544,6 +544,44 @@ impl Attention {
 }
 
 #[cfg(test)]
+impl Attention {
+    fn new_for_test(
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        attn_softcap: Option<f64>,
+    ) -> Result<Self> {
+        use super::linear::AnyLinear;
+        let device = candle_core::Device::Cpu;
+        let q_dim = n_heads * head_dim;
+        let kv_dim = n_kv_heads * head_dim;
+        let hidden = q_dim; // input hidden size equals q_dim in these tests
+        let qkv_w = Tensor::zeros(
+            (q_dim + 2 * kv_dim, hidden),
+            candle_core::DType::F32,
+            &device,
+        )?;
+        let o_w = Tensor::zeros((hidden, q_dim), candle_core::DType::F32, &device)?;
+        Ok(Self {
+            qkv: QkvProjection::Fused(AnyLinear::from_weight_with_scale_inv(qkv_w, None, None)),
+            o_proj: AnyLinear::from_weight_with_scale_inv(o_w, None, None),
+            q_norm: None,
+            k_norm: None,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            q_dim,
+            kv_dim,
+            scale: 1.0 / (head_dim as f64).sqrt(),
+            attn_softcap,
+            sliding_window: None,
+            v_norm: false,
+            rms_norm_eps: 1e-5,
+        })
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::common::config::{Activation, NormType};
@@ -624,6 +662,118 @@ mod tests {
         assert_eq!(kv_len, 10);
         assert_eq!(k2.dims4()?, (1, 1, 10, 2));
         assert_eq!(v2.dims4()?, (1, 1, 10, 2));
+        Ok(())
+    }
+
+    #[test]
+    fn repeat_kv_gqa_expands_kv_heads_to_q_heads() -> Result<()> {
+        let attn = Attention::new_for_test(4, 2, 8, None)?; // 4 q-heads, 2 kv-heads
+        let k_data: Vec<f32> = (0..48).map(|v| v as f32).collect(); // (1,2,3,8)
+        let k = Tensor::from_vec(k_data, (1, 2, 3, 8), &Device::Cpu)?;
+
+        let k_rep = attn.repeat_kv(k)?;
+        let (b, h, s, d) = k_rep.dims4()?;
+        assert_eq!(
+            (b, h, s, d),
+            (1, 4, 3, 8),
+            "GQA must expand 2 kv-heads to 4"
+        );
+
+        let head0: Vec<f32> = k_rep.narrow(1, 0, 1)?.flatten_all()?.to_vec1()?;
+        let head1: Vec<f32> = k_rep.narrow(1, 1, 1)?.flatten_all()?.to_vec1()?;
+        assert_eq!(head0, head1, "head 0 and 1 must be copies of kv-head 0");
+        Ok(())
+    }
+
+    #[test]
+    fn forward_batch_prefill_output_is_correct_shape_and_finite() -> Result<()> {
+        use crate::common::paged::{BlockAllocator, DEFAULT_BLOCK_SIZE, PagedKvCache};
+        use crate::common::rope::RotaryEmbedding;
+        use std::sync::{Arc, Mutex};
+
+        let device = Device::Cpu;
+        let n_heads = 4;
+        let n_kv_heads = 2;
+        let head_dim = 8;
+        let hidden = n_heads * head_dim; // 32
+        let seq_len = 3;
+
+        let attn = Attention::new_for_test(n_heads, n_kv_heads, head_dim, None)?;
+        let rope = RotaryEmbedding::new(head_dim, 32, 10_000.0, candle_core::DType::F32, &device)?;
+        let position_ids = Tensor::from_vec(vec![0u32, 1, 2], (seq_len,), &device)?;
+
+        let x_data: Vec<f32> = (0..seq_len * hidden).map(|v| v as f32 * 0.01).collect();
+        let x = Tensor::from_vec(x_data, (1, seq_len, hidden), &device)?;
+
+        let allocator = Arc::new(Mutex::new(BlockAllocator::new(
+            16,
+            DEFAULT_BLOCK_SIZE,
+            n_kv_heads,
+            head_dim,
+            candle_core::DType::F32,
+            &device,
+            None,
+        )?));
+        let mut cache = PagedKvCache::new(Arc::clone(&allocator));
+        let mut segments = vec![SegmentInfo {
+            num_tokens: seq_len,
+            cache: &mut cache,
+            reuse_cache: false,
+        }];
+
+        let out = attn.forward_batch(&x, &rope, &position_ids, None, &mut segments)?;
+        assert_eq!(out.dims3()?, (1, seq_len, hidden));
+        let vals: Vec<f32> = out.flatten_all()?.to_vec1()?;
+        assert!(
+            vals.iter().all(|v| v.is_finite()),
+            "attention output must be finite"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn forward_batch_with_softcap_produces_finite_output() -> Result<()> {
+        use crate::common::paged::{BlockAllocator, DEFAULT_BLOCK_SIZE, PagedKvCache};
+        use crate::common::rope::RotaryEmbedding;
+        use std::sync::{Arc, Mutex};
+
+        let device = Device::Cpu;
+        let n_heads = 4;
+        let n_kv_heads = 4;
+        let head_dim = 8;
+        let hidden = n_heads * head_dim;
+        let seq_len = 2;
+
+        let attn = Attention::new_for_test(n_heads, n_kv_heads, head_dim, Some(30.0))?;
+        let rope = RotaryEmbedding::new(head_dim, 32, 10_000.0, candle_core::DType::F32, &device)?;
+        let position_ids = Tensor::from_vec(vec![0u32, 1], (seq_len,), &device)?;
+
+        let x_data: Vec<f32> = (0..seq_len * hidden).map(|v| v as f32 * 0.1).collect();
+        let x = Tensor::from_vec(x_data, (1, seq_len, hidden), &device)?;
+
+        let allocator = Arc::new(Mutex::new(BlockAllocator::new(
+            16,
+            DEFAULT_BLOCK_SIZE,
+            n_kv_heads,
+            head_dim,
+            candle_core::DType::F32,
+            &device,
+            None,
+        )?));
+        let mut cache = PagedKvCache::new(Arc::clone(&allocator));
+        let mut segments = vec![SegmentInfo {
+            num_tokens: seq_len,
+            cache: &mut cache,
+            reuse_cache: false,
+        }];
+
+        let out = attn.forward_batch(&x, &rope, &position_ids, None, &mut segments)?;
+        assert_eq!(out.dims3()?, (1, seq_len, hidden));
+        let vals: Vec<f32> = out.flatten_all()?.to_vec1()?;
+        assert!(
+            vals.iter().all(|v| v.is_finite()),
+            "softcap attention output must be finite"
+        );
         Ok(())
     }
 

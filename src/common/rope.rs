@@ -334,6 +334,86 @@ mod tests {
     }
 
     #[test]
+    fn linear_scaling_shifts_frequencies_relative_to_baseline() {
+        let device = Device::Cpu;
+        let base = RotaryEmbedding::new_with_scaling(
+            8,
+            16,
+            10_000.0,
+            RopeScaling::None,
+            DType::F32,
+            &device,
+        )
+        .expect("base rope should construct");
+
+        let scaled = RotaryEmbedding::new_with_scaling(
+            8,
+            16,
+            10_000.0,
+            RopeScaling::Linear { factor: 2.0 },
+            DType::F32,
+            &device,
+        )
+        .expect("linear rope should construct");
+
+        let base_cos = base.cos.to_vec2::<f32>().expect("base cos");
+        let scaled_cos = scaled.cos.to_vec2::<f32>().expect("scaled cos");
+
+        assert!(scaled_cos.iter().flatten().all(|v| v.is_finite()));
+        assert!(
+            (base_cos[1][0] - scaled_cos[1][0]).abs() > 1e-4,
+            "linear scaling with factor=2 must change the cos table"
+        );
+    }
+
+    #[test]
+    fn yarn_scaling_produces_finite_values_and_differs_from_baseline() {
+        let device = Device::Cpu;
+        let rope = RotaryEmbedding::new_with_scaling(
+            8,
+            32,
+            10_000.0,
+            RopeScaling::Yarn {
+                factor: 4.0,
+                original_max_pos: 16,
+                beta_fast: 32.0,
+                beta_slow: 1.0,
+            },
+            DType::F32,
+            &device,
+        )
+        .expect("yarn rope should construct");
+
+        let cos = rope.cos.to_vec2::<f32>().expect("cos");
+        let sin = rope.sin.to_vec2::<f32>().expect("sin");
+        assert!(
+            cos.iter().flatten().all(|v| v.is_finite()),
+            "Yarn cos must be finite"
+        );
+        assert!(
+            sin.iter().flatten().all(|v| v.is_finite()),
+            "Yarn sin must be finite"
+        );
+
+        let base = RotaryEmbedding::new_with_scaling(
+            8,
+            32,
+            10_000.0,
+            RopeScaling::None,
+            DType::F32,
+            &device,
+        )
+        .expect("base rope");
+        let base_cos = base.cos.to_vec2::<f32>().expect("base cos");
+        let differs = cos
+            .iter()
+            .flatten()
+            .zip(base_cos.iter().flatten())
+            .any(|(a, b)| (a - b).abs() > 1e-5);
+        assert!(differs, "Yarn with factor=4 must differ from the baseline");
+    }
+
+    #[test]
     fn apply_qk_with_positions_matches_individual_cpu() -> Result<()> {
         let device = Device::Cpu;
         let rope = RotaryEmbedding::new(8, 16, 10_000.0, DType::F32, &device)?;

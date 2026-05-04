@@ -448,6 +448,75 @@ mod tests {
     }
 
     #[test]
+    fn schedule_does_not_admit_prompt_exceeding_token_budget() {
+        let allocators = make_allocators(1, 16);
+        let config = SchedulerConfig {
+            max_num_sequences: 4,
+            max_tokens_per_step: 2, // tight budget
+        };
+        let mut sched = Scheduler::new(config, allocators, 1);
+
+        sched.add_request(vec![1, 2, 3, 4, 5], SamplingParams::default(), 10);
+
+        let out = sched.schedule(None);
+        assert_eq!(out.scheduled.len(), 0, "5-token prompt exceeds budget of 2");
+        assert_eq!(sched.num_running(), 0);
+        assert_eq!(sched.num_waiting(), 1);
+    }
+
+    #[test]
+    fn preempted_sequence_is_requeued_as_prefill() {
+        let allocators = make_allocators(1, 2); // 1 layer, 2 blocks
+        let config = SchedulerConfig {
+            max_num_sequences: 4,
+            max_tokens_per_step: 1024,
+        };
+        let mut sched = Scheduler::new(config, allocators.clone(), 1);
+
+        let id = sched.add_request(vec![42], SamplingParams::default(), 100);
+
+        // Admit the sequence (1 block needed, 2 available locally)
+        let out = sched.schedule(None);
+        assert_eq!(out.scheduled[0].phase, SequencePhase::Prefill);
+        assert_eq!(sched.num_running(), 1);
+
+        // Exhaust the allocator to simulate engine block usage
+        let b0 = allocators[0].lock().unwrap().allocate().unwrap();
+        let b1 = allocators[0].lock().unwrap().allocate().unwrap();
+        assert_eq!(allocators[0].lock().unwrap().num_free(), 0);
+
+        // Simulate prefill completed: seq now decodes at a block boundary
+        {
+            let seq = sched.get_running_mut(id).unwrap();
+            seq.num_processed_tokens = DEFAULT_BLOCK_SIZE;
+            seq.phase = SequencePhase::Decode;
+        }
+
+        // schedule() → decode needs new block, none free → preemption
+        sched.schedule(None);
+        assert_eq!(sched.num_running(), 0);
+        assert_eq!(
+            sched.num_waiting(),
+            1,
+            "preempted seq should be back in waiting"
+        );
+
+        // Release blocks and re-schedule → seq re-admitted as Prefill with reset state
+        allocators[0].lock().unwrap().free(b0);
+        allocators[0].lock().unwrap().free(b1);
+
+        let out = sched.schedule(None);
+        assert_eq!(out.scheduled.len(), 1);
+        assert_eq!(out.scheduled[0].id, id);
+        assert_eq!(out.scheduled[0].phase, SequencePhase::Prefill);
+        assert_eq!(
+            sched.get_running(id).unwrap().num_processed_tokens,
+            0,
+            "preempted seq must have num_processed_tokens reset to 0"
+        );
+    }
+
+    #[test]
     fn abort_sequence_removes_from_running_and_waiting() {
         let allocators = make_allocators(2, 32);
         let config = SchedulerConfig {

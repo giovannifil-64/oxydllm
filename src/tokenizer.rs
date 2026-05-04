@@ -444,3 +444,93 @@ impl Tokenizer {
         seqs
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokenizers::models::wordlevel::WordLevel;
+    use tokenizers::pre_tokenizers::whitespace::Whitespace;
+
+    fn build_test_tokenizer(chat_template: Option<&str>, eos_token: Option<&str>) -> Tokenizer {
+        let tmp = tempfile::tempdir().unwrap();
+
+        let model = WordLevel::builder()
+            .vocab(
+                [
+                    ("[UNK]".to_string(), 0u32),
+                    ("hello".to_string(), 1u32),
+                    ("world".to_string(), 2u32),
+                    ("<eos>".to_string(), 3u32),
+                ]
+                .into_iter()
+                .collect(),
+            )
+            .unk_token("[UNK]".to_string())
+            .build()
+            .unwrap();
+        let mut inner = tokenizers::Tokenizer::new(model);
+        inner.with_pre_tokenizer(Some(Whitespace {}));
+        inner
+            .save(tmp.path().join("tokenizer.json"), false)
+            .unwrap();
+
+        let mut cfg = serde_json::json!({});
+        if let Some(tmpl) = chat_template {
+            cfg["chat_template"] = tmpl.into();
+        }
+        if let Some(eos) = eos_token {
+            cfg["eos_token"] = eos.into();
+        }
+        std::fs::write(
+            tmp.path().join("tokenizer_config.json"),
+            serde_json::to_string(&cfg).unwrap(),
+        )
+        .unwrap();
+
+        Tokenizer::from_dir(tmp.path().to_str().unwrap()).unwrap()
+    }
+
+    #[test]
+    fn encode_decode_roundtrip() {
+        let tok = build_test_tokenizer(None, None);
+        let ids = tok.encode("hello world").unwrap();
+        assert_eq!(ids.len(), 2);
+        let text = tok.decode(&ids).unwrap();
+        assert_eq!(text, "hello world");
+    }
+
+    #[test]
+    fn has_thinking_support_false_without_template() {
+        let tok = build_test_tokenizer(None, None);
+        assert!(!tok.has_thinking_support());
+    }
+
+    #[test]
+    fn has_thinking_support_true_with_keyword_in_template() {
+        let tok = build_test_tokenizer(Some("{% if enable_thinking %}think{% endif %}"), None);
+        assert!(tok.has_thinking_support());
+    }
+
+    #[test]
+    fn eos_token_id_resolves_from_vocab() {
+        let tok = build_test_tokenizer(None, Some("<eos>"));
+        assert_eq!(
+            tok.eos_token_id(),
+            Some(3),
+            "<eos> is at index 3 in the test vocab"
+        );
+    }
+
+    #[test]
+    fn stop_token_ids_includes_eos_and_has_no_duplicates() {
+        let tok = build_test_tokenizer(None, Some("<eos>"));
+        let ids = tok.stop_token_ids();
+        assert!(ids.contains(&3), "<eos> (id=3) must be a stop token");
+        let unique: std::collections::HashSet<u32> = ids.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            ids.len(),
+            "stop token ids must not contain duplicates"
+        );
+    }
+}

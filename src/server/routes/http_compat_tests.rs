@@ -175,6 +175,289 @@ async fn post_chat(app: &Router, body: Value) -> axum::response::Response {
         .expect("request failed")
 }
 
+async fn get_request(app: &Router, uri: &str) -> axum::response::Response {
+    app.clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(uri)
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("request failed")
+}
+
+// ---------------------------------------------------------------------------
+// GET endpoint tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn health_returns_ok() {
+    let (app, _tmp) = build_test_app(vec![]).expect("test app");
+    let response = get_request(&app, "/health").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = serde_json::from_slice(
+        &to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body"),
+    )
+    .expect("json");
+    assert_eq!(body["status"], "ok");
+}
+
+#[tokio::test]
+async fn list_models_returns_list_object() {
+    let (app, _tmp) = build_test_app(vec![]).expect("test app");
+    let response = get_request(&app, "/v1/models").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = serde_json::from_slice(
+        &to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body"),
+    )
+    .expect("json");
+    assert_eq!(body["object"], "list");
+    let data = body["data"].as_array().expect("data array");
+    assert!(
+        data.iter().any(|m| m["id"] == "test-model"),
+        "test-model not in list"
+    );
+}
+
+#[tokio::test]
+async fn get_model_found_returns_model_object() {
+    let (app, _tmp) = build_test_app(vec![]).expect("test app");
+    let response = get_request(&app, "/v1/models/test-model").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = serde_json::from_slice(
+        &to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body"),
+    )
+    .expect("json");
+    assert_eq!(body["id"], "test-model");
+    assert_eq!(body["object"], "model");
+    assert_eq!(body["owned_by"], "local");
+}
+
+#[tokio::test]
+async fn get_model_not_found_returns_404() {
+    let (app, _tmp) = build_test_app(vec![]).expect("test app");
+    let response = get_request(&app, "/v1/models/nonexistent").await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let body: Value = serde_json::from_slice(
+        &to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body"),
+    )
+    .expect("json");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("nonexistent")
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Input validation error tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn empty_messages_returns_400() {
+    let (app, _tmp) = build_test_app(vec![]).expect("test app");
+    let response = post_chat(&app, json!({"model": "test-model", "messages": []})).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: Value = serde_json::from_slice(
+        &to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body"),
+    )
+    .expect("json");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("messages")
+    );
+}
+
+#[tokio::test]
+async fn missing_model_returns_400() {
+    let (app, _tmp) = build_test_app(vec![]).expect("test app");
+    let response = post_chat(
+        &app,
+        json!({"messages": [{"role": "user", "content": "hi"}]}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: Value = serde_json::from_slice(
+        &to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body"),
+    )
+    .expect("json");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("model")
+    );
+}
+
+#[tokio::test]
+async fn n_zero_returns_400() {
+    let (app, _tmp) = build_test_app(vec![]).expect("test app");
+    let response = post_chat(
+        &app,
+        json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "n": 0}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: Value = serde_json::from_slice(
+        &to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body"),
+    )
+    .expect("json");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("n")
+    );
+}
+
+#[tokio::test]
+async fn invalid_json_body_returns_422() {
+    let (app, _tmp) = build_test_app(vec![]).expect("test app");
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from("not json"))
+                .expect("request"),
+        )
+        .await
+        .expect("request failed");
+    assert!(
+        matches!(
+            response.status(),
+            StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY
+        ),
+        "expected 4xx for invalid JSON, got {}",
+        response.status()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Happy-path chat completion tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn non_streaming_chat_returns_full_response() {
+    let (app, _tmp) = build_test_app(vec![ScriptedReply {
+        content: "Hello world".to_string(),
+        finish_reason: "stop".to_string(),
+    }])
+    .expect("test app");
+
+    let response = post_chat(
+        &app,
+        json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hi"}]
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = serde_json::from_slice(
+        &to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body"),
+    )
+    .expect("json");
+
+    assert_eq!(body["object"], "chat.completion");
+    assert_eq!(body["model"], "test-model");
+    assert_eq!(body["choices"][0]["message"]["role"], "assistant");
+    assert_eq!(body["choices"][0]["message"]["content"], "Hello world");
+    assert_eq!(body["choices"][0]["finish_reason"], "stop");
+    assert!(body["choices"][0]["message"]["tool_calls"].is_null());
+    assert!(body["usage"].is_object());
+}
+
+#[tokio::test]
+async fn streaming_chat_emits_content_chunks_and_done() {
+    let (app, _tmp) = build_test_app(vec![ScriptedReply {
+        content: "Hi there".to_string(),
+        finish_reason: "stop".to_string(),
+    }])
+    .expect("test app");
+
+    let response = post_chat(
+        &app,
+        json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": true
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = String::from_utf8(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body")
+            .to_vec(),
+    )
+    .expect("utf-8");
+
+    let mut role_seen = false;
+    let mut content = String::new();
+    let mut finish_reason = None;
+    let mut done_seen = false;
+
+    for line in body.lines() {
+        let Some(payload) = line.strip_prefix("data: ") else {
+            continue;
+        };
+        if payload == "[DONE]" {
+            done_seen = true;
+            continue;
+        }
+        let chunk: Value = serde_json::from_str(payload).expect("valid SSE chunk");
+        assert_eq!(chunk["object"], "chat.completion.chunk");
+        let delta = &chunk["choices"][0]["delta"];
+        if delta.get("role").and_then(|v| v.as_str()) == Some("assistant") {
+            role_seen = true;
+        }
+        if let Some(c) = delta.get("content").and_then(|v| v.as_str()) {
+            content.push_str(c);
+        }
+        if let Some(r) = chunk["choices"][0]
+            .get("finish_reason")
+            .and_then(|v| v.as_str())
+        {
+            finish_reason = Some(r.to_string());
+        }
+    }
+
+    assert!(role_seen, "expected assistant role chunk");
+    assert_eq!(content, "Hi there");
+    assert_eq!(finish_reason.as_deref(), Some("stop"));
+    assert!(done_seen, "expected [DONE] marker");
+}
+
+// ---------------------------------------------------------------------------
+// Tool call tests
+// ---------------------------------------------------------------------------
+
 #[tokio::test]
 async fn forced_function_choice_wraps_direct_json_into_tool_call() {
     let (app, _tmp) = build_test_app(vec![ScriptedReply {

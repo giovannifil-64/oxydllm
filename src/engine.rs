@@ -521,6 +521,56 @@ mod tests {
         }
     }
 
+    struct ErrorModel {
+        device: Device,
+        allocators: Vec<SharedBlockAllocator>,
+    }
+
+    impl ErrorModel {
+        fn new(allocators: Vec<SharedBlockAllocator>) -> Self {
+            Self {
+                device: Device::Cpu,
+                allocators,
+            }
+        }
+    }
+
+    impl BatchModel for ErrorModel {
+        fn forward_batch(
+            &self,
+            _token_ids: &Tensor,
+            _position_ids: &Tensor,
+            _seq_caches: &mut [&mut [PagedKvCache]],
+            _token_counts: &[usize],
+        ) -> Result<Tensor> {
+            candle_core::bail!("simulated forward failure")
+        }
+
+        fn vocab_size(&self) -> usize {
+            32
+        }
+
+        fn stop_token_ids(&self) -> &[u32] {
+            &[]
+        }
+
+        fn max_seq_len(&self) -> usize {
+            1024
+        }
+
+        fn device(&self) -> &Device {
+            &self.device
+        }
+
+        fn num_layers(&self) -> usize {
+            self.allocators.len()
+        }
+
+        fn allocators(&self) -> &[SharedBlockAllocator] {
+            &self.allocators
+        }
+    }
+
     fn make_allocators(num_layers: usize, num_blocks: usize) -> Vec<SharedBlockAllocator> {
         (0..num_layers)
             .map(|_| {
@@ -654,6 +704,70 @@ mod tests {
         assert!(has_matching_stop_sequence(&[1, 2, 3, 4], &[vec![3, 4]]));
         assert!(!has_matching_stop_sequence(&[1, 2, 3, 4], &[vec![2, 3]]));
         assert!(!has_matching_stop_sequence(&[1, 2], &[vec![1, 2, 3]]));
+    }
+
+    #[test]
+    fn step_forward_error_propagates() {
+        let allocators = make_allocators(1, 8);
+        let mut engine = Engine::new_with_stop_controls(
+            Box::new(ErrorModel::new(allocators)),
+            test_scheduler_config(),
+            &[],
+            &[],
+        );
+        engine.add_request(vec![1, 2, 3], SamplingParams::default(), 4);
+        assert!(
+            engine.step().is_err(),
+            "forward error must propagate out of step()"
+        );
+    }
+
+    #[test]
+    fn step_mixes_prefill_and_decode_in_same_step() {
+        let allocators = make_allocators(1, 8);
+        let forced_token = 5; // not a stop token
+        let (model, forward_calls) = FakeModel::new(vec![1], forced_token, allocators);
+        let mut engine =
+            Engine::new_with_stop_controls(Box::new(model), test_scheduler_config(), &[], &[]);
+
+        // Step 1: pure prefill for seq A
+        let id_a = engine.add_request(vec![10, 11], SamplingParams::default(), 8);
+        let out = engine.step().unwrap();
+        assert_eq!(forward_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(out.new_tokens.len(), 1);
+        assert_eq!(out.new_tokens[0].seq_id, id_a);
+
+        // Step 2: seq A is in decode, seq B starts prefill → mixed batch
+        let id_b = engine.add_request(vec![20, 21], SamplingParams::default(), 8);
+        let out = engine.step().unwrap();
+        assert_eq!(
+            forward_calls.load(Ordering::Relaxed),
+            2,
+            "mixed prefill+decode must be batched into one forward call"
+        );
+        assert_eq!(out.new_tokens.len(), 2);
+        let ids: Vec<u64> = out.new_tokens.iter().map(|t| t.seq_id).collect();
+        assert!(ids.contains(&id_a), "decode seq A must emit a token");
+        assert!(ids.contains(&id_b), "prefill seq B must emit a token");
+    }
+
+    #[test]
+    fn step_finishes_with_length_when_max_tokens_reached() {
+        let allocators = make_allocators(1, 8);
+        let forced_token = 5; // not a stop token
+        let (model, _) = FakeModel::new(vec![], forced_token, allocators);
+        let mut engine =
+            Engine::new_with_stop_controls(Box::new(model), test_scheduler_config(), &[], &[]);
+
+        let seq_id = engine.add_request(vec![1, 2, 3], SamplingParams::default(), 1);
+        let out = engine.step().unwrap();
+
+        assert_eq!(out.new_tokens.len(), 1);
+        assert_eq!(out.new_tokens[0].seq_id, seq_id);
+        assert_eq!(out.completed.len(), 1);
+        assert_eq!(out.completed[0].id, seq_id);
+        assert_eq!(out.completed[0].finish_reason.as_deref(), Some("length"));
+        assert!(!engine.has_pending_work());
     }
 
     #[test]

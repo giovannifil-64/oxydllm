@@ -463,6 +463,57 @@ impl ModelManager {
     }
 
     #[cfg(test)]
+    pub fn insert_ready_with_size_for_tests(
+        &mut self,
+        model_id: &str,
+        handle: ReadyHandle,
+        weights_bytes: usize,
+        kv_bytes: usize,
+    ) {
+        self.slots.insert(
+            model_id.to_string(),
+            SlotState::Ready {
+                request_tx: handle.request_tx,
+                tokenizer: handle.tokenizer,
+                max_seq_len: handle.max_seq_len,
+                architecture: "TestArchitecture".to_string(),
+                vocab_size: 0,
+                num_layers: 0,
+                last_used: Instant::now(),
+                effective_keep_alive: self.keep_alive,
+                weights_size_bytes: weights_bytes,
+                kv_cache_bytes: kv_bytes,
+                shutdown: Arc::new(AtomicBool::new(false)),
+            },
+        );
+    }
+
+    #[cfg(test)]
+    pub fn insert_aged_slot_for_tests(
+        &mut self,
+        model_id: &str,
+        handle: ReadyHandle,
+        age: Duration,
+    ) {
+        self.slots.insert(
+            model_id.to_string(),
+            SlotState::Ready {
+                request_tx: handle.request_tx,
+                tokenizer: handle.tokenizer,
+                max_seq_len: handle.max_seq_len,
+                architecture: "TestArchitecture".to_string(),
+                vocab_size: 0,
+                num_layers: 0,
+                last_used: Instant::now() - age,
+                effective_keep_alive: self.keep_alive,
+                weights_size_bytes: 0,
+                kv_cache_bytes: 0,
+                shutdown: Arc::new(AtomicBool::new(false)),
+            },
+        );
+    }
+
+    #[cfg(test)]
     pub fn insert_ready_for_tests(&mut self, model_id: &str, handle: ReadyHandle) {
         self.slots.insert(
             model_id.to_string(),
@@ -876,4 +927,179 @@ pub fn spawn_eviction_task(manager: SharedModelManager) {
             mgr.evict_expired();
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use tokenizers::models::wordlevel::WordLevel;
+    use tokenizers::pre_tokenizers::whitespace::Whitespace;
+
+    fn build_test_manager(
+        tmp: &tempfile::TempDir,
+        keep_alive: Duration,
+        budget: Option<usize>,
+    ) -> ModelManager {
+        ModelManager::new(ModelManagerConfig {
+            models_dir: tmp.path().to_path_buf(),
+            keep_alive,
+            memory_budget_bytes: budget,
+            cuda_devices: vec![],
+            max_context_len: 512,
+            kv_quant: crate::common::kv_quant::KvQuantMode::Off,
+            qjl_quantization: false,
+            require_gpu: false,
+        })
+    }
+
+    fn build_dummy_handle() -> ReadyHandle {
+        let tmp = tempfile::tempdir().unwrap();
+        let model = WordLevel::builder()
+            .vocab([("[UNK]".to_string(), 0u32)].into_iter().collect())
+            .unk_token("[UNK]".to_string())
+            .build()
+            .unwrap();
+        let mut inner = tokenizers::Tokenizer::new(model);
+        inner.with_pre_tokenizer(Some(Whitespace {}));
+        inner
+            .save(tmp.path().join("tokenizer.json"), false)
+            .unwrap();
+        std::fs::write(tmp.path().join("tokenizer_config.json"), "{}").unwrap();
+        let tok =
+            Arc::new(crate::tokenizer::Tokenizer::from_dir(tmp.path().to_str().unwrap()).unwrap());
+        let (tx, _rx) = tokio_mpsc::unbounded_channel();
+        ReadyHandle {
+            request_tx: tx,
+            tokenizer: tok,
+            max_seq_len: 1024,
+        }
+    }
+
+    #[test]
+    fn registry_save_load_roundtrip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut reg = BTreeMap::new();
+        reg.insert(
+            "model-a".to_string(),
+            RegistryEntry {
+                architecture: "TestArch".to_string(),
+                vocab_size: 32000,
+                num_layers: 32,
+                size_bytes: 100,
+                kv_cache_bytes: 50,
+                last_used_secs: 12345,
+            },
+        );
+        save_registry(tmp.path(), &reg);
+        let loaded = load_registry(tmp.path());
+        assert_eq!(loaded["model-a"].architecture, "TestArch");
+        assert_eq!(loaded["model-a"].vocab_size, 32000);
+        assert_eq!(loaded["model-a"].size_bytes, 100);
+    }
+
+    #[test]
+    fn registry_keys_are_serialized_in_alphabetical_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut reg = BTreeMap::new();
+        reg.insert("z-model".to_string(), RegistryEntry::default());
+        reg.insert("a-model".to_string(), RegistryEntry::default());
+        reg.insert("m-model".to_string(), RegistryEntry::default());
+        save_registry(tmp.path(), &reg);
+        let content = std::fs::read_to_string(registry_path(tmp.path())).unwrap();
+        let a = content.find("a-model").unwrap();
+        let m = content.find("m-model").unwrap();
+        let z = content.find("z-model").unwrap();
+        assert!(
+            a < m && m < z,
+            "registry keys must appear in alphabetical order"
+        );
+    }
+
+    #[test]
+    fn new_prunes_stale_registry_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut reg = BTreeMap::new();
+        reg.insert("ghost-model".to_string(), RegistryEntry::default());
+        save_registry(tmp.path(), &reg);
+
+        let mgr = build_test_manager(&tmp, Duration::from_secs(60), None);
+        assert!(
+            mgr.list_registry().get("ghost-model").is_none(),
+            "stale registry entry should be pruned on startup"
+        );
+    }
+
+    #[test]
+    fn update_registry_upserts_and_persists_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut mgr = build_test_manager(&tmp, Duration::from_secs(60), None);
+
+        mgr.update_registry(
+            "my-model",
+            "LlamaForCausalLM",
+            32000,
+            32,
+            1_000_000,
+            500_000,
+        );
+
+        let entry = mgr
+            .list_registry()
+            .get("my-model")
+            .expect("entry must exist");
+        assert_eq!(entry.architecture, "LlamaForCausalLM");
+        assert_eq!(entry.vocab_size, 32000);
+        assert_eq!(entry.size_bytes, 1_000_000);
+
+        let on_disk = load_registry(tmp.path());
+        assert!(
+            on_disk.contains_key("my-model"),
+            "entry must be written to disk"
+        );
+    }
+
+    #[test]
+    fn evict_lru_returns_zero_when_no_budget() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut mgr = build_test_manager(&tmp, Duration::from_secs(60), None);
+        assert_eq!(mgr.evict_lru_for_bytes(1_000_000), 0);
+    }
+
+    #[test]
+    fn evict_lru_removes_model_when_over_budget() {
+        let tmp = tempfile::tempdir().unwrap();
+        let budget: usize = 100;
+        let mut mgr = build_test_manager(&tmp, Duration::from_secs(60), Some(budget));
+
+        let h = build_dummy_handle();
+        mgr.insert_ready_with_size_for_tests("big-model", h, 80, 0);
+
+        // total=80, budget=100: 80 + 50 > 100 → eviction required
+        let evicted = mgr.evict_lru_for_bytes(50);
+        assert_eq!(evicted, 1);
+        assert_eq!(
+            mgr.list_running().len(),
+            0,
+            "evicted model must be removed from running"
+        );
+    }
+
+    #[test]
+    fn evict_expired_removes_idle_slot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let keep_alive = Duration::from_secs(10);
+        let mut mgr = build_test_manager(&tmp, keep_alive, None);
+
+        let h = build_dummy_handle();
+        mgr.insert_aged_slot_for_tests("old-model", h, Duration::from_secs(60));
+
+        assert_eq!(mgr.list_running().len(), 1);
+        mgr.evict_expired();
+        assert_eq!(
+            mgr.list_running().len(),
+            0,
+            "slot past keep-alive must be evicted"
+        );
+    }
 }

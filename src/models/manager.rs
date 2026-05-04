@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc,
@@ -73,7 +73,7 @@ pub struct ModelManager {
     slots: HashMap<String, SlotState>,
     keep_alive: Duration,
     memory_budget_bytes: Option<usize>,
-    registry: HashMap<String, RegistryEntry>,
+    registry: BTreeMap<String, RegistryEntry>,
     cuda_devices: Vec<usize>,
     max_context_len: usize,
     kv_budget: SharedGlobalKvBudget,
@@ -93,16 +93,16 @@ pub fn registry_path(models_dir: &Path) -> PathBuf {
     models_dir.join(".rllm_registry.json")
 }
 
-pub fn load_registry(models_dir: &Path) -> HashMap<String, RegistryEntry> {
+pub fn load_registry(models_dir: &Path) -> BTreeMap<String, RegistryEntry> {
     let path = registry_path(models_dir);
     let raw = match std::fs::read_to_string(&path) {
         Ok(r) => r,
-        Err(_) => return HashMap::new(),
+        Err(_) => return BTreeMap::new(),
     };
     serde_json::from_str(&raw).unwrap_or_default()
 }
 
-pub fn save_registry(models_dir: &Path, registry: &HashMap<String, RegistryEntry>) {
+pub fn save_registry(models_dir: &Path, registry: &BTreeMap<String, RegistryEntry>) {
     let path = registry_path(models_dir);
     if let Ok(json) = serde_json::to_string_pretty(registry)
         && let Err(e) = std::fs::write(&path, &json)
@@ -266,7 +266,7 @@ impl ModelManager {
             .collect()
     }
 
-    pub fn list_registry(&self) -> &HashMap<String, RegistryEntry> {
+    pub fn list_registry(&self) -> &BTreeMap<String, RegistryEntry> {
         &self.registry
     }
 

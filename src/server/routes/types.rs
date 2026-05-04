@@ -144,9 +144,6 @@ pub struct ChatCompletionRequest {
     #[serde(default)]
     pub response_format: Option<ResponseFormat>,
     #[serde(default)]
-    #[allow(dead_code)]
-    pub user: Option<String>,
-    #[serde(default)]
     pub tools: Option<Vec<ToolDefinition>>,
     #[serde(default)]
     pub tool_choice: Option<serde_json::Value>,

@@ -26,6 +26,7 @@ pub struct DiscoveredModel {
     pub architecture: String,
     pub vocab_size: usize,
     pub num_layers: usize,
+    pub size_bytes: usize,
 }
 
 pub fn discover_models(models_dir: &Path) -> Vec<DiscoveredModel> {
@@ -62,42 +63,96 @@ pub fn discover_models(models_dir: &Path) -> Vec<DiscoveredModel> {
                 .to_string();
             let vocab_size = value["vocab_size"].as_u64().unwrap_or(0) as usize;
             let num_layers = value["num_hidden_layers"].as_u64().unwrap_or(0) as usize;
+            let size_bytes = std::fs::read_dir(&path)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter(|e| {
+                    e.path()
+                        .extension()
+                        .and_then(|x| x.to_str())
+                        .map(|x| x == "safetensors")
+                        .unwrap_or(false)
+                })
+                .filter_map(|e| e.metadata().ok().map(|m| m.len() as usize))
+                .sum();
             models.push(DiscoveredModel {
                 id,
                 architecture,
                 vocab_size,
                 num_layers,
+                size_bytes,
             });
             continue;
         }
 
         if let Some(gguf_paths) = find_gguf_files(&path) {
+            let mut stem_groups: std::collections::HashMap<String, Vec<std::path::PathBuf>> =
+                std::collections::HashMap::new();
             for gguf_path in &gguf_paths {
                 let raw_stem = gguf_path
                     .file_stem()
                     .unwrap_or_default()
                     .to_string_lossy()
                     .to_string();
-                let gguf_id = strip_gguf_split_suffix(&raw_stem).to_string();
-                let effective_id = if gguf_id.is_empty() {
+                let stem = strip_gguf_split_suffix(&raw_stem).to_string();
+                let effective_id = if stem.is_empty() {
                     id.clone()
                 } else {
-                    gguf_id
+                    canonicalize_gguf_id(&stem, &path)
                 };
+                stem_groups
+                    .entry(effective_id)
+                    .or_default()
+                    .push(gguf_path.clone());
+            }
+
+            for (effective_id, paths) in stem_groups {
                 if models
                     .iter()
                     .any(|m: &DiscoveredModel| m.id == effective_id)
                 {
                     continue;
                 }
-                if let Some(info) = discover_gguf_model(&effective_id, gguf_path) {
+                let size_bytes = paths
+                    .iter()
+                    .filter_map(|p| p.metadata().ok().map(|m| m.len() as usize))
+                    .sum();
+                if let Some(mut info) = discover_gguf_model(&effective_id, &paths[0]) {
+                    info.size_bytes = size_bytes;
                     models.push(info);
                 }
             }
         }
     }
-    models.sort_by(|a, b| a.id.cmp(&b.id));
+    models.sort_by(|a, b| a.id.to_ascii_lowercase().cmp(&b.id.to_ascii_lowercase()));
     models
+}
+
+fn canonicalize_gguf_id(stem: &str, parent_dir: &Path) -> String {
+    let dir_name = parent_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+
+    let dir_base = {
+        let lower = dir_name.to_ascii_lowercase();
+        if lower.ends_with("-gguf") || lower.ends_with("_gguf") {
+            &dir_name[..dir_name.len() - 5]
+        } else {
+            dir_name
+        }
+    };
+
+    let dir_base_lower = dir_base.to_ascii_lowercase();
+    let stem_lower = stem.to_ascii_lowercase();
+
+    if !dir_base_lower.is_empty() && stem_lower.starts_with(&dir_base_lower) {
+        let suffix = &stem[dir_base_lower.len()..];
+        format!("{}{}", dir_base, suffix.to_ascii_uppercase())
+    } else {
+        stem.to_string()
+    }
 }
 
 fn strip_gguf_split_suffix(stem: &str) -> &str {
@@ -290,23 +345,14 @@ fn discover_gguf_model(id: &str, gguf_path: &Path) -> Option<DiscoveredModel> {
         .map(|info| info.shape.dims()[0])
         .unwrap_or(0);
 
-    let arch_display = match arch.as_str() {
-        "llama" => "LlamaForCausalLM (GGUF)".to_string(),
-        "mistral" => "MistralForCausalLM (GGUF)".to_string(),
-        "qwen2" => "Qwen2ForCausalLM (GGUF)".to_string(),
-        "qwen3" => "Qwen3ForCausalLM (GGUF)".to_string(),
-        "gemma" => "GemmaForCausalLM (GGUF)".to_string(),
-        "gemma2" => "Gemma2ForCausalLM (GGUF)".to_string(),
-        "gemma3" => "Gemma3ForCausalLM (GGUF)".to_string(),
-        "gemma4" => "Gemma4ForConditionalGeneration (GGUF)".to_string(),
-        other => format!("{} (GGUF)", other),
-    };
+    let arch_display = format!("{} (GGUF)", arch);
 
     Some(DiscoveredModel {
         id: id.to_string(),
         architecture: arch_display,
         vocab_size,
         num_layers,
+        size_bytes: 0,
     })
 }
 

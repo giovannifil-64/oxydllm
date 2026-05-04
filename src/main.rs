@@ -120,6 +120,7 @@ Usage: rllm <command> [options]
 Commands:
   pull     <user/model>     Download a model from HuggingFace
   rm       <model-name>     Remove a model and its files from disk
+  list                      List all locally available models
   start                     Start the HTTP inference server
   run      <model-name>     Interactive chat in terminal
   estimate <model>          Estimate memory footprint and accuracy
@@ -591,6 +592,62 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
     })
 }
 
+fn run_list(models_dir: &std::path::Path) {
+    let mut models = models::loader::discover_models(models_dir);
+    models.sort_by(|a, b| a.id.to_lowercase().cmp(&b.id.to_lowercase()));
+
+    if models.is_empty() {
+        println!("No models found in {}", models_dir.display());
+        return;
+    }
+
+    const COL_NAME: usize = 36;
+    const COL_ARCH: usize = 34;
+
+    println!();
+    println!(
+        "  {:<COL_NAME$} {:<COL_ARCH$} {:>9}",
+        "NAME", "ARCHITECTURE", "SIZE"
+    );
+    println!("  {}", "─".repeat(COL_NAME + 1 + COL_ARCH + 1 + 9));
+
+    for m in &models {
+        let size_str = if m.size_bytes > 0 {
+            fmt_size(m.size_bytes)
+        } else {
+            "—".to_string()
+        };
+        println!(
+            "  {:<COL_NAME$} {:<COL_ARCH$} {:>9}",
+            truncate(&m.id, COL_NAME),
+            truncate(&m.architecture, COL_ARCH),
+            size_str,
+        );
+    }
+    println!();
+    println!("  {} model(s)  —  {}", models.len(), models_dir.display());
+    println!();
+}
+
+fn truncate(s: &str, max: usize) -> &str {
+    if s.len() <= max { s } else { &s[..max] }
+}
+
+fn fmt_size(bytes: usize) -> String {
+    const GB: usize = 1024 * 1024 * 1024;
+    const MB: usize = 1024 * 1024;
+    const KB: usize = 1024;
+    if bytes >= GB {
+        format!("{:.2} GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.1} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.0} KB", bytes as f64 / KB as f64)
+    } else {
+        format!("{} B", bytes)
+    }
+}
+
 fn clamp_to_char_boundary(s: &str, idx: usize) -> usize {
     let mut i = idx.min(s.len());
     while i > 0 && !s.is_char_boundary(i) {
@@ -862,6 +919,9 @@ fn main() -> anyhow::Result<()> {
     }
 
     match args[1].as_str() {
+        "list" => {
+            run_list(&default_models_dir());
+        }
         "start" => {
             let start_args = parse_start_args(&args[2..]).unwrap_or_else(|e| {
                 eprintln!("Error: {e}");

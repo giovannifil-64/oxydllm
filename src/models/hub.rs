@@ -79,6 +79,7 @@ fn group_gguf_variants(gguf_files: &[(String, u64)]) -> Vec<GgufVariant> {
 fn select_variant<'a>(
     variants: &'a [GgufVariant],
     preferred: Option<&str>,
+    already_present: &std::collections::HashSet<String>,
 ) -> anyhow::Result<&'a GgufVariant> {
     if let Some(pref) = preferred {
         return variants
@@ -98,16 +99,45 @@ fn select_variant<'a>(
         return Ok(&variants[0]);
     }
 
+    let present: Vec<&GgufVariant> = variants
+        .iter()
+        .filter(|v| already_present.contains(&v.quant_name))
+        .collect();
+    let available: Vec<&GgufVariant> = variants
+        .iter()
+        .filter(|v| !already_present.contains(&v.quant_name))
+        .collect();
+
     println!("  Multiple GGUF variants available — choose one to download:\n");
+
+    if !present.is_empty() {
+        println!("  Already downloaded:");
+        for v in &present {
+            println!(
+                "    \u{2713} {:<16}  {:>10}  {}",
+                v.quant_name,
+                fmt_size_f(v.total_size()),
+                crate::models::estimate::quant_accuracy_str(&v.quant_name),
+            );
+        }
+        println!();
+    }
+
+    if available.is_empty() {
+        anyhow::bail!(
+            "All variants of this model are already downloaded. Use --force to re-download."
+        );
+    }
+
     println!(
         "  {:>2}  {:<16}  {:>10}  {:>5}  Accuracy",
         "#", "Format", "Size", "Files"
     );
     println!("  {}", "─".repeat(56));
 
-    let recommended_idx = best_variant_idx(variants);
+    let recommended_idx = best_variant_idx(&available);
 
-    for (i, v) in variants.iter().enumerate() {
+    for (i, v) in available.iter().enumerate() {
         let star = if Some(i) == recommended_idx {
             " ★"
         } else {
@@ -136,29 +166,29 @@ fn select_variant<'a>(
     if !std::io::stdin().is_terminal() {
         println!(
             "  Non-interactive — selecting {} (#{}).",
-            variants[default - 1].quant_name,
+            available[default - 1].quant_name,
             default
         );
-        return Ok(&variants[default - 1]);
+        return Ok(available[default - 1]);
     }
 
     loop {
-        print!("  Select [1-{}] (default: {}): ", variants.len(), default);
+        print!("  Select [1-{}] (default: {}): ", available.len(), default);
         std::io::stdout().flush().ok();
         let mut line = String::new();
         std::io::stdin().lock().read_line(&mut line)?;
         let trimmed = line.trim();
         if trimmed.is_empty() {
-            return Ok(&variants[default - 1]);
+            return Ok(available[default - 1]);
         }
         match trimmed.parse::<usize>() {
-            Ok(n) if n >= 1 && n <= variants.len() => return Ok(&variants[n - 1]),
-            _ => println!("  Please enter a number between 1 and {}.", variants.len()),
+            Ok(n) if n >= 1 && n <= available.len() => return Ok(available[n - 1]),
+            _ => println!("  Please enter a number between 1 and {}.", available.len()),
         }
     }
 }
 
-fn best_variant_idx(variants: &[GgufVariant]) -> Option<usize> {
+fn best_variant_idx(variants: &[&GgufVariant]) -> Option<usize> {
     if let Some(i) = variants
         .iter()
         .position(|v| v.quant_name.eq_ignore_ascii_case("Q4_K_M"))
@@ -264,7 +294,25 @@ pub fn pull(config: &PullConfig) -> anyhow::Result<()> {
             }
         });
 
-        let chosen = select_variant(&variants, target_variant_str)?;
+        let already_present: std::collections::HashSet<String> = if dest.exists() && !config.force {
+            variants
+                .iter()
+                .filter(|v| v.quant_name != "Safetensors")
+                .filter(|v| {
+                    v.files.iter().all(|(fname, expected_size)| {
+                        let p = dest.join(fname);
+                        p.exists()
+                            && (*expected_size == 0
+                                || p.metadata().map(|m| m.len()).unwrap_or(0) >= *expected_size)
+                    })
+                })
+                .map(|v| v.quant_name.clone())
+                .collect()
+        } else {
+            std::collections::HashSet::new()
+        };
+
+        let chosen = select_variant(&variants, target_variant_str, &already_present)?;
 
         if chosen.quant_name == "Safetensors" {
             download_safetensors = true;
@@ -278,26 +326,6 @@ pub fn pull(config: &PullConfig) -> anyhow::Result<()> {
                 chosen.files.iter().map(|(f, _)| f.clone()).collect();
 
             if dest.exists() {
-                let all_complete = chosen.files.iter().all(|(fname, expected_size)| {
-                    let path = dest.join(fname);
-                    if !path.exists() {
-                        return false;
-                    }
-                    if *expected_size > 0 {
-                        let actual = path.metadata().map(|m| m.len()).unwrap_or(0);
-                        actual >= *expected_size
-                    } else {
-                        true
-                    }
-                });
-                if all_complete && !config.force {
-                    anyhow::bail!(
-                        "Variant '{}' is already present in '{}'.\n\
-                         Use --force to re-download it.",
-                        chosen.quant_name,
-                        dest.display()
-                    );
-                }
                 for (f, _) in &chosen.files {
                     let _ = std::fs::remove_file(dest.join(f));
                 }

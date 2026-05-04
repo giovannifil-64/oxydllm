@@ -57,11 +57,7 @@ fn resolve_local_path(model: &str, models_dir: &Path) -> Option<PathBuf> {
             return Some(p);
         }
     }
-    let p = models_dir.join(model);
-    if p.exists() {
-        return Some(p);
-    }
-    None
+    crate::models::loader::resolve_model_path(models_dir, model)
 }
 
 fn estimate_local(dir: &Path, ctx_len: usize, num_seqs: usize) -> Result<()> {
@@ -143,14 +139,25 @@ fn estimate_local_safetensors(dir: &Path, ctx_len: usize, num_seqs: usize) -> Re
         None
     };
 
-    let dtype_str = read_torch_dtype(&config_path).unwrap_or_else(|| "F32 / BF16".to_string());
+    let dtype_str = read_torch_dtype(&config_path).unwrap_or_else(|| "BF16".to_string());
+    let is_fp8 =
+        dtype_str.to_uppercase().contains("FLOAT8") || dtype_str.to_uppercase().contains("F8E4M3");
+    let effective_bytes = if is_fp8 {
+        weights_bytes * 2
+    } else {
+        weights_bytes
+    };
 
     println!();
     println!("  Model    {}", model_name);
     println!("  Dir      {}", dir.display());
-    println!("  Format   {} safetensors", dtype_str);
+    print!("  Format   {} safetensors", dtype_str);
+    if is_fp8 {
+        print!("  (Metal: dequantized to BF16 at load → 2× file size)");
+    }
     println!();
-    print_weights_kv_total(weights_bytes, geometry.as_ref(), ctx_len, num_seqs);
+    println!();
+    print_weights_kv_total(effective_bytes, geometry.as_ref(), ctx_len, num_seqs);
     println!("  Accuracy 100%  (full-precision weights)");
     println!();
 
@@ -359,15 +366,27 @@ fn parse_geometry_from_config_file(path: &Path) -> Result<ModelGeometry> {
 }
 
 fn parse_geometry_from_json(json: &serde_json::Value) -> Option<ModelGeometry> {
-    let num_layers = json["num_hidden_layers"].as_u64()? as usize;
-    let num_kv_heads = json["num_key_value_heads"]
+    let root = if json["text_config"].is_object() {
+        let mut merged = json.clone();
+        if let (Some(obj), Some(text)) = (merged.as_object_mut(), json["text_config"].as_object()) {
+            for (k, v) in text {
+                obj.entry(k).or_insert_with(|| v.clone());
+            }
+        }
+        std::borrow::Cow::Owned(merged)
+    } else {
+        std::borrow::Cow::Borrowed(json)
+    };
+
+    let num_layers = root["num_hidden_layers"].as_u64()? as usize;
+    let num_kv_heads = root["num_key_value_heads"]
         .as_u64()
-        .or_else(|| json["num_attention_heads"].as_u64())? as usize;
-    let head_dim = if let Some(hd) = json["head_dim"].as_u64() {
+        .or_else(|| root["num_attention_heads"].as_u64())? as usize;
+    let head_dim = if let Some(hd) = root["head_dim"].as_u64() {
         hd as usize
     } else {
-        let hidden = json["hidden_size"].as_u64()? as usize;
-        let heads = json["num_attention_heads"].as_u64()? as usize;
+        let hidden = root["hidden_size"].as_u64()? as usize;
+        let heads = root["num_attention_heads"].as_u64()? as usize;
         hidden / heads
     };
     Some(ModelGeometry {

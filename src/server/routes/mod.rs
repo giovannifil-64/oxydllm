@@ -18,6 +18,25 @@ use axum::http::StatusCode;
 use axum::response::Json;
 use axum::routing::{get, post};
 
+async fn wait_for_shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut sigterm =
+            signal(SignalKind::terminate()).expect("failed to install SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = sigterm.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    }
+}
+
 use crate::models::manager::{self, ModelManager, ModelManagerConfig, SharedModelManager};
 
 struct AppState {
@@ -56,6 +75,7 @@ pub struct StartServerArgs {
     pub models_dir: PathBuf,
     pub port: u16,
     pub keep_alive: Duration,
+    pub shutdown_timeout: Duration,
     pub memory_budget_bytes: Option<usize>,
     pub cuda_devices: Vec<usize>,
     pub max_context_len: usize,
@@ -69,6 +89,7 @@ pub fn start_server(args: StartServerArgs) -> anyhow::Result<()> {
         models_dir,
         port,
         keep_alive,
+        shutdown_timeout,
         memory_budget_bytes,
         cuda_devices,
         max_context_len,
@@ -146,7 +167,27 @@ pub fn start_server(args: StartServerArgs) -> anyhow::Result<()> {
         );
 
         let listener = tokio::net::TcpListener::bind(&addr).await?;
-        axum::serve(listener, app).await?;
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(async move {
+            wait_for_shutdown_signal().await;
+            tracing::info!(
+                drain_timeout_s = shutdown_timeout.as_secs(),
+                "shutdown signal received, draining in-flight requests"
+            );
+            let _ = shutdown_tx.send(());
+            tokio::time::sleep(shutdown_timeout).await;
+            tracing::warn!("graceful shutdown timed out, forcing exit");
+            std::process::exit(1);
+        });
+
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                let _ = shutdown_rx.await;
+            })
+            .await?;
+
+        tracing::info!("server shut down cleanly");
         Ok::<_, anyhow::Error>(())
     })?;
 

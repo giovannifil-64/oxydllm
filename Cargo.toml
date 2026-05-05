@@ -21,7 +21,7 @@ candle-metal-kernels = { git = "https://github.com/huggingface/candle.git", tag 
 objc2-metal = { version = "0.3.2", optional = true }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
-tokio = { version = "1.49.0", features = ["rt-multi-thread", "macros", "sync", "net", "signal"] }
+tokio = { version = "1.49.0", features = ["rt-multi-thread", "macros", "sync", "net", "signal", "time"] }
 tokio-stream = { version = "0.1.18", features = ["sync"] }
 tokenizers = { version = "0.22.2", default-features = false, features = ["onig"] }
 minijinja = { version = "2.16.0", features = ["builtins"] }

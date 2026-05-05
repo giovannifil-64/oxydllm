@@ -37,6 +37,7 @@ struct StartArgs {
     models_dir: PathBuf,
     port: u16,
     keep_alive: Duration,
+    shutdown_timeout: Duration,
     memory_budget_bytes: Option<usize>,
     cuda_devices: Vec<usize>,
     max_context_len: usize,
@@ -136,14 +137,15 @@ Server options (start):
   --port <PORT>             Listen port (default: 11313)
   --models-dir <DIR>        Models directory (default: ~/.rllm/models/)
   --keep-alive <SECS>       Keep-alive seconds before eviction (default: 900)
+  --shutdown-timeout <SECS> Seconds to wait for in-flight requests on shutdown (default: 30)
   --memory-budget <MB>      Max total VRAM for loaded models in MB; LRU eviction when exceeded
   --max-context-len <N>     Max tokens per sequence for KV cache (default: 4096)
   --devices <IDS>           Comma-separated CUDA device indices to use (default: auto, env: RLLM_DEVICES)
                             Examples: --devices 0   --devices 0,1,2
   --kv-quant <MODE>         KV cache quantization mode (default: off, no quantization)
-                            lossless: 4-bit, quality-neutral (~3.7x compression)
-                            balanced: 3-bit, near-identical quality (~4.9x compression)
-                            aggressive: 2-bit, maximum compression (~7x compression)
+                            - lossless: 4-bit, quality-neutral (~3.7x compression)
+                            - balanced: 3-bit, near-identical quality (~4.9x compression)
+                            - aggressive: 2-bit, maximum compression (~7x compression)
   --qjl-quantization        Enable Stage-2 QJL key residual quantization (default: disabled)
   --require-gpu             Fail startup if no GPU device available (default: disabled)
 
@@ -377,6 +379,7 @@ fn parse_start_args(args: &[String]) -> Result<StartArgs, String> {
     let mut models_dir: Option<PathBuf> = None;
     let mut port: u16 = 11313;
     let mut keep_alive_secs: u64 = 900;
+    let mut shutdown_timeout_secs: u64 = 30;
     let mut memory_budget_mb: Option<usize> = None;
     let mut devices_raw: Option<Vec<usize>> = None;
     let mut max_context_len: usize = 4096;
@@ -438,6 +441,14 @@ fn parse_start_args(args: &[String]) -> Result<StartArgs, String> {
                     args.get(i).ok_or("--kv-quant requires a value")?,
                 )?;
             }
+            "--shutdown-timeout" => {
+                i += 1;
+                shutdown_timeout_secs = args
+                    .get(i)
+                    .ok_or("--shutdown-timeout requires a value")?
+                    .parse()
+                    .map_err(|_| "Invalid shutdown-timeout value (expected integer seconds)")?;
+            }
             "--qjl-quantization" => {
                 qjl_quantization = true;
             }
@@ -453,6 +464,7 @@ fn parse_start_args(args: &[String]) -> Result<StartArgs, String> {
         models_dir: models_dir.unwrap_or_else(default_models_dir),
         port,
         keep_alive: Duration::from_secs(keep_alive_secs),
+        shutdown_timeout: Duration::from_secs(shutdown_timeout_secs),
         memory_budget_bytes: memory_budget_mb.map(|mb| mb * 1024 * 1024),
         cuda_devices: resolve_devices(devices_raw),
         max_context_len,
@@ -932,6 +944,7 @@ fn main() -> anyhow::Result<()> {
                 models_dir: start_args.models_dir,
                 port: start_args.port,
                 keep_alive: start_args.keep_alive,
+                shutdown_timeout: start_args.shutdown_timeout,
                 memory_budget_bytes: start_args.memory_budget_bytes,
                 cuda_devices: start_args.cuda_devices,
                 max_context_len: start_args.max_context_len,

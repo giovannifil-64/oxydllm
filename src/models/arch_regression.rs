@@ -536,18 +536,28 @@ mod tests {
     // BlockAllocator::append / flush_pending / gather, catching bugs that
     // pure unit-level quantize/dequantize tests cannot reach.
 
+    fn softmax(v: &[f32]) -> Vec<f32> {
+        let max = v.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let e: Vec<f32> = v.iter().map(|x| (x - max).exp()).collect();
+        let s: f32 = e.iter().sum();
+        e.iter().map(|x| x / s).collect()
+    }
+
     fn softmax_l1(a: &[f32], b: &[f32]) -> f32 {
-        fn softmax(v: &[f32]) -> Vec<f32> {
-            let max = v.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-            let e: Vec<f32> = v.iter().map(|x| (x - max).exp()).collect();
-            let s: f32 = e.iter().sum();
-            e.iter().map(|x| x / s).collect()
-        }
         softmax(a)
             .iter()
             .zip(softmax(b))
             .map(|(x, y)| (x - y).abs())
             .sum()
+    }
+
+    fn softmax_l2(a: &[f32], b: &[f32]) -> f32 {
+        softmax(a)
+            .iter()
+            .zip(softmax(b))
+            .map(|(x, y)| (x - y).powi(2))
+            .sum::<f32>()
+            .sqrt()
     }
 
     #[test]
@@ -594,39 +604,85 @@ mod tests {
         let off_flat: Vec<f32> = off_logits.flatten_all().unwrap().to_vec1().unwrap();
         let quant_flat: Vec<f32> = quant_logits.flatten_all().unwrap().to_vec1().unwrap();
         let l1 = softmax_l1(&off_flat, &quant_flat);
+        let l2 = softmax_l2(&off_flat, &quant_flat);
 
         assert!(
             l1 < 0.5,
             "kv_quant/lossless: softmax L1 distance {l1:.4} exceeds threshold 0.5 — \
              quantization is introducing excessive error in the KV read-back path"
         );
+        assert!(
+            l2 < 0.35,
+            "kv_quant/lossless: softmax L2 distance {l2:.4} exceeds threshold 0.35 — \
+             quantization is introducing large per-token error in the KV read-back path"
+        );
     }
 
     #[test]
-    fn kv_quant_balanced_finite() {
+    fn kv_quant_balanced_vs_off() {
         use crate::common::kv_quant::KvQuantizer;
 
         let spec = ArchSpec {
-            name: "kv_quant_balanced",
+            name: "kv_quant_balanced_vs_off",
             ..Default::default()
         };
         let dev = Device::Cpu;
+
         let tensors = build_weights(&spec, &dev);
+        let tensors2: rustc_hash::FxHashMap<String, Tensor> = tensors
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+
+        let model_off = build_model_from_tensors(&spec, tensors, None)
+            .expect("kv_quant/balanced_vs_off: failed to build unquantized model");
 
         let quantizer = Arc::new(KvQuantizer::new_with_qjl(3, HEAD_DIM, true));
-        let model_quant = build_model_from_tensors(&spec, tensors, Some(quantizer))
-            .expect("kv_quant/balanced: failed to build model");
+        let model_quant = build_model_from_tensors(&spec, tensors2, Some(quantizer))
+            .expect("kv_quant/balanced_vs_off: failed to build balanced model");
 
-        let mut caches = make_caches(&model_quant);
+        let mut caches_off = make_caches(&model_off);
+        let mut caches_quant = make_caches(&model_quant);
 
-        let prefill_logits =
-            run_prefill(&model_quant, &mut caches, 8).expect("kv_quant/balanced: prefill failed");
-        assert_logits_ok(&prefill_logits, 8, "kv_quant/balanced/prefill");
+        run_prefill(&model_off, &mut caches_off, 8)
+            .expect("kv_quant/balanced_vs_off: prefill failed (off)");
+        run_prefill(&model_quant, &mut caches_quant, 8)
+            .expect("kv_quant/balanced_vs_off: prefill failed (balanced)");
 
+        let mut off_logits = None;
+        let mut quant_logits = None;
         for step in 0..3 {
-            let decode_logits = run_decode(&model_quant, &mut caches, 8 + step)
-                .unwrap_or_else(|e| panic!("kv_quant/balanced: decode step {step} failed: {e}"));
-            assert_logits_ok(&decode_logits, 1, "kv_quant/balanced/decode");
+            off_logits = Some(
+                run_decode(&model_off, &mut caches_off, 8 + step).unwrap_or_else(|e| {
+                    panic!("kv_quant/balanced_vs_off: decode {step} failed (off): {e}")
+                }),
+            );
+            quant_logits = Some(
+                run_decode(&model_quant, &mut caches_quant, 8 + step).unwrap_or_else(|e| {
+                    panic!("kv_quant/balanced_vs_off: decode {step} failed (balanced): {e}")
+                }),
+            );
         }
+
+        let off_logits = off_logits.unwrap();
+        let quant_logits = quant_logits.unwrap();
+        assert_logits_ok(&off_logits, 1, "kv_quant/balanced_vs_off/off");
+        assert_logits_ok(&quant_logits, 1, "kv_quant/balanced_vs_off/balanced");
+
+        let off_flat: Vec<f32> = off_logits.flatten_all().unwrap().to_vec1().unwrap();
+        let quant_flat: Vec<f32> = quant_logits.flatten_all().unwrap().to_vec1().unwrap();
+        let l1 = softmax_l1(&off_flat, &quant_flat);
+        let l2 = softmax_l2(&off_flat, &quant_flat);
+
+        assert!(
+            l1 < 0.7,
+            "kv_quant/balanced: softmax L1 distance {l1:.4} exceeds threshold 0.7 — \
+             3-bit quantization is introducing excessive error in the KV read-back path"
+        );
+        assert!(
+            l2 < 0.5,
+            "kv_quant/balanced: softmax L2 distance {l2:.4} exceeds threshold 0.5 — \
+             3-bit quantization is introducing large per-token error in the KV read-back path"
+        );
     }
 }

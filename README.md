@@ -28,17 +28,14 @@
 
 A rust-based inference engine for Large Language Models.
 
-> [!IMPORTANT]
-> This project is under development and not yet ready for production use.
-> 
-> At the moment it only supports text input/output and a limited set of models.
-
 > [!NOTE]
 > For transparency, the engine has been developed with the assistant of Claude. The code has been reviewed and edited, but may still contain inaccuracies, suboptimal implementations, or other kind of issues not yet identified.
 > 
 > The engine has been tested primarily on Apple Silicon, so Metal support is more mature than CUDA. Contributions to improve NVIDIA GPU support are welcome.
 > 
 > GGUF support is available, but compatibility still depends on architecture and quantization variant.
+>
+> At the moment it only supports text input/output and a limited set of models.
 
 ## Features
 - OpenAI-compatible chat completions endpoint (`/v1/chat/completions`)
@@ -52,8 +49,6 @@ A rust-based inference engine for Large Language Models.
 - GGUF quantized model support (Q4_K_M, Q5_0, Q8_0, and others), including sharded GGUF loading
 - Streaming responses via Server-Sent Events
 - Model download directly from HuggingFace with interactive variant selection
-
-Compatibility details for chat completions live in [docs/openai-chat-completions-compat.md](docs/openai-chat-completions-compat.md).
 
 ## Architecture
 <span style="color: #f56900;">r</span>LLM is built on top of the Candle tensor library. The model layer implements a unified transformer architecture that covers most supported model families with minimal per-architecture branching. The inference engine uses paged KV allocation with a shared block pool, a prefix cache keyed on rolling block hashes, and a scheduler that handles concurrent prefill and decode across multiple sequences.

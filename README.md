@@ -1,6 +1,6 @@
 <p align="center">
   <picture>
-    <img src=".github/res/oxydLLM.png" width="250">
+    <img src=".github/res/oxydLLM.png" width="350">
   </picture>
 </p>
 

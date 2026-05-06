@@ -1915,7 +1915,7 @@ checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
 
 [[package]]
 name = "oxydllm"
-version = "0.0.0-alpha.9"
+version = "0.0.0-alpha.10"
 dependencies = [
  "anyhow",
  "axum",

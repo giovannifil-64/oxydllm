@@ -2,6 +2,80 @@
 
 All notable changes to this project will be documented in this file.
 
+## 0.0.0-alpha.10
+
+- **Project renamed from `rllm` to `oxydllm`** — binary, data directory, registry file, and env vars all updated.
+- Added Phi-3 / Phi-3.5 support (safetensors + GGUF), including fused weight projection and LongRoPE scaling.
+- Added `Mistral3ForConditionalGeneration` architecture support.
+- Introduced OpenAI-compatible function calling and structured output (JSON Schema validation).
+- Added FP8 weight loading with runtime dequantization and per-tensor scale handling.
+- Built out a full CI/CD pipeline: CUDA multi-arch builds, ARM64, multi-platform Docker images, and architecture regression tests.
+- New CLI commands: `oxydllm list` and `oxydllm version`.
+- Integrated `tracing` for structured logging across the codebase.
+
+### New Features
+- Project-wide rename: binary `oxydllm`, data dir `~/.oxydllm/`, registry `.oxydllm_registry.json`, env var `OXYDLLM_DEVICES`.
+- Phi-3 / Phi-3.5 model support: fused `qkv_proj` / `gate_up_proj` weight handling in both safetensors and GGUF; `build_llama_tokenizer` for GGUF tokenizer type; LongRoPE (`RopeScaling::LongRoPE`) for Phi-3.5.
+- `Mistral3ForConditionalGeneration` added to the supported architecture list; `text_config` nesting in HF parser handled for multimodal configs.
+- OpenAI-compatible function calling: tool definitions, tool-call detection, `ToolCallDelta` streaming, `finish_reason: "tool_calls"`.
+- Structured output with JSON Schema validation (`type`, `required`, `additionalProperties`, `properties`, `items`, `enum`); invalid output yields `finish_reason: "content_filter"`.
+- FP8 weight loading with per-tensor `_scale_inv` / `scale` dequantization at load time.
+- Hadamard transform in KV quantization with fallback for non-power-of-two `head_dim`.
+- Alternating sliding-window attention support at the layer level.
+- Per-device GPU locking mechanism replacing the global lock for finer-grained concurrency control.
+- `oxydllm list` command: shows locally available models with size, architecture, and last-used date.
+- `oxydllm version` command.
+- Graceful server shutdown with configurable timeout and OS signal handling.
+- Abort-sequence API: `abort_sequence` in engine, scheduler, and routes for cancelling in-flight requests.
+
+### Performance and Efficiency
+- FP8 runtime dequantization avoids storing full-precision weight copies, reducing peak memory at load time.
+- `apply_qk_with_positions` in RoPE for optimised per-position tensor handling.
+- KV quantization Hadamard transform improves quantization quality for large head dims.
+- `GateUpProjection::Packed` variant for pre-fused gate+up tensors (Phi-3 / Phi-3.5) avoids splitting overhead.
+
+### Reliability and Correctness
+- Fixed Gemma2 arch defaults: FFN pre/post norms were inadvertently disabled.
+- Fixed RoPE `dims4` handling on the Metal feature flag path.
+- Added `require-gpu` guard and hardened attention/causal-mask paths against out-of-bounds indexing.
+- Fixed case-insensitive model path resolution and improved FP8 tensor key matching.
+- Fixed leading-whitespace stripping in token decoding for both server streaming and interactive mode.
+- Fixed Cargo release profile settings that were causing oversized debug builds.
+- Causal mask functions now accept an explicit `DType` to avoid implicit promotions.
+
+### Refactors and Maintainability
+- `routes.rs` split into focused sub-modules for improved readability.
+- Device key representation migrated to `DeviceLocation` enum.
+- `QkvProjection` now uses `AnyLinear` internally; `GateUpProjection` extended with `Packed` and `Simple` variants.
+- Registry management switched from `HashMap` to `BTreeMap` for deterministic ordering.
+- Removed unused `user` field from `ChatCompletionRequest`.
+- `tracing` integrated for structured, levelled logging across engine, scheduler, and server.
+
+### Tests
+- Unit tests for `Attention` and `RotaryEmbedding`.
+- Unit tests for `ModelManager` and tokenizer (error handling, encoding round-trips).
+- Architecture regression tests for `StandardTransformer` (CPU, run in pre-push hook and CI).
+
+### CI / Infra
+- Full GitHub Actions pipeline: CPU, CUDA (multi-arch: Ampere, Ada, Hopper, Blackwell Ultra), ARM64, macOS.
+- Multi-platform Docker images for CPU with manifest-list support.
+- Nightly build workflow with GHCR image cleanup for untagged images.
+- Architecture regression test step gated before release publishing.
+- Docker fallback: rebuild without cache on image pull failure.
+- Binary stripping for macOS and Linux release artifacts.
+- Rust toolchain version pinned in `rust-toolchain.toml` and read by all workflows.
+
+### Dependencies
+- `candle-core` / `candle-metal-kernels` updated to 0.10.2.
+- `candle` / `cudarc` updated to 0.10.1 / 0.19.4.
+- Added `fastrand` and `tempfile`.
+- `action-gh-release` upgraded to v3 in nightly and release workflows.
+- General dependency updates (`Cargo.lock` bump).
+
+**Full Changelog**: https://github.com/giovannifil-64/oxydllm/compare/0.0.0-alpha.9...0.0.0-alpha.10
+
+---
+
 ## 0.0.0-alpha.9
 
 - Added Gemma4 support with stronger per-layer transformer configuration.

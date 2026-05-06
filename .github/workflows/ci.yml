@@ -10,8 +10,22 @@ name: CI
 on:
   push:
     branches: [main]
+    paths:
+      - "src/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - "install.sh"
+      - ".github/workflows/ci.yml"
   pull_request:
     branches: [main]
+    paths:
+      - "src/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - "install.sh"
+      - ".github/workflows/ci.yml"
 
 env:
   CARGO_TERM_COLOR: always
@@ -39,14 +53,12 @@ jobs:
   audit:
     name: Security audit
     runs-on: ubuntu-22.04
-    permissions:
-      contents: read
-      checks: write
     steps:
       - uses: actions/checkout@v6
-      - uses: rustsec/audit-check@v2
+      - uses: taiki-e/install-action@v2
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          tool: cargo-audit
+      - run: cargo audit
 
   # ── macOS: check + clippy + test with Metal feature ─────────────────────────
   check-macos:
@@ -62,16 +74,9 @@ jobs:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: clippy
 
-      - name: Cache Cargo
-        uses: actions/cache@v5
+      - uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-            target
-          key: macos-arm64-metal-ci-${{ hashFiles('Cargo.lock') }}
-          restore-keys: macos-arm64-metal-ci-
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Check (Metal)
         run: cargo check --release
@@ -96,16 +101,9 @@ jobs:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: clippy
 
-      - name: Cache Cargo
-        uses: actions/cache@v5
+      - uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-            target
-          key: linux-x86_64-cpu-ci-${{ hashFiles('Cargo.lock') }}
-          restore-keys: linux-x86_64-cpu-ci-
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Install system deps
         run: |
@@ -150,16 +148,10 @@ jobs:
             | sh -s -- -y --default-toolchain "$RUST_TOOLCHAIN" --profile minimal
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
-      - name: Cache Cargo
-        uses: actions/cache@v5
+      - uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-            target
-          key: linux-x86_64-cuda-ci-sm${{ matrix.cuda_arch }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: linux-x86_64-cuda-ci-sm${{ matrix.cuda_arch }}-
+          prefix-key: linux-x86_64-cuda-sm${{ matrix.cuda_arch }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Check (CUDA)
         run: cargo check --no-default-features --features cuda
@@ -190,16 +182,9 @@ jobs:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: clippy
 
-      - name: Cache Cargo
-        uses: actions/cache@v5
+      - uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-            target
-          key: linux-arm64-cpu-ci-${{ hashFiles('Cargo.lock') }}
-          restore-keys: linux-arm64-cpu-ci-
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Install system deps
         run: |
@@ -241,16 +226,10 @@ jobs:
             | sh -s -- -y --default-toolchain "$RUST_TOOLCHAIN" --profile minimal
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
-      - name: Cache Cargo
-        uses: actions/cache@v5
+      - uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-            target
-          key: linux-arm64-cuda-ci-sm${{ matrix.cuda_arch }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: linux-arm64-cuda-ci-sm${{ matrix.cuda_arch }}-
+          prefix-key: linux-arm64-cuda-sm${{ matrix.cuda_arch }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Check (CUDA)
         run: cargo check --no-default-features --features cuda

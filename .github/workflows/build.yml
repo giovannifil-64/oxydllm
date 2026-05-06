@@ -44,16 +44,9 @@ jobs:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           targets: aarch64-apple-darwin
 
-      - name: Cache Cargo
-        uses: actions/cache@v5
+      - uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-            target
-          key: macos-arm64-metal-${{ hashFiles('Cargo.lock') }}
-          restore-keys: macos-arm64-metal-
+          prefix-key: build-macos-arm64-metal
 
       - name: Build (Metal, release)
         run: cargo build --release
@@ -89,16 +82,9 @@ jobs:
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
 
-      - name: Cache Cargo
-        uses: actions/cache@v5
+      - uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-            target
-          key: linux-x86_64-cpu-${{ hashFiles('Cargo.lock') }}
-          restore-keys: linux-x86_64-cpu-
+          prefix-key: build-linux-x86_64-cpu
 
       - name: Install system deps
         run: |
@@ -173,16 +159,9 @@ jobs:
             | sh -s -- -y --default-toolchain "$RUST_TOOLCHAIN" --profile minimal
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
-      - name: Cache Cargo
-        uses: actions/cache@v5
+      - uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-            target
-          key: linux-x86_64-cuda-sm${{ matrix.variant.arch }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: linux-x86_64-cuda-sm${{ matrix.variant.arch }}-
+          prefix-key: build-linux-x86_64-cuda-sm${{ matrix.variant.arch }}
 
       - name: Build (CUDA, release)
         env:
@@ -236,16 +215,9 @@ jobs:
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
 
-      - name: Cache Cargo
-        uses: actions/cache@v5
+      - uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-            target
-          key: linux-arm64-cpu-${{ hashFiles('Cargo.lock') }}
-          restore-keys: linux-arm64-cpu-
+          prefix-key: build-linux-arm64-cpu
 
       - name: Install system deps
         run: |
@@ -312,16 +284,9 @@ jobs:
             | sh -s -- -y --default-toolchain "$RUST_TOOLCHAIN" --profile minimal
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
-      - name: Cache Cargo
-        uses: actions/cache@v5
+      - uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-            target
-          key: linux-arm64-cuda-sm${{ matrix.variant.arch }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: linux-arm64-cuda-sm${{ matrix.variant.arch }}-
+          prefix-key: build-linux-arm64-cuda-sm${{ matrix.variant.arch }}
 
       - name: Build (CUDA, release)
         env:

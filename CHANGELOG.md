@@ -2,6 +2,25 @@
 
 All notable changes to this project will be documented in this file.
 
+## 0.0.0-alpha.10.0.1
+
+- Fixed release workflow stalling indefinitely on tag push due to missing repository context and insufficient permissions.
+- Replaced deprecated `rustsec/audit-check` with `taiki-e/install-action` + `cargo audit`.
+- Migrated all CI and build workflow cache jobs from `actions/cache` to `Swatinem/rust-cache`.
+- Restricted CI cache writes to `main` branch only, reducing total cache storage from ~9.2 GB to ~2.6 GB.
+- Added path filters to CI so it only triggers on code changes, not on docs or workflow-only commits.
+
+### CI / Infra
+- **Release workflow — repository context**: `verify-ci` was calling `gh run list` without `--repo`, causing it to fail silently in the ephemeral runner environment (no git checkout in that job). Added `--repo ${{ github.repository }}`.
+- **Release workflow — permissions**: The workflow-level `permissions` block (`contents: write`, `packages: write`) implicitly set `actions: read` to `none`. `gh run list` was failing with HTTP 403, silently caught by `2>/dev/null || echo "[]"`, making every poll return `status=<none>`. Fixed by adding `permissions: actions: read` at the `verify-ci` job level.
+- **Release workflow — polling timeout**: Reduced polling attempts from 40 to 20 (10 minutes). CI completes well within this window under normal conditions.
+- **Security audit**: Replaced deprecated `rustsec/audit-check@v2` (required `checks: write` and is no longer maintained) with `taiki-e/install-action@v2` + `cargo audit`. Installs a prebuilt binary in ~5 s with no extra permissions needed.
+- **CI cache**: Replaced all `actions/cache@v5` blocks in `ci.yml` with `Swatinem/rust-cache@v2`, which automatically prunes `incremental/` and `.fingerprint/` directories before saving. CUDA cache size reduced from ~490 MB to ~265 MB per architecture. Added `save-if: ${{ github.ref == 'refs/heads/main' }}` — PR runs restore from existing caches but do not write new entries. Total cache storage reduced from ~9.2 GB to ~2.6 GB.
+- **Build cache**: Replaced all `actions/cache@v5` blocks in `build.yml` with `Swatinem/rust-cache@v2`. Each native binary build job uses a distinct `prefix-key` to prevent cache collisions with CI jobs. No `save-if` restriction since build jobs are only triggered by nightly cron and release tags, never by PRs.
+- **CI path filters**: Added `paths` filters to both `push` and `pull_request` triggers. CI now only runs when `src/**`, `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `install.sh`, or `.github/workflows/ci.yml` change. Commits that only touch docs, images, or other workflow files no longer trigger a full CI run.
+
+**Full Changelog**: https://github.com/giovannifil-64/oxydllm/compare/0.0.0-alpha.10...0.0.0-alpha.10.0.1
+
 ## 0.0.0-alpha.10
 
 - **Project renamed from `rllm` to `oxydllm`** — binary, data directory, registry file, and env vars all updated.

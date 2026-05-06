@@ -88,7 +88,7 @@ jobs:
         uses: actions/download-artifact@v8
         with:
           path: dist/
-          pattern: rllm-*
+          pattern: oxydllm-*
           merge-multiple: true
 
       - name: List artifacts
@@ -120,18 +120,18 @@ jobs:
             ```
 
             Installer auto-selects the right binary from detected GPU compute capability.
-            Override with `RLLM_CUDA_TARGET=<ada|hopper|blackwell|blackwell-ultra|blackwell-consumer>` (x86_64)
-            or `RLLM_CUDA_TARGET=<hopper|blackwell|blackwell-ultra|thor>` (arm64).
+            Override with `OXYDLLM_CUDA_TARGET=<ada|hopper|blackwell|blackwell-ultra|blackwell-consumer>` (x86_64)
+            or `OXYDLLM_CUDA_TARGET=<hopper|blackwell|blackwell-ultra|thor>` (arm64).
 
             **Linux (CPU only)**
             ```bash
-            curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/main/install.sh | RLLM_NO_GPU=1 sh
+            curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/main/install.sh | OXYDLLM_NO_GPU=1 sh
             ```
 
             **Docker (CUDA)**
             ```bash
             docker run --gpus all -p 11313:11313 \
-              -v ~/.rllm/models:/root/.rllm/models \
+              -v ~/.oxydllm/models:/root/.oxydllm/models \
               ghcr.io/${{ github.repository }}:latest start
             ```
 
@@ -141,7 +141,7 @@ jobs:
             **Docker (CPU)**
             ```bash
             docker run -p 11313:11313 \
-              -v ~/.rllm/models:/root/.rllm/models \
+              -v ~/.oxydllm/models:/root/.oxydllm/models \
               ghcr.io/${{ github.repository }}:cpu start
             ```
 

@@ -1,6 +1,6 @@
 ---
 name: Bug report
-about: Create a report to help us improve rLLM
+about: Create a report to help us improve oxydLLM
 title: '[BUG] '
 labels: bug
 assignees: ''
@@ -22,7 +22,7 @@ A clear and concise description of what you expected to happen.
 - OS: [e.g. macOS, Linux]
 - Hardware (GPU/CPU): [e.g. M4 Max, Nvidia RTX 4090]
 - Rust version (if compiled from source): `rustc --version`
-- `rllm` version or commit hash: [e.g. 0.0.0-alpha.9, commit abc1234]
+- `oxydllm` version or commit hash: [e.g. 0.0.0-alpha.9, commit abc1234]
 
 **Additional context**
 Add any other context about the problem here.

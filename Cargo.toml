@@ -1,5 +1,5 @@
 [package]
-name = "rllm"
+name = "oxydllm"
 version = "0.0.0-alpha.9"
 edition = "2024"
 
@@ -9,7 +9,7 @@ cuda  = ["candle-core/cuda"]
 metal = ["candle-core/metal", "dep:candle-metal-kernels", "dep:objc2-metal"]
 
 [[bin]]
-name = "rllm"
+name = "oxydllm"
 path = "src/main.rs"
 
 [dependencies]

@@ -1,27 +1,25 @@
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset=".github/res/rllm_dark.png" width="250">
-    <source media="(prefers-color-scheme: light)" srcset=".github/res/rllm_light.png" width="250">
-    <img src=".github/res/rllm_white.png" width="250">
+    <img src=".github/res/oxydLLM.png" width="250">
   </picture>
 </p>
 
 <br>
 
 <p align="center">
-    <a href="https://github.com/giovannifil-64/rllm/actions/workflows/ci.yml">
-        <img src="https://github.com/giovannifil-64/rllm/actions/workflows/ci.yml/badge.svg?branch=main" />
+    <a href="https://github.com/giovannifil-64/oxydllm/actions/workflows/ci.yml">
+        <img src="https://github.com/giovannifil-64/oxydllm/actions/workflows/ci.yml/badge.svg?branch=main" />
     </a>
-    <a href="https://github.com/giovannifil-64/rllm/actions/workflows/nightly.yml">
-        <img src="https://github.com/giovannifil-64/rllm/actions/workflows/nightly.yml/badge.svg?branch=main" />
+    <a href="https://github.com/giovannifil-64/oxydllm/actions/workflows/nightly.yml">
+        <img src="https://github.com/giovannifil-64/oxydllm/actions/workflows/nightly.yml/badge.svg?branch=main" />
     </a>
-    <a href="https://github.com/giovannifil-64/rllm/actions/workflows/release.yml">
-        <img src="https://github.com/giovannifil-64/rllm/actions/workflows/release.yml/badge.svg?branch=main" />
+    <a href="https://github.com/giovannifil-64/oxydllm/actions/workflows/release.yml">
+        <img src="https://github.com/giovannifil-64/oxydllm/actions/workflows/release.yml/badge.svg?branch=main" />
     </a>
 </p>
 
 <p align="center">
-    <img src="https://img.shields.io/github/repo-size/giovannifil-64/rllm" />
+    <img src="https://img.shields.io/github/repo-size/giovannifil-64/oxydllm" />
 </p>
 
 <br>
@@ -51,7 +49,7 @@ A rust-based inference engine for Large Language Models.
 - Model download directly from HuggingFace with interactive variant selection
 
 ## Architecture
-<span style="color: #f56900;">r</span>LLM is built on top of the Candle tensor library. The model layer implements a unified transformer architecture that covers most supported model families with minimal per-architecture branching. The inference engine uses paged KV allocation with a shared block pool, a prefix cache keyed on rolling block hashes, and a scheduler that handles concurrent prefill and decode across multiple sequences.
+oxydLLM is built on top of the Candle tensor library. The model layer implements a unified transformer architecture that covers most supported model families with minimal per-architecture branching. The inference engine uses paged KV allocation with a shared block pool, a prefix cache keyed on rolling block hashes, and a scheduler that handles concurrent prefill and decode across multiple sequences.
 
 KV cache quantization uses TurboQuant with MSE-based quantization during the decode phase, reducing memory overhead without significant quality loss. Metal kernels provide fused operations for attention, normalization, and positional embeddings on Apple Silicon.
 
@@ -101,13 +99,13 @@ The following model families are not currently supported:
 - Encoder-only models (BERT, etc.)
 
 ## Installation
-For using <span style="color: #f56900;">r</span>LLM, you can either build from source or use the provided installers.
+For using oxydLLM, you can either build from source or use the provided installers.
 
 ### Building from source
 Clone the repository
 ```bash
-git clone https://github.com/giovannifil-64/rllm.git
-cd rllm
+git clone https://github.com/giovannifil-64/oxydllm
+cd oxydllm
 ```
 
 Build the project (requires [Rust toolchain](https://rust-lang.org/tools/install/)) with the appropriate feature base on your platform
@@ -126,7 +124,7 @@ CUDA_COMPUTE_CAP=120 cargo build --release --features cuda  # Blackwell consumer
 ```
 
 > [!NOTE]
-> `CUDA_COMPUTE_CAP` is consumed by Candle's CUDA kernel build scripts (`candle-kernels`), not by a direct `rllm` build flag. If not set, Candle tries to auto-detect compute capability from `nvidia-smi`.
+> `CUDA_COMPUTE_CAP` is consumed by Candle's CUDA kernel build scripts (`candle-kernels`), not by a direct `oxydllm` build flag. If not set, Candle tries to auto-detect compute capability from `nvidia-smi`.
 
 Run the server
 
@@ -144,17 +142,17 @@ You can use the provided `install.sh` script to download and install the appropr
 Simply run:
 
 ```bash
-curl -fsSL https://github.com/giovannifil-64/rllm/raw/main/install.sh | sh
+curl -fsSL https://github.com/giovannifil-64/oxydllm/raw/main/install.sh | sh
 ```
 
 > [!TIP]
-> You can override the automatic GPU detection by setting the `RLLM_CUDA_TARGET` environment variable to one of the supported targets before running the installer script. This is useful if you want to install a specific CUDA variant or if automatic detection fails.
+> You can override the automatic GPU detection by setting the `OXYDLLM_CUDA_TARGET` environment variable to one of the supported targets before running the installer script. This is useful if you want to install a specific CUDA variant or if automatic detection fails.
 > 
 > ```bash
 > # x86_64
-> RLLM_CUDA_TARGET=ada|hopper|blackwell|blackwell-ultra|blackwell-consumer curl -fsSL https://github.com/giovannifil-64/rllm/raw/main/install.sh | sh
+> OXYDLLM_CUDA_TARGET=ada|hopper|blackwell|blackwell-ultra|blackwell-consumer curl -fsSL https://github.com/giovannifil-64/oxydllm/raw/main/install.sh | sh
 > # arm64
-> RLLM_CUDA_TARGET=hopper|blackwell|blackwell-ultra|thor curl -fsSL https://github.com/giovannifil-64/rllm/raw/main/install.sh | sh
+> OXYDLLM_CUDA_TARGET=hopper|blackwell|blackwell-ultra|thor curl -fsSL https://github.com/giovannifil-64/oxydllm/raw/main/install.sh | sh
 > ```
 
 If you prefer to manually download the installer, you can find the latest releases on GitHub:
@@ -162,53 +160,53 @@ If you prefer to manually download the installer, you can find the latest releas
 #### macOS (Apple Silicon)
 > [!IMPORTANT]
 > Intel-based Macs are not supported
-- `rllm-macos-arm64`
+- `oxydllm-macos-arm64`
 
 #### Linux (CUDA)
 
 ##### x86_64
-- `rllm-linux-x86_64-cuda-ada.tar.gz` for Ada (sm_89, compute 8.9)
-- `rllm-linux-x86_64-cuda-hopper.tar.gz` for Hopper (sm_90, compute 9.x)
-- `rllm-linux-x86_64-cuda-blackwell.tar.gz` for Blackwell datacenter (sm_100, compute 10.x)
-- `rllm-linux-x86_64-cuda-blackwell-ultra.tar.gz` for Blackwell Ultra (sm_103, compute 10.3+)
-- `rllm-linux-x86_64-cuda-blackwell-consumer.tar.gz` for Blackwell consumer (sm_120, compute 12.x, RTX 50xx)
+- `oxydllm-linux-x86_64-cuda-ada.tar.gz` for Ada (sm_89, compute 8.9)
+- `oxydllm-linux-x86_64-cuda-hopper.tar.gz` for Hopper (sm_90, compute 9.x)
+- `oxydllm-linux-x86_64-cuda-blackwell.tar.gz` for Blackwell datacenter (sm_100, compute 10.x)
+- `oxydllm-linux-x86_64-cuda-blackwell-ultra.tar.gz` for Blackwell Ultra (sm_103, compute 10.3+)
+- `oxydllm-linux-x86_64-cuda-blackwell-consumer.tar.gz` for Blackwell consumer (sm_120, compute 12.x, RTX 50xx)
 
 ##### arm64 (GH200 / DGX Spark / GB300 / Jetson Thor)
-- `rllm-linux-arm64-cuda-hopper.tar.gz` for Hopper (GH200, sm_90)
-- `rllm-linux-arm64-cuda-blackwell.tar.gz` for Blackwell datacenter (DGX Spark/B200, sm_100)
-- `rllm-linux-arm64-cuda-blackwell-ultra.tar.gz` for Blackwell Ultra (GB300, sm_103)
-- `rllm-linux-arm64-cuda-thor.tar.gz` for Thor / Jetson Thor (sm_110)
+- `oxydllm-linux-arm64-cuda-hopper.tar.gz` for Hopper (GH200, sm_90)
+- `oxydllm-linux-arm64-cuda-blackwell.tar.gz` for Blackwell datacenter (DGX Spark/B200, sm_100)
+- `oxydllm-linux-arm64-cuda-blackwell-ultra.tar.gz` for Blackwell Ultra (GB300, sm_103)
+- `oxydllm-linux-arm64-cuda-thor.tar.gz` for Thor / Jetson Thor (sm_110)
 
 ## Usage
 Download a model
 ```bash
-rllm pull Qwen/Qwen3-0.6B
+oxydllm pull Qwen/Qwen3-0.6B
 ```
 
 For GGUF repos, the variant selection prompt shows which quantizations are already downloaded (marked ✓) and only numbers the ones that aren't.
 
 List locally available models
 ```bash
-rllm list
+oxydllm list
 ```
 
 Displays a table with NAME, ARCHITECTURE, and SIZE for each model found in the models directory, sorted alphabetically.
 
 You can also estimate memory requirements before downloading
 ```bash
-rllm estimate Qwen/Qwen3-4B-GGUF --context-len 8192 --num-sequences 4
+oxydllm estimate Qwen/Qwen3-4B-GGUF --context-len 8192 --num-sequences 4
 ```
 
-`estimate` and `run` both accept partial model names — `rllm run Qwen3-4B` resolves to the first matching local model.
+`estimate` and `run` both accept partial model names — `oxydllm run Qwen3-4B` resolves to the first matching local model.
 
 Interactive chat
 ```bash
-rllm run Qwen3-0.6B
+oxydllm run Qwen3-0.6B
 ```
 
 Remove a model
 ```bash
-rllm rm Qwen3-0.6B
+oxydllm rm Qwen3-0.6B
 ```
 
 > [!IMPORTANT]
@@ -246,7 +244,7 @@ curl http://localhost:11313/v1/chat/completions \
 ## Server Options
 ```
 --port <PORT>          Listen port (default: 11313)
---models-dir <DIR>     Models directory (default: ~/.rllm/models)
+--models-dir <DIR>     Models directory (default: ~/.oxydllm/models)
 --keep-alive <SECS>    Idle timeout before model eviction (default: 900)
 --memory-budget <MB>   Maximum VRAM for loaded models
 --max-context-len <N>  KV cache context length per sequence (default: 4096)
@@ -257,7 +255,7 @@ curl http://localhost:11313/v1/chat/completions \
 ```
 
 ## Run Options
-Options specific to the `rllm run` interactive chat command (not available in the server):
+Options specific to the `oxydllm run` interactive chat command (not available in the server):
 ```
 --temperature <T>      Sampling temperature (default: 0.7)
 --top-k <K>            Top-k filtering (default: 0, disabled)

@@ -64,7 +64,7 @@ struct RmArgs {
 }
 
 fn default_models_dir() -> PathBuf {
-    dirs_home().join(".rllm").join("models")
+    dirs_home().join(".oxydllm").join("models")
 }
 
 fn dirs_home() -> PathBuf {
@@ -91,12 +91,12 @@ fn resolve_devices(explicit: Option<Vec<usize>>) -> Vec<usize> {
     if let Some(d) = explicit {
         return d;
     }
-    if let Ok(env) = std::env::var("RLLM_DEVICES")
+    if let Ok(env) = std::env::var("OXYDLLM_DEVICES")
         && !env.trim().is_empty()
     {
         match parse_devices(&env) {
             Ok(d) => return d,
-            Err(e) => tracing::warn!(error = %e, "RLLM_DEVICES ignored"),
+            Err(e) => tracing::warn!(error = %e, "OXYDLLM_DEVICES ignored"),
         }
     }
     vec![]
@@ -104,7 +104,7 @@ fn resolve_devices(explicit: Option<Vec<usize>>) -> Vec<usize> {
 
 fn init_tracing() {
     let env_filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("rllm=info,hyper=warn,tower=warn"));
+        .unwrap_or_else(|_| EnvFilter::new("oxydllm=info,hyper=warn,tower=warn"));
 
     let _ = tracing_subscriber::fmt()
         .with_env_filter(env_filter)
@@ -116,7 +116,7 @@ fn init_tracing() {
 fn print_usage() {
     eprintln!(
         "\
-Usage: rllm <command> [options]
+Usage: oxydllm <command> [options]
 
 Commands:
   pull     <user/model>     Download a model from HuggingFace
@@ -127,7 +127,7 @@ Commands:
   estimate <model>          Estimate memory footprint and accuracy
 
 Download options (pull):
-  --models-dir <DIR>        Destination directory (default: ~/.rllm/models/)
+  --models-dir <DIR>        Destination directory (default: ~/.oxydllm/models/)
   --name <NAME>             Folder name override (default: model name)
   --token <TOKEN>           HuggingFace token for gated models
   --variant <FORMAT>        GGUF variant to download (e.g. Q4_K_M); skips interactive prompt
@@ -135,12 +135,12 @@ Download options (pull):
 
 Server options (start):
   --port <PORT>             Listen port (default: 11313)
-  --models-dir <DIR>        Models directory (default: ~/.rllm/models/)
+  --models-dir <DIR>        Models directory (default: ~/.oxydllm/models/)
   --keep-alive <SECS>       Keep-alive seconds before eviction (default: 900)
   --shutdown-timeout <SECS> Seconds to wait for in-flight requests on shutdown (default: 30)
   --memory-budget <MB>      Max total VRAM for loaded models in MB; LRU eviction when exceeded
   --max-context-len <N>     Max tokens per sequence for KV cache (default: 4096)
-  --devices <IDS>           Comma-separated CUDA device indices to use (default: auto, env: RLLM_DEVICES)
+  --devices <IDS>           Comma-separated CUDA device indices to use (default: auto, env: OXYDLLM_DEVICES)
                             Examples: --devices 0   --devices 0,1,2
   --kv-quant <MODE>         KV cache quantization mode (default: off, no quantization)
                             - lossless: 4-bit, quality-neutral (~3.7x compression)
@@ -150,8 +150,8 @@ Server options (start):
   --require-gpu             Fail startup if no GPU device available (default: disabled)
 
 Chat options (run):
-  --models-dir <DIR>        Models directory (default: ~/.rllm/models/)
-  --devices <ID>            CUDA device index to use (default: auto, env: RLLM_DEVICES)
+  --models-dir <DIR>        Models directory (default: ~/.oxydllm/models/)
+  --devices <ID>            CUDA device index to use (default: auto, env: OXYDLLM_DEVICES)
   --max-context-len <N>     Max tokens per sequence for KV cache (default: 4096)
   --kv-quant <MODE>         KV cache quantization: off, lossless, balanced, aggressive
   --qjl-quantization        Enable Stage-2 QJL key residual quantization (default: disabled)
@@ -164,11 +164,11 @@ Chat options (run):
   --repeat-window <N>       Trailing token window for repetition penalty (default: 0 = full history)
 
 Remove options (rm):
-  --models-dir <DIR>        Models directory (default: ~/.rllm/models/)
+  --models-dir <DIR>        Models directory (default: ~/.oxydllm/models/)
   --force / -f              Skip confirmation prompt
 
 Estimate options (estimate):
-  --models-dir <DIR>        Models directory (default: ~/.rllm/models/)
+  --models-dir <DIR>        Models directory (default: ~/.oxydllm/models/)
   --token <TOKEN>           HuggingFace token (for private repos)
   --context-len <N>         Context length for KV cache estimate (default: 4096)
   --num-sequences <N>       Concurrent sequences for KV cache estimate (default: 1)"
@@ -1021,7 +1021,7 @@ fn main() -> anyhow::Result<()> {
             print_usage();
         }
         "--version" | "-v" => {
-            println!("rllm {}", env!("CARGO_PKG_VERSION"));
+            println!("oxydllm {}", env!("CARGO_PKG_VERSION"));
         }
         _ => {
             eprintln!("Unknown command: {}", args[1]);

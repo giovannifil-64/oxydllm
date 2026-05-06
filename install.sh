@@ -1,31 +1,31 @@
 #!/usr/bin/env sh
-# rLLM installer
+# oxydLLM installer
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/giovannifil-64/rllm/main/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/giovannifil-64/oxydllm/main/install.sh | sh
 #
 # Nightly:
-#   curl -fsSL https://raw.githubusercontent.com/giovannifil-64/rllm/main/install.sh | RLLM_CHANNEL=nightly sh
+#   curl -fsSL https://raw.githubusercontent.com/giovannifil-64/oxydllm/main/install.sh | OXYDLLM_CHANNEL=nightly sh
 #
 # Environment overrides:
-#   RLLM_CHANNEL     - stable (default) or nightly
-#   RLLM_VERSION     - install a specific version tag, e.g. v0.1.0 (ignored for nightly)
-#   RLLM_NO_GPU      - set to 1 to force CPU binary on Linux
-#   RLLM_CUDA_TARGET - auto (default), ada, hopper, blackwell, blackwell-ultra, blackwell-consumer (Linux x86_64);
-#                      hopper, blackwell, blackwell-ultra, thor (Linux arm64)
-#   RLLM_INSTALL_DIR - destination directory (default: /usr/local/bin)
+#   OXYDLLM_CHANNEL     - stable (default) or nightly
+#   OXYDLLM_VERSION     - install a specific version tag, e.g. v0.1.0 (ignored for nightly)
+#   OXYDLLM_NO_GPU      - set to 1 to force CPU binary on Linux
+#   OXYDLLM_CUDA_TARGET - auto (default), ada, hopper, blackwell, blackwell-ultra, blackwell-consumer (Linux x86_64);
+#                         hopper, blackwell, blackwell-ultra, thor (Linux arm64)
+#   OXYDLLM_INSTALL_DIR - destination directory (default: /usr/local/bin)
 
 main() {
 set -eu
 
-REPO="giovannifil-64/rllm"
+REPO="giovannifil-64/oxydllm"
 GITHUB_API="https://api.github.com/repos/${REPO}"
 GITHUB_RELEASES="https://github.com/${REPO}/releases"
 
-INSTALL_DIR="${RLLM_INSTALL_DIR:-/usr/local/bin}"
-CHANNEL="${RLLM_CHANNEL:-stable}"
-NO_GPU="${RLLM_NO_GPU:-0}"
-CUDA_TARGET_OVERRIDE="${RLLM_CUDA_TARGET:-auto}"
+INSTALL_DIR="${OXYDLLM_INSTALL_DIR:-/usr/local/bin}"
+CHANNEL="${OXYDLLM_CHANNEL:-stable}"
+NO_GPU="${OXYDLLM_NO_GPU:-0}"
+CUDA_TARGET_OVERRIDE="${OXYDLLM_CUDA_TARGET:-auto}"
 CUDA_TARGET=""
 
 say() {
@@ -154,7 +154,7 @@ detect_cuda_target() {
 install_systemd_service() {
     if ! available systemctl; then
         warn "systemd not found. The server was installed but not configured as a service."
-        warn "Start manually with: rllm start"
+        warn "Start manually with: oxydllm start"
         return
     fi
 
@@ -164,28 +164,28 @@ install_systemd_service() {
     if [ -z "${SERVICE_HOME}" ]; then
         SERVICE_HOME="${HOME}"
     fi
-    MODELS_DIR="${SERVICE_HOME}/.rllm/models"
+    MODELS_DIR="${SERVICE_HOME}/.oxydllm/models"
 
     say "Configuring systemd service as user '${SERVICE_USER}'..."
     as_root mkdir -p "${MODELS_DIR}"
-    as_root chown -R "${SERVICE_USER}:${SERVICE_GROUP}" "${SERVICE_HOME}/.rllm"
+    as_root chown -R "${SERVICE_USER}:${SERVICE_GROUP}" "${SERVICE_HOME}/.oxydllm"
 
-    if [ ! -f /etc/default/rllm ]; then
-        cat <<'ENVEOF' | as_root tee /etc/default/rllm >/dev/null
-# rLLM server configuration
-# RLLM_PORT=11313
-# RLLM_MAX_CONTEXT_LEN=4096
-# RLLM_KEEP_ALIVE=900
-# RLLM_MEMORY_BUDGET=
-# RLLM_KV_QUANT=off
-# RLLM_DEVICES=
+    if [ ! -f /etc/default/oxydllm ]; then
+        cat <<'ENVEOF' | as_root tee /etc/default/oxydllm >/dev/null
+# oxydLLM server configuration
+# OXYDLLM_PORT=11313
+# OXYDLLM_MAX_CONTEXT_LEN=4096
+# OXYDLLM_KEEP_ALIVE=900
+# OXYDLLM_MEMORY_BUDGET=
+# OXYDLLM_KV_QUANT=off
+# OXYDLLM_DEVICES=
 # RUST_LOG=warn
 ENVEOF
     fi
 
-    cat <<UNITEOF | as_root tee /etc/systemd/system/rllm.service >/dev/null
+    cat <<UNITEOF | as_root tee /etc/systemd/system/oxydllm.service >/dev/null
 [Unit]
-Description=rLLM inference server
+Description=oxydLLM inference server
 After=network-online.target
 Wants=network-online.target
 
@@ -195,8 +195,8 @@ User=${SERVICE_USER}
 Group=${SERVICE_GROUP}
 Environment=HOME=${SERVICE_HOME}
 Environment=RUST_LOG=warn
-EnvironmentFile=-/etc/default/rllm
-ExecStart=${INSTALL_DIR}/rllm start --models-dir ${MODELS_DIR}
+EnvironmentFile=-/etc/default/oxydllm
+ExecStart=${INSTALL_DIR}/oxydllm start --models-dir ${MODELS_DIR}
 Restart=always
 RestartSec=3
 LimitNOFILE=65536
@@ -209,14 +209,14 @@ UNITEOF
     case "${SYSTEMCTL_STATE}" in
         running|degraded)
             as_root systemctl daemon-reload
-            as_root systemctl enable rllm >/dev/null 2>&1
-            as_root systemctl restart rllm
+            as_root systemctl enable oxydllm >/dev/null 2>&1
+            as_root systemctl restart oxydllm
             say "systemd service installed and started."
             ;;
         *)
             warn "systemd is not fully running (state: ${SYSTEMCTL_STATE:-unknown})."
             warn "Service file installed but not started automatically."
-            warn "Start manually with: sudo systemctl start rllm"
+            warn "Start manually with: sudo systemctl start oxydllm"
             ;;
     esac
 }
@@ -228,10 +228,10 @@ install_launchd_agent() {
         return
     fi
 
-    MODELS_DIR="${HOME}/.rllm/models"
-    LOG_DIR="${HOME}/.rllm/logs"
-    PLIST_PATH="${HOME}/Library/LaunchAgents/com.rllm.rllmd.plist"
-    LABEL="com.rllm.rllmd"
+    MODELS_DIR="${HOME}/.oxydllm/models"
+    LOG_DIR="${HOME}/.oxydllm/logs"
+    PLIST_PATH="${HOME}/Library/LaunchAgents/com.oxydllm.oxydllmd.plist"
+    LABEL="com.oxydllm.oxydllmd"
     GUI_DOMAIN="gui/$(id -u)"
 
     mkdir -p "${MODELS_DIR}" "${LOG_DIR}" "$(dirname "${PLIST_PATH}")"
@@ -248,7 +248,7 @@ install_launchd_agent() {
 
     <key>ProgramArguments</key>
     <array>
-        <string>${INSTALL_DIR}/rllm</string>
+        <string>${INSTALL_DIR}/oxydllm</string>
         <string>start</string>
         <string>--models-dir</string>
         <string>${MODELS_DIR}</string>
@@ -264,9 +264,9 @@ install_launchd_agent() {
     </dict>
 
     <key>StandardOutPath</key>
-    <string>${LOG_DIR}/rllm.log</string>
+    <string>${LOG_DIR}/oxydllm.log</string>
     <key>StandardErrorPath</key>
-    <string>${LOG_DIR}/rllm.log</string>
+    <string>${LOG_DIR}/oxydllm.log</string>
 
     <key>EnvironmentVariables</key>
     <dict>
@@ -300,7 +300,7 @@ case "${OS}" in
     Darwin)
         case "${ARCH}" in
             arm64) PLATFORM="macos-arm64" ;;
-            *) err "rLLM supports only Apple Silicon (arm64) on macOS." ;;
+            *) err "oxydLLM supports only Apple Silicon (arm64) on macOS." ;;
         esac
         ;;
     Linux)
@@ -319,7 +319,7 @@ case "${OS}" in
                                 CUDA_TARGET="${CUDA_TARGET_OVERRIDE}"
                                 ;;
                             *)
-                                warn "Invalid RLLM_CUDA_TARGET='${CUDA_TARGET_OVERRIDE}'. Using auto detection."
+                                warn "Invalid OXYDLLM_CUDA_TARGET='${CUDA_TARGET_OVERRIDE}'. Using auto detection."
                                 CUDA_TARGET="$(detect_cuda_target || true)"
                                 ;;
                         esac
@@ -340,7 +340,7 @@ case "${OS}" in
                                 warn "NVIDIA GPU compute capability (${CAP_RAW:-unknown}) is newer than the"
                                 warn "supported x86_64 targets (Ada 8.9 / Hopper 9.x / Blackwell 10.x / Ultra 10.3+ / 12.x consumer)."
                                 warn "Falling back to CPU build."
-                                warn "Override with RLLM_CUDA_TARGET=<ada|hopper|blackwell|blackwell-ultra|blackwell-consumer>"
+                                warn "Override with OXYDLLM_CUDA_TARGET=<ada|hopper|blackwell|blackwell-ultra|blackwell-consumer>"
                                 warn "at your own risk, or build from source with CUDA_COMPUTE_CAP=<target>."
                                 PLATFORM="linux-x86_64-cpu"
                                 ;;
@@ -377,7 +377,7 @@ case "${OS}" in
                                 CUDA_TARGET="${CUDA_TARGET_OVERRIDE}"
                                 ;;
                             *)
-                                warn "Invalid RLLM_CUDA_TARGET='${CUDA_TARGET_OVERRIDE}' for ARM64. Using auto detection."
+                                warn "Invalid OXYDLLM_CUDA_TARGET='${CUDA_TARGET_OVERRIDE}' for ARM64. Using auto detection."
                                 warn "Valid ARM64 CUDA targets: hopper, blackwell, blackwell-ultra, thor"
                                 CUDA_TARGET="$(detect_cuda_target || true)"
                                 ;;
@@ -395,7 +395,7 @@ case "${OS}" in
                                 warn "NVIDIA GPU compute capability (${CAP_RAW:-unknown}) is newer than the"
                                 warn "supported ARM64 targets (Hopper 9.x / Blackwell 10.x / Ultra 10.3+ / Thor 11.x)."
                                 warn "Falling back to CPU build."
-                                warn "Override with RLLM_CUDA_TARGET=<hopper|blackwell|blackwell-ultra|thor>"
+                                warn "Override with OXYDLLM_CUDA_TARGET=<hopper|blackwell|blackwell-ultra|thor>"
                                 warn "at your own risk, or build from source with CUDA_COMPUTE_CAP=<target>."
                                 PLATFORM="linux-arm64-cpu"
                                 ;;
@@ -407,7 +407,7 @@ case "${OS}" in
                             *)
                                 warn "No ARM64 build for detected target '${CUDA_TARGET}'. Falling back to CPU build."
                                 warn "Supported ARM64 CUDA targets: hopper, blackwell, blackwell-ultra, thor"
-                                warn "Override with RLLM_CUDA_TARGET=<hopper|blackwell|blackwell-ultra|thor>"
+                                warn "Override with OXYDLLM_CUDA_TARGET=<hopper|blackwell|blackwell-ultra|thor>"
                                 PLATFORM="linux-arm64-cpu"
                                 ;;
                         esac
@@ -431,67 +431,67 @@ esac
 
 case "${CHANNEL}" in
     nightly)
-        RLLM_VERSION="nightly"
+        OXYDLLM_VERSION="nightly"
         say "Installing nightly (${PLATFORM})..."
         ;;
     stable)
-        if [ -n "${RLLM_VERSION:-}" ]; then
-            say "Installing ${RLLM_VERSION} (${PLATFORM})..."
+        if [ -n "${OXYDLLM_VERSION:-}" ]; then
+            say "Installing ${OXYDLLM_VERSION} (${PLATFORM})..."
         else
             say "Fetching latest stable release..."
-            RLLM_VERSION="$(
+            OXYDLLM_VERSION="$(
                 curl -fsSL "${GITHUB_API}/releases/latest" \
                 | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
                 | head -1
             )"
-            [ -n "${RLLM_VERSION}" ] || err "Could not determine latest release tag. Set RLLM_VERSION manually."
-            say "Installing ${RLLM_VERSION} (${PLATFORM})..."
+            [ -n "${OXYDLLM_VERSION}" ] || err "Could not determine latest release tag. Set OXYDLLM_VERSION manually."
+            say "Installing ${OXYDLLM_VERSION} (${PLATFORM})..."
         fi
         ;;
     *)
-        err "RLLM_CHANNEL must be 'stable' or 'nightly'."
+        err "OXYDLLM_CHANNEL must be 'stable' or 'nightly'."
         ;;
 esac
 
-BASE_URL="${GITHUB_RELEASES}/download/${RLLM_VERSION}"
+BASE_URL="${GITHUB_RELEASES}/download/${OXYDLLM_VERSION}"
 
 case "${PLATFORM}" in
     linux-x86_64-cuda-ada)
-        # Legacy archive (rllm-linux-x86_64-cuda.tar.gz) is built from the same
+        # Legacy archive (oxydllm-linux-x86_64-cuda.tar.gz) is built from the same
         # sm_89 sources as cuda-ada, so it is safe as a fallback.
-        CANDIDATE_TARBALLS="rllm-linux-x86_64-cuda-ada.tar.gz rllm-linux-x86_64-cuda.tar.gz"
+        CANDIDATE_TARBALLS="oxydllm-linux-x86_64-cuda-ada.tar.gz oxydllm-linux-x86_64-cuda.tar.gz"
         ;;
     linux-x86_64-cuda-hopper)
         # No cross-generation fallback: sm_89 SASS does NOT reliably run on
         # sm_90 hardware without PTX embedding, which candle-kernels omits.
-        CANDIDATE_TARBALLS="rllm-linux-x86_64-cuda-hopper.tar.gz"
+        CANDIDATE_TARBALLS="oxydllm-linux-x86_64-cuda-hopper.tar.gz"
         ;;
     linux-x86_64-cuda-blackwell)
         # Same reasoning: sm_90/sm_89 SASS is not guaranteed on sm_100.
-        CANDIDATE_TARBALLS="rllm-linux-x86_64-cuda-blackwell.tar.gz"
+        CANDIDATE_TARBALLS="oxydllm-linux-x86_64-cuda-blackwell.tar.gz"
         ;;
     linux-x86_64-cuda-blackwell-ultra)
         # sm_103 SASS is not guaranteed on sm_100 hardware.
-        CANDIDATE_TARBALLS="rllm-linux-x86_64-cuda-blackwell-ultra.tar.gz"
+        CANDIDATE_TARBALLS="oxydllm-linux-x86_64-cuda-blackwell-ultra.tar.gz"
         ;;
     linux-x86_64-cuda-blackwell-consumer)
         # sm_120 is architecture-specific and not guaranteed on any other target.
-        CANDIDATE_TARBALLS="rllm-linux-x86_64-cuda-blackwell-consumer.tar.gz"
+        CANDIDATE_TARBALLS="oxydllm-linux-x86_64-cuda-blackwell-consumer.tar.gz"
         ;;
     linux-arm64-cuda-hopper)
-        CANDIDATE_TARBALLS="rllm-linux-arm64-cuda-hopper.tar.gz"
+        CANDIDATE_TARBALLS="oxydllm-linux-arm64-cuda-hopper.tar.gz"
         ;;
     linux-arm64-cuda-blackwell)
-        CANDIDATE_TARBALLS="rllm-linux-arm64-cuda-blackwell.tar.gz"
+        CANDIDATE_TARBALLS="oxydllm-linux-arm64-cuda-blackwell.tar.gz"
         ;;
     linux-arm64-cuda-blackwell-ultra)
-        CANDIDATE_TARBALLS="rllm-linux-arm64-cuda-blackwell-ultra.tar.gz"
+        CANDIDATE_TARBALLS="oxydllm-linux-arm64-cuda-blackwell-ultra.tar.gz"
         ;;
     linux-arm64-cuda-thor)
-        CANDIDATE_TARBALLS="rllm-linux-arm64-cuda-thor.tar.gz"
+        CANDIDATE_TARBALLS="oxydllm-linux-arm64-cuda-thor.tar.gz"
         ;;
     *)
-        CANDIDATE_TARBALLS="rllm-${PLATFORM}.tar.gz"
+        CANDIDATE_TARBALLS="oxydllm-${PLATFORM}.tar.gz"
         ;;
 esac
 
@@ -545,11 +545,11 @@ if [ -z "${TARBALL}" ]; then
 
     case "${PLATFORM}" in
         linux-x86_64-cuda-hopper|linux-x86_64-cuda-blackwell|linux-x86_64-cuda-blackwell-ultra|linux-x86_64-cuda-blackwell-consumer|linux-arm64-cuda-hopper|linux-arm64-cuda-blackwell|linux-arm64-cuda-blackwell-ultra|linux-arm64-cuda-thor)
-            err "No compatible binary for ${PLATFORM} in release ${RLLM_VERSION}.
+            err "No compatible binary for ${PLATFORM} in release ${OXYDLLM_VERSION}.
 This release may predate multi-architecture CUDA builds.
 Options:
-  - Try a newer release: RLLM_VERSION=<newer-tag> ... install.sh
-  - Use the nightly channel: RLLM_CHANNEL=nightly ... install.sh
+  - Try a newer release: OXYDLLM_VERSION=<newer-tag> ... install.sh
+  - Use the nightly channel: OXYDLLM_CHANNEL=nightly ... install.sh
   - Build from source with CUDA_COMPUTE_CAP=${BUILD_CAP}"
             ;;
         *)
@@ -579,17 +579,17 @@ say "Verifying checksum..."
 
 say "Extracting archive..."
 tar -xzf "${TMPDIR}/${TARBALL}" -C "${TMPDIR}"
-[ -f "${TMPDIR}/rllm" ] || err "Binary 'rllm' not found in archive."
-chmod +x "${TMPDIR}/rllm"
+[ -f "${TMPDIR}/oxydllm" ] || err "Binary 'oxydllm' not found in archive."
+chmod +x "${TMPDIR}/oxydllm"
 
-if [ "${OS}" = "Linux" ] && available systemctl && systemctl list-unit-files 2>/dev/null | grep -q '^rllm\.service'; then
-    if as_root systemctl is-active --quiet rllm 2>/dev/null; then
-        say "Stopping running rllm service for upgrade..."
-        as_root systemctl stop rllm || true
+if [ "${OS}" = "Linux" ] && available systemctl && systemctl list-unit-files 2>/dev/null | grep -q '^oxydllm\.service'; then
+    if as_root systemctl is-active --quiet oxydllm 2>/dev/null; then
+        say "Stopping running oxydllm service for upgrade..."
+        as_root systemctl stop oxydllm || true
     fi
-elif [ "${OS}" = "Darwin" ] && [ -f "${HOME}/Library/LaunchAgents/com.rllm.rllmd.plist" ]; then
-    say "Stopping running rllm launchd agent for upgrade..."
-    launchctl bootout "gui/$(id -u)" "${HOME}/Library/LaunchAgents/com.rllm.rllmd.plist" 2>/dev/null || true
+elif [ "${OS}" = "Darwin" ] && [ -f "${HOME}/Library/LaunchAgents/com.oxydllm.oxydllmd.plist" ]; then
+    say "Stopping running oxydllm launchd agent for upgrade..."
+    launchctl bootout "gui/$(id -u)" "${HOME}/Library/LaunchAgents/com.oxydllm.oxydllmd.plist" 2>/dev/null || true
 fi
 
 if [ ! -d "${INSTALL_DIR}" ]; then
@@ -600,12 +600,12 @@ if [ ! -d "${INSTALL_DIR}" ]; then
     fi
 fi
 
-DEST="${INSTALL_DIR}/rllm"
+DEST="${INSTALL_DIR}/oxydllm"
 if [ -w "${INSTALL_DIR}" ]; then
-    mv "${TMPDIR}/rllm" "${DEST}"
+    mv "${TMPDIR}/oxydllm" "${DEST}"
 else
     say "Installing to ${INSTALL_DIR} (may ask for password)..."
-    as_root mv "${TMPDIR}/rllm" "${DEST}"
+    as_root mv "${TMPDIR}/oxydllm" "${DEST}"
 fi
 chmod +x "${DEST}" 2>/dev/null || as_root chmod +x "${DEST}"
 
@@ -618,7 +618,7 @@ fi
 INSTALLED_VER="$(${DEST} --version 2>/dev/null | head -1 || echo unknown)"
 
 echo ""
-say "rLLM installed successfully."
+say "oxydLLM installed successfully."
 echo ""
 echo "Binary  : ${DEST}"
 echo "Version : ${INSTALLED_VER}"
@@ -629,23 +629,23 @@ echo ""
 
 if [ "${OS}" = "Linux" ] && available systemctl; then
     echo "Service management:"
-    echo "  sudo systemctl status rllm"
-    echo "  sudo systemctl restart rllm"
-    echo "  sudo systemctl stop rllm"
-    echo "  sudo journalctl -u rllm -f"
+    echo "  sudo systemctl status oxydllm"
+    echo "  sudo systemctl restart oxydllm"
+    echo "  sudo systemctl stop oxydllm"
+    echo "  sudo journalctl -u oxydllm -f"
     echo ""
 elif [ "${OS}" = "Darwin" ]; then
     echo "launchd service management:"
-    echo "  launchctl kickstart -k gui/$(id -u)/com.rllm.rllmd"
-    echo "  launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.rllm.rllmd.plist"
-    echo "  launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.rllm.rllmd.plist"
-    echo "Logs: ~/.rllm/logs/rllm.log"
+    echo "  launchctl kickstart -k gui/$(id -u)/com.oxydllm.oxydllmd"
+    echo "  launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.oxydllm.oxydllmd.plist"
+    echo "  launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.oxydllm.oxydllmd.plist"
+    echo "Logs: ~/.oxydllm/logs/oxydllm.log"
     echo ""
 fi
 
 echo "Quick start:"
-echo "  rllm pull Qwen/Qwen3-0.6B"
-echo "  rllm run Qwen3-0.6B"
+echo "  oxydllm pull Qwen/Qwen3-0.6B"
+echo "  oxydllm run Qwen3-0.6B"
 echo ""
 
 case ":${PATH}:" in

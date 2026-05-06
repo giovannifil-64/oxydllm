@@ -1914,6 +1914,32 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
 
 [[package]]
+name = "oxydllm"
+version = "0.0.0-alpha.9"
+dependencies = [
+ "anyhow",
+ "axum",
+ "candle-core",
+ "candle-metal-kernels",
+ "chrono",
+ "lru",
+ "minijinja",
+ "minijinja-contrib",
+ "objc2-metal",
+ "reqwest",
+ "rustc-hash",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokenizers",
+ "tokio",
+ "tokio-stream",
+ "tower",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "paste"
 version = "1.0.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2246,32 +2272,6 @@ dependencies = [
  "libc",
  "untrusted",
  "windows-sys 0.52.0",
-]
-
-[[package]]
-name = "rllm"
-version = "0.0.0-alpha.9"
-dependencies = [
- "anyhow",
- "axum",
- "candle-core",
- "candle-metal-kernels",
- "chrono",
- "lru",
- "minijinja",
- "minijinja-contrib",
- "objc2-metal",
- "reqwest",
- "rustc-hash",
- "serde",
- "serde_json",
- "tempfile",
- "tokenizers",
- "tokio",
- "tokio-stream",
- "tower",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]

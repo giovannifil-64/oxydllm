@@ -59,22 +59,22 @@ jobs:
         run: cargo build --release
 
       - name: Strip binary (macOS release artifact)
-        run: strip -x target/release/rllm
+        run: strip -x target/release/oxydllm
 
       - name: Package binary
         run: |
           cd target/release
-          tar -czf ../../rllm-macos-arm64.tar.gz rllm
+          tar -czf ../../oxydllm-macos-arm64.tar.gz oxydllm
           cd ../..
-          shasum -a 256 rllm-macos-arm64.tar.gz > rllm-macos-arm64.tar.gz.sha256
+          shasum -a 256 oxydllm-macos-arm64.tar.gz > oxydllm-macos-arm64.tar.gz.sha256
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
-          name: rllm-macos-arm64
+          name: oxydllm-macos-arm64
           path: |
-            rllm-macos-arm64.tar.gz
-            rllm-macos-arm64.tar.gz.sha256
+            oxydllm-macos-arm64.tar.gz
+            oxydllm-macos-arm64.tar.gz.sha256
           retention-days: 7
 
   # ── Linux CPU ───────────────────────────────────────────────────────────────
@@ -109,22 +109,22 @@ jobs:
         run: cargo build --release --no-default-features
 
       - name: Strip binary (Linux CPU release artifact)
-        run: strip --strip-unneeded target/release/rllm
+        run: strip --strip-unneeded target/release/oxydllm
 
       - name: Package binary
         run: |
           cd target/release
-          tar -czf ../../rllm-linux-x86_64-cpu.tar.gz rllm
+          tar -czf ../../oxydllm-linux-x86_64-cpu.tar.gz oxydllm
           cd ../..
-          sha256sum rllm-linux-x86_64-cpu.tar.gz > rllm-linux-x86_64-cpu.tar.gz.sha256
+          sha256sum oxydllm-linux-x86_64-cpu.tar.gz > oxydllm-linux-x86_64-cpu.tar.gz.sha256
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
-          name: rllm-linux-x86_64-cpu
+          name: oxydllm-linux-x86_64-cpu
           path: |
-            rllm-linux-x86_64-cpu.tar.gz
-            rllm-linux-x86_64-cpu.tar.gz.sha256
+            oxydllm-linux-x86_64-cpu.tar.gz
+            oxydllm-linux-x86_64-cpu.tar.gz.sha256
           retention-days: 7
 
   # ── Linux CUDA ──────────────────────────────────────────────────────────────
@@ -190,38 +190,38 @@ jobs:
         run: cargo build --release --no-default-features --features cuda
 
       - name: Strip binary (Linux CUDA release artifact)
-        run: strip --strip-unneeded target/release/rllm
+        run: strip --strip-unneeded target/release/oxydllm
 
       - name: Package binary
         run: |
           cd target/release
-          TAR_NAME="rllm-linux-x86_64-${{ matrix.variant.tar_suffix }}.tar.gz"
-          tar -czf ../../"${TAR_NAME}" rllm
+          TAR_NAME="oxydllm-linux-x86_64-${{ matrix.variant.tar_suffix }}.tar.gz"
+          tar -czf ../../"${TAR_NAME}" oxydllm
           cd ../..
           sha256sum "${TAR_NAME}" > "${TAR_NAME}.sha256"
 
           if [ "${{ matrix.variant.legacy_alias }}" = "true" ]; then
-            cp "${TAR_NAME}" rllm-linux-x86_64-cuda.tar.gz
-            sha256sum rllm-linux-x86_64-cuda.tar.gz > rllm-linux-x86_64-cuda.tar.gz.sha256
+            cp "${TAR_NAME}" oxydllm-linux-x86_64-cuda.tar.gz
+            sha256sum oxydllm-linux-x86_64-cuda.tar.gz > oxydllm-linux-x86_64-cuda.tar.gz.sha256
           fi
 
       - name: Upload CUDA target artifact
         uses: actions/upload-artifact@v7
         with:
-          name: rllm-linux-x86_64-${{ matrix.variant.tar_suffix }}
+          name: oxydllm-linux-x86_64-${{ matrix.variant.tar_suffix }}
           path: |
-            rllm-linux-x86_64-${{ matrix.variant.tar_suffix }}.tar.gz
-            rllm-linux-x86_64-${{ matrix.variant.tar_suffix }}.tar.gz.sha256
+            oxydllm-linux-x86_64-${{ matrix.variant.tar_suffix }}.tar.gz
+            oxydllm-linux-x86_64-${{ matrix.variant.tar_suffix }}.tar.gz.sha256
           retention-days: 7
 
       - name: Upload CUDA legacy artifact alias (sm_89)
         if: matrix.variant.legacy_alias
         uses: actions/upload-artifact@v7
         with:
-          name: rllm-linux-x86_64-cuda
+          name: oxydllm-linux-x86_64-cuda
           path: |
-            rllm-linux-x86_64-cuda.tar.gz
-            rllm-linux-x86_64-cuda.tar.gz.sha256
+            oxydllm-linux-x86_64-cuda.tar.gz
+            oxydllm-linux-x86_64-cuda.tar.gz.sha256
           retention-days: 7
 
   # ── Linux arm64 CPU ─────────────────────────────────────────────────────────
@@ -256,22 +256,22 @@ jobs:
         run: cargo build --release --no-default-features
 
       - name: Strip binary (Linux arm64 CPU release artifact)
-        run: strip --strip-unneeded target/release/rllm
+        run: strip --strip-unneeded target/release/oxydllm
 
       - name: Package binary
         run: |
           cd target/release
-          tar -czf ../../rllm-linux-arm64-cpu.tar.gz rllm
+          tar -czf ../../oxydllm-linux-arm64-cpu.tar.gz oxydllm
           cd ../..
-          sha256sum rllm-linux-arm64-cpu.tar.gz > rllm-linux-arm64-cpu.tar.gz.sha256
+          sha256sum oxydllm-linux-arm64-cpu.tar.gz > oxydllm-linux-arm64-cpu.tar.gz.sha256
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
-          name: rllm-linux-arm64-cpu
+          name: oxydllm-linux-arm64-cpu
           path: |
-            rllm-linux-arm64-cpu.tar.gz
-            rllm-linux-arm64-cpu.tar.gz.sha256
+            oxydllm-linux-arm64-cpu.tar.gz
+            oxydllm-linux-arm64-cpu.tar.gz.sha256
           retention-days: 7
 
   # ── Linux arm64 CUDA ────────────────────────────────────────────────────────
@@ -329,21 +329,21 @@ jobs:
         run: cargo build --release --no-default-features --features cuda
 
       - name: Strip binary (Linux arm64 CUDA release artifact)
-        run: strip --strip-unneeded target/release/rllm
+        run: strip --strip-unneeded target/release/oxydllm
 
       - name: Package binary
         run: |
-          TAR_NAME="rllm-linux-arm64-${{ matrix.variant.tar_suffix }}.tar.gz"
-          cd target/release && tar -czf ../../"${TAR_NAME}" rllm && cd ../..
+          TAR_NAME="oxydllm-linux-arm64-${{ matrix.variant.tar_suffix }}.tar.gz"
+          cd target/release && tar -czf ../../"${TAR_NAME}" oxydllm && cd ../..
           sha256sum "${TAR_NAME}" > "${TAR_NAME}.sha256"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
-          name: rllm-linux-arm64-${{ matrix.variant.tar_suffix }}
+          name: oxydllm-linux-arm64-${{ matrix.variant.tar_suffix }}
           path: |
-            rllm-linux-arm64-${{ matrix.variant.tar_suffix }}.tar.gz
-            rllm-linux-arm64-${{ matrix.variant.tar_suffix }}.tar.gz.sha256
+            oxydllm-linux-arm64-${{ matrix.variant.tar_suffix }}.tar.gz
+            oxydllm-linux-arm64-${{ matrix.variant.tar_suffix }}.tar.gz.sha256
           retention-days: 7
 
   # ── Docker CPU ──────────────────────────────────────────────────────────────

@@ -246,7 +246,7 @@ pub fn pull(config: &PullConfig) -> anyhow::Result<()> {
 
     let client = reqwest::blocking::Client::builder()
         .timeout(None)
-        .user_agent(concat!("rllm/", env!("CARGO_PKG_VERSION")))
+        .user_agent(concat!("oxydllm/", env!("CARGO_PKG_VERSION")))
         .build()?;
 
     print!("Fetching file list...");
@@ -623,14 +623,14 @@ fn check_status(status: u16, repo_id: &str) -> anyhow::Result<()> {
         401 => anyhow::bail!(
             "Authentication required for '{repo_id}'.\n\
              Create a token at https://huggingface.co/settings/tokens, then:\n\
-               rllm pull {repo_id} --token <TOKEN>\n\
+               oxydllm pull {repo_id} --token <TOKEN>\n\
              or set the HF_TOKEN environment variable."
         ),
         403 => anyhow::bail!(
             "Access denied to '{repo_id}' — this model requires accepting a license.\n\
              1. Visit https://huggingface.co/{repo_id} and accept the terms\n\
              2. Create a token at https://huggingface.co/settings/tokens\n\
-             3. Run:  rllm pull {repo_id} --token <TOKEN>"
+             3. Run:  oxydllm pull {repo_id} --token <TOKEN>"
         ),
         404 => anyhow::bail!("Model '{repo_id}' not found on HuggingFace."),
         code => anyhow::bail!("HuggingFace returned HTTP {}.", code),

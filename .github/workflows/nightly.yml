@@ -91,7 +91,7 @@ jobs:
         uses: actions/download-artifact@v8
         with:
           path: dist/
-          pattern: rllm-*
+          pattern: oxydllm-*
           merge-multiple: true
 
       - name: List artifacts
@@ -141,31 +141,31 @@ jobs:
 
             **macOS (Apple Silicon)**
             ```bash
-            curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/main/install.sh | RLLM_CHANNEL=nightly sh
+            curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/main/install.sh | OXYDLLM_CHANNEL=nightly sh
             ```
 
             **Linux x86_64 (CUDA)**
             ```bash
-            curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/main/install.sh | RLLM_CHANNEL=nightly sh
+            curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/main/install.sh | OXYDLLM_CHANNEL=nightly sh
             ```
 
             **Linux arm64 (CUDA — GH200 / DGX Spark / GB300 / Jetson Thor)**
             ```bash
-            curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/main/install.sh | RLLM_CHANNEL=nightly sh
+            curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/main/install.sh | OXYDLLM_CHANNEL=nightly sh
             ```
 
             Installer auto-selects the right CUDA target from detected GPU compute capability.
-            Override with `RLLM_CUDA_TARGET`: x86_64 values: `ada`, `hopper`, `blackwell`, `blackwell-ultra`, `blackwell-consumer`; arm64 values: `hopper`, `blackwell`, `blackwell-ultra`, `thor`.
+            Override with `OXYDLLM_CUDA_TARGET`: x86_64 values: `ada`, `hopper`, `blackwell`, `blackwell-ultra`, `blackwell-consumer`; arm64 values: `hopper`, `blackwell`, `blackwell-ultra`, `thor`.
 
             **Linux (CPU)**
             ```bash
-            curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/main/install.sh | RLLM_CHANNEL=nightly RLLM_NO_GPU=1 sh
+            curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/main/install.sh | OXYDLLM_CHANNEL=nightly OXYDLLM_NO_GPU=1 sh
             ```
 
             **Docker (CUDA)**
             ```bash
             docker run --gpus all -p 11313:11313 \
-              -v ~/.rllm/models:/root/.rllm/models \
+              -v ~/.oxydllm/models:/root/.oxydllm/models \
               ghcr.io/${{ github.repository }}:nightly start
             ```
 
@@ -175,7 +175,7 @@ jobs:
             **Docker (CPU)**
             ```bash
             docker run -p 11313:11313 \
-              -v ~/.rllm/models:/root/.rllm/models \
+              -v ~/.oxydllm/models:/root/.oxydllm/models \
               ghcr.io/${{ github.repository }}:nightly-cpu start
             ```
   cleanup-ghcr:
@@ -187,7 +187,7 @@ jobs:
     steps:
       - uses: actions/delete-package-versions@v5
         with:
-          package-name: rllm
+          package-name: oxydllm
           package-type: container
           min-versions-to-keep: 0
           delete-only-untagged-versions: true

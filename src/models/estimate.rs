@@ -3,10 +3,10 @@
 // ─────────────────────────────────────────────────────────────────────────────
 //
 // Usage:
-//   rllm estimate <model-name>                    # local model in models_dir
-//   rllm estimate <user/repo>                     # remote HF repo (no download)
-//   rllm estimate <model> --context-len 8192      # custom context length
-//   rllm estimate <model> --num-sequences 4       # concurrent sequences
+//   oxydllm estimate <model-name>                    # local model in models_dir
+//   oxydllm estimate <user/repo>                     # remote HF repo (no download)
+//   oxydllm estimate <model> --context-len 8192      # custom context length
+//   oxydllm estimate <model> --num-sequences 4       # concurrent sequences
 //
 // For local GGUF models, only the file header is parsed — the full quantized
 // weight data is NOT loaded into memory, making this command instant.
@@ -172,7 +172,7 @@ fn estimate_remote(
 ) -> Result<()> {
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
-        .user_agent(concat!("rllm/", env!("CARGO_PKG_VERSION")))
+        .user_agent(concat!("oxydllm/", env!("CARGO_PKG_VERSION")))
         .build()?;
 
     print!("  Fetching file list for {}...", repo_id);

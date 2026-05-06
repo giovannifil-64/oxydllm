@@ -90,7 +90,7 @@ pub enum GetResult {
 }
 
 pub fn registry_path(models_dir: &Path) -> PathBuf {
-    models_dir.join(".rllm_registry.json")
+    models_dir.join(".oxydllm_registry.json")
 }
 
 pub fn load_registry(models_dir: &Path) -> BTreeMap<String, RegistryEntry> {

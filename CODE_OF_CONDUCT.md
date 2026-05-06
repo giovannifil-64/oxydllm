@@ -59,7 +59,7 @@ representative at an online or offline event.
 ## Enforcement
 
 Instances of abusive, harassing, or otherwise unacceptable behavior may be
-reported via [GitHub Discussions](https://github.com/giovannifil-64/rllm/discussions).
+reported via [GitHub Discussions](https://github.com/giovannifil-64/oxydllm/discussions).
 All complaints will be reviewed and investigated promptly and fairly.
 
 All community leaders are obligated to respect the privacy and security of the

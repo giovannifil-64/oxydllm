@@ -1,21 +1,21 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# rLLM — CUDA image (Linux x86_64 + arm64, Ada / Hopper / Blackwell / Thor)
+# oxydLLM — CUDA image (Linux x86_64 + arm64, Ada / Hopper / Blackwell / Thor)
 #
 # Build (x86_64):
-#   docker build -t rllm:cuda-ada --build-arg CUDA_ARCH=89 .
-#   docker build -t rllm:cuda-hopper --build-arg CUDA_ARCH=90 .
-#   docker build -t rllm:cuda-blackwell --build-arg CUDA_ARCH=100 .
-#   docker build -t rllm:cuda-blackwell-ultra --build-arg CUDA_ARCH=103 .
-#   docker build -t rllm:cuda-blackwell-consumer --build-arg CUDA_ARCH=120 .
+#   docker build -t oxydllm:cuda-ada --build-arg CUDA_ARCH=89 .
+#   docker build -t oxydllm:cuda-hopper --build-arg CUDA_ARCH=90 .
+#   docker build -t oxydllm:cuda-blackwell --build-arg CUDA_ARCH=100 .
+#   docker build -t oxydllm:cuda-blackwell-ultra --build-arg CUDA_ARCH=103 .
+#   docker build -t oxydllm:cuda-blackwell-consumer --build-arg CUDA_ARCH=120 .
 #
 # Build (arm64 — DGX Spark / GH200 / GB300 / Jetson Thor):
-#   docker buildx build --platform linux/arm64 -t rllm:cuda-blackwell-arm64 --build-arg CUDA_ARCH=100 .
-#   docker buildx build --platform linux/arm64 -t rllm:cuda-thor-arm64 --build-arg CUDA_ARCH=110 .
+#   docker buildx build --platform linux/arm64 -t oxydllm:cuda-blackwell-arm64 --build-arg CUDA_ARCH=100 .
+#   docker buildx build --platform linux/arm64 -t oxydllm:cuda-thor-arm64 --build-arg CUDA_ARCH=110 .
 #
 # Run:
 #   docker run --gpus all -p 11313:11313 \
-#     -v ~/.rllm/models:/root/.rllm/models \
-#     rllm:cuda start
+#     -v ~/.oxydllm/models:/root/.oxydllm/models \
+#     oxydllm:cuda start
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── Stage 1: build ───────────────────────────────────────────────────────────
@@ -64,14 +64,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libssl3 ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /app/target/release/rllm /usr/local/bin/rllm
-RUN chmod +x /usr/local/bin/rllm
+COPY --from=builder /app/target/release/oxydllm /usr/local/bin/oxydllm
+RUN chmod +x /usr/local/bin/oxydllm
 
-VOLUME ["/root/.rllm/models"]
+VOLUME ["/root/.oxydllm/models"]
 EXPOSE 11313
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
     CMD curl -f http://localhost:11313/health || exit 1
 
-ENTRYPOINT ["rllm"]
-CMD ["start", "--models-dir", "/root/.rllm/models"]
+ENTRYPOINT ["oxydllm"]
+CMD ["start", "--models-dir", "/root/.oxydllm/models"]

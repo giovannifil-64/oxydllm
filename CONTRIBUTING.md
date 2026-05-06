@@ -1,4 +1,4 @@
-# Contributing to rLLM
+# Contributing to oxydLLM
 
 Thank you for your interest in contributing! Below is everything you need to get started.
 
@@ -11,8 +11,8 @@ Thank you for your interest in contributing! Below is everything you need to get
 ## Setting up the project
 
 ```bash
-git clone https://github.com/giovannifil-64/rllm.git
-cd rllm
+git clone https://github.com/giovannifil-64/oxydllm.git
+cd oxydllm
 git config core.hooksPath .githooks
 cargo build
 ```

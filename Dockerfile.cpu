@@ -1,13 +1,13 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# rLLM — CPU-only image (Linux x86_64, no GPU required)
+# oxydLLM — CPU-only image (Linux x86_64, no GPU required)
 #
 # Build:
-#   docker build -f Dockerfile.cpu -t rllm:cpu .
+#   docker build -f Dockerfile.cpu -t oxydllm:cpu .
 #
 # Run:
 #   docker run -p 11313:11313 \
-#     -v ~/.rllm/models:/root/.rllm/models \
-#     rllm:cpu start
+#     -v ~/.oxydllm/models:/root/.oxydllm/models \
+#     oxydllm:cpu start
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── Stage 1: build ───────────────────────────────────────────────────────────
@@ -47,14 +47,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libssl3 ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /app/target/release/rllm /usr/local/bin/rllm
-RUN chmod +x /usr/local/bin/rllm
+COPY --from=builder /app/target/release/oxydllm /usr/local/bin/oxydllm
+RUN chmod +x /usr/local/bin/oxydllm
 
-VOLUME ["/root/.rllm/models"]
+VOLUME ["/root/.oxydllm/models"]
 EXPOSE 11313
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
     CMD curl -f http://localhost:11313/health || exit 1
 
-ENTRYPOINT ["rllm"]
-CMD ["start", "--models-dir", "/root/.rllm/models"]
+ENTRYPOINT ["oxydllm"]
+CMD ["start", "--models-dir", "/root/.oxydllm/models"]

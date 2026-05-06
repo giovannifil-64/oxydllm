@@ -1,5 +1,5 @@
 // ─────────────────────────────────────────────────────────────────────────────
-// metal_ops.rs  — Metal-accelerated kernels for rLLM
+// metal_ops.rs  — Metal-accelerated kernels for oxydLLM
 // ─────────────────────────────────────────────────────────────────────────────
 //
 // All ops wrap candle-metal-kernels (already a project dependency) via

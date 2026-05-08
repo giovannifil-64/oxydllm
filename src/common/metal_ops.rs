@@ -6,17 +6,25 @@
 // candle's `CustomOp` traits, matching the same pattern used for SDPA.
 //
 // Kernels provided:
-//   • SDPA  — fused Flash-Attention (vector + full paths, GQA-native)
-//   • RMSNorm  — single-pass fused normalisation + scale
-//   • Softmax  — fused softmax over last dimension
-//   • RoPE     — fused rotary embedding (standard non-interleaved layout)
+//   • SDPA        — fused Flash-Attention (vector + full paths, GQA-native)
+//   • RMSNorm     — single-pass fused normalisation + scale
+//   • Softmax     — fused softmax over last dimension
+//   • RoPE        — fused rotary embedding (standard non-interleaved layout)
+//   • GatedSiLU   — fused silu(gate)*up from a single interleaved [*, 2N] tensor
+//   • SiLU-Mul    — fused silu(gate)*up from two separate contiguous tensors
 // ─────────────────────────────────────────────────────────────────────────────
 
 use candle_core::{
     CpuStorage, CustomOp1, CustomOp2, CustomOp3, D, DType, Layout, MetalStorage, Result, Shape,
     Tensor, backend::BackendStorage,
 };
-use candle_metal_kernels::SdpaDType;
+use candle_metal_kernels::{
+    SdpaDType,
+    metal::{ComputeCommandEncoder, ComputePipeline},
+};
+use objc2_metal::{MTLResourceUsage, MTLSize};
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
 
 // ─── SDPA ────────────────────────────────────────────────────────────────────
 
@@ -463,6 +471,227 @@ impl CustomOp3 for RopeOp {
     }
 }
 
+// ─── FFN Fused Kernels ────────────────────────────────────────────────────────
+//
+// Two complementary kernels cover every FFN variant:
+//
+//   GatedSiluOp  — takes the combined matmul output [*, 2*N] produced by
+//                  Fused/Packed gate_up projections and computes
+//                  silu(gate)*up in a single pass, avoiding two extra
+//                  encoder creations and an intermediate buffer.
+//
+//   SiluMulOp    — takes two separate contiguous tensors [*, N] (from the
+//                  GGUF Separate path) and computes silu(gate)*up in-place.
+//
+// Both kernels promote F16/BF16 arithmetic to F32 for the SiLU computation
+// and cast back, matching the precision of the scalar fallback path.
+
+const FFN_METAL_SOURCE: &str = include_str!("ffn_kernels.metal");
+
+// Pipeline cache keyed by (device registry ID, kernel function name).
+// Compilation (first call per device+kernel) takes ~50-100 ms; subsequent
+// calls just clone the cached Arc-wrapped pipeline state.
+static FFN_PIPELINES: OnceLock<Mutex<HashMap<(u64, &'static str), ComputePipeline>>> =
+    OnceLock::new();
+
+fn get_or_compile_ffn_pipeline(
+    device: &candle_metal_kernels::metal::Device,
+    kernel_name: &'static str,
+) -> Result<ComputePipeline> {
+    let cache = FFN_PIPELINES.get_or_init(|| Mutex::new(HashMap::new()));
+    let key = (device.registry_id(), kernel_name);
+
+    let mut guard = cache
+        .lock()
+        .map_err(|e| candle_core::Error::Msg(format!("FFN pipeline cache poisoned: {e}")))?;
+
+    if let Some(p) = guard.get(&key) {
+        return Ok(p.clone());
+    }
+
+    let lib = device
+        .new_library_with_source(FFN_METAL_SOURCE, None)
+        .map_err(|e| candle_core::Error::Msg(format!("FFN Metal compile: {e}")))?;
+
+    let func = lib
+        .get_function(kernel_name, None)
+        .map_err(|e| candle_core::Error::Msg(format!("FFN kernel '{kernel_name}': {e}")))?;
+
+    let pipeline = device
+        .new_compute_pipeline_state_with_function(&func)
+        .map_err(|e| candle_core::Error::Msg(format!("FFN pipeline: {e}")))?;
+
+    guard.insert(key, pipeline.clone());
+    Ok(pipeline)
+}
+
+fn ffn_dispatch(pipeline: &ComputePipeline, encoder: &ComputeCommandEncoder, elem_count: usize) {
+    let tg_size = pipeline.max_total_threads_per_threadgroup().min(1024);
+    let tg_count = elem_count.div_ceil(tg_size);
+    encoder.dispatch_thread_groups(
+        MTLSize {
+            width: tg_count,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: tg_size,
+            height: 1,
+            depth: 1,
+        },
+    );
+}
+
+// ─── GatedSiluOp ─────────────────────────────────────────────────────────────
+//
+// Reads a single contiguous [*, 2*N] tensor where the first N columns are the
+// gate projection output and the second N are the up projection output.
+// Computes silu(gate) * up and writes [*, N].
+
+struct GatedSiluOp {
+    intermediate_size: usize,
+}
+
+impl CustomOp1 for GatedSiluOp {
+    fn name(&self) -> &'static str {
+        "metal-gated-silu"
+    }
+
+    fn cpu_fwd(&self, _s: &CpuStorage, _l: &Layout) -> Result<(CpuStorage, Shape)> {
+        candle_core::bail!("GatedSiluOp: Metal-only")
+    }
+
+    fn metal_fwd(&self, x: &MetalStorage, lx: &Layout) -> Result<(MetalStorage, Shape)> {
+        if !lx.is_contiguous() {
+            candle_core::bail!("GatedSiluOp: input must be contiguous");
+        }
+        let rank = lx.shape().rank();
+        let last_dim = lx.dims()[rank - 1];
+        if last_dim != 2 * self.intermediate_size {
+            candle_core::bail!(
+                "GatedSiluOp: last dim {last_dim} != 2*intermediate_size={}",
+                2 * self.intermediate_size
+            );
+        }
+
+        let out_elems = lx.shape().elem_count() / 2;
+        let mut out_dims = lx.dims().to_vec();
+        *out_dims.last_mut().unwrap() = self.intermediate_size;
+        let out_shape = Shape::from_dims(&out_dims);
+
+        let kernel_name: &'static str = match x.dtype() {
+            DType::F32 => "gated_silu_f32",
+            DType::F16 => "gated_silu_f16",
+            DType::BF16 => "gated_silu_bf16",
+            other => candle_core::bail!("GatedSiluOp: unsupported dtype {other:?}"),
+        };
+
+        let device = x.device();
+        let output = device.new_buffer(out_elems, x.dtype(), "gated_silu_out")?;
+        let pipeline = get_or_compile_ffn_pipeline(device.device(), kernel_name)?;
+        let encoder = device.command_encoder()?;
+
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(
+            0,
+            Some(x.buffer()),
+            lx.start_offset() * x.dtype().size_in_bytes(),
+        );
+        encoder.set_buffer(1, Some(&*output), 0);
+        encoder.set_bytes(2, &(out_elems as u32));
+        encoder.set_bytes(3, &(self.intermediate_size as u32));
+        encoder.use_resource(x.buffer(), MTLResourceUsage::Read);
+        encoder.use_resource(&*output, MTLResourceUsage::Write);
+        ffn_dispatch(&pipeline, &encoder, out_elems);
+
+        Ok((
+            MetalStorage::new(output, device.clone(), out_elems, x.dtype()),
+            out_shape,
+        ))
+    }
+}
+
+// ─── SiluMulOp ───────────────────────────────────────────────────────────────
+//
+// Takes two separate contiguous tensors `gate` and `up` of identical shape and
+// computes silu(gate[i]) * up[i] element-wise.
+
+struct SiluMulOp;
+
+impl CustomOp2 for SiluMulOp {
+    fn name(&self) -> &'static str {
+        "metal-silu-mul"
+    }
+
+    fn cpu_fwd(
+        &self,
+        _s1: &CpuStorage,
+        _l1: &Layout,
+        _s2: &CpuStorage,
+        _l2: &Layout,
+    ) -> Result<(CpuStorage, Shape)> {
+        candle_core::bail!("SiluMulOp: Metal-only")
+    }
+
+    fn metal_fwd(
+        &self,
+        gate: &MetalStorage,
+        lg: &Layout,
+        up: &MetalStorage,
+        lu: &Layout,
+    ) -> Result<(MetalStorage, Shape)> {
+        if !lg.is_contiguous() || !lu.is_contiguous() {
+            candle_core::bail!("SiluMulOp: both inputs must be contiguous");
+        }
+        if gate.dtype() != up.dtype() {
+            candle_core::bail!(
+                "SiluMulOp: dtype mismatch {:?} vs {:?}",
+                gate.dtype(),
+                up.dtype()
+            );
+        }
+        let elem_count = lg.shape().elem_count();
+        if elem_count != lu.shape().elem_count() {
+            candle_core::bail!("SiluMulOp: shape mismatch");
+        }
+
+        let kernel_name: &'static str = match gate.dtype() {
+            DType::F32 => "silu_mul_f32",
+            DType::F16 => "silu_mul_f16",
+            DType::BF16 => "silu_mul_bf16",
+            other => candle_core::bail!("SiluMulOp: unsupported dtype {other:?}"),
+        };
+
+        let device = gate.device();
+        let output = device.new_buffer(elem_count, gate.dtype(), "silu_mul_out")?;
+        let pipeline = get_or_compile_ffn_pipeline(device.device(), kernel_name)?;
+        let encoder = device.command_encoder()?;
+
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(
+            0,
+            Some(gate.buffer()),
+            lg.start_offset() * gate.dtype().size_in_bytes(),
+        );
+        encoder.set_buffer(
+            1,
+            Some(up.buffer()),
+            lu.start_offset() * up.dtype().size_in_bytes(),
+        );
+        encoder.set_buffer(2, Some(&*output), 0);
+        encoder.set_bytes(3, &(elem_count as u32));
+        encoder.use_resource(gate.buffer(), MTLResourceUsage::Read);
+        encoder.use_resource(up.buffer(), MTLResourceUsage::Read);
+        encoder.use_resource(&*output, MTLResourceUsage::Write);
+        ffn_dispatch(&pipeline, &encoder, elem_count);
+
+        Ok((
+            MetalStorage::new(output, device.clone(), elem_count, gate.dtype()),
+            lg.shape().clone(),
+        ))
+    }
+}
+
 // ─── Public API ──────────────────────────────────────────────────────────────
 
 /// Scaled Dot Product Attention via Metal fused kernels.
@@ -524,4 +753,21 @@ pub fn sdpa_available(tensor: &Tensor, head_dim: usize) -> bool {
     tensor.device().is_metal()
         && matches!(tensor.dtype(), DType::F16 | DType::BF16 | DType::F32)
         && matches!(head_dim, 32 | 64 | 72 | 80 | 96 | 128 | 256)
+}
+
+/// Fused gated-SiLU via Metal kernel.
+///
+/// `x` must be a contiguous tensor of shape `[*, 2*intermediate_size]` where
+/// the first `intermediate_size` columns are the gate projection and the second
+/// are the up projection.  Returns `[*, intermediate_size]` = silu(gate) * up.
+pub fn gated_silu_fused(x: &Tensor, intermediate_size: usize) -> Result<Tensor> {
+    x.apply_op1_no_bwd(&GatedSiluOp { intermediate_size })
+}
+
+/// Fused SiLU-Mul via Metal kernel.
+///
+/// Both `gate` and `up` must be contiguous tensors of the same shape.
+/// Returns a tensor of the same shape with values `silu(gate[i]) * up[i]`.
+pub fn silu_mul_fused(gate: &Tensor, up: &Tensor) -> Result<Tensor> {
+    gate.apply_op2_no_bwd(up, &SiluMulOp)
 }

@@ -219,6 +219,13 @@ impl FeedForward {
         let gated = match &self.gate_up {
             GateUpProjection::Fused(gu) => {
                 let out = gu.forward(x)?;
+                // On Metal with SiLU: fuse the activation+multiply into one kernel,
+                // avoiding two separate encoder creations and an intermediate buffer.
+                #[cfg(feature = "metal")]
+                if matches!(self.activation, Activation::SiLU) && out.device().is_metal() {
+                    let act = super::metal_ops::gated_silu_fused(&out, self.intermediate_size)?;
+                    return self.down_proj.forward(&act);
+                }
                 let gate = out.narrow(D::Minus1, 0, self.intermediate_size)?;
                 let up = out.narrow(D::Minus1, self.intermediate_size, self.intermediate_size)?;
                 let activated = match self.activation {
@@ -230,6 +237,11 @@ impl FeedForward {
             GateUpProjection::Separate { gate: gp, up: up_p } => {
                 let gate = gp.forward(x)?;
                 let up = up_p.forward(x)?;
+                #[cfg(feature = "metal")]
+                if matches!(self.activation, Activation::SiLU) && gate.device().is_metal() {
+                    let act = super::metal_ops::silu_mul_fused(&gate, &up)?;
+                    return self.down_proj.forward(&act);
+                }
                 let activated = match self.activation {
                     Activation::SiLU => silu(&gate)?,
                     Activation::GeLUTanh => gelu_tanh(&gate)?,
@@ -238,6 +250,11 @@ impl FeedForward {
             }
             GateUpProjection::Packed(gu) => {
                 let out = gu.forward(x)?;
+                #[cfg(feature = "metal")]
+                if matches!(self.activation, Activation::SiLU) && out.device().is_metal() {
+                    let act = super::metal_ops::gated_silu_fused(&out, self.intermediate_size)?;
+                    return self.down_proj.forward(&act);
+                }
                 let gate = out.narrow(D::Minus1, 0, self.intermediate_size)?;
                 let up = out.narrow(D::Minus1, self.intermediate_size, self.intermediate_size)?;
                 let activated = match self.activation {

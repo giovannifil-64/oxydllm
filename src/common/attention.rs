@@ -26,14 +26,6 @@ fn log_sdpa_fallback_once(head_dim: usize, dtype: candle_core::DType) {
     });
 }
 
-#[cfg(feature = "metal")]
-fn log_softcap_sdpa_policy_once() {
-    static LOGGED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-    LOGGED.get_or_init(|| {
-        tracing::warn!("Metal SDPA softcap path disabled; using standard attention fallback");
-    });
-}
-
 pub struct SegmentInfo<'a> {
     pub num_tokens: usize,
     pub cache: &'a mut PagedKvCache,
@@ -410,89 +402,75 @@ impl Attention {
         let out_buf = Tensor::zeros((b, self.n_heads, total_seq, hd), q.dtype(), device)?;
         let mut q_offset = 0usize;
 
-        // ── Metal SDPA path for batch ────────────────────────────────
+        // ── Per-segment routing: Metal SDPA or standard fallback ────────
+        // SDPA eligibility per segment:
+        //   - Metal available + supported head_dim (base)
+        //   - no cached-prefix prefill bug (kv_len > num_tokens for multi-token seg)
+        //   - softcap: only the vector kernel (num_tokens ≤ 8) supports it;
+        //     decode steps always qualify, prefill with softcap falls back
         #[cfg(feature = "metal")]
-        if self.attn_softcap.is_some() {
-            log_softcap_sdpa_policy_once();
-        }
+        let sdpa_base_ok = super::metal_ops::sdpa_available(&q, self.head_dim);
         #[cfg(feature = "metal")]
-        let use_sdpa = self.attn_softcap.is_none()
-            && super::metal_ops::sdpa_available(&q, self.head_dim)
-            && !kv_lengths
-                .iter()
-                .zip(segments.iter())
-                .any(|(&kv_len, seg)| seg.num_tokens > 1 && kv_len > seg.num_tokens);
-        #[cfg(not(feature = "metal"))]
-        let use_sdpa = false;
-
-        #[cfg(feature = "metal")]
-        if !use_sdpa
-            && self.attn_softcap.is_none()
-            && !super::metal_ops::sdpa_available(&q, self.head_dim)
-        {
+        if !sdpa_base_ok {
             log_sdpa_fallback_once(self.head_dim, q.dtype());
         }
 
-        if use_sdpa {
+        for (i, seg) in segments.iter().enumerate() {
+            let q_seg = q.narrow(2, q_offset, seg.num_tokens)?;
+            let (k_seg, v_seg, kv_len) = truncate_kv_window(
+                k_parts[i].clone(),
+                v_parts[i].clone(),
+                kv_lengths[i],
+                self.sliding_window,
+                seg.num_tokens,
+            )?;
+
             #[cfg(feature = "metal")]
-            for (i, seg) in segments.iter().enumerate() {
-                let q_seg = q.narrow(2, q_offset, seg.num_tokens)?;
-                let (k_seg, v_seg, _) = truncate_kv_window(
-                    k_parts[i].clone(),
-                    v_parts[i].clone(),
-                    kv_lengths[i],
-                    self.sliding_window,
-                    seg.num_tokens,
-                )?;
+            let use_seg_sdpa = sdpa_base_ok
+                && !(seg.num_tokens > 1 && kv_lengths[i] > seg.num_tokens)
+                && (self.attn_softcap.is_none() || seg.num_tokens <= 8);
+            #[cfg(not(feature = "metal"))]
+            let use_seg_sdpa = false;
 
-                // SDPA handles GQA natively — no repeat_kv needed.
-                let q_c_owned;
-                let q_c = if q_seg.is_contiguous() {
-                    &q_seg
-                } else {
-                    q_c_owned = q_seg.contiguous()?;
-                    &q_c_owned
-                };
-                let k_c_owned;
-                let k_c = if k_seg.is_contiguous() {
-                    &k_seg
-                } else {
-                    k_c_owned = k_seg.contiguous()?;
-                    &k_c_owned
-                };
-                let v_c_owned;
-                let v_c = if v_seg.is_contiguous() {
-                    &v_seg
-                } else {
-                    v_c_owned = v_seg.contiguous()?;
-                    &v_c_owned
-                };
+            if use_seg_sdpa {
+                #[cfg(feature = "metal")]
+                {
+                    // SDPA handles GQA natively — no repeat_kv needed.
+                    let q_c_owned;
+                    let q_c = if q_seg.is_contiguous() {
+                        &q_seg
+                    } else {
+                        q_c_owned = q_seg.contiguous()?;
+                        &q_c_owned
+                    };
+                    let k_c_owned;
+                    let k_c = if k_seg.is_contiguous() {
+                        &k_seg
+                    } else {
+                        k_c_owned = k_seg.contiguous()?;
+                        &k_c_owned
+                    };
+                    let v_c_owned;
+                    let v_c = if v_seg.is_contiguous() {
+                        &v_seg
+                    } else {
+                        v_c_owned = v_seg.contiguous()?;
+                        &v_c_owned
+                    };
 
-                let seg_out = super::metal_ops::sdpa(
-                    q_c,
-                    k_c,
-                    v_c,
-                    None,
-                    seg.num_tokens > 1, // causal for prefill segments
-                    self.scale as f32,
-                    self.attn_softcap.map(|s| s as f32).unwrap_or(1.0),
-                )?;
-                let seg_out = seg_out.contiguous()?;
-                out_buf.slice_set(&seg_out, 2, q_offset)?;
-                q_offset += seg.num_tokens;
-            }
-        } else {
-            // ── Fallback: standard attention ─────────────────────────
-            for (i, seg) in segments.iter().enumerate() {
-                let q_seg = q.narrow(2, q_offset, seg.num_tokens)?;
-                let (k_seg, v_seg, kv_len) = truncate_kv_window(
-                    k_parts[i].clone(),
-                    v_parts[i].clone(),
-                    kv_lengths[i],
-                    self.sliding_window,
-                    seg.num_tokens,
-                )?;
-
+                    let seg_out = super::metal_ops::sdpa(
+                        q_c,
+                        k_c,
+                        v_c,
+                        None,
+                        seg.num_tokens > 1,
+                        self.scale as f32,
+                        self.attn_softcap.map(|s| s as f32).unwrap_or(1.0),
+                    )?;
+                    out_buf.slice_set(&seg_out.contiguous()?, 2, q_offset)?;
+                }
+            } else {
+                // ── Fallback: standard attention ─────────────────────
                 let k_seg = self.repeat_kv(k_seg)?;
                 let v_seg = self.repeat_kv(v_seg)?;
 
@@ -532,8 +510,9 @@ impl Attention {
                 let attn = softmax_last_dim(&scores)?;
                 let seg_out = attn.matmul(&v_seg)?.contiguous()?;
                 out_buf.slice_set(&seg_out, 2, q_offset)?;
-                q_offset += seg.num_tokens;
             }
+
+            q_offset += seg.num_tokens;
         }
 
         let out = out_buf

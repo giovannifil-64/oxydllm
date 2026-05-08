@@ -262,10 +262,6 @@ impl BlockAllocator {
         self.block_size
     }
 
-    pub fn is_quantized(&self) -> bool {
-        matches!(self.pool, KvPool::Quantized { .. })
-    }
-
     pub fn dims(&self) -> (usize, usize) {
         (self.n_kv_heads, self.head_dim)
     }
@@ -576,21 +572,17 @@ impl PagedKvCache {
                     let id = alloc.allocate()?;
                     self.table.block_ids.push(id);
                 }
-                let id = *self.table.block_ids.last().unwrap();
-                if !skip_pool_write {
-                    if alloc.is_quantized() {
-                        self.pending_writes.push(PendingWrite {
-                            block_id: id,
-                            offset: current_offset,
-                            k_chunk: k_chunk.clone(),
-                            v_chunk: v_chunk.clone(),
-                        });
-                    } else {
-                        alloc.write(id, current_offset, &k_chunk, &v_chunk)?;
-                    }
-                }
-                id
+                *self.table.block_ids.last().unwrap()
             };
+
+            if !skip_pool_write {
+                self.pending_writes.push(PendingWrite {
+                    block_id,
+                    offset: current_offset,
+                    k_chunk: k_chunk.clone(),
+                    v_chunk: v_chunk.clone(),
+                });
+            }
 
             let base = (block_id * block_size) as u32;
             for off in current_offset as u32..(current_offset + n) as u32 {
@@ -958,6 +950,7 @@ mod tests {
         let prefix_v =
             Tensor::from_vec((100..116).map(|x| x as f32).collect(), (1, 2, 2, 4), &dev).unwrap();
         let _ = source.append(&prefix_k, &prefix_v).unwrap();
+        source.flush_pending().unwrap(); // pool writes are deferred; flush before reuse
         let prefix_block_id = source.block_id_at(0).unwrap();
 
         let mut cache = PagedKvCache::new(Arc::clone(&alloc));

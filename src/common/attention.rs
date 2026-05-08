@@ -56,6 +56,7 @@ pub struct Attention {
     sliding_window: Option<usize>,
     v_norm: bool,
     rms_norm_eps: f64,
+    out_buf: std::cell::RefCell<Option<Tensor>>,
 }
 
 fn truncate_kv_window(
@@ -214,6 +215,7 @@ impl Attention {
             sliding_window: actual_window,
             v_norm: cfg.v_norm,
             rms_norm_eps: cfg.rms_norm_eps,
+            out_buf: std::cell::RefCell::new(None),
         })
     }
 
@@ -297,6 +299,7 @@ impl Attention {
             sliding_window: actual_window,
             v_norm: cfg.v_norm,
             rms_norm_eps: cfg.rms_norm_eps,
+            out_buf: std::cell::RefCell::new(None),
         })
     }
 
@@ -399,7 +402,25 @@ impl Attention {
         }
 
         let device = x.device();
-        let out_buf = Tensor::zeros((b, self.n_heads, total_seq, hd), q.dtype(), device)?;
+        let out_buf = {
+            let mut cached = self.out_buf.borrow_mut();
+            let needs_alloc = cached.as_ref().is_none_or(|t| {
+                let d = t.dims();
+                d[0] != b
+                    || d[1] != self.n_heads
+                    || d[2] != total_seq
+                    || d[3] != hd
+                    || t.dtype() != q.dtype()
+            });
+            if needs_alloc {
+                *cached = Some(Tensor::zeros(
+                    (b, self.n_heads, total_seq, hd),
+                    q.dtype(),
+                    device,
+                )?);
+            }
+            cached.as_ref().unwrap().clone()
+        };
         let mut q_offset = 0usize;
 
         // ── Per-segment routing: Metal SDPA or standard fallback ────────
@@ -556,6 +577,7 @@ impl Attention {
             sliding_window: None,
             v_norm: false,
             rms_norm_eps: 1e-5,
+            out_buf: std::cell::RefCell::new(None),
         })
     }
 }

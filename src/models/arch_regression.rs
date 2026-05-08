@@ -687,4 +687,80 @@ mod tests {
              3-bit quantization is introducing large per-token error in the KV read-back path"
         );
     }
+
+    /// P-6 chunking parity: a single packed forward over `[seq_a; seq_b]` must
+    /// produce the same logits as two sequential forward calls (one per seq)
+    /// concatenated along the seq dim.  This is the property the engine
+    /// relies on when it splits prefill into two `forward_batch` calls.
+    #[test]
+    fn chunked_forward_matches_single_packed_forward() {
+        let model = build_model(ArchSpec {
+            name: "chunked_parity",
+            ..ArchSpec::default()
+        })
+        .unwrap();
+        let dev = model.device().clone();
+
+        let len_a = 7usize;
+        let len_b = 11usize;
+        let tokens_a: Vec<u32> = (1..=len_a as u32).collect();
+        let tokens_b: Vec<u32> = (10..10 + len_b as u32).collect();
+        let pos_a: Vec<u32> = (0..len_a as u32).collect();
+        let pos_b: Vec<u32> = (0..len_b as u32).collect();
+
+        // Single packed forward: caches for seq A and seq B side by side.
+        let mut caches_a_pkd = make_caches(&model);
+        let mut caches_b_pkd = make_caches(&model);
+        let combined_tokens: Vec<u32> = tokens_a.iter().chain(tokens_b.iter()).copied().collect();
+        let combined_pos: Vec<u32> = pos_a.iter().chain(pos_b.iter()).copied().collect();
+        let input_pkd = Tensor::from_vec(combined_tokens, (1, len_a + len_b), &dev).unwrap();
+        let pos_pkd = Tensor::from_vec(combined_pos, (len_a + len_b,), &dev).unwrap();
+        let mut slices_pkd: Vec<&mut [PagedKvCache]> = vec![
+            caches_a_pkd.as_mut_slice(),
+            caches_b_pkd.as_mut_slice(),
+        ];
+        let logits_pkd = model
+            .forward_batch(&input_pkd, &pos_pkd, &mut slices_pkd, &[len_a, len_b])
+            .unwrap();
+        crate::common::block::flush_caches(&mut slices_pkd).unwrap();
+
+        // Two-chunk forward: seq A alone, then seq B alone, then concat logits.
+        let mut caches_a_chk = make_caches(&model);
+        let mut caches_b_chk = make_caches(&model);
+        let input_a = Tensor::from_vec(tokens_a.clone(), (1, len_a), &dev).unwrap();
+        let pos_a_t = Tensor::from_vec(pos_a.clone(), (len_a,), &dev).unwrap();
+        let mut slices_a: Vec<&mut [PagedKvCache]> = vec![caches_a_chk.as_mut_slice()];
+        let logits_a = model
+            .forward_batch(&input_a, &pos_a_t, &mut slices_a, &[len_a])
+            .unwrap();
+
+        let input_b = Tensor::from_vec(tokens_b.clone(), (1, len_b), &dev).unwrap();
+        let pos_b_t = Tensor::from_vec(pos_b.clone(), (len_b,), &dev).unwrap();
+        let mut slices_b: Vec<&mut [PagedKvCache]> = vec![caches_b_chk.as_mut_slice()];
+        let logits_b = model
+            .forward_batch(&input_b, &pos_b_t, &mut slices_b, &[len_b])
+            .unwrap();
+
+        let logits_chk = Tensor::cat(&[&logits_a, &logits_b], 1).unwrap();
+
+        // Both flushes happen after both chunks complete in the real engine.
+        let mut all_chk: Vec<&mut [PagedKvCache]> =
+            vec![caches_a_chk.as_mut_slice(), caches_b_chk.as_mut_slice()];
+        crate::common::block::flush_caches(&mut all_chk).unwrap();
+
+        // Compare logits.  CPU compute is deterministic; tolerance accounts
+        // only for any reordering of equivalent ops.
+        let p = logits_pkd.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let c = logits_chk.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        assert_eq!(p.len(), c.len(), "chunked vs packed shape mismatch");
+        let max_diff = p
+            .iter()
+            .zip(c.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_diff < 1e-4,
+            "chunked forward diverges from packed: max_abs_diff = {max_diff:.6}"
+        );
+    }
 }

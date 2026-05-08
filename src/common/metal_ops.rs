@@ -771,3 +771,137 @@ pub fn gated_silu_fused(x: &Tensor, intermediate_size: usize) -> Result<Tensor> 
 pub fn silu_mul_fused(gate: &Tensor, up: &Tensor) -> Result<Tensor> {
     gate.apply_op2_no_bwd(up, &SiluMulOp)
 }
+
+#[cfg(test)]
+mod fused_kernel_parity_tests {
+    //! Numerical parity between fused Metal kernels and the scalar reference
+    //! path on a real Metal device.  Each test silently skips on machines
+    //! without a Metal device available (e.g. CI Linux runners), so the
+    //! suite stays useful both locally on macOS and in cross-platform CI.
+    //!
+    //! Tolerance is loose because F16/BF16 differ between fused (F32-promote
+    //! intermediate) and scalar (F16/BF16-native) paths.
+
+    use super::*;
+    use candle_core::{D, Device};
+
+    fn metal_device_or_skip() -> Option<Device> {
+        Device::new_metal(0).ok()
+    }
+
+    fn max_abs_diff_f32(a: &[f32], b: &[f32]) -> f32 {
+        a.iter()
+            .zip(b.iter())
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max)
+    }
+
+    #[test]
+    fn gated_silu_matches_scalar_path_f32() {
+        let Some(dev) = metal_device_or_skip() else {
+            return;
+        };
+
+        // [batch=1, seq=4, 2*N=16] → output [1, 4, 8]
+        let n = 8usize;
+        let data: Vec<f32> = (0..1 * 4 * 2 * n)
+            .map(|i| (i as f32 - 32.0) * 0.05)
+            .collect();
+        let x = Tensor::from_vec(data, (1, 4, 2 * n), &dev).unwrap();
+
+        let fused = gated_silu_fused(&x, n).unwrap();
+
+        let gate = x.narrow(D::Minus1, 0, n).unwrap();
+        let up = x.narrow(D::Minus1, n, n).unwrap();
+        let scalar = (gate.silu().unwrap() * up).unwrap();
+
+        let f = fused.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let s = scalar.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let diff = max_abs_diff_f32(&f, &s);
+        assert!(diff < 1e-5, "max_abs_diff = {diff}");
+    }
+
+    #[test]
+    fn gated_silu_matches_scalar_path_bf16() {
+        let Some(dev) = metal_device_or_skip() else {
+            return;
+        };
+
+        let n = 4usize;
+        let data: Vec<f32> = (0..1 * 2 * 2 * n).map(|i| (i as f32 - 8.0) * 0.1).collect();
+        let x = Tensor::from_vec(data, (1, 2, 2 * n), &dev)
+            .unwrap()
+            .to_dtype(DType::BF16)
+            .unwrap();
+
+        let fused = gated_silu_fused(&x, n).unwrap();
+
+        let gate = x.narrow(D::Minus1, 0, n).unwrap();
+        let up = x.narrow(D::Minus1, n, n).unwrap();
+        let scalar = (gate.silu().unwrap() * up).unwrap();
+
+        let f = fused
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let s = scalar
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let diff = max_abs_diff_f32(&f, &s);
+        // BF16 precision: ~7 bits of mantissa → ~1e-2 absolute for activations near unity.
+        assert!(diff < 0.05, "max_abs_diff (bf16) = {diff}");
+    }
+
+    #[test]
+    fn silu_mul_matches_scalar_path_f32() {
+        let Some(dev) = metal_device_or_skip() else {
+            return;
+        };
+
+        let n = 16usize;
+        let gate_data: Vec<f32> = (0..n).map(|i| (i as f32 - 8.0) * 0.1).collect();
+        let up_data: Vec<f32> = (0..n).map(|i| (i as f32 - 4.0) * 0.2).collect();
+        let gate = Tensor::from_vec(gate_data, (1, n), &dev).unwrap();
+        let up = Tensor::from_vec(up_data, (1, n), &dev).unwrap();
+
+        let fused = silu_mul_fused(&gate, &up).unwrap();
+        let scalar = (gate.silu().unwrap() * &up).unwrap();
+
+        let f = fused.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let s = scalar.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let diff = max_abs_diff_f32(&f, &s);
+        assert!(diff < 1e-5, "max_abs_diff = {diff}");
+    }
+
+    #[test]
+    fn gated_silu_rejects_wrong_last_dim() {
+        let Some(dev) = metal_device_or_skip() else {
+            return;
+        };
+        let x = Tensor::zeros((1, 2, 7), DType::F32, &dev).unwrap();
+        // intermediate_size=4 → expects last dim = 8, but we have 7.
+        let res = gated_silu_fused(&x, 4);
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn silu_mul_rejects_dtype_mismatch() {
+        let Some(dev) = metal_device_or_skip() else {
+            return;
+        };
+        let gate = Tensor::zeros((1, 4), DType::F32, &dev).unwrap();
+        let up = Tensor::zeros((1, 4), DType::F32, &dev)
+            .unwrap()
+            .to_dtype(DType::BF16)
+            .unwrap();
+        let res = silu_mul_fused(&gate, &up);
+        assert!(res.is_err());
+    }
+}

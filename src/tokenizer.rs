@@ -338,10 +338,6 @@ impl Tokenizer {
             .or_else(|| self.inner.token_to_id(content))
     }
 
-    pub fn id_to_token(&self, token_id: u32) -> Option<String> {
-        self.inner.id_to_token(token_id)
-    }
-
     pub fn has_thinking_support(&self) -> bool {
         self.chat_template
             .as_deref()

@@ -16,7 +16,6 @@ const TOKEN_DECODE_CACHE_CAP: usize = 8192;
 struct DecodedToken {
     text: String,
     bytes: Vec<u8>,
-    piece: Option<String>,
 }
 
 struct TokenDecodeCache {
@@ -35,11 +34,9 @@ impl TokenDecodeCache {
             return hit.clone();
         }
         let text = tokenizer.decode(&[token_id]).unwrap_or_default();
-        let piece = tokenizer.id_to_token(token_id);
         let decoded = DecodedToken {
             bytes: text.as_bytes().to_vec(),
             text,
-            piece,
         };
         self.entries.push(token_id, decoded.clone());
         decoded
@@ -158,42 +155,11 @@ fn clamp_to_char_boundary(s: &str, idx: usize) -> usize {
     i
 }
 
-fn prefix_decode_token(
-    tokenizer: &Tokenizer,
-    decode_cache: &mut TokenDecodeCache,
-    all_ids: &[u32],
-    decoded_len: &mut usize,
-    token: u32,
-) -> Option<String> {
-    let decoded = decode_cache.decode_token(tokenizer, token);
-    let mut single = decoded.text;
-    if !single.is_empty() && !single.contains('\u{FFFD}') {
-        let has_leading_ws = single
-            .chars()
-            .next()
-            .map(char::is_whitespace)
-            .unwrap_or(false);
-
-        // Some tokenizers (e.g. SentencePiece) keep word-boundary markers in
-        // vocab entries and drop them when decoding a single token. Reinsert
-        // a leading space for non-initial tokens to keep incremental decoding
-        // consistent with full-sequence decoding.
-        if *decoded_len > 0
-            && !has_leading_ws
-            && decoded
-                .piece
-                .as_deref()
-                .map(|p| p.starts_with('▁') || p.starts_with('Ġ'))
-                .unwrap_or(false)
-        {
-            single.insert(0, ' ');
-        }
-
-        *decoded_len += single.len();
-        return Some(single);
-    }
-    let full = tokenizer.decode(all_ids).unwrap_or_default();
-    let start = clamp_to_char_boundary(&full, *decoded_len);
+/// Pure suffix-emission logic given the canonical full decode and the bytes
+/// already emitted.  Trailing `U+FFFD` is held back so multi-byte UTF-8
+/// split across tokens is buffered until the continuation token arrives.
+fn emit_suffix(full: &str, decoded_len: &mut usize) -> Option<String> {
+    let start = clamp_to_char_boundary(full, *decoded_len);
     let new_text = &full[start..];
     let emit = new_text.trim_end_matches('\u{FFFD}');
     if !emit.is_empty() {
@@ -202,6 +168,105 @@ fn prefix_decode_token(
     } else {
         *decoded_len = start;
         None
+    }
+}
+
+fn prefix_decode_token(
+    tokenizer: &Tokenizer,
+    all_ids: &[u32],
+    decoded_len: &mut usize,
+) -> Option<String> {
+    let full = tokenizer.decode(all_ids).unwrap_or_default();
+    emit_suffix(&full, decoded_len)
+}
+
+#[cfg(test)]
+mod streaming_decode_tests {
+    use super::*;
+
+    /// Drive `emit_suffix` with the canonical decode at each step (`steps[i]`
+    /// = what `tokenizer.decode(all_ids[..=i])` would return) and return the
+    /// concatenation of every emitted chunk.
+    fn run_stream(steps: &[&str]) -> String {
+        let mut decoded_len = 0;
+        let mut out = String::new();
+        for full in steps {
+            if let Some(s) = emit_suffix(full, &mut decoded_len) {
+                out.push_str(&s);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn cumulative_emission_matches_final_canonical_text() {
+        let steps = [
+            "Sono",
+            "Sono un",
+            "Sono un assistente",
+            "Sono un assistente virtuale",
+        ];
+        assert_eq!(run_stream(&steps), *steps.last().unwrap());
+    }
+
+    #[test]
+    fn space_only_token_followed_by_g_prefixed_token_does_not_double_space() {
+        // Regression: the old fast-path heuristic ("piece starts with Ġ ⇒
+        // prepend space") emitted an extra space when a Ġ-only space token
+        // was followed by a Ġ-prefixed token, producing "...assistente
+        // virtuale" → "...assistente  virtuale" with drift that could later
+        // swallow a character (the original "  irtuale" report).  Canonical
+        // suffix-emission must reproduce the canonical text exactly.
+        let steps = [
+            "Sono un assistente",
+            "Sono un assistente ",
+            "Sono un assistente virtuale",
+        ];
+        assert_eq!(run_stream(&steps), "Sono un assistente virtuale");
+    }
+
+    #[test]
+    fn no_character_loss_across_partial_utf8_token_boundary() {
+        // Token N decodes to a partial multi-byte UTF-8 (FFFD trailing); the
+        // next token completes the codepoint.  The emitter must hold the
+        // partial char back and emit the complete sequence on the next step.
+        let steps = ["caf\u{FFFD}", "café", "café 🎉"];
+        assert_eq!(run_stream(&steps), "café 🎉");
+    }
+
+    #[test]
+    fn empty_step_emits_nothing() {
+        let steps = ["hello", "hello", "hello world"];
+        assert_eq!(run_stream(&steps), "hello world");
+    }
+
+    #[test]
+    fn idempotent_when_decoded_len_matches_full_len() {
+        let mut decoded_len = 5;
+        let out = emit_suffix("hello", &mut decoded_len);
+        assert!(out.is_none());
+        assert_eq!(decoded_len, 5);
+    }
+
+    #[test]
+    fn clamps_decoded_len_past_end_of_full() {
+        // Defensive: if some upstream bug bumps decoded_len past full.len(),
+        // the clamp should bound it and emit nothing rather than panic.
+        let mut decoded_len = 100;
+        let out = emit_suffix("short", &mut decoded_len);
+        assert!(out.is_none());
+        assert_eq!(decoded_len, 5);
+    }
+
+    #[test]
+    fn clamps_decoded_len_to_char_boundary_inside_multibyte() {
+        // decoded_len starts in the middle of a 2-byte UTF-8 char (é = 2 bytes).
+        // Clamp must back off to the previous char boundary.
+        let mut decoded_len = 4; // "café" = 5 bytes; offset 4 is inside é
+        let out = emit_suffix("café!", &mut decoded_len);
+        // Should clamp to 3 (start of é) and emit "é!"
+        assert_eq!(out.as_deref(), Some("é!"));
+        assert_eq!(decoded_len, 6);
     }
 }
 
@@ -301,10 +366,8 @@ pub fn engine_loop(
                                 tracker.thinking_ids.push(tok.token);
                                 if let Some(text) = prefix_decode_token(
                                     &tokenizer,
-                                    &mut decode_cache,
                                     &tracker.thinking_ids,
                                     &mut tracker.thinking_decoded_len,
-                                    tok.token,
                                 ) && tracker.tx.send(EngineEvent::ReasoningToken(text)).is_err()
                                 {
                                     disconnected = true;
@@ -321,10 +384,8 @@ pub fn engine_loop(
                                 tracker.output_ids.push(tok.token);
                                 if let Some(text) = prefix_decode_token(
                                     &tokenizer,
-                                    &mut decode_cache,
                                     &tracker.output_ids,
                                     &mut tracker.decoded_len,
-                                    tok.token,
                                 ) {
                                     let drained = std::mem::take(&mut tracker.pending_raw_lps);
                                     let mut logprob_entries: Vec<EngineLogprobEntry> =

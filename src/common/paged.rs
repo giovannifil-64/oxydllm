@@ -723,15 +723,14 @@ impl PagedKvCache {
             )?
         };
 
-        // Two GPU→CPU syncs total (one for K, one for V) regardless of layer count.
         let k_vec: Vec<f32> = k_cat
-            .to_dtype(DType::F32)?
             .to_device(&Device::Cpu)?
+            .to_dtype(DType::F32)?
             .flatten_all()?
             .to_vec1()?;
         let v_vec: Vec<f32> = v_cat
-            .to_dtype(DType::F32)?
             .to_device(&Device::Cpu)?
+            .to_dtype(DType::F32)?
             .flatten_all()?
             .to_vec1()?;
 

@@ -620,6 +620,8 @@ fn warm_up_model(model: &dyn BatchModel) {
         let mut cache_slices: Vec<&mut [PagedKvCache]> = vec![caches.as_mut_slice()];
         if let Err(e) = model.forward_batch(&input, &position_ids, &mut cache_slices, &[8]) {
             tracing::warn!(error = %e, "warmup prefill forward failed (non-fatal)");
+        } else if let Err(e) = crate::common::block::flush_caches(&mut cache_slices) {
+            tracing::warn!(error = %e, "warmup prefill flush failed (non-fatal)");
         }
     }
 

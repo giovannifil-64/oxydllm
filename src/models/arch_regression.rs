@@ -264,7 +264,9 @@ mod tests {
         let pos = Tensor::from_vec(positions, (seq_len,), dev)?;
 
         let mut slices: Vec<&mut [PagedKvCache]> = vec![caches.as_mut_slice()];
-        model.forward_batch(&input, &pos, &mut slices, &[seq_len])
+        let logits = model.forward_batch(&input, &pos, &mut slices, &[seq_len])?;
+        crate::common::block::flush_caches(&mut slices)?;
+        Ok(logits)
     }
 
     fn run_decode(

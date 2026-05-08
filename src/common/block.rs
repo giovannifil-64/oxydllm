@@ -372,12 +372,6 @@ pub fn run_transformer_layers_batch(
         )?;
     }
 
-    for seq_cache in seq_caches.iter_mut() {
-        for cache in seq_cache.iter_mut() {
-            cache.flush_pending()?;
-        }
-    }
-
     let x = c.norm.forward(&x)?;
     let logits = c.lm_head.forward(&x)?;
 
@@ -387,4 +381,13 @@ pub fn run_transformer_layers_batch(
     } else {
         Ok(logits)
     }
+}
+
+pub fn flush_caches(seq_caches: &mut [&mut [PagedKvCache]]) -> Result<()> {
+    for seq_cache in seq_caches.iter_mut() {
+        for cache in seq_cache.iter_mut() {
+            cache.flush_pending()?;
+        }
+    }
+    Ok(())
 }

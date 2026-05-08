@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use candle_core::{Device, Result, Tensor};
 
+use crate::common::block::flush_caches;
 use crate::common::paged::{DEFAULT_BLOCK_SIZE, PagedKvCache, SharedBlockAllocator};
 use crate::common::prefix_cache::PrefixCache;
 use crate::models::traits::BatchModel;
@@ -121,6 +122,28 @@ fn has_matching_stop_sequence(tokens: &[u32], stop_sequences: &[Vec<u32>]) -> bo
         let n = seq.len();
         n > 0 && tokens.len() >= n && tokens[tokens.len() - n..] == seq[..]
     })
+}
+
+const PREFILL_CHUNK_THRESHOLD: usize = 1024;
+
+fn pick_prefill_chunk_split(uncached_lens: &[usize], total_prefill_tokens: usize) -> Option<usize> {
+    if uncached_lens.len() < 2 || total_prefill_tokens < PREFILL_CHUNK_THRESHOLD {
+        return None;
+    }
+    let target = total_prefill_tokens / 2;
+    let mut acc = 0usize;
+    for (i, &n) in uncached_lens.iter().enumerate() {
+        acc += n;
+        if acc >= target {
+            // Need at least one prefill in each half for a meaningful split.
+            return if i + 1 < uncached_lens.len() {
+                Some(i + 1)
+            } else {
+                None
+            };
+        }
+    }
+    None
 }
 
 impl Engine {
@@ -310,18 +333,67 @@ impl Engine {
             });
         }
 
-        let input = Tensor::from_vec(all_token_ids, (1, total_tokens), device)?;
-        let position_ids = Tensor::from_vec(all_positions, (total_tokens,), device)?;
+        let prefill_uncached_lens: Vec<usize> =
+            prefill_infos.iter().map(|i| i.uncached_len).collect();
+        let split_seq_idx = pick_prefill_chunk_split(&prefill_uncached_lens, total_prefill_tokens);
 
         // Ensure sequence caches are restored even if forward_batch panics.
         let logits = {
             let mut cache_guard = CacheRestoreGuard::new(scheduler, &prefill_ids, &decode_ids);
             let mut cache_slices = cache_guard.cache_slices();
-            let logits_result =
-                model.forward_batch(&input, &position_ids, &mut cache_slices, &token_counts);
+
+            let combined_result: Result<Tensor> = (|| {
+                let logits = if let Some(split) = split_seq_idx {
+                    let prefill_a_tokens: usize = prefill_uncached_lens[..split].iter().sum();
+                    let chunk_b_tokens = total_tokens - prefill_a_tokens;
+
+                    let input_a = Tensor::from_vec(
+                        all_token_ids[..prefill_a_tokens].to_vec(),
+                        (1, prefill_a_tokens),
+                        device,
+                    )?;
+                    let positions_a = Tensor::from_vec(
+                        all_positions[..prefill_a_tokens].to_vec(),
+                        (prefill_a_tokens,),
+                        device,
+                    )?;
+                    let input_b = Tensor::from_vec(
+                        all_token_ids[prefill_a_tokens..].to_vec(),
+                        (1, chunk_b_tokens),
+                        device,
+                    )?;
+                    let positions_b = Tensor::from_vec(
+                        all_positions[prefill_a_tokens..].to_vec(),
+                        (chunk_b_tokens,),
+                        device,
+                    )?;
+
+                    let counts_a: Vec<usize> = token_counts[..split].to_vec();
+                    let counts_b: Vec<usize> = token_counts[split..].to_vec();
+
+                    // cache_slices is laid out [prefill_caches..., decode_caches...]
+                    // so split at the prefill seq index gives the right grouping.
+                    let (caches_a, caches_b) = cache_slices.split_at_mut(split);
+
+                    let logits_a =
+                        model.forward_batch(&input_a, &positions_a, caches_a, &counts_a)?;
+                    let logits_b =
+                        model.forward_batch(&input_b, &positions_b, caches_b, &counts_b)?;
+
+                    // Both logits have shape [1, n_chunk, vocab]; concat along seq.
+                    Tensor::cat(&[&logits_a, &logits_b], 1)?
+                } else {
+                    let input = Tensor::from_vec(all_token_ids, (1, total_tokens), device)?;
+                    let position_ids = Tensor::from_vec(all_positions, (total_tokens,), device)?;
+                    model.forward_batch(&input, &position_ids, &mut cache_slices, &token_counts)?
+                };
+                flush_caches(&mut cache_slices)?;
+                Ok(logits)
+            })();
+
             drop(cache_slices);
             cache_guard.restore();
-            logits_result?
+            combined_result?
         };
 
         let batch_logits = logits.squeeze(0)?;
@@ -445,6 +517,29 @@ mod tests {
     use candle_core::DType;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn pick_chunk_split_skips_small_batches() {
+        assert_eq!(pick_prefill_chunk_split(&[256, 256], 512), None);
+        assert_eq!(pick_prefill_chunk_split(&[4096], 4096), None);
+        assert_eq!(pick_prefill_chunk_split(&[], 0), None);
+    }
+
+    #[test]
+    fn pick_chunk_split_balances_two_equal_seqs() {
+        assert_eq!(pick_prefill_chunk_split(&[1024, 1024], 2048), Some(1));
+    }
+
+    #[test]
+    fn pick_chunk_split_handles_uneven_seqs() {
+        assert_eq!(pick_prefill_chunk_split(&[200, 1500], 1700), None);
+        assert_eq!(pick_prefill_chunk_split(&[800, 800, 800], 2400), Some(2));
+    }
+
+    #[test]
+    fn pick_chunk_split_returns_none_when_first_seq_dominates() {
+        assert_eq!(pick_prefill_chunk_split(&[3000, 100], 3100), Some(1));
+    }
 
     struct FakeModel {
         device: Device,

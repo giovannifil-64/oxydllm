@@ -715,10 +715,8 @@ mod tests {
         let combined_pos: Vec<u32> = pos_a.iter().chain(pos_b.iter()).copied().collect();
         let input_pkd = Tensor::from_vec(combined_tokens, (1, len_a + len_b), &dev).unwrap();
         let pos_pkd = Tensor::from_vec(combined_pos, (len_a + len_b,), &dev).unwrap();
-        let mut slices_pkd: Vec<&mut [PagedKvCache]> = vec![
-            caches_a_pkd.as_mut_slice(),
-            caches_b_pkd.as_mut_slice(),
-        ];
+        let mut slices_pkd: Vec<&mut [PagedKvCache]> =
+            vec![caches_a_pkd.as_mut_slice(), caches_b_pkd.as_mut_slice()];
         let logits_pkd = model
             .forward_batch(&input_pkd, &pos_pkd, &mut slices_pkd, &[len_a, len_b])
             .unwrap();

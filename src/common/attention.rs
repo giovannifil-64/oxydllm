@@ -228,6 +228,12 @@ impl Attention {
     ) -> Result<Self> {
         let prefix = format!("blk.{}", layer_idx);
         let hd = cfg.head_dim;
+        let load_bias = |name: &str| -> Result<Option<Tensor>> {
+            match gguf.try_get(name) {
+                Some(qt) => Ok(Some(qt.dequantize(device)?.to_dtype(dtype)?)),
+                None => Ok(None),
+            }
+        };
         let qkv = if let Some(qkv_qt) = gguf.try_get(&format!("{prefix}.attn_qkv.weight")) {
             let q_dim = cfg.n_heads * hd;
             let kv_dim = cfg.n_kv_heads * hd;
@@ -241,18 +247,41 @@ impl Attention {
                     got
                 );
             }
-            QkvProjection::Fused(AnyLinear::Quantized(QLinear::from_arc(qkv_qt, dtype)?))
+            let qkv_bias = load_bias(&format!("{prefix}.attn_qkv.bias"))?;
+            QkvProjection::Fused(AnyLinear::Quantized(QLinear::from_arc_with_bias(
+                qkv_qt, qkv_bias, dtype,
+            )?))
         } else {
-            let q_proj = QLinear::from_arc(gguf.get(&format!("{prefix}.attn_q.weight"))?, dtype)?;
-            let k_proj = QLinear::from_arc(gguf.get(&format!("{prefix}.attn_k.weight"))?, dtype)?;
-            let v_proj = QLinear::from_arc(gguf.get(&format!("{prefix}.attn_v.weight"))?, dtype)?;
+            let q_bias = load_bias(&format!("{prefix}.attn_q.bias"))?;
+            let k_bias = load_bias(&format!("{prefix}.attn_k.bias"))?;
+            let v_bias = load_bias(&format!("{prefix}.attn_v.bias"))?;
+            let q_proj = QLinear::from_arc_with_bias(
+                gguf.get(&format!("{prefix}.attn_q.weight"))?,
+                q_bias,
+                dtype,
+            )?;
+            let k_proj = QLinear::from_arc_with_bias(
+                gguf.get(&format!("{prefix}.attn_k.weight"))?,
+                k_bias,
+                dtype,
+            )?;
+            let v_proj = QLinear::from_arc_with_bias(
+                gguf.get(&format!("{prefix}.attn_v.weight"))?,
+                v_bias,
+                dtype,
+            )?;
             QkvProjection::Separate {
                 q: AnyLinear::Quantized(q_proj),
                 k: AnyLinear::Quantized(k_proj),
                 v: AnyLinear::Quantized(v_proj),
             }
         };
-        let o_proj = QLinear::from_arc(gguf.get(&format!("{prefix}.attn_output.weight"))?, dtype)?;
+        let o_bias = load_bias(&format!("{prefix}.attn_output.bias"))?;
+        let o_proj = QLinear::from_arc_with_bias(
+            gguf.get(&format!("{prefix}.attn_output.weight"))?,
+            o_bias,
+            dtype,
+        )?;
 
         let q_norm = if cfg.qk_norm {
             let qt = gguf.get(&format!("{prefix}.attn_q_norm.weight"))?;

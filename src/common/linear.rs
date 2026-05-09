@@ -150,6 +150,7 @@ pub fn softmax_last_dim(x: &Tensor) -> Result<Tensor> {
 
 pub struct QLinear {
     inner: QMatMul,
+    bias: Option<Tensor>,
     out_dtype: DType,
 }
 
@@ -157,6 +158,19 @@ impl QLinear {
     pub fn from_arc(qtensor: Arc<QTensor>, out_dtype: DType) -> Result<Self> {
         Ok(Self {
             inner: QMatMul::from_arc(qtensor)?,
+            bias: None,
+            out_dtype,
+        })
+    }
+
+    pub fn from_arc_with_bias(
+        qtensor: Arc<QTensor>,
+        bias: Option<Tensor>,
+        out_dtype: DType,
+    ) -> Result<Self> {
+        Ok(Self {
+            inner: QMatMul::from_arc(qtensor)?,
+            bias,
             out_dtype,
         })
     }
@@ -194,10 +208,15 @@ impl QLinear {
             out
         };
 
-        if out.dtype() != self.out_dtype {
-            out.to_dtype(self.out_dtype)
+        let out = if out.dtype() != self.out_dtype {
+            out.to_dtype(self.out_dtype)?
         } else {
-            Ok(out)
+            out
+        };
+
+        match &self.bias {
+            Some(b) => out.broadcast_add(b),
+            None => Ok(out),
         }
     }
 }

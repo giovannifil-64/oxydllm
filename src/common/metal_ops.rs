@@ -692,6 +692,62 @@ impl CustomOp2 for SiluMulOp {
     }
 }
 
+// ─── SoftcapOp ───────────────────────────────────────────────────────────────
+//
+// Element-wise out[i] = cap * tanh(x[i] / cap).  Replaces the 3-op fallback
+// (`(x / cap).tanh() * cap`) with a single Metal pass.  Used by Gemma2
+// attention scores (cap=50) and Gemma2/Gemma4 logits (cap=30).
+
+struct SoftcapOp {
+    softcap: f32,
+}
+
+impl CustomOp1 for SoftcapOp {
+    fn name(&self) -> &'static str {
+        "metal-softcap"
+    }
+
+    fn cpu_fwd(&self, _s: &CpuStorage, _l: &Layout) -> Result<(CpuStorage, Shape)> {
+        candle_core::bail!("SoftcapOp: Metal-only")
+    }
+
+    fn metal_fwd(&self, x: &MetalStorage, l: &Layout) -> Result<(MetalStorage, Shape)> {
+        if !l.is_contiguous() {
+            candle_core::bail!("SoftcapOp: input must be contiguous");
+        }
+        let kernel_name: &'static str = match x.dtype() {
+            DType::F32 => "softcap_f32",
+            DType::F16 => "softcap_f16",
+            DType::BF16 => "softcap_bf16",
+            other => candle_core::bail!("SoftcapOp: unsupported dtype {other:?}"),
+        };
+
+        let elem_count = l.shape().elem_count();
+        let device = x.device();
+        let output = device.new_buffer(elem_count, x.dtype(), "softcap_out")?;
+        let pipeline = get_or_compile_ffn_pipeline(device.device(), kernel_name)?;
+        let encoder = device.command_encoder()?;
+
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(
+            0,
+            Some(x.buffer()),
+            l.start_offset() * x.dtype().size_in_bytes(),
+        );
+        encoder.set_buffer(1, Some(&*output), 0);
+        encoder.set_bytes(2, &(elem_count as u32));
+        encoder.set_bytes(3, &self.softcap);
+        encoder.use_resource(x.buffer(), MTLResourceUsage::Read);
+        encoder.use_resource(&*output, MTLResourceUsage::Write);
+        ffn_dispatch(&pipeline, &encoder, elem_count);
+
+        Ok((
+            MetalStorage::new(output, device.clone(), elem_count, x.dtype()),
+            l.shape().clone(),
+        ))
+    }
+}
+
 // ─── Public API ──────────────────────────────────────────────────────────────
 
 /// Scaled Dot Product Attention via Metal fused kernels.
@@ -770,6 +826,13 @@ pub fn gated_silu_fused(x: &Tensor, intermediate_size: usize) -> Result<Tensor> 
 /// Returns a tensor of the same shape with values `silu(gate[i]) * up[i]`.
 pub fn silu_mul_fused(gate: &Tensor, up: &Tensor) -> Result<Tensor> {
     gate.apply_op2_no_bwd(up, &SiluMulOp)
+}
+
+/// Fused softcap via Metal kernel: `out[i] = cap * tanh(x[i] / cap)`.
+///
+/// `x` must be contiguous.  Returns a tensor of the same shape and dtype.
+pub fn softcap_fused(x: &Tensor, softcap: f32) -> Result<Tensor> {
+    x.apply_op1_no_bwd(&SoftcapOp { softcap })
 }
 
 #[cfg(test)]
@@ -903,5 +966,61 @@ mod fused_kernel_parity_tests {
             .unwrap();
         let res = silu_mul_fused(&gate, &up);
         assert!(res.is_err());
+    }
+
+    #[test]
+    fn softcap_matches_scalar_path_f32() {
+        let Some(dev) = metal_device_or_skip() else {
+            return;
+        };
+        // Cover small, near-zero, and large-magnitude inputs.
+        let data: Vec<f32> = (0..64).map(|i| (i as f32 - 32.0) * 5.0).collect();
+        let x = Tensor::from_vec(data, (4, 16), &dev).unwrap();
+        let cap = 30.0f32;
+
+        let fused = softcap_fused(&x, cap).unwrap();
+        let scalar = (x.affine(1.0 / cap as f64, 0.0).unwrap().tanh().unwrap())
+            .affine(cap as f64, 0.0)
+            .unwrap();
+
+        let f = fused.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let s = scalar.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let diff = max_abs_diff_f32(&f, &s);
+        assert!(diff < 1e-5, "max_abs_diff = {diff}");
+    }
+
+    #[test]
+    fn softcap_matches_scalar_path_bf16() {
+        let Some(dev) = metal_device_or_skip() else {
+            return;
+        };
+        let data: Vec<f32> = (0..32).map(|i| (i as f32 - 16.0) * 2.0).collect();
+        let x = Tensor::from_vec(data, (2, 16), &dev)
+            .unwrap()
+            .to_dtype(DType::BF16)
+            .unwrap();
+        let cap = 50.0f32;
+
+        let fused = softcap_fused(&x, cap).unwrap();
+        let scalar = (x.affine(1.0 / cap as f64, 0.0).unwrap().tanh().unwrap())
+            .affine(cap as f64, 0.0)
+            .unwrap();
+
+        let f = fused
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let s = scalar
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let diff = max_abs_diff_f32(&f, &s);
+        assert!(diff < 0.5, "max_abs_diff (bf16) = {diff}");
     }
 }

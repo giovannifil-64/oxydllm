@@ -98,3 +98,44 @@ kernel void silu_mul_bf16(
     out[gid] = (bfloat)(silu_f32(g) * u);
 }
 #endif
+
+// ── Softcap: out[i] = cap * tanh(x[i] / cap) ─────────────────────────────────
+// Used by Gemma2 attention scores (cap=50) and Gemma2/Gemma4 logits (cap=30).
+// Replaces the 3-op fallback `(x/cap).tanh()*cap` with one kernel pass.
+
+kernel void softcap_f32(
+    device const float* x   [[buffer(0)]],
+    device       float* out [[buffer(1)]],
+    constant uint&      n   [[buffer(2)]],
+    constant float&     cap [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= n) return;
+    out[gid] = cap * tanh(x[gid] / cap);
+}
+
+kernel void softcap_f16(
+    device const half* x   [[buffer(0)]],
+    device       half* out [[buffer(1)]],
+    constant uint&     n   [[buffer(2)]],
+    constant float&    cap [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= n) return;
+    float v = (float)x[gid];
+    out[gid] = (half)(cap * tanh(v / cap));
+}
+
+#if defined(__HAVE_BFLOAT__)
+kernel void softcap_bf16(
+    device const bfloat* x   [[buffer(0)]],
+    device       bfloat* out [[buffer(1)]],
+    constant uint&       n   [[buffer(2)]],
+    constant float&      cap [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= n) return;
+    float v = (float)x[gid];
+    out[gid] = (bfloat)(cap * tanh(v / cap));
+}
+#endif

@@ -376,8 +376,19 @@ pub fn run_transformer_layers_batch(
     let logits = c.lm_head.forward(&x)?;
 
     if let Some(cap) = c.logit_softcap {
-        let cap_t = cap;
-        (logits / cap_t)?.tanh()?.affine(cap_t, 0.0)
+        #[cfg(feature = "metal")]
+        {
+            if logits.device().is_metal() {
+                let l = logits.contiguous()?;
+                super::metal_ops::softcap_fused(&l, cap as f32)
+            } else {
+                (logits / cap)?.tanh()?.affine(cap, 0.0)
+            }
+        }
+        #[cfg(not(feature = "metal"))]
+        {
+            (logits / cap)?.tanh()?.affine(cap, 0.0)
+        }
     } else {
         Ok(logits)
     }

@@ -529,7 +529,19 @@ impl Attention {
                     .affine(self.scale, 0.)?;
 
                 if let Some(softcap) = self.attn_softcap {
-                    scores = (scores / softcap)?.tanh()?.affine(softcap, 0.)?;
+                    #[cfg(feature = "metal")]
+                    {
+                        if scores.device().is_metal() {
+                            let s = scores.contiguous()?;
+                            scores = super::metal_ops::softcap_fused(&s, softcap as f32)?;
+                        } else {
+                            scores = (scores / softcap)?.tanh()?.affine(softcap, 0.)?;
+                        }
+                    }
+                    #[cfg(not(feature = "metal"))]
+                    {
+                        scores = (scores / softcap)?.tanh()?.affine(softcap, 0.)?;
+                    }
                 }
 
                 let scores = if let Some(m) = mask {

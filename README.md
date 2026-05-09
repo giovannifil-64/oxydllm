@@ -54,7 +54,7 @@ oxydLLM is built on top of the Candle tensor library. The model layer implements
 KV cache quantization uses TurboQuant with MSE-based quantization during the decode phase, reducing memory overhead without significant quality loss. Metal kernels provide fused operations for attention, normalization, and positional embeddings on Apple Silicon.
 
 ## Tested Models
-Here you can find a list of models that have been tested, divided by architecture. This is not an exhaustive list of compatible models.
+Here you can find a list of models that have been tested, divided by architecture. This is ***not*** an exhaustive list of compatible models.
 
 ### LlamaForCausalLM
 - `Llama-3.2-1B-Instruct`
@@ -63,17 +63,16 @@ Here you can find a list of models that have been tested, divided by architectur
 - `Ministral-3-3B-Instruct-2512`
 
 ### Qwen2ForCausalLM
-- `Qwen2.5-1.5B-Instruct`
+- `Qwen2.5-1.5B-Instruct` (including Q2_K and Q4_K_M quantized variants)
+- `Qwen2.5-3B-Instruct`
 
 ### Qwen3ForCausalLM
 > [!NOTE]
 > All Qwen3 models have been tested with and without thinking enabled.
 
-- `Qwen3-0.6B`
-- `Qwen3-0.6B-Q8_0`
+- `Qwen3-0.6B` (including the Q8_0 quantized variant)
 - `Qwen3-1.7B-Q8_0`
-- `Qwen3-4B-Q4_K_M`
-- `Qwen3-4B-Q5_0`
+- `Qwen3-4B` (specifically the Q4_K_M and Q5_0 quantized variants)
 
 ### GemmaForCausalLM
 - `gemma-2b-it`

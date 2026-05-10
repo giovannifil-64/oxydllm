@@ -2,6 +2,59 @@
 
 All notable changes to this project will be documented in this file.
 
+## 0.0.0-alpha.11
+
+- Added AWQ quantization support across attention, FFN, and `lm_head`, with QKV and gate+up fused at load time.
+- New Metal-accelerated fused kernels for `gated_silu`, `silu_mul`, and logit/attention `softcap`.
+- Added bias loading for QKV and output projections in both safetensors and GGUF paths.
+- Reworked streaming decode to always emit from a full-sequence canonical decode, eliminating BPE drift and double-spacing artifacts.
+- Introduced chunked prefill for large batched prompts to reduce peak memory during the prefill phase.
+
+### New Features
+- AWQ weight loading (`src/common/awq.rs`): `AwqRawTensors`, `dequantize_awq`, `concat_awq_along_out`, and `AWQ_PACK_ORDER = [0, 2, 4, 6, 1, 3, 5, 7]`. Auto-detected via `ModelWeights::try_get_awq(prefix)` for q/k/v/o, gate/up/down, and `lm_head`. Dequantization happens at load time, so no Metal kernel changes are required at inference time.
+- AWQ attention loader: when `qkv_proj` is detected as AWQ, q/k/v are concatenated along the output dimension and loaded as a single fused projection (matmul count per layer = 2, identical to the fp16 path). Mixed-format layers are rejected with a descriptive error.
+- AWQ FFN loader: `gate_proj` + `up_proj` AWQ tensors are fused into a single packed projection; `down_proj` is loaded as a separate AWQ linear.
+- `AnyLinear::from_awq` constructor for building linear layers directly from AWQ raw tensors with optional bias.
+- Quantization-config validation in the HF parser (`hf_parser.rs`) ensures only AWQ configurations supported by the runtime are accepted.
+- Bias support for attention projections: `q_proj.bias`, `k_proj.bias`, `v_proj.bias`, and `o_proj.bias` are now loaded in both the safetensors and GGUF (`attn_q.bias`, `attn_k.bias`, `attn_v.bias`, `attn_qkv.bias`, `attn_output.bias`) paths. Fused QKV biases are concatenated to match the fused weight layout.
+- Chunked prefill (`pick_prefill_chunk_split` in `engine.rs`): batches with two or more prefill sequences and a combined uncached length ≥ 1024 tokens are split into two halves and forwarded sequentially, sharing the same KV cache slices. Single-sequence prefills and small batches keep the original single-pass path.
+- `flush_caches` extracted as a reusable helper in `block.rs` so the engine can flush pending KV writes after each prefill chunk.
+
+### Performance and Efficiency
+- **Metal `gated_silu_fused`**: single-kernel `silu(x[..H]) * x[H..]` for packed gate+up activations (Phi-3 / Phi-3.5 and AWQ-fused FFN paths), avoiding two separate kernel launches and intermediate buffers.
+- **Metal `silu_mul_fused`**: single-kernel `silu(gate) * up` for the standard split gate/up FFN layout.
+- **Metal `softcap_fused`**: single-kernel `tanh(x / cap) * cap` used by Gemma2/3 attention softcap and final logit softcap; replaces the three-op `(x / cap).tanh() * cap` chain.
+- **Attention scratch buffer**: added `out_buf: RefCell<Option<Tensor>>` to `Attention` for reusing the output projection tensor across decode steps.
+- **KV-quant flush dtype reorder**: `to_device(Cpu)` is now applied before `to_dtype(F32)` when reading quantized K/V back to host memory, so the (potentially expensive) dtype conversion runs on CPU instead of issuing an extra GPU cast.
+- AWQ runtime size estimation in `estimate.rs` excludes pre-dequantization scratch tensors so the reported in-memory footprint matches the actual fp16/bf16 weight size after dequantization.
+
+### Reliability and Correctness
+- **Streaming decode rewrite** (`src/server/routes/engine_loop.rs`, `src/main.rs`): removed the per-token fast path that re-inserted a leading space when the vocab piece started with `▁` or `Ġ`. The heuristic could double-space (`"assistente"` + `" "` + `"virtuale"` → `"assistente  virtuale"`) and produce character drift that later swallowed user-visible characters. Streaming now always decodes the full accumulated id list and emits only the suffix beyond `decoded_len`, with trailing `U+FFFD` held back until the continuation token arrives. The `piece` field on the decode cache is no longer needed and was removed.
+- Output of fused QKV biases requires either all of q/k/v biases or none; mismatched bias presence falls back to a separate (non-fused) projection layout to avoid silent shape errors.
+- AWQ projections validate that out-features (`scales.dim(1)`) match `n_heads * head_dim` (q) and `n_kv_heads * head_dim` (k/v) before fusing.
+
+### Refactors and Maintainability
+- Engine prefill body extracted into a small closure so the chunked and single-pass paths share cache-slice handling and `flush_caches` is called uniformly at the end.
+- `engine_loop.rs` split the streaming decode into a pure `emit_suffix(full, decoded_len)` helper that is independently unit-tested.
+
+### Tests
+- Streaming decode unit tests (`streaming_decode_tests` in `engine_loop.rs`): cumulative-emission matches canonical decode, no double-spacing across `Ġ`-prefixed tokens, no character loss across partial-UTF-8 token boundaries, idempotency when `decoded_len == full.len()`, defensive clamping past end of `full`, and char-boundary clamping inside multibyte sequences.
+- AWQ unit tests covering load round-trips and runtime-size accounting.
+- Engine chunk-split tests (`pick_prefill_chunk_split`): small-batch skip, balanced two-sequence split, dominant-first-sequence skip, and three-sequence balancing.
+- Architecture regression coverage extended with additional `run_prefill` slice setups; existing slice initialization simplified.
+
+### Documentation
+- README updated to clarify model-compatibility notes.
+
+### CI / Infra
+- **Release notes now include the `CHANGELOG.md` section for the tag**: previously the release workflow set `body:` to the Installation block alone, fully overwriting the release body and leaving the changelog content visible only in the repository file. A new `Extract changelog section for this tag` step in `release.yml` slices the relevant block out of `CHANGELOG.md` (from `## <version>` to the next `## ` heading) and prepends it to the body, with the Installation/checksums block following and the auto-generated `**Full Changelog**` link appended by `softprops/action-gh-release` at the end.
+- **Heading match is literal, not regex**: the awk extractor matches the version heading via `index()` rather than interpolating the tag into a regex. This makes characters like `.`, `+` (semver build metadata), and `-` behave as plain text and removes the need to escape future tag formats.
+- **Prefix-collision guard**: the heading match also requires either an exact length match or a trailing whitespace character, so a tag `1.2` cannot accidentally match a heading `## 1.2.3`.
+- **Inline `**Full Changelog**` and `---` separators stripped from extracted sections**: the manual `**Full Changelog**` line at the bottom of each changelog section is dropped during extraction so it doesn't duplicate the auto-generated comparison link, and standalone `---` separators between historical sections are removed for the same reason.
+- **Missing-entry fallback**: if a tag is pushed without a matching `## <version>` in `CHANGELOG.md`, the release proceeds with a placeholder body and a GitHub Actions `::warning::` instead of failing, so a forgotten changelog entry never blocks a hotfix.
+
+**Full Changelog**: https://github.com/giovannifil-64/oxydllm/compare/0.0.0-alpha.10.0.1...0.0.0-alpha.11
+
 ## 0.0.0-alpha.10.0.1
 
 - Fixed release workflow stalling indefinitely on tag push due to missing repository context and insufficient permissions.

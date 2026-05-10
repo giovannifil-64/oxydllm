@@ -99,6 +99,57 @@ jobs:
       - name: List artifacts
         run: ls -lh dist/
 
+      - name: Extract changelog section for this tag
+        id: changelog
+        run: |
+          VERSION="${{ github.ref_name }}"
+
+          if [ ! -f CHANGELOG.md ]; then
+            echo "::warning::CHANGELOG.md not found; release body will omit the changelog section."
+            BODY="_No CHANGELOG.md found in repository._"
+          else
+            # Extract the block from "## <VERSION>" up to (but not including)
+            # the next "## " heading. Drop the trailing "**Full Changelog**"
+            # link and inter-section "---" separators so they don't duplicate
+            # the auto-generated notes appended by softprops/action-gh-release.
+            # The heading is matched as a literal prefix (via index()) so any
+            # regex meta-characters in the version — `.`, `+` (semver build
+            # metadata), `-` — are treated as plain text. Falls back to a
+            # placeholder if the tag has no entry yet — release proceeds,
+            # but we surface a warning.
+            HEADING="## ${VERSION}"
+            BODY=$(awk -v h="$HEADING" '
+              # Match "## <version>" exactly, or "## <version>" followed by
+              # whitespace (so trailing spaces in a heading do not break the
+              # match while still rejecting longer-prefix collisions, e.g.
+              # tag "1.2" must not match heading "## 1.2.3").
+              !in_section && index($0, h) == 1 && \
+                (length($0) == length(h) || \
+                 substr($0, length(h) + 1, 1) ~ /[[:space:]]/) {
+                in_section = 1
+                next
+              }
+              in_section && /^## / { exit }
+              in_section && /^\*\*Full Changelog\*\*:/ { next }
+              in_section && /^---[[:space:]]*$/ { next }
+              in_section { print }
+            ' CHANGELOG.md)
+
+            if [ -z "$(echo "$BODY" | tr -d '[:space:]')" ]; then
+              echo "::warning::No changelog entry found for ${VERSION} in CHANGELOG.md."
+              BODY="_No changelog entry for \`${VERSION}\` in CHANGELOG.md._"
+            fi
+          fi
+
+          # Hand the multi-line body to subsequent steps via $GITHUB_OUTPUT
+          # using the random-delimiter form recommended by GitHub.
+          DELIM="EOF_$(openssl rand -hex 8)"
+          {
+            echo "body<<${DELIM}"
+            echo "$BODY"
+            echo "${DELIM}"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Create Release
         uses: softprops/action-gh-release@v3
         with:
@@ -107,6 +158,8 @@ jobs:
           draft: false
           prerelease: ${{ contains(github.ref_name, '-') }}
           body: |
+            ${{ steps.changelog.outputs.body }}
+
             ## Installation
 
             **macOS (Apple Silicon)**

@@ -1,3 +1,4 @@
+use super::awq::{AwqRawTensors, concat_awq_along_out};
 use super::config::BlockConfig;
 use super::gguf_weights::GgufWeights;
 use super::linear::{AnyLinear, QLinear, softmax_last_dim};
@@ -98,6 +99,12 @@ impl Attention {
         let hd = cfg.head_dim;
         let q_dim = cfg.n_heads * hd;
         let kv_dim = cfg.n_kv_heads * hd;
+        let q_prefix = format!("{}.q_proj", p);
+
+        if let Some(q_raw) = weights.try_get_awq(&q_prefix) {
+            return Self::load_awq(cfg, &p, q_raw, weights, layer_idx);
+        }
+
         let qkv_weight_name = format!("{}.qkv_proj.weight", p);
         let q_weight_name = format!("{}.q_proj.weight", p);
         let k_weight_name = format!("{}.k_proj.weight", p);
@@ -202,6 +209,135 @@ impl Attention {
 
         Ok(Self {
             qkv: QkvProjection::Fused(qkv_proj),
+            o_proj,
+            q_norm,
+            k_norm,
+            n_heads: cfg.n_heads,
+            n_kv_heads: cfg.n_kv_heads,
+            head_dim: hd,
+            q_dim,
+            kv_dim,
+            scale: cfg.attention_scale.unwrap_or(1.0 / (hd as f64).sqrt()),
+            attn_softcap: cfg.attn_softcap,
+            sliding_window: actual_window,
+            v_norm: cfg.v_norm,
+            rms_norm_eps: cfg.rms_norm_eps,
+            out_buf: std::cell::RefCell::new(None),
+        })
+    }
+
+    fn load_awq(
+        cfg: &BlockConfig,
+        p: &str,
+        q_raw: AwqRawTensors,
+        weights: &ModelWeights,
+        layer_idx: usize,
+    ) -> Result<Self> {
+        let hd = cfg.head_dim;
+        let q_dim = cfg.n_heads * hd;
+        let kv_dim = cfg.n_kv_heads * hd;
+
+        let device = q_raw.scales.device().clone();
+        let dtype = q_raw.scales.dtype();
+
+        let k_prefix = format!("{p}.k_proj");
+        let v_prefix = format!("{p}.v_proj");
+        let o_prefix = format!("{p}.o_proj");
+
+        let k_raw = weights.try_get_awq(&k_prefix).ok_or_else(|| {
+            candle_core::Error::Msg(format!(
+                "Mixed quantization at {p}: q_proj is AWQ but k_proj.qweight is missing. \
+                 oxydllm requires every projection in a layer to share the same format."
+            ))
+        })?;
+        let v_raw = weights.try_get_awq(&v_prefix).ok_or_else(|| {
+            candle_core::Error::Msg(format!(
+                "Mixed quantization at {p}: q_proj is AWQ but v_proj.qweight is missing."
+            ))
+        })?;
+        let o_raw = weights.try_get_awq(&o_prefix).ok_or_else(|| {
+            candle_core::Error::Msg(format!(
+                "Mixed quantization at {p}: q_proj is AWQ but o_proj.qweight is missing."
+            ))
+        })?;
+
+        let q_bias = weights.try_get(&format!("{p}.q_proj.bias")).cloned();
+        let k_bias = weights.try_get(&format!("{p}.k_proj.bias")).cloned();
+        let v_bias = weights.try_get(&format!("{p}.v_proj.bias")).cloned();
+        let o_bias = weights.try_get(&format!("{p}.o_proj.bias")).cloned();
+
+        if q_raw.scales.dim(1)? != q_dim {
+            candle_core::bail!(
+                "AWQ q_proj out_features {} != n_heads*head_dim {q_dim} at {p}",
+                q_raw.scales.dim(1)?
+            );
+        }
+        if k_raw.scales.dim(1)? != kv_dim || v_raw.scales.dim(1)? != kv_dim {
+            candle_core::bail!(
+                "AWQ k/v_proj out_features mismatch (k={}, v={}) vs n_kv_heads*head_dim {kv_dim} at {p}",
+                k_raw.scales.dim(1)?,
+                v_raw.scales.dim(1)?
+            );
+        }
+
+        let bias_fusable = matches!(
+            (&q_bias, &k_bias, &v_bias),
+            (Some(_), Some(_), Some(_)) | (None, None, None)
+        );
+        let dims_fusable = q_dim.is_multiple_of(8) && kv_dim.is_multiple_of(8);
+        let qkv_fused = bias_fusable && dims_fusable;
+        let group_size = q_raw
+            .group_size()
+            .map_err(|e| candle_core::Error::Msg(format!("AWQ q_proj group_size at {p}: {e:#}")))?;
+        if layer_idx == 0 {
+            tracing::info!(
+                group_size,
+                qkv_fused,
+                bias_present = q_bias.is_some(),
+                "AWQ attention loader engaged"
+            );
+        }
+
+        let qkv = if qkv_fused {
+            let fused_raw = concat_awq_along_out(&[q_raw, k_raw, v_raw])
+                .map_err(|e| candle_core::Error::Msg(format!("AWQ QKV fuse failed: {e:#}")))?;
+            let fused_bias = match (q_bias, k_bias, v_bias) {
+                (Some(qb), Some(kb), Some(vb)) => Some(Tensor::cat(&[&qb, &kb, &vb], 0)?),
+                _ => None,
+            };
+            QkvProjection::Fused(AnyLinear::from_awq(&fused_raw, fused_bias, &device, dtype)?)
+        } else {
+            QkvProjection::Separate {
+                q: AnyLinear::from_awq(&q_raw, q_bias, &device, dtype)?,
+                k: AnyLinear::from_awq(&k_raw, k_bias, &device, dtype)?,
+                v: AnyLinear::from_awq(&v_raw, v_bias, &device, dtype)?,
+            }
+        };
+        let o_proj = AnyLinear::from_awq(&o_raw, o_bias, &device, dtype)?;
+
+        let q_norm = if cfg.qk_norm {
+            Some(RMSNorm::new(
+                weights.get(&format!("{p}.q_norm.weight"))?.clone(),
+                cfg.rms_norm_eps,
+                cfg.norm_type,
+            )?)
+        } else {
+            None
+        };
+        let k_norm = if cfg.qk_norm {
+            Some(RMSNorm::new(
+                weights.get(&format!("{p}.k_norm.weight"))?.clone(),
+                cfg.rms_norm_eps,
+                cfg.norm_type,
+            )?)
+        } else {
+            None
+        };
+
+        let actual_window = compute_sliding_window(cfg);
+
+        Ok(Self {
+            qkv,
             o_proj,
             q_norm,
             k_norm,

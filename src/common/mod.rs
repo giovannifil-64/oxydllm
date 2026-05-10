@@ -1,4 +1,5 @@
 pub mod attention;
+pub mod awq;
 pub mod block;
 pub mod config;
 pub mod ffn;

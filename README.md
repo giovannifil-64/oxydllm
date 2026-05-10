@@ -45,6 +45,7 @@ A rust-based inference engine for Large Language Models.
 - Multi-model server: load several models simultaneously with LRU eviction and configurable memory budgets
 - Thinking/reasoning model support with separated `reasoning_content` field
 - GGUF quantized model support (Q4_K_M, Q5_0, Q8_0, and others), including sharded GGUF loading
+- AWQ 4-bit quantized safetensors support (autoawq GEMM layout) with auto-detection, fused QKV/gate-up projections, and load-time dequantization
 - Streaming responses via Server-Sent Events
 - Model download directly from HuggingFace with interactive variant selection
 
@@ -72,7 +73,7 @@ Here you can find a list of models that have been tested, divided by architectur
 
 - `Qwen3-0.6B` (including the Q8_0 quantized variant)
 - `Qwen3-1.7B-Q8_0`
-- `Qwen3-4B` (specifically the Q4_K_M and Q5_0 quantized variants)
+- `Qwen3-4B` (Q4_K_M, Q5_0, and AWQ 4-bit autoawq GEMM variants)
 
 ### GemmaForCausalLM
 - `gemma-2b-it`
@@ -276,6 +277,7 @@ The following options are shared between `start` and `run`:
 - **Gemma4 edge cases**: Some checkpoints may require architecture-specific tuning.
 - **Metal softcap SDPA policy**: The Metal SDPA path with attention softcap is currently hard-disabled in runtime (no experimental toggle) and falls back to the standard attention path.
 - **CUDA optimization**: Support exists but is not optimized for production use.
+- **AWQ runtime memory footprint**: AWQ checkpoints currently dequantize to fp16/bf16 at load time, so resident weight memory matches an equivalent fp16 model rather than the on-disk 4-bit footprint. Inference throughput matches fp16 thanks to fused QKV/gate-up projections.
 
 ## CUDA Status
 CUDA is currently a functional compatibility path, not a performance-tuned backend.

@@ -30,6 +30,7 @@ pub fn parse(config_path: &str) -> Result<StandardTransformerConfig> {
 
     let arch = v["architectures"][0].as_str().unwrap_or("Unknown");
     maybe_log_torch_dtype(&v);
+    validate_quantization_config(&v["quantization_config"])?;
 
     if let Some(reason) = crate::models::arch_defaults::known_unsupported_reason(arch) {
         anyhow::bail!("Architecture '{arch}' is not supported: {reason}");
@@ -307,6 +308,49 @@ fn parse_generation_eos(config_path: &str) -> Vec<u32> {
         Err(_) => return Vec::new(),
     };
     parse_eos(&v["eos_token_id"])
+}
+
+fn validate_quantization_config(v: &Value) -> Result<()> {
+    if v.is_null() {
+        return Ok(());
+    }
+    let method = v["quant_method"].as_str().unwrap_or("");
+    let bits = v["bits"].as_u64();
+    let group_size = v["group_size"].as_u64();
+    let version = v["version"].as_str().unwrap_or("gemm");
+
+    match method.to_ascii_lowercase().as_str() {
+        "awq" => {
+            if bits != Some(4) {
+                anyhow::bail!(
+                    "AWQ checkpoint requires 4-bit weights, found bits={:?}. Only 4-bit AWQ is supported.",
+                    bits
+                );
+            }
+            if !version.eq_ignore_ascii_case("gemm") {
+                anyhow::bail!(
+                    "AWQ version '{version}' is not supported (only 'gemm' has a runtime path). \
+                     Re-export the checkpoint with autoawq's GEMM kernel or use a different model."
+                );
+            }
+            tracing::info!(
+                quant = "awq",
+                version = "gemm",
+                bits = 4,
+                group_size = group_size.unwrap_or(128),
+                "AWQ 4-bit checkpoint detected; weights will be dequantized at load time"
+            );
+            Ok(())
+        }
+        "gptq" => anyhow::bail!(
+            "GPTQ checkpoints are not yet supported. AWQ is supported; GPTQ requires a separate loader."
+        ),
+        "" => Ok(()),
+        other => anyhow::bail!(
+            "Unknown quantization method '{other}' in quantization_config. \
+             Supported: awq (gemm, 4-bit)."
+        ),
+    }
 }
 
 fn maybe_log_torch_dtype(v: &Value) {

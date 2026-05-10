@@ -434,7 +434,7 @@ fn load_standard_safetensors(
     let weight_paths = resolve_weight_paths(model_dir)?;
     let weight_path_refs: Vec<&str> = weight_paths.iter().map(|s| s.as_str()).collect();
     let weights = ModelWeights::load(&weight_path_refs, device, dtype)?;
-    let weights_size = weights.total_size_bytes();
+    let weights_size = weights.runtime_size_bytes();
 
     let num_layers = cfg.num_hidden_layers;
     let per_layer_head_dims = cfg
@@ -507,6 +507,9 @@ fn load_standard_safetensors(
 
         let lm_head = if cfg.tie_word_embeddings {
             AnyLinear::from_weight_with_scale_inv(embed_weight.clone(), lm_head_scale_inv, None)
+        } else if let Some(lm_head_awq) = weights.try_get_awq("lm_head") {
+            AnyLinear::from_awq(&lm_head_awq, None, device, dtype)
+                .map_err(|e| anyhow::anyhow!("{e}"))?
         } else {
             AnyLinear::from_weight_with_scale_inv(
                 weights

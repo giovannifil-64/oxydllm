@@ -1,3 +1,4 @@
+use crate::common::awq::{AwqRawTensors, dequantize_awq};
 use candle_core::quantized::{QMatMul, QTensor};
 use candle_core::{DType, Device, Result, Tensor};
 use std::sync::Arc;
@@ -244,6 +245,17 @@ impl AnyLinear {
         }
     }
 
+    pub fn from_awq(
+        raw: &AwqRawTensors,
+        bias: Option<Tensor>,
+        device: &Device,
+        dtype: DType,
+    ) -> Result<Self> {
+        let weight = dequantize_awq(raw, device, dtype)
+            .map_err(|e| candle_core::Error::Msg(format!("AWQ dequantization failed: {e:#}")))?;
+        Ok(Self::Float(Linear::new(weight, bias)))
+    }
+
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         match self {
             Self::Float(l) => l.forward(x),
@@ -256,6 +268,112 @@ impl AnyLinear {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn any_linear_from_awq_matches_reference_linear() -> Result<()> {
+        use crate::common::awq::{AWQ_PACK_FACTOR, AWQ_PACK_ORDER, AwqRawTensors};
+
+        let device = Device::Cpu;
+        let in_features = 4;
+        let out_features = 8;
+        let group_size = 2;
+        let groups = in_features / group_size;
+        let packed_out = out_features / AWQ_PACK_FACTOR;
+
+        let mut iweight: Vec<Vec<u8>> = Vec::with_capacity(in_features);
+        for i in 0..in_features {
+            iweight.push(
+                (0..out_features)
+                    .map(|j| ((i * 5 + j) & 0xF) as u8)
+                    .collect(),
+            );
+        }
+        let izero: Vec<Vec<u8>> = (0..groups)
+            .map(|g| (0..out_features).map(|j| ((g + j) & 0xF) as u8).collect())
+            .collect();
+        let scales: Vec<f32> = (0..groups)
+            .flat_map(|g| (0..out_features).map(move |j| 0.05 * (g as f32 + 1.0) + 0.01 * j as f32))
+            .collect();
+
+        let mut qweight_words: Vec<u32> = vec![0; in_features * packed_out];
+        for (i, row) in iweight.iter().enumerate().take(in_features) {
+            for j in 0..packed_out {
+                let mut word: u32 = 0;
+                for (k, &offset) in AWQ_PACK_ORDER.iter().enumerate() {
+                    let orig_col = j * AWQ_PACK_FACTOR + offset;
+                    word |= (row[orig_col] as u32 & 0xF) << (4 * k as u32);
+                }
+                qweight_words[i * packed_out + j] = word;
+            }
+        }
+        let mut qzero_words: Vec<u32> = vec![0; groups * packed_out];
+        for (g, row) in izero.iter().enumerate().take(groups) {
+            for j in 0..packed_out {
+                let mut word: u32 = 0;
+                for (k, &offset) in AWQ_PACK_ORDER.iter().enumerate() {
+                    let orig_col = j * AWQ_PACK_FACTOR + offset;
+                    word |= (row[orig_col] as u32 & 0xF) << (4 * k as u32);
+                }
+                qzero_words[g * packed_out + j] = word;
+            }
+        }
+
+        let qweight = Tensor::from_vec(
+            qweight_words
+                .into_iter()
+                .map(|w| w as i32)
+                .collect::<Vec<_>>(),
+            (in_features, packed_out),
+            &device,
+        )?;
+        let qzeros = Tensor::from_vec(
+            qzero_words
+                .into_iter()
+                .map(|w| w as i32)
+                .collect::<Vec<_>>(),
+            (groups, packed_out),
+            &device,
+        )?;
+        let scales_t = Tensor::from_vec(scales.clone(), (groups, out_features), &device)?;
+
+        let raw = AwqRawTensors {
+            qweight,
+            qzeros,
+            scales: scales_t,
+        };
+        let bias_vec: Vec<f32> = (0..out_features).map(|j| 0.1 * j as f32).collect();
+        let bias = Tensor::from_vec(bias_vec.clone(), (out_features,), &device)?;
+        let awq_linear = AnyLinear::from_awq(&raw, Some(bias.clone()), &device, DType::F32)?;
+
+        // Build reference [out, in] weight from the unpacked int4 matrix.
+        let mut ref_weight = vec![0f32; out_features * in_features];
+        for i in 0..in_features {
+            let g = i / group_size;
+            for j in 0..out_features {
+                let w = iweight[i][j] as i32 - izero[g][j] as i32;
+                ref_weight[j * in_features + i] = w as f32 * scales[g * out_features + j];
+            }
+        }
+        let ref_weight_t = Tensor::from_vec(ref_weight, (out_features, in_features), &device)?;
+        let ref_linear = Linear::new(ref_weight_t, Some(bias));
+
+        let x = Tensor::from_vec(
+            (0..in_features)
+                .map(|v| 0.1 * (v as f32) - 0.05)
+                .collect::<Vec<_>>(),
+            (1, in_features),
+            &device,
+        )?;
+        let out_awq = awq_linear.forward(&x)?.to_vec2::<f32>()?;
+        let out_ref = ref_linear.forward(&x)?.to_vec2::<f32>()?;
+
+        for (a_row, r_row) in out_awq.iter().zip(out_ref.iter()) {
+            for (a, r) in a_row.iter().zip(r_row.iter()) {
+                assert!((a - r).abs() < 1e-6, "awq={a} ref={r}");
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn any_linear_selects_fp8_variant_for_fp8_weights() -> Result<()> {

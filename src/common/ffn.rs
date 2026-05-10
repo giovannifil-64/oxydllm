@@ -1,3 +1,4 @@
+use super::awq::{AwqRawTensors, concat_awq_along_out};
 use super::config::Activation;
 use super::gguf_weights::GgufWeights;
 use super::linear::{AnyLinear, QLinear, gelu_tanh, silu};
@@ -22,6 +23,11 @@ pub struct FeedForward {
 impl FeedForward {
     pub fn load(layer_idx: usize, weights: &ModelWeights, activation: Activation) -> Result<Self> {
         let p = format!("model.layers.{}.mlp", layer_idx);
+
+        if let Some(down_raw) = weights.try_get_awq(&format!("{p}.down_proj")) {
+            return Self::load_awq(&p, down_raw, weights, activation, layer_idx);
+        }
+
         let down_weight_name = format!("{}.down_proj.weight", p);
         let down_w = weights.get(&down_weight_name)?.clone();
         let down_scale_inv = weights.try_get_scale_inv(&down_weight_name).cloned();
@@ -134,6 +140,99 @@ impl FeedForward {
             candle_core::bail!(
                 "Unsupported FFN layout at {}: expected gate_proj+up_proj, gate_up_proj, or up_proj",
                 p
+            );
+        };
+
+        Ok(Self {
+            gate_up,
+            down_proj,
+            intermediate_size,
+            activation,
+        })
+    }
+
+    fn load_awq(
+        p: &str,
+        down_raw: AwqRawTensors,
+        weights: &ModelWeights,
+        activation: Activation,
+        layer_idx: usize,
+    ) -> Result<Self> {
+        let device = down_raw.scales.device().clone();
+        let dtype = down_raw.scales.dtype();
+
+        // down_proj: out_features = hidden, in_features = intermediate.
+        let intermediate_size = down_raw
+            .qweight
+            .dim(0)
+            .map_err(|e| candle_core::Error::Msg(format!("AWQ down_proj rank: {e}")))?;
+        let down_proj = AnyLinear::from_awq(&down_raw, None, &device, dtype)?;
+
+        let gate_prefix = format!("{p}.gate_proj");
+        let up_prefix = format!("{p}.up_proj");
+        let gate_up_prefix = format!("{p}.gate_up_proj");
+
+        let gate_up = if let (Some(gate_raw), Some(up_raw)) = (
+            weights.try_get_awq(&gate_prefix),
+            weights.try_get_awq(&up_prefix),
+        ) {
+            let gate_out = gate_raw.scales.dim(1)?;
+            let up_out = up_raw.scales.dim(1)?;
+            if gate_out != intermediate_size || up_out != intermediate_size {
+                candle_core::bail!(
+                    "AWQ FFN shape mismatch at {p}: gate/up out_features must both be {intermediate_size}, got gate={gate_out} up={up_out}"
+                );
+            }
+
+            let gate_up_fused = intermediate_size.is_multiple_of(8);
+            if layer_idx == 0 {
+                tracing::info!(
+                    intermediate_size,
+                    gate_up_fused,
+                    "AWQ FFN loader engaged (separate gate/up tensors)"
+                );
+            }
+            if gate_up_fused {
+                let fused_raw = concat_awq_along_out(&[gate_raw, up_raw]).map_err(|e| {
+                    candle_core::Error::Msg(format!("AWQ gate+up fuse failed: {e:#}"))
+                })?;
+                GateUpProjection::Fused(AnyLinear::from_awq(&fused_raw, None, &device, dtype)?)
+            } else {
+                GateUpProjection::Separate {
+                    gate: AnyLinear::from_awq(&gate_raw, None, &device, dtype)?,
+                    up: AnyLinear::from_awq(&up_raw, None, &device, dtype)?,
+                }
+            }
+        } else if let Some(gate_up_raw) = weights.try_get_awq(&gate_up_prefix) {
+            let packed_out = gate_up_raw.scales.dim(1)?;
+            if packed_out != 2 * intermediate_size {
+                candle_core::bail!(
+                    "AWQ FFN gate_up out_features {packed_out} != 2*{intermediate_size}"
+                );
+            }
+            if layer_idx == 0 {
+                tracing::info!(
+                    intermediate_size,
+                    "AWQ FFN loader engaged (pre-fused gate_up_proj)"
+                );
+            }
+            GateUpProjection::Fused(AnyLinear::from_awq(&gate_up_raw, None, &device, dtype)?)
+        } else if let Some(up_raw) = weights.try_get_awq(&up_prefix) {
+            let up_out = up_raw.scales.dim(1)?;
+            if up_out != intermediate_size {
+                candle_core::bail!("AWQ FFN up_proj out_features {up_out} != {intermediate_size}");
+            }
+            if layer_idx == 0 {
+                tracing::info!(
+                    intermediate_size,
+                    "AWQ FFN loader engaged (ungated up-only path)"
+                );
+            }
+            GateUpProjection::Simple(AnyLinear::from_awq(&up_raw, None, &device, dtype)?)
+        } else {
+            candle_core::bail!(
+                "Mixed quantization at {p}: down_proj is AWQ but no gate/up tensors are AWQ. \
+                 Expected one of: ({{gate,up}}_proj.qweight) or (gate_up_proj.qweight) or (up_proj.qweight)."
             );
         };
 

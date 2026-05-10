@@ -1,3 +1,4 @@
+use crate::common::awq::AwqRawTensors;
 use anyhow::{Context, Result};
 use candle_core::{DType, Device, Tensor, safetensors::MmapedSafetensors};
 use rustc_hash::FxHashMap;
@@ -19,6 +20,13 @@ fn load_tensor_with_dtype(
         .with_context(|| format!("Failed to load tensor {}", name))?;
 
     let target_dtype = if force_f32 { DType::F32 } else { dtype };
+
+    if matches!(
+        t.dtype(),
+        DType::U8 | DType::U32 | DType::I16 | DType::I32 | DType::I64
+    ) {
+        return Ok(t);
+    }
 
     if t.dtype() == DType::F8E4M3 {
         // Metal has no F8E4M3 compute kernels (not even type conversion), so the on-the-fly
@@ -225,14 +233,39 @@ impl ModelWeights {
         self.try_get(&format!("{}_scale_inv", weight_name))
     }
 
-    /// Returns the actual memory footprint of all loaded tensors in bytes.
-    /// This reflects the dtype used at load time (BF16 on GPU, F32 on CPU),
-    /// which may differ from the on-disk size of the safetensors files.
-    pub fn total_size_bytes(&self) -> usize {
-        self.tensors
+    pub fn try_get_awq(&self, prefix: &str) -> Option<AwqRawTensors> {
+        let qweight = self.try_get(&format!("{prefix}.qweight"))?.clone();
+        let qzeros = self.try_get(&format!("{prefix}.qzeros"))?.clone();
+        let scales = self.try_get(&format!("{prefix}.scales"))?.clone();
+        Some(AwqRawTensors {
+            qweight,
+            qzeros,
+            scales,
+        })
+    }
+
+    pub fn runtime_size_bytes(&self) -> usize {
+        let runtime_dtype = self
+            .tensors
             .values()
-            .map(|t| t.dtype().size_in_bytes() * t.elem_count())
-            .sum()
+            .find(|t| matches!(t.dtype(), DType::F16 | DType::BF16 | DType::F32))
+            .map(|t| t.dtype())
+            .unwrap_or(DType::BF16);
+        let runtime_elem_bytes = runtime_dtype.size_in_bytes();
+
+        let mut total = 0usize;
+        for (name, t) in &self.tensors {
+            if name.ends_with(".qzeros") || name.ends_with(".scales") {
+                // Folded into the dequantized weight; not retained after load.
+                continue;
+            }
+            if name.ends_with(".qweight") {
+                total += t.elem_count() * 8 * runtime_elem_bytes;
+                continue;
+            }
+            total += t.dtype().size_in_bytes() * t.elem_count();
+        }
+        total
     }
 }
 
@@ -270,6 +303,46 @@ mod tests {
             .expect("scaled tensor should exist")
             .to_vec2::<f32>()?;
         assert_eq!(scaled, vec![vec![2.0, 4.0], vec![1.5, 2.0]]);
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_size_bytes_expands_qweight_and_drops_qzeros_scales() -> Result<()> {
+        let device = Device::Cpu;
+        let mut tensors = FxHashMap::default();
+
+        let qweight = Tensor::zeros((1, 4), DType::I32, &device)?;
+        let qzeros = Tensor::zeros((1, 4), DType::I32, &device)?;
+        let scales = Tensor::zeros((1, 32), DType::BF16, &device)?;
+        let bias = Tensor::zeros((32,), DType::BF16, &device)?;
+        let ln = Tensor::zeros((8,), DType::BF16, &device)?;
+
+        tensors.insert("layer.0.q_proj.qweight".into(), qweight);
+        tensors.insert("layer.0.q_proj.qzeros".into(), qzeros);
+        tensors.insert("layer.0.q_proj.scales".into(), scales);
+        tensors.insert("layer.0.q_proj.bias".into(), bias);
+        tensors.insert("layer.0.input_layernorm.weight".into(), ln);
+
+        let weights = ModelWeights::from_tensors(tensors);
+
+        assert_eq!(weights.runtime_size_bytes(), 64 + 64 + 16);
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_size_bytes_sums_tensor_bytes_for_non_awq_models() -> Result<()> {
+        let device = Device::Cpu;
+        let mut tensors = FxHashMap::default();
+        tensors.insert(
+            "layer.0.self_attn.q_proj.weight".into(),
+            Tensor::zeros((4, 4), DType::BF16, &device)?,
+        );
+        tensors.insert(
+            "layer.0.input_layernorm.weight".into(),
+            Tensor::zeros((4,), DType::BF16, &device)?,
+        );
+        let weights = ModelWeights::from_tensors(tensors);
+        assert_eq!(weights.runtime_size_bytes(), 40);
         Ok(())
     }
 

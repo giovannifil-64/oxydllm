@@ -142,23 +142,57 @@ fn estimate_local_safetensors(dir: &Path, ctx_len: usize, num_seqs: usize) -> Re
     let dtype_str = read_torch_dtype(&config_path).unwrap_or_else(|| "BF16".to_string());
     let is_fp8 =
         dtype_str.to_uppercase().contains("FLOAT8") || dtype_str.to_uppercase().contains("F8E4M3");
-    let effective_bytes = if is_fp8 {
-        weights_bytes * 2
+    let quant_info = read_quantization_config(&config_path);
+
+    let (effective_bytes, format_label, accuracy_label) = if let Some(qi) = quant_info.as_ref() {
+        if let Some(expansion) = awq_qweight_expansion(qi.bits.unwrap_or(4)) {
+            let (total_bytes, qweight_bytes) =
+                sum_safetensors_bytes(dir).unwrap_or((weights_bytes, 0));
+            let other_bytes = total_bytes.saturating_sub(qweight_bytes);
+            let runtime_bytes = other_bytes + (qweight_bytes as f64 * expansion) as usize;
+            let bits = qi.bits.unwrap_or(4);
+            let gs = qi.group_size.unwrap_or(128);
+            let version = qi
+                .version
+                .clone()
+                .unwrap_or_else(|| "gemm".to_string())
+                .to_lowercase();
+            let label = format!(
+                "AWQ {bits}-bit ({version}, group_size={gs}) safetensors  (load-time dequant: qweight expands {expansion:.0}×)"
+            );
+            (
+                runtime_bytes,
+                label,
+                "Accuracy ~lossy  (AWQ-calibrated 4-bit weights, near-fp16 quality)",
+            )
+        } else {
+            (
+                weights_bytes,
+                format!("{} safetensors  (unsupported variant)", qi.method),
+                "Accuracy unknown",
+            )
+        }
+    } else if is_fp8 {
+        (
+            weights_bytes * 2,
+            format!("{dtype_str} safetensors  (Metal: dequantized to BF16 at load → 2× file size)"),
+            "Accuracy 100%  (full-precision weights)",
+        )
     } else {
-        weights_bytes
+        (
+            weights_bytes,
+            format!("{dtype_str} safetensors"),
+            "Accuracy 100%  (full-precision weights)",
+        )
     };
 
     println!();
     println!("  Model    {}", model_name);
     println!("  Dir      {}", dir.display());
-    print!("  Format   {} safetensors", dtype_str);
-    if is_fp8 {
-        print!("  (Metal: dequantized to BF16 at load → 2× file size)");
-    }
-    println!();
+    println!("  Format   {}", format_label);
     println!();
     print_weights_kv_total(effective_bytes, geometry.as_ref(), ctx_len, num_seqs);
-    println!("  Accuracy 100%  (full-precision weights)");
+    println!("  {}", accuracy_label);
     println!();
 
     Ok(())
@@ -222,14 +256,20 @@ fn estimate_remote(
         })
         .sum();
 
-    let geometry = fetch_remote_config(&client, repo_id, token).or_else(|| {
+    let primary_config_json = fetch_remote_config_json(&client, repo_id, token);
+    let fallback_config_json = if primary_config_json.is_none() {
         let base_repo = repo_id.trim_end_matches("-GGUF").trim_end_matches("-gguf");
         if base_repo != repo_id {
-            fetch_remote_config(&client, base_repo, token)
+            fetch_remote_config_json(&client, base_repo, token)
         } else {
             None
         }
-    });
+    } else {
+        None
+    };
+    let config_json = primary_config_json.or(fallback_config_json);
+    let geometry = config_json.as_ref().and_then(parse_geometry_from_json);
+    let quant_info = config_json.as_ref().and_then(parse_quantization_from_json);
 
     println!();
     println!("  Model  {}  (remote)", repo_id);
@@ -284,20 +324,49 @@ fn estimate_remote(
 
     if safetensors_bytes > 0 {
         println!();
+        let is_awq = quant_info
+            .as_ref()
+            .and_then(|qi| awq_qweight_expansion(qi.bits.unwrap_or(4)))
+            .is_some();
+
+        let (runtime_weight_bytes, approx) = if is_awq {
+            ((safetensors_bytes as f64 * 3.1) as usize, true)
+        } else {
+            (safetensors_bytes as usize, false)
+        };
+
         let kv_bytes = geometry
             .as_ref()
             .map(|g| kv_cache_bytes(g, ctx_len, num_seqs));
         let kv_str = kv_bytes.map(fmt_bytes).unwrap_or_else(|| "?".to_string());
-        let total = kv_bytes.map(|b| b + safetensors_bytes as usize);
+        let total = kv_bytes.map(|b| b + runtime_weight_bytes);
         let total_str = total.map(fmt_bytes).unwrap_or_else(|| "?".to_string());
         println!("  {}", "─".repeat(72));
+        let (label, accuracy) = if is_awq {
+            (
+                format!(
+                    "AWQ {}-bit safetensors",
+                    quant_info.as_ref().and_then(|qi| qi.bits).unwrap_or(4)
+                ),
+                "~lossy",
+            )
+        } else {
+            ("safetensors (F32/BF16)".to_string(), "100%")
+        };
         println!(
-            "  {:<26}  {:>9}  {:>9}  {:>10}  100%",
-            "safetensors (F32/BF16)",
+            "  {:<26}  {:>9}  {:>9}  {:>10}  {}",
+            label,
             fmt_bytes(safetensors_bytes as usize),
             kv_str,
             total_str,
+            accuracy,
         );
+        if approx {
+            println!(
+                "  (AWQ runtime weights ≈ {}, dequantized to BF16 at load. Approximate — pull then re-estimate locally for an exact figure)",
+                fmt_bytes(runtime_weight_bytes)
+            );
+        }
     }
 
     if gguf_files.is_empty() && safetensors_bytes == 0 {
@@ -309,11 +378,11 @@ fn estimate_remote(
     Ok(())
 }
 
-fn fetch_remote_config(
+fn fetch_remote_config_json(
     client: &reqwest::blocking::Client,
     repo_id: &str,
     token: Option<&str>,
-) -> Option<ModelGeometry> {
+) -> Option<serde_json::Value> {
     let url = format!("{}/{}/resolve/main/config.json", HF_ENDPOINT, repo_id);
     let mut req = client.get(&url);
     if let Some(tok) = token {
@@ -323,8 +392,18 @@ fn fetch_remote_config(
     if !resp.status().is_success() {
         return None;
     }
-    let json: serde_json::Value = resp.json().ok()?;
-    parse_geometry_from_json(&json)
+    resp.json().ok()
+}
+
+fn parse_quantization_from_json(json: &serde_json::Value) -> Option<QuantInfo> {
+    let qc = json.get("quantization_config")?;
+    let method = qc["quant_method"].as_str()?.to_string();
+    Some(QuantInfo {
+        method,
+        bits: qc["bits"].as_u64(),
+        group_size: qc["group_size"].as_u64(),
+        version: qc["version"].as_str().map(|s| s.to_string()),
+    })
 }
 
 struct ModelGeometry {
@@ -553,6 +632,64 @@ fn read_torch_dtype(config_path: &Path) -> Option<String> {
     let content = std::fs::read_to_string(config_path).ok()?;
     let json: serde_json::Value = serde_json::from_str(&content).ok()?;
     json["torch_dtype"].as_str().map(|s| s.to_uppercase())
+}
+
+#[derive(Clone)]
+pub struct QuantInfo {
+    pub method: String,
+    pub bits: Option<u64>,
+    pub group_size: Option<u64>,
+    pub version: Option<String>,
+}
+
+pub fn read_quantization_config(config_path: &Path) -> Option<QuantInfo> {
+    let content = std::fs::read_to_string(config_path).ok()?;
+    let json: serde_json::Value = serde_json::from_str(&content).ok()?;
+    let qc = json.get("quantization_config")?;
+    let method = qc["quant_method"].as_str()?.to_string();
+    Some(QuantInfo {
+        method,
+        bits: qc["bits"].as_u64(),
+        group_size: qc["group_size"].as_u64(),
+        version: qc["version"].as_str().map(|s| s.to_string()),
+    })
+}
+
+pub fn awq_qweight_expansion(bits: u64) -> Option<f64> {
+    match bits {
+        4 => Some(4.0),
+        8 => Some(2.0),
+        _ => None,
+    }
+}
+
+pub fn sum_safetensors_bytes(dir: &Path) -> Result<(usize, usize)> {
+    let paths: Vec<PathBuf> = std::fs::read_dir(dir)?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            p.extension()
+                .and_then(|x| x.to_str())
+                .map(|x| x.eq_ignore_ascii_case("safetensors"))
+                .unwrap_or(false)
+        })
+        .collect();
+    if paths.is_empty() {
+        return Ok((0, 0));
+    }
+    let path_strs: Vec<&str> = paths.iter().filter_map(|p| p.to_str()).collect();
+    let mmap = unsafe { candle_core::safetensors::MmapedSafetensors::multi(&path_strs)? };
+
+    let mut total: usize = 0;
+    let mut qweight: usize = 0;
+    for (name, view) in mmap.tensors() {
+        let nbytes = view.data().len();
+        total += nbytes;
+        if name.ends_with(".qweight") {
+            qweight += nbytes;
+        }
+    }
+    Ok((total, qweight))
 }
 
 fn fmt_bytes(bytes: usize) -> String {

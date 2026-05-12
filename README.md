@@ -58,38 +58,38 @@ KV cache quantization uses TurboQuant with MSE-based quantization during the dec
 Here you can find a list of models that have been tested, divided by architecture. This is ***not*** an exhaustive list of compatible models.
 
 ### LlamaForCausalLM
-- `Llama-3.2-1B-Instruct`
+- `meta-llama/Llama-3.2-1B-Instruct`
 
 ### Mistral3ForConditionalGeneration
-- `Ministral-3-3B-Instruct-2512`
+- `mistralai/Ministral-3-3B-Instruct-2512`
 
 ### Qwen2ForCausalLM
-- `Qwen2.5-1.5B-Instruct` (including Q2_K and Q4_K_M quantized variants)
-- `Qwen2.5-3B-Instruct`
+- `Qwen/Qwen2.5-1.5B-Instruct` (including Q2_K and Q4_K_M quantized variants)
+- `Qwen/Qwen2.5-3B-Instruct`
 
 ### Qwen3ForCausalLM
 > [!NOTE]
 > All Qwen3 models have been tested with and without thinking enabled.
 
-- `Qwen3-0.6B` (including the Q8_0 quantized variant)
-- `Qwen3-1.7B-Q8_0`
-- `Qwen3-4B` (Q4_K_M, Q5_0, and AWQ 4-bit autoawq GEMM variants)
+- `Qwen/Qwen3-0.6B` (including the Q8_0 quantized variant)
+- `Qwen/Qwen3-1.7B-Q8_0`
+- `Qwen/Qwen3-4B` (Q4_K_M, Q5_0, and AWQ 4-bit autoawq GEMM variants)
 
 ### GemmaForCausalLM
-- `gemma-2b-it`
+- `google/gemma-2b-it`
 
 ### Gemma2ForCausalLM
-- `gemma-2-2b-it`
+- `google/gemma-2-2b-it`
 
 ### Gemma3ForCausalLM
-- `gemma-3-270m-it`
-- `gemma-3-1b-it`
+- `google/gemma-3-270m-it`
+- `google/gemma-3-1b-it`
 
 ### Gemma4ForConditionalGeneration (Minor issues)
-- `gemma-4-E2B-it` - Known edge cases on some checkpoints/configurations
+- `google/gemma-4-E2B-it` - Known edge cases on some checkpoints/configurations
 
 ### Phi3ForCausalLM
-- `Phi-3.5-mini-instruct`
+- `microsoft/Phi-3.5-mini-instruct`
 
 ## Unsupported Model Families
 The following model families are not currently supported:
@@ -178,35 +178,32 @@ If you prefer to manually download the installer, you can find the latest releas
 - `oxydllm-linux-arm64-cuda-thor.tar.gz` for Thor / Jetson Thor (sm_110)
 
 ## Usage
-Download a model
+Download a model from HuggingFace using the `user/model` repo ID. For GGUF repos, an interactive prompt lists available quantizations and lets you pick one; variants already on disk are shown with a check mark and excluded from the numbered choices. Use `--variant Q4_K_M` to skip the prompt, `--token` for gated models, and `--name` to save under a custom local name instead of the default `user/model` path.
 ```bash
-oxydllm pull Qwen/Qwen3-0.6B
+oxydllm pull Qwen/Qwen3-4B-GGUF
+oxydllm pull Qwen/Qwen3-4B-GGUF --variant Q4_K_M
+oxydllm pull meta-llama/Llama-3.1-8B-Instruct --token hf_xxxxxxxxxxxx
 ```
 
-For GGUF repos, the variant selection prompt shows which quantizations are already downloaded (marked ✓) and only numbers the ones that aren't.
-
-List locally available models
+List locally available models. Each model is identified by its HuggingFace `user/model` ID, which is the same string you pass to `run`, `estimate`, and `rm`, and the same one the API expects in the `model` field. Multiple GGUF quantizations stored in the same folder each appear as a separate entry.
 ```bash
 oxydllm list
+oxydllm list --models-dir /path/to/models
 ```
 
-Displays a table with NAME, ARCHITECTURE, and SIZE for each model found in the models directory, sorted alphabetically.
-
-You can also estimate memory requirements before downloading
+Estimate memory requirements for a model before downloading or running it. Accepts both local model IDs and HuggingFace repo IDs for remote estimation. Both `estimate` and `run` accept partial model names: `oxydllm run Qwen/Qwen3-4B` resolves to the first matching local model.
 ```bash
 oxydllm estimate Qwen/Qwen3-4B-GGUF --context-len 8192 --num-sequences 4
 ```
 
-`estimate` and `run` both accept partial model names — `oxydllm run Qwen3-4B` resolves to the first matching local model.
-
-Interactive chat
+Start an interactive chat session in the terminal, loading the model directly without starting an HTTP server.
 ```bash
-oxydllm run Qwen3-0.6B
+oxydllm run Qwen/Qwen3-0.6B
 ```
 
-Remove a model
+Remove a model from disk and deregister it from the local registry.
 ```bash
-oxydllm rm Qwen3-0.6B
+oxydllm rm Qwen/Qwen3-0.6B
 ```
 
 > [!IMPORTANT]
@@ -224,7 +221,7 @@ The fastest way to interact with the server is through the OpenAI-compatible API
 curl http://localhost:11313/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "Qwen3-0.6B",
+    "model": "Qwen/Qwen3-0.6B",
     "messages": [{"role": "user", "content": "Hello"}]
   }'
 ```
@@ -235,7 +232,7 @@ Thinking mode (for models that support it):
 curl http://localhost:11313/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "Qwen3-4B-Q4_K_M",
+    "model": "Qwen/Qwen3-4B-Q4_K_M",
     "messages": [{"role": "user", "content": "Explain quantum entanglement"}],
     "enable_thinking": true
   }'

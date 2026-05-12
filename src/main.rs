@@ -912,7 +912,12 @@ fn main() -> anyhow::Result<()> {
 
     match args[1].as_str() {
         "list" => {
-            run_list(&default_models_dir());
+            let models_dir = args[2..]
+                .windows(2)
+                .find(|w| w[0] == "--models-dir")
+                .map(|w| std::path::PathBuf::from(&w[1]))
+                .unwrap_or_else(default_models_dir);
+            run_list(&models_dir);
         }
         "start" => {
             let start_args = parse_start_args(&args[2..]).unwrap_or_else(|e| {

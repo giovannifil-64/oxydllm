@@ -40,93 +40,126 @@ pub fn discover_models(models_dir: &Path) -> Vec<DiscoveredModel> {
         if !path.is_dir() {
             continue;
         }
-
-        let id = path
+        let name = path
             .file_name()
             .unwrap_or_default()
             .to_string_lossy()
             .to_string();
 
-        let config_path = path.join("config.json");
-        if config_path.exists() {
-            let raw = match std::fs::read_to_string(&config_path) {
-                Ok(r) => r,
-                Err(_) => continue,
-            };
-            let value: serde_json::Value = match serde_json::from_str(&raw) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            let architecture = value["architectures"][0]
-                .as_str()
-                .unwrap_or("Unknown")
-                .to_string();
-            let vocab_size = value["vocab_size"].as_u64().unwrap_or(0) as usize;
-            let num_layers = value["num_hidden_layers"].as_u64().unwrap_or(0) as usize;
-            let size_bytes = std::fs::read_dir(&path)
-                .into_iter()
-                .flatten()
-                .flatten()
-                .filter(|e| {
-                    e.path()
-                        .extension()
-                        .and_then(|x| x.to_str())
-                        .map(|x| x == "safetensors")
-                        .unwrap_or(false)
-                })
-                .filter_map(|e| e.metadata().ok().map(|m| m.len() as usize))
-                .sum();
-            models.push(DiscoveredModel {
-                id,
-                architecture,
-                vocab_size,
-                num_layers,
-                size_bytes,
-            });
+        if scan_model_entry(&name, None, &path, &mut models) {
             continue;
         }
 
-        if let Some(gguf_paths) = find_gguf_files(&path) {
-            let mut stem_groups: std::collections::HashMap<String, Vec<std::path::PathBuf>> =
-                std::collections::HashMap::new();
-            for gguf_path in &gguf_paths {
-                let raw_stem = gguf_path
-                    .file_stem()
+        if let Ok(children) = std::fs::read_dir(&path) {
+            for child in children.flatten() {
+                let child_path = child.path();
+                if !child_path.is_dir() {
+                    continue;
+                }
+                let child_name = child_path
+                    .file_name()
                     .unwrap_or_default()
                     .to_string_lossy()
                     .to_string();
-                let stem = strip_gguf_split_suffix(&raw_stem).to_string();
-                let effective_id = if stem.is_empty() {
-                    id.clone()
-                } else {
-                    canonicalize_gguf_id(&stem, &path)
-                };
-                stem_groups
-                    .entry(effective_id)
-                    .or_default()
-                    .push(gguf_path.clone());
-            }
-
-            for (effective_id, paths) in stem_groups {
-                if models
-                    .iter()
-                    .any(|m: &DiscoveredModel| m.id == effective_id)
-                {
-                    continue;
-                }
-                let size_bytes = paths
-                    .iter()
-                    .filter_map(|p| p.metadata().ok().map(|m| m.len() as usize))
-                    .sum();
-                if let Some(mut info) = discover_gguf_model(&effective_id, &paths[0]) {
-                    info.size_bytes = size_bytes;
-                    models.push(info);
-                }
+                let full_id = format!("{}/{}", name, child_name);
+                scan_model_entry(&full_id, Some(&name), &child_path, &mut models);
             }
         }
     }
     models.sort_by(|a, b| a.id.to_ascii_lowercase().cmp(&b.id.to_ascii_lowercase()));
     models
+}
+
+fn scan_model_entry(
+    id: &str,
+    namespace: Option<&str>,
+    path: &Path,
+    models: &mut Vec<DiscoveredModel>,
+) -> bool {
+    let config_path = path.join("config.json");
+    if config_path.exists() {
+        let raw = match std::fs::read_to_string(&config_path) {
+            Ok(r) => r,
+            Err(_) => return false,
+        };
+        let value: serde_json::Value = match serde_json::from_str(&raw) {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
+        let architecture = value["architectures"][0]
+            .as_str()
+            .unwrap_or("Unknown")
+            .to_string();
+        let vocab_size = value["vocab_size"].as_u64().unwrap_or(0) as usize;
+        let num_layers = value["num_hidden_layers"].as_u64().unwrap_or(0) as usize;
+        let size_bytes = std::fs::read_dir(path)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| {
+                e.path()
+                    .extension()
+                    .and_then(|x| x.to_str())
+                    .map(|x| x == "safetensors")
+                    .unwrap_or(false)
+            })
+            .filter_map(|e| e.metadata().ok().map(|m| m.len() as usize))
+            .sum();
+        models.push(DiscoveredModel {
+            id: id.to_string(),
+            architecture,
+            vocab_size,
+            num_layers,
+            size_bytes,
+        });
+        return true;
+    }
+
+    if let Some(gguf_paths) = find_gguf_files(path) {
+        let mut stem_groups: std::collections::HashMap<String, Vec<std::path::PathBuf>> =
+            std::collections::HashMap::new();
+        for gguf_path in &gguf_paths {
+            let raw_stem = gguf_path
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+            let stem = strip_gguf_split_suffix(&raw_stem).to_string();
+            let local_id = if stem.is_empty() {
+                id.to_string()
+            } else {
+                canonicalize_gguf_id(&stem, path)
+            };
+            let effective_id = match namespace {
+                Some(ns) => format!("{}/{}", ns, local_id),
+                None => local_id,
+            };
+            stem_groups
+                .entry(effective_id)
+                .or_default()
+                .push(gguf_path.clone());
+        }
+
+        for (effective_id, paths) in stem_groups {
+            if models
+                .iter()
+                .any(|m: &DiscoveredModel| m.id == effective_id)
+            {
+                continue;
+            }
+            let size_bytes = paths
+                .iter()
+                .filter_map(|p| p.metadata().ok().map(|m| m.len() as usize))
+                .sum();
+            if let Some(mut info) = discover_gguf_model(&effective_id, &paths[0]) {
+                info.size_bytes = size_bytes;
+                models.push(info);
+            }
+        }
+        return true;
+    }
+
+    false
 }
 
 fn canonicalize_gguf_id(stem: &str, parent_dir: &Path) -> String {
@@ -171,6 +204,8 @@ fn strip_gguf_split_suffix(stem: &str) -> &str {
 }
 
 pub fn resolve_model_path(models_dir: &Path, model_id: &str) -> Option<PathBuf> {
+    // Fast path: works for both flat ("ModelName") and nested ("user/ModelName").
+    // PathBuf::join resolves the '/' in the id as a subdirectory on all platforms.
     let direct = models_dir.join(model_id);
     if direct.is_dir() {
         let ok = direct.join("config.json").exists() || find_gguf_file(&direct).is_some();
@@ -178,6 +213,69 @@ pub fn resolve_model_path(models_dir: &Path, model_id: &str) -> Option<PathBuf> 
             return Some(direct);
         }
     }
+
+    if let Some((namespace, local_id)) = model_id.split_once('/') {
+        let ns_dir = models_dir.join(namespace);
+        if !ns_dir.is_dir() {
+            return None;
+        }
+        let needle = local_id.to_ascii_lowercase();
+        let entries: Vec<_> = std::fs::read_dir(&ns_dir)
+            .ok()?
+            .flatten()
+            .filter(|e| e.path().is_dir())
+            .collect();
+
+        for entry in &entries {
+            let path = entry.path();
+            if let Some(gguf_paths) = find_gguf_files(&path) {
+                for gguf_path in &gguf_paths {
+                    let raw_stem = gguf_path
+                        .file_stem()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .to_string();
+                    let stem = strip_gguf_split_suffix(&raw_stem);
+                    let local_effective = canonicalize_gguf_id(stem, &path);
+                    if local_effective.eq_ignore_ascii_case(local_id)
+                        || stem.eq_ignore_ascii_case(local_id)
+                    {
+                        return Some(path);
+                    }
+                }
+            }
+        }
+
+        let mut prefix_match: Option<PathBuf> = None;
+        for entry in &entries {
+            let path = entry.path();
+            let dir_name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(|s| s.to_ascii_lowercase())
+                .unwrap_or_default();
+            if dir_name.starts_with(&needle) || needle.starts_with(&dir_name) {
+                let valid = path.join("config.json").exists() || find_gguf_file(&path).is_some();
+                if valid {
+                    let better = prefix_match
+                        .as_ref()
+                        .map(|p| {
+                            p.file_name()
+                                .and_then(|n| n.to_str())
+                                .map(|s| s.len())
+                                .unwrap_or(usize::MAX)
+                                > dir_name.len()
+                        })
+                        .unwrap_or(true);
+                    if better {
+                        prefix_match = Some(path);
+                    }
+                }
+            }
+        }
+        return prefix_match;
+    }
+
     let needle = model_id.to_ascii_lowercase();
     let entries: Vec<_> = std::fs::read_dir(models_dir)
         .ok()?

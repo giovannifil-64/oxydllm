@@ -582,7 +582,7 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
         return Err("Missing <model-name>".to_string());
     }
 
-    let model_dir = if model_name.contains('/') || model_name.contains('\\') {
+    let model_dir = if std::path::Path::new(&model_name).is_absolute() {
         model_name.clone()
     } else {
         let base = models_dir.unwrap_or_else(default_models_dir);
@@ -947,14 +947,7 @@ fn main() -> anyhow::Result<()> {
                 print_usage();
                 std::process::exit(1);
             });
-            let dest_name = pull_args.name.unwrap_or_else(|| {
-                pull_args
-                    .repo_id
-                    .rsplit('/')
-                    .next()
-                    .unwrap_or(&pull_args.repo_id)
-                    .to_string()
-            });
+            let dest_name = pull_args.name.unwrap_or_else(|| pull_args.repo_id.clone());
             let token = pull_args
                 .token
                 .or_else(|| std::env::var("HF_TOKEN").ok())

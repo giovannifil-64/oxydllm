@@ -27,6 +27,7 @@ pub struct DiscoveredModel {
     pub vocab_size: usize,
     pub num_layers: usize,
     pub size_bytes: usize,
+    pub created_at: u64,
 }
 
 pub fn discover_models(models_dir: &Path) -> Vec<DiscoveredModel> {
@@ -105,12 +106,20 @@ fn scan_model_entry(
             })
             .filter_map(|e| e.metadata().ok().map(|m| m.len() as usize))
             .sum();
+        let created_at = path
+            .metadata()
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
         models.push(DiscoveredModel {
             id: id.to_string(),
             architecture,
             vocab_size,
             num_layers,
             size_bytes,
+            created_at,
         });
         return true;
     }
@@ -445,12 +454,21 @@ fn discover_gguf_model(id: &str, gguf_path: &Path) -> Option<DiscoveredModel> {
 
     let arch_display = format!("{} (GGUF)", arch);
 
+    let created_at = gguf_path
+        .metadata()
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
     Some(DiscoveredModel {
         id: id.to_string(),
         architecture: arch_display,
         vocab_size,
         num_layers,
         size_bytes: 0,
+        created_at,
     })
 }
 

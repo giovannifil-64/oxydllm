@@ -24,11 +24,15 @@ pub(super) async fn list_models(State(state): State<Arc<AppState>>) -> impl Into
         .map(|m| {
             let size_bytes = registry.get(&m.id).map(|e| e.size_bytes).unwrap_or(0);
             let last_used_secs = registry.get(&m.id).map(|e| e.last_used_secs).unwrap_or(0);
+            let owned_by =
+                m.id.split_once('/')
+                    .map(|(ns, _)| ns.to_string())
+                    .unwrap_or_else(|| "local".to_string());
             serde_json::json!({
                 "id": m.id,
                 "object": "model",
-                "created": 0,
-                "owned_by": "local",
+                "created": m.created_at,
+                "owned_by": owned_by,
                 "architecture": m.architecture,
                 "vocab_size": m.vocab_size,
                 "num_layers": m.num_layers,
@@ -60,11 +64,15 @@ pub(super) async fn get_model(
     match model {
         Some(m) => {
             let size_bytes = registry.get(&m.id).map(|e| e.size_bytes).unwrap_or(0);
+            let owned_by =
+                m.id.split_once('/')
+                    .map(|(ns, _)| ns.to_string())
+                    .unwrap_or_else(|| "local".to_string());
             Ok(Json(serde_json::json!({
                 "id": m.id,
                 "object": "model",
-                "created": 0,
-                "owned_by": "local",
+                "created": m.created_at,
+                "owned_by": owned_by,
                 "architecture": m.architecture,
                 "vocab_size": m.vocab_size,
                 "num_layers": m.num_layers,

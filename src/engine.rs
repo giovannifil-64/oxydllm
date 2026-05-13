@@ -21,6 +21,10 @@ pub struct NewToken {
 pub struct StepOutput {
     pub new_tokens: Vec<NewToken>,
     pub completed: Vec<CompletedSequence>,
+    /// Number of prefill sequences that had a prefix cache hit this step.
+    pub prefix_cache_hits: usize,
+    /// Number of prefill sequences that had no prefix cache match this step.
+    pub prefix_cache_misses: usize,
 }
 
 struct CacheRestoreGuard<'a> {
@@ -330,6 +334,8 @@ impl Engine {
             return Ok(StepOutput {
                 new_tokens,
                 completed,
+                prefix_cache_hits: 0,
+                prefix_cache_misses: 0,
             });
         }
 
@@ -487,9 +493,19 @@ impl Engine {
         }
 
         let completed = scheduler.retire_finished();
+        let prefix_cache_hits = prefill_infos
+            .iter()
+            .filter(|i| i.num_cached_blocks > 0)
+            .count();
+        let prefix_cache_misses = prefill_infos
+            .iter()
+            .filter(|i| i.num_cached_blocks == 0)
+            .count();
         Ok(StepOutput {
             new_tokens,
             completed,
+            prefix_cache_hits,
+            prefix_cache_misses,
         })
     }
 
@@ -507,6 +523,10 @@ impl Engine {
 
     pub fn has_pending_work(&self) -> bool {
         self.scheduler.has_pending_work()
+    }
+
+    pub fn queue_depth(&self) -> usize {
+        self.scheduler.queue_depth()
     }
 }
 

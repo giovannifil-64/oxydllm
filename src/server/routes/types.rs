@@ -168,6 +168,9 @@ pub struct EngineLogprobEntry {
 }
 
 pub struct IncomingRequest {
+    /// UUID generated at HTTP handler entry, shared across all completions for
+    /// the same API call. Used to correlate all log lines for one request.
+    pub request_id: String,
     pub prompt_tokens: Vec<u32>,
     pub sampling_params: SamplingParams,
     pub max_tokens: usize,

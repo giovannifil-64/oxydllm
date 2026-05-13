@@ -3,6 +3,7 @@ mod engine_loop;
 mod handlers;
 #[cfg(test)]
 mod http_compat_tests;
+mod metrics;
 mod types;
 
 pub use chat::apply_chat_template;
@@ -46,6 +47,7 @@ struct AppState {
 fn build_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/health", get(handlers::health))
+        .route("/metrics", get(metrics::serve_metrics))
         .route("/v1/models", get(handlers::list_models))
         .route("/v1/models/running", get(handlers::list_running_models))
         .route("/v1/models/{*model_id}", get(handlers::get_model))
@@ -146,6 +148,7 @@ pub fn start_server(args: StartServerArgs) -> anyhow::Result<()> {
         let models_endpoint = format!("http://localhost:{port}/v1/models");
         let running_models_endpoint = format!("http://localhost:{port}/v1/models/running");
         let health_endpoint = format!("http://localhost:{port}/health");
+        let metrics_endpoint = format!("http://localhost:{port}/metrics");
 
         tracing::info!(address = %addr, "server listening");
         tracing::info!(method = "POST", endpoint = %api_endpoint, "API endpoint");
@@ -156,6 +159,7 @@ pub fn start_server(args: StartServerArgs) -> anyhow::Result<()> {
             "running models endpoint"
         );
         tracing::info!(method = "GET", endpoint = %health_endpoint, "health endpoint");
+        tracing::info!(method = "GET", endpoint = %metrics_endpoint, "Prometheus metrics endpoint");
         tracing::info!(
             keep_alive_s = keep_alive.as_secs(),
             "models evicted after keep-alive timeout"

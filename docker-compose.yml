@@ -21,6 +21,7 @@
 #   OXYDLLM_MAX_QUEUED_REQUESTS  Max queued requests before HTTP 429 (default: 200)
 #   OXYDLLM_DEVICES           Comma-separated CUDA device indices (default: auto)
 #   RUST_LOG                  Log level (default: warn)
+#   LOG_FORMAT                Set to "json" for machine-parseable structured log output
 # ─────────────────────────────────────────────────────────────────────────────
 
 name: oxydllm
@@ -41,6 +42,7 @@ x-common: &common
     - OXYDLLM_MAX_NUM_SEQS=${OXYDLLM_MAX_NUM_SEQS:-}
     - OXYDLLM_MAX_QUEUED_REQUESTS=${OXYDLLM_MAX_QUEUED_REQUESTS:-200}
     - OXYDLLM_DEVICES=${OXYDLLM_DEVICES:-}
+    - LOG_FORMAT=${LOG_FORMAT:-}
   healthcheck:
     test: ["CMD", "curl", "-f", "http://localhost:11313/health"]
     interval: 30s

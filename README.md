@@ -1,7 +1,6 @@
 <p align="center">
-  <picture>
-    <img src=".github/res/oxydLLM.png" width="350">
-  </picture>
+  <img width="350" src=".github/res/oxydLLM_light.png#gh-light-mode-only">
+  <img width="350" src=".github/res/oxydLLM_dark.png#gh-dark-mode-only">
 </p>
 
 <br>
@@ -213,6 +212,7 @@ oxydllm rm Qwen/Qwen3-0.6B
 ### API
 The fastest way to interact with the server is through the OpenAI-compatible API. The following endpoints are available:
 - `GET /health`
+- `GET /metrics`
 - `GET /v1/models`
 - `GET /v1/models/running`
 - `GET /v1/models/{model_id}`
@@ -239,6 +239,67 @@ curl http://localhost:11313/v1/chat/completions \
   }'
 ```
 
+### Observability
+
+#### Prometheus metrics (`GET /metrics`)
+
+Metrics are exposed in Prometheus text format at `GET /metrics`. Scrape this endpoint with Prometheus or any compatible agent (Vector, OpenTelemetry Collector, etc.).
+
+```bash
+curl http://localhost:11313/metrics
+```
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `oxydllm_ttft_milliseconds` | Histogram | `model` | Time-to-first-token in ms, from request enqueue to first generated token. Includes prefill and queue wait. Buckets: 10, 50, 100, 200, 500, 1000, 2000, 5000 ms. |
+| `oxydllm_tokens_per_second` | Histogram | `model` | Decode throughput in tokens/s from first token to completion. Buckets: 1, 5, 10, 20, 50, 100, 200 tok/s. |
+| `oxydllm_requests_total` | Counter | `model`, `status` | Total completed requests. `status` is `ok` or `error`. |
+| `oxydllm_queue_depth` | Gauge | — | Current number of sequences in the engine (waiting + running). Updated each engine step. |
+| `oxydllm_prefix_cache_requests_total` | Counter | `model`, `result` | Prefix KV cache lookups by result (`hit` or `miss`). Compute hit ratio with `rate(hit[5m]) / rate(total[5m])`. |
+| `oxydllm_model_weights_bytes` | Gauge | `model` | Weight memory in bytes, set at load and cleared at unload. |
+| `oxydllm_kv_cache_allocated_bytes` | Gauge | `model` | KV cache memory reserved at load time per model. Not the dynamically occupied portion. |
+| `oxydllm_vram_used_bytes` | Gauge | — | Total inference memory: `model_weights_bytes + kv_cache_allocated_bytes` across all loaded models. |
+
+> **Apple Silicon note**: there is no discrete VRAM on Apple Silicon — all memory metrics measure unified system memory shared between CPU and GPU.
+
+Example Prometheus queries:
+```promql
+# Average TTFT over the last 5 minutes
+histogram_quantile(0.95, rate(oxydllm_ttft_milliseconds_bucket[5m]))
+
+# Prefix cache hit ratio
+rate(oxydllm_prefix_cache_requests_total{result="hit"}[5m])
+  / rate(oxydllm_prefix_cache_requests_total[5m])
+
+# Request throughput by status
+rate(oxydllm_requests_total[1m])
+```
+
+#### Structured logs and request tracing
+
+Every request is assigned a `request_id` (UUID v4) at the HTTP handler entry point. This ID appears in all log events for that request — from template rendering to the final token — making it possible to trace a single request end-to-end across concurrent traffic:
+
+```bash
+grep 'request_id=abc-123' app.log
+```
+
+By default logs use a compact human-readable format. Set `LOG_FORMAT=json` for machine-parseable output compatible with Loki, Datadog, AWS CloudWatch, and `jq`. The variable is read at startup and applies to all commands, not just `start`:
+
+```bash
+LOG_FORMAT=json oxydllm start
+LOG_FORMAT=json oxydllm run Qwen/Qwen3-4B-Q4_K_M
+```
+
+Each log line becomes a self-contained JSON object:
+```json
+{"timestamp":"2024-01-01T12:00:00.123Z","level":"INFO","fields":{"request_id":"abc-123","ttft_ms":123.4,"model_id":"Qwen/Qwen3-4B-Q4_K_M"},"message":"first token emitted"}
+```
+
+Query a single request's lifecycle with Loki: `{app="oxydllm"} | json | request_id="abc-123"`, or with `jq`:
+```bash
+oxydllm start 2>&1 | jq 'select(.fields.request_id=="abc-123")'
+```
+
 ## Server Options
 Every option can be set via a CLI flag or an environment variable. CLI flags take priority when both are set. When running as a system service (launchd on macOS, systemd on Linux) you typically configure via env vars without touching the service unit file itself.
 
@@ -257,6 +318,8 @@ Every option can be set via a CLI flag or an environment variable. CLI flags tak
 | `--qjl-quantization` | — | disabled | Enable Stage-2 QJL key residual quantization |
 | `--require-gpu` | — | disabled | Fail startup if no GPU device is available |
 
+To produce machine-parseable JSON log output (useful with Loki, Datadog, or `jq`), set `LOG_FORMAT=json`. The variable is read at startup and applies to all commands. See the [Observability](#observability) section for details and examples.
+
 ### Configuration examples
 
 **systemd (Linux)** — edit `/etc/default/oxydllm`, then `sudo systemctl restart oxydllm`:
@@ -264,17 +327,19 @@ Every option can be set via a CLI flag or an environment variable. CLI flags tak
 OXYDLLM_MAX_CONTEXT_LEN=8192
 OXYDLLM_MAX_NUM_SEQS=16
 OXYDLLM_KV_QUANT=balanced
+LOG_FORMAT=json
 ```
 
 **launchd (macOS)** — edit `~/Library/LaunchAgents/com.oxydllm.oxydllmd.plist` under `EnvironmentVariables`, then reload the agent:
 ```xml
 <key>OXYDLLM_MAX_CONTEXT_LEN</key><string>8192</string>
 <key>OXYDLLM_MAX_NUM_SEQS</key><string>16</string>
+<key>LOG_FORMAT</key><string>json</string>
 ```
 
 **Docker**:
 ```bash
-docker run -e OXYDLLM_MAX_CONTEXT_LEN=8192 -e OXYDLLM_MAX_NUM_SEQS=16 \
+docker run -e OXYDLLM_MAX_CONTEXT_LEN=8192 -e OXYDLLM_MAX_NUM_SEQS=16 -e LOG_FORMAT=json \
   -p 11313:11313 ghcr.io/giovannifil-64/oxydllm:latest start --models-dir /root/.oxydllm/models
 ```
 
@@ -283,6 +348,7 @@ docker run -e OXYDLLM_MAX_CONTEXT_LEN=8192 -e OXYDLLM_MAX_NUM_SEQS=16 \
 OXYDLLM_MAX_CONTEXT_LEN=8192
 OXYDLLM_MAX_NUM_SEQS=16
 OXYDLLM_KV_QUANT=balanced
+LOG_FORMAT=json
 ```
 
 ## Run Options

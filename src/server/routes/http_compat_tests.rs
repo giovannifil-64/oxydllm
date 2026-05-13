@@ -193,6 +193,70 @@ async fn get_request(app: &Router, uri: &str) -> axum::response::Response {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+async fn metrics_endpoint_returns_prometheus_text() {
+    let (app, _tmp) = build_test_app(vec![]).expect("test app");
+    let response = get_request(&app, "/metrics").await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let headers = response.headers().clone();
+    let ct = headers
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(
+        ct.contains("text/plain"),
+        "expected text/plain content-type, got: {ct}"
+    );
+
+    let body = String::from_utf8(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body")
+            .to_vec(),
+    )
+    .expect("utf-8");
+
+    // Simple Gauges (non-vec) always appear in Prometheus output even with value 0.
+    // Labeled Vecs (HistogramVec, CounterVec, GaugeVec) only appear after at least
+    // one label combination has been observed or set. We check the gauges that the
+    // handler explicitly sets for the test model.
+    for metric in &[
+        "oxydllm_queue_depth",
+        "oxydllm_vram_used_bytes",
+        "oxydllm_model_weights_bytes",
+        "oxydllm_kv_cache_allocated_bytes",
+    ] {
+        assert!(
+            body.contains(metric),
+            "expected metric '{metric}' in /metrics output"
+        );
+    }
+}
+
+#[tokio::test]
+async fn metrics_endpoint_shows_test_model_label() {
+    let (app, _tmp) = build_test_app(vec![]).expect("test app");
+    let response = get_request(&app, "/metrics").await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = String::from_utf8(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body")
+            .to_vec(),
+    )
+    .expect("utf-8");
+
+    // The handler calls list_running() and sets oxydllm_model_weights_bytes and
+    // oxydllm_kv_cache_allocated_bytes for every loaded model. The test model is
+    // in SlotState::Ready, so its label must appear in the output.
+    assert!(
+        body.contains("test-model"),
+        "expected test-model label in /metrics output"
+    );
+}
+
+#[tokio::test]
 async fn health_returns_ok() {
     let (app, _tmp) = build_test_app(vec![]).expect("test app");
     let response = get_request(&app, "/health").await;

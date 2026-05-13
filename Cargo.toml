@@ -30,7 +30,9 @@ chrono = "0.4.44"
 rustc-hash = "2.1.2"
 lru = "0.18.0"
 tracing = "0.1.44"
-tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt", "json"] }
+prometheus = "0.14.0"
+uuid = { version = "1.23.1", features = ["v4"] }
 
 [dev-dependencies]
 tokio = { version = "1.52.2", features = ["rt-multi-thread", "macros", "time"] }

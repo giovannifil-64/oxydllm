@@ -1183,6 +1183,7 @@ pub(super) async fn chat_completions(
     .map_err(|msg| error_response(StatusCode::BAD_REQUEST, msg, "invalid_request_error"))?;
     let has_tools = !tool_config.tools.is_empty();
 
+    let request_id = uuid::Uuid::new_v4().to_string();
     let t_request = std::time::Instant::now();
 
     let get_result = {
@@ -1310,6 +1311,7 @@ pub(super) async fn chat_completions(
     let prompt_len = prompt_tokens.len();
 
     tracing::debug!(
+        request_id = %request_id,
         model_id = %model_id,
         template_ms,
         encode_ms,
@@ -1395,6 +1397,7 @@ pub(super) async fn chat_completions(
         handle
             .request_tx
             .try_send(IncomingRequest {
+                request_id: request_id.clone(),
                 prompt_tokens: prompt_tokens.clone(),
                 sampling_params,
                 max_tokens,

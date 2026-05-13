@@ -108,11 +108,21 @@ fn init_tracing() {
     let env_filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("oxydllm=info,hyper=warn,tower=warn"));
 
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(env_filter)
-        .with_target(false)
-        .compact()
-        .try_init();
+    // LOG_FORMAT=json emits one JSON object per line — machine-parseable by
+    // Loki, Datadog, CloudWatch, or `jq`. Omit for human-readable compact format.
+    if std::env::var("LOG_FORMAT").as_deref() == Ok("json") {
+        let _ = tracing_subscriber::fmt()
+            .json()
+            .with_env_filter(env_filter)
+            .with_target(false)
+            .try_init();
+    } else {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
+            .with_target(false)
+            .compact()
+            .try_init();
+    }
 }
 
 fn print_usage() {

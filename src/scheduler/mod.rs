@@ -308,6 +308,10 @@ impl Scheduler {
         !self.waiting.is_empty() || !self.running.is_empty()
     }
 
+    pub fn queue_depth(&self) -> usize {
+        self.waiting.len() + self.running.len()
+    }
+
     #[cfg(test)]
     pub fn num_running(&self) -> usize {
         self.running.len()

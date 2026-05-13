@@ -5,6 +5,7 @@ use std::sync::Arc;
 use lru::LruCache;
 use tokio::sync::mpsc as tokio_mpsc;
 
+use super::metrics;
 use super::types::{EngineEvent, EngineLogprobEntry, IncomingRequest};
 use crate::engine::Engine;
 use crate::scheduler::sequence::SequenceId;
@@ -74,6 +75,9 @@ type PendingRawLogprob = (u32, f32, RawTopLogprobs);
 
 struct SeqTracker {
     tx: tokio_mpsc::UnboundedSender<EngineEvent>,
+    /// UUID from the originating HTTP request. Shared across all N completions
+    /// of the same API call. Use this to correlate log lines end-to-end.
+    request_id: String,
     model_id: String,
     enqueued_at: std::time::Instant,
     first_token_at: Option<std::time::Instant>,
@@ -99,20 +103,20 @@ fn abort_sequences(
     seq_ids.sort_unstable();
     seq_ids.dedup();
     for seq_id in seq_ids {
-        let model_id = trackers.remove(&seq_id).map(|t| t.model_id);
+        let info = trackers.remove(&seq_id).map(|t| (t.request_id, t.model_id));
         let _ = engine.abort_sequence(seq_id);
-        match model_id {
-            Some(model_id) => {
+        match info {
+            Some((request_id, model_id)) => {
                 tracing::debug!(
+                    request_id = %request_id,
                     model_id = %model_id,
-                    request_id = seq_id,
                     seq_id,
                     reason = %reason,
                     "request aborted"
                 )
             }
             None => {
-                tracing::debug!(request_id = seq_id, seq_id, reason = %reason, "request aborted")
+                tracing::debug!(seq_id, reason = %reason, "request aborted")
             }
         }
     }
@@ -123,6 +127,7 @@ fn enqueue_request(
     engine: &mut Engine,
     trackers: &mut HashMap<SequenceId, SeqTracker>,
 ) {
+    let request_id = req.request_id.clone();
     let model_id = req.model_id.clone();
     let enqueued_at = req.enqueued_at;
     let seq_id = engine.add_request_with_stop(
@@ -131,11 +136,17 @@ fn enqueue_request(
         req.max_tokens,
         req.extra_stop_token_ids,
     );
-    tracing::debug!(model_id = %model_id, request_id = seq_id, seq_id, "request enqueued");
+    tracing::debug!(
+        request_id = %request_id,
+        model_id = %model_id,
+        seq_id,
+        "request enqueued"
+    );
     trackers.insert(
         seq_id,
         SeqTracker {
             tx: req.response_tx,
+            request_id,
             model_id,
             enqueued_at,
             first_token_at: None,
@@ -409,12 +420,15 @@ pub fn engine_loop(
                                 let ttft_ms = tracker.enqueued_at.elapsed().as_secs_f64() * 1000.0;
                                 let ttft_ms = (ttft_ms * 10.0).round() / 10.0;
                                 tracing::info!(
+                                    request_id = %tracker.request_id,
                                     model_id = %tracker.model_id,
-                                    request_id = tok.seq_id,
                                     seq_id = tok.seq_id,
                                     ttft_ms,
                                     "first token emitted"
                                 );
+                                metrics::TTFT_HISTOGRAM
+                                    .with_label_values(&[&tracker.model_id])
+                                    .observe(ttft_ms);
                                 tracker.first_token_at = Some(std::time::Instant::now());
                             }
                             tracker.token_count += 1;
@@ -580,8 +594,8 @@ pub fn engine_loop(
                             let decode_ms = ((decode_s * 1000.0) * 10.0).round() / 10.0;
                             let tps = (tps * 100.0).round() / 100.0;
                             tracing::info!(
+                                request_id = %tracker.request_id,
                                 model_id = %tracker.model_id,
-                                request_id = completed.id,
                                 seq_id = completed.id,
                                 completion_tokens = tracker.token_count,
                                 total_ms,
@@ -589,6 +603,12 @@ pub fn engine_loop(
                                 tokens_per_second = tps,
                                 "request completed"
                             );
+                            metrics::TPS_HISTOGRAM
+                                .with_label_values(&[&tracker.model_id])
+                                .observe(tps);
+                            metrics::REQUESTS_TOTAL
+                                .with_label_values(&[tracker.model_id.as_str(), "ok"])
+                                .inc();
                             let _ = tracker.tx.send(EngineEvent::Finish {
                                 finish_reason: completed
                                     .finish_reason
@@ -599,6 +619,21 @@ pub fn engine_loop(
                             });
                             let _ = tracker.tx.send(EngineEvent::StreamEnd);
                         }
+                    }
+
+                    // Update prefix cache counters from this step's prefill results.
+                    if step.prefix_cache_hits + step.prefix_cache_misses > 0 {
+                        let model_label = trackers
+                            .values()
+                            .next()
+                            .map(|t| t.model_id.clone())
+                            .unwrap_or_default();
+                        metrics::PREFIX_CACHE_REQUESTS
+                            .with_label_values(&[model_label.as_str(), "hit"])
+                            .inc_by(step.prefix_cache_hits as f64);
+                        metrics::PREFIX_CACHE_REQUESTS
+                            .with_label_values(&[model_label.as_str(), "miss"])
+                            .inc_by(step.prefix_cache_misses as f64);
                     }
                 }
                 Err(e) => {
@@ -633,6 +668,8 @@ pub fn engine_loop(
                     }
                 }
             }
+            // Update queue depth after each step (reflects post-step state).
+            metrics::QUEUE_DEPTH.set(engine.queue_depth() as f64);
             std::thread::yield_now();
         }
     }

@@ -83,8 +83,11 @@ struct SeqTracker {
     thinking_ids: Vec<u32>,
     decoded_len: usize,
     thinking_decoded_len: usize,
-    /// Raw logprob data buffered for output tokens not yet emitted as text.
     pending_raw_lps: Vec<PendingRawLogprob>,
+    out_stable_end: usize,
+    out_stable_text: String,
+    think_stable_end: usize,
+    think_stable_text: String,
 }
 
 fn abort_sequences(
@@ -143,6 +146,10 @@ fn enqueue_request(
             decoded_len: 0,
             thinking_decoded_len: 0,
             pending_raw_lps: Vec::new(),
+            out_stable_end: 0,
+            out_stable_text: String::new(),
+            think_stable_end: 0,
+            think_stable_text: String::new(),
         },
     );
 }
@@ -171,12 +178,75 @@ fn emit_suffix(full: &str, decoded_len: &mut usize) -> Option<String> {
     }
 }
 
-fn prefix_decode_token(
+const DECODE_STABLE_LOOKBACK: usize = 4;
+
+fn decode_with_neutral_prefix(
+    tokenizer: &Tokenizer,
+    ids: &[u32],
+    neutral_id: u32,
+    neutral_text: &str,
+) -> String {
+    if ids.is_empty() {
+        return String::new();
+    }
+    let mut prefixed = Vec::with_capacity(ids.len() + 1);
+    prefixed.push(neutral_id);
+    prefixed.extend_from_slice(ids);
+    let with_prefix = tokenizer.decode(&prefixed).unwrap_or_default();
+    with_prefix
+        .strip_prefix(neutral_text)
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| tokenizer.decode(ids).unwrap_or_default())
+}
+
+fn advance_stable_window(
+    tokenizer: &Tokenizer,
+    all_ids: &[u32],
+    stable_end: &mut usize,
+    stable_text: &mut String,
+    neutral_id: u32,
+    neutral_text: &str,
+) {
+    let new_stable_end = all_ids.len().saturating_sub(DECODE_STABLE_LOOKBACK);
+    if new_stable_end <= *stable_end {
+        return;
+    }
+    if *stable_end == 0 {
+        *stable_text = tokenizer
+            .decode(&all_ids[..new_stable_end])
+            .unwrap_or_default();
+    } else {
+        let delta_ids = &all_ids[*stable_end..new_stable_end];
+        let delta = decode_with_neutral_prefix(tokenizer, delta_ids, neutral_id, neutral_text);
+        stable_text.push_str(&delta);
+    }
+    *stable_end = new_stable_end;
+}
+
+fn prefix_decode_incremental(
     tokenizer: &Tokenizer,
     all_ids: &[u32],
     decoded_len: &mut usize,
+    stable_end: &mut usize,
+    stable_text: &mut String,
+    neutral_id: u32,
+    neutral_text: &str,
 ) -> Option<String> {
-    let full = tokenizer.decode(all_ids).unwrap_or_default();
+    advance_stable_window(
+        tokenizer,
+        all_ids,
+        stable_end,
+        stable_text,
+        neutral_id,
+        neutral_text,
+    );
+    let window_ids = &all_ids[*stable_end..];
+    let window_text = if *stable_end == 0 {
+        tokenizer.decode(window_ids).unwrap_or_default()
+    } else {
+        decode_with_neutral_prefix(tokenizer, window_ids, neutral_id, neutral_text)
+    };
+    let full = format!("{}{}", stable_text, window_text);
     emit_suffix(&full, decoded_len)
 }
 
@@ -273,7 +343,7 @@ mod streaming_decode_tests {
 pub fn engine_loop(
     mut engine: Engine,
     tokenizer: Arc<Tokenizer>,
-    mut request_rx: tokio_mpsc::UnboundedReceiver<IncomingRequest>,
+    mut request_rx: tokio_mpsc::Receiver<IncomingRequest>,
     shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) {
     let gpu_lock = crate::gpu_lock::gpu_lock_for(engine.device());
@@ -284,6 +354,13 @@ pub fn engine_loop(
     let think_start_id = tokenizer.special_token_id("<think>");
     let think_end_id = tokenizer.special_token_id("</think>");
     let mut decode_cache = TokenDecodeCache::new();
+
+    let neutral_id = tokenizer
+        .encode("a")
+        .ok()
+        .and_then(|ids| ids.into_iter().next())
+        .unwrap_or(1);
+    let neutral_text = tokenizer.decode(&[neutral_id]).unwrap_or_default();
 
     loop {
         if shutdown.load(std::sync::atomic::Ordering::Acquire) {
@@ -364,10 +441,14 @@ pub fn engine_loop(
 
                             if tracker.in_thinking {
                                 tracker.thinking_ids.push(tok.token);
-                                if let Some(text) = prefix_decode_token(
+                                if let Some(text) = prefix_decode_incremental(
                                     &tokenizer,
                                     &tracker.thinking_ids,
                                     &mut tracker.thinking_decoded_len,
+                                    &mut tracker.think_stable_end,
+                                    &mut tracker.think_stable_text,
+                                    neutral_id,
+                                    &neutral_text,
                                 ) && tracker.tx.send(EngineEvent::ReasoningToken(text)).is_err()
                                 {
                                     disconnected = true;
@@ -382,10 +463,14 @@ pub fn engine_loop(
                                     ));
                                 }
                                 tracker.output_ids.push(tok.token);
-                                if let Some(text) = prefix_decode_token(
+                                if let Some(text) = prefix_decode_incremental(
                                     &tokenizer,
                                     &tracker.output_ids,
                                     &mut tracker.decoded_len,
+                                    &mut tracker.out_stable_end,
+                                    &mut tracker.out_stable_text,
+                                    neutral_id,
+                                    &neutral_text,
                                 ) {
                                     let drained = std::mem::take(&mut tracker.pending_raw_lps);
                                     let mut logprob_entries: Vec<EngineLogprobEntry> =

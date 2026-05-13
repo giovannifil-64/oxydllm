@@ -173,11 +173,18 @@ install_systemd_service() {
     if [ ! -f /etc/default/oxydllm ]; then
         cat <<'ENVEOF' | as_root tee /etc/default/oxydllm >/dev/null
 # oxydLLM server configuration
+# All variables are optional. Uncomment and set to override defaults.
+# CLI flags passed to ExecStart take priority over these variables.
+#
 # OXYDLLM_PORT=11313
+# OXYDLLM_MODELS_DIR=
 # OXYDLLM_MAX_CONTEXT_LEN=4096
 # OXYDLLM_KEEP_ALIVE=900
+# OXYDLLM_SHUTDOWN_TIMEOUT=30
 # OXYDLLM_MEMORY_BUDGET=
 # OXYDLLM_KV_QUANT=off
+# OXYDLLM_MAX_NUM_SEQS=
+# OXYDLLM_MAX_QUEUED_REQUESTS=200
 # OXYDLLM_DEVICES=
 # RUST_LOG=warn
 ENVEOF
@@ -272,6 +279,20 @@ install_launchd_agent() {
     <dict>
         <key>RUST_LOG</key>
         <string>warn</string>
+        <!-- Uncomment and set any of the following to customize the server.
+             Edit this file, then run:
+               launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.oxydllm.oxydllmd.plist
+               launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.oxydllm.oxydllmd.plist
+
+        <key>OXYDLLM_PORT</key><string>11313</string>
+        <key>OXYDLLM_MAX_CONTEXT_LEN</key><string>4096</string>
+        <key>OXYDLLM_KEEP_ALIVE</key><string>900</string>
+        <key>OXYDLLM_MEMORY_BUDGET</key><string></string>
+        <key>OXYDLLM_KV_QUANT</key><string>off</string>
+        <key>OXYDLLM_MAX_NUM_SEQS</key><string></string>
+        <key>OXYDLLM_MAX_QUEUED_REQUESTS</key><string>200</string>
+        <key>OXYDLLM_DEVICES</key><string></string>
+        -->
     </dict>
 
     <key>SoftResourceLimits</key>

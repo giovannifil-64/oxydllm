@@ -1394,7 +1394,7 @@ pub(super) async fn chat_completions(
 
         handle
             .request_tx
-            .send(IncomingRequest {
+            .try_send(IncomingRequest {
                 prompt_tokens: prompt_tokens.clone(),
                 sampling_params,
                 max_tokens,
@@ -1404,12 +1404,17 @@ pub(super) async fn chat_completions(
                 enable_thinking,
                 extra_stop_token_ids: extra_stop_token_ids.clone(),
             })
-            .map_err(|_| {
-                error_response(
+            .map_err(|e| match e {
+                tokio::sync::mpsc::error::TrySendError::Full(_) => error_response(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "Server overloaded: too many queued requests. Retry later.",
+                    "rate_limit_error",
+                ),
+                tokio::sync::mpsc::error::TrySendError::Closed(_) => error_response(
                     StatusCode::SERVICE_UNAVAILABLE,
                     "Engine unavailable",
                     "server_error",
-                )
+                ),
             })?;
         completion_rxs.push(response_rx);
     }

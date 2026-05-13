@@ -41,6 +41,7 @@ A rust-based inference engine for Large Language Models.
 - **Structured output** — `response_format` with `json_object` and `json_schema`; request-time schema validation includes strict-mode requirements plus recursive `$ref` / `$defs`, `anyOf`, enums, nested objects/arrays, and nullable unions
 - Metal acceleration on Apple Silicon with fused attention, RMSNorm, RoPE, and Softmax kernels
 - Paged KV cache with prefix caching for reduced redundant computation
+- Batched scheduler, where all active sequences share each GPU forward pass so throughput scales with concurrent users rather than collapsing to serial execution. At startup the scheduler computes `max_num_seqs` automatically as `total_kv_blocks / ceil(context_len / block_size)`, capped to 256; the value is logged and can be overridden with `--max-num-seqs`. Incoming requests are held in a bounded `tokio::sync::mpsc` channel of capacity `--max-queued-requests` (default 200); once full, new arrivals receive HTTP 429 immediately, bounding memory consumption under sustained load.
 - KV cache quantization (Lossless/Balanced/Aggressive) to reduce memory footprint by 2-4x
 - Multi-model server: load several models simultaneously with LRU eviction and configurable memory budgets
 - Thinking/reasoning model support with separated `reasoning_content` field
@@ -239,16 +240,49 @@ curl http://localhost:11313/v1/chat/completions \
 ```
 
 ## Server Options
+Every option can be set via a CLI flag or an environment variable. CLI flags take priority when both are set. When running as a system service (launchd on macOS, systemd on Linux) you typically configure via env vars without touching the service unit file itself.
+
+| Flag | Env var | Default | Description |
+|---|---|---|---|
+| `--port <PORT>` | `OXYDLLM_PORT` | `11313` | Listen port |
+| `--models-dir <DIR>` | `OXYDLLM_MODELS_DIR` | `~/.oxydllm/models` | Model storage directory |
+| `--keep-alive <SECS>` | `OXYDLLM_KEEP_ALIVE` | `900` | Idle seconds before model eviction |
+| `--memory-budget <MB>` | `OXYDLLM_MEMORY_BUDGET` | — | Max VRAM for loaded models; LRU eviction when exceeded |
+| `--max-context-len <N>` | `OXYDLLM_MAX_CONTEXT_LEN` | `4096` | KV cache context length per sequence |
+| `--max-num-seqs <N>` | `OXYDLLM_MAX_NUM_SEQS` | auto | Max concurrent sequences per model (auto-computed from KV block budget at load time) |
+| `--max-queued-requests <N>` | `OXYDLLM_MAX_QUEUED_REQUESTS` | `200` | Request queue depth; returns HTTP 429 when full |
+| `--devices <IDS>` | `OXYDLLM_DEVICES` | auto | Comma-separated CUDA device indices |
+| `--kv-quant <MODE>` | `OXYDLLM_KV_QUANT` | `off` | KV cache quantization: `off`, `lossless`, `balanced`, `aggressive` |
+| `--shutdown-timeout <SECS>` | `OXYDLLM_SHUTDOWN_TIMEOUT` | `30` | Grace period for in-flight requests on shutdown |
+| `--qjl-quantization` | — | disabled | Enable Stage-2 QJL key residual quantization |
+| `--require-gpu` | — | disabled | Fail startup if no GPU device is available |
+
+### Configuration examples
+
+**systemd (Linux)** — edit `/etc/default/oxydllm`, then `sudo systemctl restart oxydllm`:
 ```
---port <PORT>          Listen port (default: 11313)
---models-dir <DIR>     Models directory (default: ~/.oxydllm/models)
---keep-alive <SECS>    Idle timeout before model eviction (default: 900)
---memory-budget <MB>   Maximum VRAM for loaded models
---max-context-len <N>  KV cache context length per sequence (default: 4096)
---devices <IDS>        Comma-separated CUDA device indices
---kv-quant <MODE>      KV cache quantization: off, lossless, balanced, aggressive
---qjl-quantization     Enable Stage-2 QJL key residual quantization
---require-gpu          Fail startup if no GPU device is available (default: disabled)
+OXYDLLM_MAX_CONTEXT_LEN=8192
+OXYDLLM_MAX_NUM_SEQS=16
+OXYDLLM_KV_QUANT=balanced
+```
+
+**launchd (macOS)** — edit `~/Library/LaunchAgents/com.oxydllm.oxydllmd.plist` under `EnvironmentVariables`, then reload the agent:
+```xml
+<key>OXYDLLM_MAX_CONTEXT_LEN</key><string>8192</string>
+<key>OXYDLLM_MAX_NUM_SEQS</key><string>16</string>
+```
+
+**Docker**:
+```bash
+docker run -e OXYDLLM_MAX_CONTEXT_LEN=8192 -e OXYDLLM_MAX_NUM_SEQS=16 \
+  -p 11313:11313 ghcr.io/giovannifil-64/oxydllm:latest start --models-dir /root/.oxydllm/models
+```
+
+**docker compose** — set variables in your shell or a `.env` file:
+```
+OXYDLLM_MAX_CONTEXT_LEN=8192
+OXYDLLM_MAX_NUM_SEQS=16
+OXYDLLM_KV_QUANT=balanced
 ```
 
 ## Run Options

@@ -63,10 +63,8 @@ fn create_test_model_dir(root: &Path, model_id: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn spawn_scripted_engine(
-    replies: Vec<ScriptedReply>,
-) -> tokio_mpsc::UnboundedSender<IncomingRequest> {
-    let (request_tx, mut request_rx) = tokio_mpsc::unbounded_channel::<IncomingRequest>();
+fn spawn_scripted_engine(replies: Vec<ScriptedReply>) -> tokio_mpsc::Sender<IncomingRequest> {
+    let (request_tx, mut request_rx) = tokio_mpsc::channel::<IncomingRequest>(64);
     let scripted = Arc::new(Mutex::new(VecDeque::from(replies)));
     tokio::spawn(async move {
         while let Some(req) = request_rx.recv().await {
@@ -108,6 +106,8 @@ fn build_test_app(replies: Vec<ScriptedReply>) -> anyhow::Result<(Router, TempDi
         kv_quant: KvQuantMode::Off,
         qjl_quantization: false,
         require_gpu: false,
+        max_num_seqs: None,
+        max_queued_requests: 200,
     });
     manager.insert_ready_for_tests(
         model_id,

@@ -10,6 +10,17 @@
 #
 # Override the image registry (e.g. for forks or private registries):
 #   OXYDLLM_IMAGE=ghcr.io/myorg/oxydllm docker compose up oxydllm-cuda
+#
+# Configuration via environment variables (set in your shell or a .env file):
+#   OXYDLLM_PORT              Listen port (default: 11313)
+#   OXYDLLM_MAX_CONTEXT_LEN   Max tokens per sequence (default: 4096)
+#   OXYDLLM_KEEP_ALIVE        Idle eviction timeout in seconds (default: 900)
+#   OXYDLLM_MEMORY_BUDGET     Max VRAM budget in MB; LRU eviction when exceeded
+#   OXYDLLM_KV_QUANT          KV cache quantization: off, lossless, balanced, aggressive
+#   OXYDLLM_MAX_NUM_SEQS      Max concurrent sequences (default: auto from KV budget)
+#   OXYDLLM_MAX_QUEUED_REQUESTS  Max queued requests before HTTP 429 (default: 200)
+#   OXYDLLM_DEVICES           Comma-separated CUDA device indices (default: auto)
+#   RUST_LOG                  Log level (default: warn)
 # ─────────────────────────────────────────────────────────────────────────────
 
 name: oxydllm
@@ -22,6 +33,14 @@ x-common: &common
     - "${OXYDLLM_PORT:-11313}:11313"
   environment:
     - RUST_LOG=${RUST_LOG:-warn}
+    - OXYDLLM_PORT=${OXYDLLM_PORT:-11313}
+    - OXYDLLM_MAX_CONTEXT_LEN=${OXYDLLM_MAX_CONTEXT_LEN:-4096}
+    - OXYDLLM_KEEP_ALIVE=${OXYDLLM_KEEP_ALIVE:-900}
+    - OXYDLLM_MEMORY_BUDGET=${OXYDLLM_MEMORY_BUDGET:-}
+    - OXYDLLM_KV_QUANT=${OXYDLLM_KV_QUANT:-off}
+    - OXYDLLM_MAX_NUM_SEQS=${OXYDLLM_MAX_NUM_SEQS:-}
+    - OXYDLLM_MAX_QUEUED_REQUESTS=${OXYDLLM_MAX_QUEUED_REQUESTS:-200}
+    - OXYDLLM_DEVICES=${OXYDLLM_DEVICES:-}
   healthcheck:
     test: ["CMD", "curl", "-f", "http://localhost:11313/health"]
     interval: 30s
@@ -44,10 +63,6 @@ services:
       - start
       - --models-dir
       - /root/.oxydllm/models
-      - --port
-      - "11313"
-      - --max-context-len
-      - "${OXYDLLM_CONTEXT_LEN:-4096}"
     profiles: [cuda, default]
 
   oxydllm-cpu:
@@ -57,10 +72,6 @@ services:
       - start
       - --models-dir
       - /root/.oxydllm/models
-      - --port
-      - "11313"
-      - --max-context-len
-      - "${OXYDLLM_CONTEXT_LEN:-4096}"
     profiles: [cpu]
 
 volumes:

@@ -258,6 +258,10 @@ impl BlockAllocator {
         self.free_list.len()
     }
 
+    pub fn num_total(&self) -> usize {
+        self.num_blocks
+    }
+
     pub fn block_size(&self) -> usize {
         self.block_size
     }

@@ -23,7 +23,7 @@ use crate::tokenizer::Tokenizer;
 
 #[derive(Clone)]
 pub struct ReadyHandle {
-    pub request_tx: tokio_mpsc::UnboundedSender<IncomingRequest>,
+    pub request_tx: tokio_mpsc::Sender<IncomingRequest>,
     pub tokenizer: Arc<Tokenizer>,
     pub max_seq_len: usize,
 }
@@ -33,7 +33,7 @@ enum SlotState {
         waiters: Vec<oneshot::Sender<Result<ReadyHandle, String>>>,
     },
     Ready {
-        request_tx: tokio_mpsc::UnboundedSender<IncomingRequest>,
+        request_tx: tokio_mpsc::Sender<IncomingRequest>,
         tokenizer: Arc<Tokenizer>,
         max_seq_len: usize,
         architecture: String,
@@ -80,6 +80,8 @@ pub struct ModelManager {
     kv_quant: KvQuantMode,
     qjl_quantization: bool,
     require_gpu: bool,
+    max_num_seqs: Option<usize>,
+    max_queued_requests: usize,
 }
 
 pub type SharedModelManager = Arc<tokio::sync::Mutex<ModelManager>>;
@@ -161,6 +163,8 @@ pub struct ModelManagerConfig {
     pub kv_quant: KvQuantMode,
     pub qjl_quantization: bool,
     pub require_gpu: bool,
+    pub max_num_seqs: Option<usize>,
+    pub max_queued_requests: usize,
 }
 
 impl ModelManager {
@@ -174,6 +178,8 @@ impl ModelManager {
             kv_quant,
             qjl_quantization,
             require_gpu,
+            max_num_seqs,
+            max_queued_requests,
         } = config;
         let mut registry = load_registry(&models_dir);
         // Remove registry entries whose model directory no longer exists.
@@ -214,6 +220,8 @@ impl ModelManager {
             kv_quant,
             qjl_quantization,
             require_gpu,
+            max_num_seqs,
+            max_queued_requests,
         }
     }
 
@@ -424,6 +432,8 @@ impl ModelManager {
             kv_quant: self.kv_quant,
             qjl_quantization: self.qjl_quantization,
             require_gpu: self.require_gpu,
+            max_num_seqs: self.max_num_seqs,
+            max_queued_requests: self.max_queued_requests,
         });
 
         GetResult::Wait(rx)
@@ -554,7 +564,7 @@ impl ModelManager {
 }
 
 struct LoadResult {
-    request_tx: tokio_mpsc::UnboundedSender<IncomingRequest>,
+    request_tx: tokio_mpsc::Sender<IncomingRequest>,
     tokenizer: Arc<Tokenizer>,
     max_seq_len: usize,
     architecture: String,
@@ -576,6 +586,8 @@ struct SpawnLoadParams {
     kv_quant: KvQuantMode,
     qjl_quantization: bool,
     require_gpu: bool,
+    max_num_seqs: Option<usize>,
+    max_queued_requests: usize,
 }
 
 /// Runs dummy forward passes to force the device (Metal/CUDA) to JIT-compile
@@ -670,6 +682,8 @@ fn spawn_load(params: SpawnLoadParams) {
         kv_quant,
         qjl_quantization,
         require_gpu,
+        max_num_seqs,
+        max_queued_requests,
     } = params;
 
     let (result_tx, result_rx) = oneshot::channel::<Result<LoadResult, String>>();
@@ -699,14 +713,14 @@ fn spawn_load(params: SpawnLoadParams) {
         };
 
         tracing::info!(model_id = %model_id_thread, "loading model");
-        let max_num_sequences: usize = 8;
+        let load_max_num_sequences: usize = max_num_seqs.unwrap_or(8);
         let (batch_model, weights_size_bytes) = match loader::load_batch_model(
             &model_dir,
             &model_id_thread,
             &device,
             loader::LoadBatchOptions {
                 max_context_len,
-                max_num_sequences,
+                max_num_sequences: load_max_num_sequences,
                 kv_budget: &kv_budget,
                 kv_quant,
                 qjl_quantization,
@@ -767,7 +781,42 @@ fn spawn_load(params: SpawnLoadParams) {
             "model ready"
         );
 
-        let (request_tx, request_rx) = tokio_mpsc::unbounded_channel();
+        let block_size = if batch_model.allocators().is_empty() {
+            crate::common::paged::DEFAULT_BLOCK_SIZE
+        } else {
+            batch_model.allocators()[0].lock().unwrap().block_size()
+        };
+        let total_blocks = if batch_model.allocators().is_empty() {
+            0
+        } else {
+            batch_model.allocators()[0].lock().unwrap().num_total()
+        };
+        let blocks_per_seq = max_context_len.div_ceil(block_size).max(1);
+        let dynamic_max = (total_blocks / blocks_per_seq).clamp(1, 256);
+        let scheduler_max_seqs = match max_num_seqs {
+            Some(n) => {
+                let capped = n.min(dynamic_max);
+                if capped < n {
+                    tracing::warn!(
+                        model_id = %model_id_thread,
+                        requested = n,
+                        capacity = dynamic_max,
+                        "max-num-seqs capped by available KV blocks"
+                    );
+                }
+                capped
+            }
+            None => {
+                tracing::info!(
+                    model_id = %model_id_thread,
+                    max_num_seqs = dynamic_max,
+                    "max concurrent sequences computed from KV block capacity"
+                );
+                dynamic_max
+            }
+        };
+
+        let (request_tx, request_rx) = tokio_mpsc::channel(max_queued_requests);
         let shutdown = Arc::new(AtomicBool::new(false));
 
         let result = LoadResult {
@@ -784,7 +833,7 @@ fn spawn_load(params: SpawnLoadParams) {
         let _ = result_tx.send(Ok(result));
 
         let config = SchedulerConfig {
-            max_num_sequences: 8,
+            max_num_sequences: scheduler_max_seqs,
             max_tokens_per_step: 4096,
         };
         let extra_stop_ids = tokenizer.stop_token_ids();
@@ -952,6 +1001,8 @@ mod tests {
             kv_quant: crate::common::kv_quant::KvQuantMode::Off,
             qjl_quantization: false,
             require_gpu: false,
+            max_num_seqs: None,
+            max_queued_requests: 200,
         })
     }
 
@@ -970,7 +1021,7 @@ mod tests {
         std::fs::write(tmp.path().join("tokenizer_config.json"), "{}").unwrap();
         let tok =
             Arc::new(crate::tokenizer::Tokenizer::from_dir(tmp.path().to_str().unwrap()).unwrap());
-        let (tx, _rx) = tokio_mpsc::unbounded_channel();
+        let (tx, _rx) = tokio_mpsc::channel(200);
         ReadyHandle {
             request_tx: tx,
             tokenizer: tok,

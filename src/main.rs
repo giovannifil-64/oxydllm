@@ -44,6 +44,8 @@ struct StartArgs {
     kv_quant: common::kv_quant::KvQuantMode,
     qjl_quantization: bool,
     require_gpu: bool,
+    max_num_seqs: Option<usize>,
+    max_queued_requests: usize,
 }
 
 struct RunArgs {
@@ -119,59 +121,63 @@ fn print_usage() {
 Usage: oxydllm <command> [options]
 
 Commands:
-  pull     <user/model>     Download a model from HuggingFace
-  rm       <model-name>     Remove a model and its files from disk
-  list                      List all locally available models
-  start                     Start the HTTP inference server
-  run      <model-name>     Interactive chat in terminal
-  estimate <model>          Estimate memory footprint and accuracy
+  pull     <user/model>      Download a model from HuggingFace
+  rm       <model-name>      Remove a model and its files from disk
+  list                       List all locally available models
+  start                      Start the HTTP inference server
+  run      <model-name>      Interactive chat in terminal
+  estimate <model>           Estimate memory footprint and accuracy
 
 Download options (pull):
-  --models-dir <DIR>        Destination directory (default: ~/.oxydllm/models/)
-  --name <NAME>             Folder name override (default: model name)
-  --token <TOKEN>           HuggingFace token for gated models
-  --variant <FORMAT>        GGUF variant to download (e.g. Q4_K_M); skips interactive prompt
-  --force                   Overwrite if model already exists
+  --models-dir <DIR>         Destination directory (default: ~/.oxydllm/models/)
+  --name <NAME>              Folder name override (default: model name)
+  --token <TOKEN>            HuggingFace token for gated models
+  --variant <FORMAT>         GGUF variant to download (e.g. Q4_K_M); skips interactive prompt
+  --force                    Overwrite if model already exists
 
 Server options (start):
-  --port <PORT>             Listen port (default: 11313)
-  --models-dir <DIR>        Models directory (default: ~/.oxydllm/models/)
-  --keep-alive <SECS>       Keep-alive seconds before eviction (default: 900)
-  --shutdown-timeout <SECS> Seconds to wait for in-flight requests on shutdown (default: 30)
-  --memory-budget <MB>      Max total VRAM for loaded models in MB; LRU eviction when exceeded
-  --max-context-len <N>     Max tokens per sequence for KV cache (default: 4096)
-  --devices <IDS>           Comma-separated CUDA device indices to use (default: auto, env: OXYDLLM_DEVICES)
-                            Examples: --devices 0   --devices 0,1,2
-  --kv-quant <MODE>         KV cache quantization mode (default: off, no quantization)
-                            - lossless: 4-bit, quality-neutral (~3.7x compression)
-                            - balanced: 3-bit, near-identical quality (~4.9x compression)
-                            - aggressive: 2-bit, maximum compression (~7x compression)
-  --qjl-quantization        Enable Stage-2 QJL key residual quantization (default: disabled)
-  --require-gpu             Fail startup if no GPU device available (default: disabled)
+  CLI flags take priority over environment variables.
+
+  --port <PORT>              Listen port (default: 11313, env: OXYDLLM_PORT)
+  --models-dir <DIR>         Models directory (default: ~/.oxydllm/models/, env: OXYDLLM_MODELS_DIR)
+  --keep-alive <SECS>        Keep-alive seconds before eviction (default: 900, env: OXYDLLM_KEEP_ALIVE)
+  --shutdown-timeout <SECS>  Seconds to wait for in-flight requests on shutdown (default: 30, env: OXYDLLM_SHUTDOWN_TIMEOUT)
+  --memory-budget <MB>       Max total VRAM for loaded models in MB; LRU eviction when exceeded (env: OXYDLLM_MEMORY_BUDGET)
+  --max-context-len <N>      Max tokens per sequence for KV cache (default: 4096, env: OXYDLLM_MAX_CONTEXT_LEN)
+  --devices <IDS>            Comma-separated CUDA device indices to use (default: auto, env: OXYDLLM_DEVICES)
+                             Examples: --devices 0   --devices 0,1,2
+  --kv-quant <MODE>          KV cache quantization mode (default: off, env: OXYDLLM_KV_QUANT)
+                             - lossless: 4-bit, quality-neutral
+                             - balanced: 3-bit, near-identical quality
+                             - aggressive: 2-bit, maximum compression
+  --qjl-quantization         Enable Stage-2 QJL key residual quantization (default: disabled)
+  --require-gpu              Fail startup if no GPU device available (default: disabled)
+  --max-num-seqs <N>         Max concurrent sequences per model (default: auto from KV budget, env: OXYDLLM_MAX_NUM_SEQS)
+  --max-queued-requests <N>  Max requests queued per model before returning 429 (default: 200, env: OXYDLLM_MAX_QUEUED_REQUESTS)
 
 Chat options (run):
-  --models-dir <DIR>        Models directory (default: ~/.oxydllm/models/)
-  --devices <ID>            CUDA device index to use (default: auto, env: OXYDLLM_DEVICES)
-  --max-context-len <N>     Max tokens per sequence for KV cache (default: 4096)
-  --kv-quant <MODE>         KV cache quantization: off, lossless, balanced, aggressive
-  --qjl-quantization        Enable Stage-2 QJL key residual quantization (default: disabled)
-  --require-gpu             Fail startup if no GPU device available (default: disabled)
-  --temperature <T>         Sampling temperature (default: 0.7)
-  --top-k <K>               Top-k filtering (default: 0, disabled)
-  --top-p <P>               Nucleus sampling (default: 1.0)
-  --min-p <P>               Min-p filtering (default: 0.0)
-  --repeat-penalty <R>      Repetition penalty (default: 1.0)
-  --repeat-window <N>       Trailing token window for repetition penalty (default: 0 = full history)
+  --models-dir <DIR>         Models directory (default: ~/.oxydllm/models/)
+  --devices <ID>             CUDA device index to use (default: auto, env: OXYDLLM_DEVICES)
+  --max-context-len <N>      Max tokens per sequence for KV cache (default: 4096)
+  --kv-quant <MODE>          KV cache quantization: off, lossless, balanced, aggressive
+  --qjl-quantization         Enable Stage-2 QJL key residual quantization (default: disabled)
+  --require-gpu              Fail startup if no GPU device available (default: disabled)
+  --temperature <T>          Sampling temperature (default: 0.7)
+  --top-k <K>                Top-k filtering (default: 0, disabled)
+  --top-p <P>                Nucleus sampling (default: 1.0)
+  --min-p <P>                Min-p filtering (default: 0.0)
+  --repeat-penalty <R>       Repetition penalty (default: 1.0)
+  --repeat-window <N>        Trailing token window for repetition penalty (default: 0 = full history)
 
 Remove options (rm):
-  --models-dir <DIR>        Models directory (default: ~/.oxydllm/models/)
-  --force / -f              Skip confirmation prompt
+  --models-dir <DIR>         Models directory (default: ~/.oxydllm/models/)
+  --force / -f               Skip confirmation prompt
 
 Estimate options (estimate):
-  --models-dir <DIR>        Models directory (default: ~/.oxydllm/models/)
-  --token <TOKEN>           HuggingFace token (for private repos)
-  --context-len <N>         Context length for KV cache estimate (default: 4096)
-  --num-sequences <N>       Concurrent sequences for KV cache estimate (default: 1)"
+  --models-dir <DIR>         Models directory (default: ~/.oxydllm/models/)
+  --token <TOKEN>            HuggingFace token (for private repos)
+  --context-len <N>          Context length for KV cache estimate (default: 4096)
+  --num-sequences <N>        Concurrent sequences for KV cache estimate (default: 1)"
     );
 }
 
@@ -375,17 +381,36 @@ fn run_rm(args: &RmArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn env_usize(name: &str) -> Option<usize> {
+    std::env::var(name).ok()?.parse().ok()
+}
+
+fn env_u16(name: &str) -> Option<u16> {
+    std::env::var(name).ok()?.parse().ok()
+}
+
+fn env_u64(name: &str) -> Option<u64> {
+    std::env::var(name).ok()?.parse().ok()
+}
+
 fn parse_start_args(args: &[String]) -> Result<StartArgs, String> {
-    let mut models_dir: Option<PathBuf> = None;
-    let mut port: u16 = 11313;
-    let mut keep_alive_secs: u64 = 900;
-    let mut shutdown_timeout_secs: u64 = 30;
-    let mut memory_budget_mb: Option<usize> = None;
+    let mut models_dir: Option<PathBuf> =
+        std::env::var("OXYDLLM_MODELS_DIR").ok().map(PathBuf::from);
+    let mut port: u16 = env_u16("OXYDLLM_PORT").unwrap_or(11313);
+    let mut keep_alive_secs: u64 = env_u64("OXYDLLM_KEEP_ALIVE").unwrap_or(900);
+    let mut shutdown_timeout_secs: u64 = env_u64("OXYDLLM_SHUTDOWN_TIMEOUT").unwrap_or(30);
+    let mut memory_budget_mb: Option<usize> = env_usize("OXYDLLM_MEMORY_BUDGET");
     let mut devices_raw: Option<Vec<usize>> = None;
-    let mut max_context_len: usize = 4096;
-    let mut kv_quant = common::kv_quant::KvQuantMode::Off;
+    let mut max_context_len: usize = env_usize("OXYDLLM_MAX_CONTEXT_LEN").unwrap_or(4096);
+    let mut kv_quant = std::env::var("OXYDLLM_KV_QUANT")
+        .ok()
+        .map(|v| common::kv_quant::KvQuantMode::parse(&v))
+        .transpose()?
+        .unwrap_or(common::kv_quant::KvQuantMode::Off);
     let mut qjl_quantization = false;
     let mut require_gpu = false;
+    let mut max_num_seqs: Option<usize> = env_usize("OXYDLLM_MAX_NUM_SEQS");
+    let mut max_queued_requests: usize = env_usize("OXYDLLM_MAX_QUEUED_REQUESTS").unwrap_or(200);
     let mut i = 0;
 
     while i < args.len() {
@@ -455,6 +480,29 @@ fn parse_start_args(args: &[String]) -> Result<StartArgs, String> {
             "--require-gpu" => {
                 require_gpu = true;
             }
+            "--max-num-seqs" => {
+                i += 1;
+                let n: usize = args
+                    .get(i)
+                    .ok_or("--max-num-seqs requires a value")?
+                    .parse()
+                    .map_err(|_| "Invalid max-num-seqs value (expected positive integer)")?;
+                if n == 0 {
+                    return Err("--max-num-seqs must be at least 1".to_string());
+                }
+                max_num_seqs = Some(n);
+            }
+            "--max-queued-requests" => {
+                i += 1;
+                max_queued_requests = args
+                    .get(i)
+                    .ok_or("--max-queued-requests requires a value")?
+                    .parse()
+                    .map_err(|_| "Invalid max-queued-requests value (expected positive integer)")?;
+                if max_queued_requests == 0 {
+                    return Err("--max-queued-requests must be at least 1".to_string());
+                }
+            }
             other => return Err(format!("Unknown option: {}", other)),
         }
         i += 1;
@@ -471,6 +519,8 @@ fn parse_start_args(args: &[String]) -> Result<StartArgs, String> {
         kv_quant,
         qjl_quantization,
         require_gpu,
+        max_num_seqs,
+        max_queued_requests,
     })
 }
 
@@ -936,6 +986,8 @@ fn main() -> anyhow::Result<()> {
                 kv_quant: start_args.kv_quant,
                 qjl_quantization: start_args.qjl_quantization,
                 require_gpu: start_args.require_gpu,
+                max_num_seqs: start_args.max_num_seqs,
+                max_queued_requests: start_args.max_queued_requests,
             })?
         }
         "run" => {

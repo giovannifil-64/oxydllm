@@ -82,6 +82,8 @@ pub struct StartServerArgs {
     pub kv_quant: crate::common::kv_quant::KvQuantMode,
     pub qjl_quantization: bool,
     pub require_gpu: bool,
+    pub max_num_seqs: Option<usize>,
+    pub max_queued_requests: usize,
 }
 
 pub fn start_server(args: StartServerArgs) -> anyhow::Result<()> {
@@ -96,6 +98,8 @@ pub fn start_server(args: StartServerArgs) -> anyhow::Result<()> {
         kv_quant,
         qjl_quantization,
         require_gpu,
+        max_num_seqs,
+        max_queued_requests,
     } = args;
 
     if !models_dir.exists() {
@@ -122,6 +126,8 @@ pub fn start_server(args: StartServerArgs) -> anyhow::Result<()> {
             kv_quant,
             qjl_quantization,
             require_gpu,
+            max_num_seqs,
+            max_queued_requests,
         },
     )));
 

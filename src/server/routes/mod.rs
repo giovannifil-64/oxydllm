@@ -48,7 +48,7 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/health", get(handlers::health))
         .route("/v1/models", get(handlers::list_models))
         .route("/v1/models/running", get(handlers::list_running_models))
-        .route("/v1/models/{model_id}", get(handlers::get_model))
+        .route("/v1/models/{*model_id}", get(handlers::get_model))
         .route("/v1/chat/completions", post(chat::chat_completions))
         .with_state(state)
 }

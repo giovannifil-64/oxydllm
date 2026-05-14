@@ -209,6 +209,19 @@ oxydllm rm Qwen/Qwen3-0.6B
 > [!IMPORTANT]
 > Models are loaded on demand when the first request for that model arrives.
 
+Update oxydllm to a newer release. Without flags the command queries the GitHub releases API for the latest stable non-pre-release build and compares the remote version tag against the installed binary. Pass `--pre` to target the most recent pre-release instead, or `--nightly` to compare the rolling nightly build against the compile-time Unix timestamp baked into the binary at build time. When the installed version is already current the command reports that and exits without making any changes. `update` is only available in binaries installed via `install.sh`; source builds receive an informational error and exit.
+```bash
+oxydllm update
+oxydllm update --pre
+oxydllm update --nightly
+```
+
+Remove oxydllm from the system. The command stops and removes the OS service (launchd agent on macOS, systemd unit on Linux), deletes the binary via self-removal, and then exits cleanly. A confirmation prompt is always shown before any changes are made. Pass `--purge` to also remove `~/.oxydllm/` and all downloaded models; this operation cannot be undone. `uninstall` is only available in binaries installed via `install.sh`.
+```bash
+oxydllm uninstall
+oxydllm uninstall --purge
+```
+
 ### API
 The fastest way to interact with the server is through the OpenAI-compatible API. The following endpoints are available:
 - `GET /health`

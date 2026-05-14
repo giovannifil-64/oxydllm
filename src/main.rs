@@ -65,6 +65,15 @@ struct RmArgs {
     force: bool,
 }
 
+struct UpdateArgs {
+    nightly: bool,
+    pre: bool,
+}
+
+struct UninstallArgs {
+    purge: bool,
+}
+
 fn default_models_dir() -> PathBuf {
     dirs_home().join(".oxydllm").join("models")
 }
@@ -133,6 +142,8 @@ Usage: oxydllm <command> [options]
 Commands:
   pull     <user/model>      Download a model from HuggingFace
   rm       <model-name>      Remove a model and its files from disk
+  update   [--nightly|--pre]      Update oxydllm to the latest version
+  uninstall [--purge]             Remove oxydllm from the system
   list                       List all locally available models
   start                      Start the HTTP inference server
   run      <model-name>      Interactive chat in terminal
@@ -182,6 +193,13 @@ Chat options (run):
 Remove options (rm):
   --models-dir <DIR>         Models directory (default: ~/.oxydllm/models/)
   --force / -f               Skip confirmation prompt
+
+Update options (update):
+  --nightly                  Update to the latest nightly build
+  --pre / --prerelease       Include pre-release versions (alpha, beta, rc)
+
+Uninstall options (uninstall):
+  --purge                    Also remove ~/.oxydllm/ (models and all data)
 
 Estimate options (estimate):
   --models-dir <DIR>         Models directory (default: ~/.oxydllm/models/)
@@ -346,6 +364,30 @@ fn parse_rm_args(args: &[String]) -> Result<RmArgs, String> {
     })
 }
 
+fn parse_update_args(args: &[String]) -> Result<UpdateArgs, String> {
+    let mut nightly = false;
+    let mut pre = false;
+    for arg in args {
+        match arg.as_str() {
+            "--nightly" => nightly = true,
+            "--pre" | "--prerelease" => pre = true,
+            other => return Err(format!("Unknown option: {other}")),
+        }
+    }
+    Ok(UpdateArgs { nightly, pre })
+}
+
+fn parse_uninstall_args(args: &[String]) -> Result<UninstallArgs, String> {
+    let mut purge = false;
+    for arg in args {
+        match arg.as_str() {
+            "--purge" => purge = true,
+            other => return Err(format!("Unknown option: {other}")),
+        }
+    }
+    Ok(UninstallArgs { purge })
+}
+
 fn run_rm(args: &RmArgs) -> anyhow::Result<()> {
     use std::io::{BufRead, Write};
 
@@ -389,6 +431,252 @@ fn run_rm(args: &RmArgs) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+fn check_dist_build(cmd: &str) {
+    if cfg!(not(dist_build)) {
+        eprintln!("'{cmd}' is only available for binaries installed via install.sh.");
+        eprintln!("To rebuild from source: cargo build --release");
+        std::process::exit(1);
+    }
+}
+
+fn run_update(args: &UpdateArgs) -> anyhow::Result<()> {
+    check_dist_build("update");
+    if args.nightly {
+        run_update_nightly()
+    } else {
+        run_update_stable(args.pre)
+    }
+}
+
+fn github_client() -> anyhow::Result<reqwest::blocking::Client> {
+    let mut headers = reqwest::header::HeaderMap::new();
+    if let Ok(token) = std::env::var("GITHUB_TOKEN") {
+        let value = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
+            .map_err(|e| anyhow::anyhow!("Invalid GITHUB_TOKEN value: {e}"))?;
+        headers.insert(reqwest::header::AUTHORIZATION, value);
+    }
+    reqwest::blocking::Client::builder()
+        .user_agent("oxydllm-updater")
+        .default_headers(headers)
+        .build()
+        .map_err(Into::into)
+}
+
+fn run_update_stable(include_pre: bool) -> anyhow::Result<()> {
+    let client = github_client()?;
+
+    let remote_tag: String = if include_pre {
+        let releases: serde_json::Value = client
+            .get("https://api.github.com/repos/giovannifil-64/oxydllm/releases")
+            .send()?
+            .error_for_status()?
+            .json()?;
+        releases
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("GitHub API returned unexpected format"))?
+            .iter()
+            .find(|r| r["tag_name"].as_str() != Some("nightly"))
+            .ok_or_else(|| anyhow::anyhow!("No releases found"))?["tag_name"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("GitHub API response missing tag_name"))?
+            .to_string()
+    } else {
+        let response = client
+            .get("https://api.github.com/repos/giovannifil-64/oxydllm/releases/latest")
+            .send()?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            println!("No stable release available yet.");
+            println!(
+                "Use --pre to include pre-release versions, or --nightly for the latest build."
+            );
+            return Ok(());
+        }
+        response.error_for_status()?.json::<serde_json::Value>()?["tag_name"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("GitHub API response missing tag_name"))?
+            .to_string()
+    };
+
+    let strip_v = |s: &str| s.trim_start_matches('v').to_string();
+    let local = strip_v(env!("CARGO_PKG_VERSION"));
+    let remote = strip_v(&remote_tag);
+
+    if remote == local {
+        println!("Already up-to-date ({remote_tag}).");
+        return Ok(());
+    }
+
+    println!(
+        "Update available: {} → {remote_tag}",
+        env!("CARGO_PKG_VERSION")
+    );
+    run_install_sh("stable")
+}
+
+fn run_update_nightly() -> anyhow::Result<()> {
+    let client = github_client()?;
+
+    let response = client
+        .get("https://api.github.com/repos/giovannifil-64/oxydllm/releases/tags/nightly")
+        .send()?;
+
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        println!("Nightly release temporarily unavailable — the build may be in progress.");
+        println!("Try again in a few minutes.");
+        return Ok(());
+    }
+
+    let release: serde_json::Value = response.error_for_status()?.json()?;
+
+    let published_at = release["published_at"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("GitHub API response missing published_at"))?;
+
+    let release_ts = chrono::DateTime::parse_from_rfc3339(published_at)
+        .map_err(|e| anyhow::anyhow!("Failed to parse release timestamp: {e}"))?
+        .timestamp() as u64;
+
+    let build_ts: u64 = env!("OXYDLLM_BUILD_TS").parse().unwrap_or(0);
+
+    if release_ts <= build_ts {
+        println!("Already up-to-date (nightly).");
+        return Ok(());
+    }
+
+    println!("Nightly update available.");
+    run_install_sh("nightly")
+}
+
+fn run_install_sh(channel: &str) -> anyhow::Result<()> {
+    println!("Updating to latest {channel} release...");
+    let status = std::process::Command::new("sh")
+        .arg("-c")
+        .arg("curl -fsSL https://raw.githubusercontent.com/giovannifil-64/oxydllm/main/install.sh | sh")
+        .env("OXYDLLM_CHANNEL", channel)
+        .status()?;
+    if !status.success() {
+        anyhow::bail!("Update failed (install.sh exited with non-zero status).");
+    }
+    Ok(())
+}
+
+fn run_uninstall(args: &UninstallArgs) -> anyhow::Result<()> {
+    check_dist_build("uninstall");
+    run_uninstall_impl(args)
+}
+
+fn run_uninstall_impl(args: &UninstallArgs) -> anyhow::Result<()> {
+    use std::io::{BufRead, Write};
+
+    let home = dirs_home();
+    let binary = std::env::current_exe()?;
+    let data_dir = home.join(".oxydllm");
+
+    let service_path: Option<std::path::PathBuf> = match std::env::consts::OS {
+        "macos" => Some(home.join("Library/LaunchAgents/com.oxydllm.oxydllmd.plist")),
+        "linux" => Some(std::path::PathBuf::from(
+            "/etc/systemd/system/oxydllm.service",
+        )),
+        _ => None,
+    };
+
+    println!("This will remove:");
+    println!("  Binary   : {}", binary.display());
+    if let Some(ref sp) = service_path
+        && sp.exists()
+    {
+        println!("  Service  : {}", sp.display());
+    }
+    if args.purge {
+        println!(
+            "  Data dir : {}  (including all downloaded models — cannot be undone)",
+            data_dir.display()
+        );
+    } else {
+        println!();
+        println!("Your models in {} will NOT be removed.", data_dir.display());
+        println!("Use --purge to also delete models and all data.");
+    }
+    println!();
+    print!("Proceed? [y/N] ");
+    std::io::stdout().flush()?;
+    let mut answer = String::new();
+    std::io::stdin().lock().read_line(&mut answer)?;
+    if !matches!(answer.trim().to_lowercase().as_str(), "y" | "yes") {
+        println!("Aborted.");
+        return Ok(());
+    }
+
+    match std::env::consts::OS {
+        "macos" => {
+            if let Some(ref sp) = service_path
+                && sp.exists()
+            {
+                let uid_out = std::process::Command::new("id").arg("-u").output()?;
+                let uid = String::from_utf8(uid_out.stdout)?.trim().to_string();
+                let _ = std::process::Command::new("launchctl")
+                    .args(["bootout", &format!("gui/{uid}"), sp.to_str().unwrap_or("")])
+                    .status();
+                std::fs::remove_file(sp)?;
+                println!("Removed launchd agent.");
+            }
+        }
+        "linux" => {
+            if let Some(ref sp) = service_path
+                && sp.exists()
+            {
+                let _ = uninstall_sudo(&["systemctl", "stop", "oxydllm"]);
+                let _ = uninstall_sudo(&["systemctl", "disable", "oxydllm"]);
+                uninstall_sudo(&["rm", "-f", sp.to_str().unwrap_or("")])?;
+                if std::path::Path::new("/etc/default/oxydllm").exists() {
+                    uninstall_sudo(&["rm", "-f", "/etc/default/oxydllm"])?;
+                }
+                uninstall_sudo(&["systemctl", "daemon-reload"])?;
+                println!("Removed systemd service.");
+            }
+        }
+        _ => {}
+    }
+
+    remove_with_sudo_fallback(&binary)?;
+    println!("Removed binary.");
+
+    if args.purge && data_dir.exists() {
+        std::fs::remove_dir_all(&data_dir)?;
+        println!("Removed data directory.");
+    }
+
+    println!("\noxydllm uninstalled.");
+    Ok(())
+}
+
+fn uninstall_sudo(args: &[&str]) -> anyhow::Result<()> {
+    let status = std::process::Command::new("sudo").args(args).status()?;
+    if !status.success() {
+        anyhow::bail!("Command failed: sudo {}", args.join(" "));
+    }
+    Ok(())
+}
+
+fn remove_with_sudo_fallback(path: &std::path::Path) -> anyhow::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            let status = std::process::Command::new("sudo")
+                .args(["rm", "-f", path.to_str().unwrap_or("")])
+                .status()?;
+            if !status.success() {
+                anyhow::bail!(
+                    "Failed to remove '{}': permission denied (sudo also failed)",
+                    path.display()
+                );
+            }
+            Ok(())
+        }
+        Err(e) => Err(e.into()),
+    }
 }
 
 fn env_usize(name: &str) -> Option<usize> {
@@ -1056,6 +1344,22 @@ fn main() -> anyhow::Result<()> {
                 std::process::exit(1);
             });
             run_rm(&rm_args)?;
+        }
+        "update" => {
+            let update_args = parse_update_args(&args[2..]).unwrap_or_else(|e| {
+                eprintln!("Error: {e}");
+                print_usage();
+                std::process::exit(1);
+            });
+            run_update(&update_args)?;
+        }
+        "uninstall" => {
+            let uninstall_args = parse_uninstall_args(&args[2..]).unwrap_or_else(|e| {
+                eprintln!("Error: {e}");
+                print_usage();
+                std::process::exit(1);
+            });
+            run_uninstall(&uninstall_args)?;
         }
         "--help" | "-h" | "help" => {
             print_usage();

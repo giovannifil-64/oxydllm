@@ -49,6 +49,8 @@ jobs:
           prefix-key: build-macos-arm64-metal
 
       - name: Build (Metal, release)
+        env:
+          OXYDLLM_DIST_BUILD: "1"
         run: cargo build --release
 
       - name: Strip binary (macOS release artifact)
@@ -92,6 +94,8 @@ jobs:
           sudo apt-get install -y --no-install-recommends pkg-config libssl-dev
 
       - name: Build (CPU-only, release)
+        env:
+          OXYDLLM_DIST_BUILD: "1"
         run: cargo build --release --no-default-features
 
       - name: Strip binary (Linux CPU release artifact)
@@ -166,6 +170,7 @@ jobs:
       - name: Build (CUDA, release)
         env:
           CUDA_COMPUTE_CAP: ${{ matrix.variant.arch }}
+          OXYDLLM_DIST_BUILD: "1"
         run: cargo build --release --no-default-features --features cuda
 
       - name: Strip binary (Linux CUDA release artifact)
@@ -225,6 +230,8 @@ jobs:
           sudo apt-get install -y --no-install-recommends pkg-config libssl-dev
 
       - name: Build (CPU-only, release)
+        env:
+          OXYDLLM_DIST_BUILD: "1"
         run: cargo build --release --no-default-features
 
       - name: Strip binary (Linux arm64 CPU release artifact)
@@ -291,6 +298,7 @@ jobs:
       - name: Build (CUDA, release)
         env:
           CUDA_COMPUTE_CAP: ${{ matrix.variant.arch }}
+          OXYDLLM_DIST_BUILD: "1"
         run: cargo build --release --no-default-features --features cuda
 
       - name: Strip binary (Linux arm64 CUDA release artifact)

@@ -636,6 +636,86 @@ mod tests {
         }
     }
 
+    // Like FakeModel, but writes zero KV tensors to the cache on each forward pass,
+    // allowing block_id_at() to return valid IDs for prefix cache registration.
+    struct KvFakeModel {
+        device: Device,
+        vocab_size: usize,
+        stop_tokens: Vec<u32>,
+        allocators: Vec<SharedBlockAllocator>,
+        num_layers: usize,
+        forced_token: u32,
+    }
+
+    impl KvFakeModel {
+        fn new(
+            stop_tokens: Vec<u32>,
+            forced_token: u32,
+            allocators: Vec<SharedBlockAllocator>,
+        ) -> Self {
+            let num_layers = allocators.len();
+            Self {
+                device: Device::Cpu,
+                vocab_size: 32,
+                stop_tokens,
+                num_layers,
+                allocators,
+                forced_token,
+            }
+        }
+    }
+
+    impl BatchModel for KvFakeModel {
+        fn forward_batch(
+            &self,
+            token_ids: &Tensor,
+            _position_ids: &Tensor,
+            seq_caches: &mut [&mut [PagedKvCache]],
+            token_counts: &[usize],
+        ) -> Result<Tensor> {
+            let (_, total_tokens) = token_ids.dims2()?;
+            // append expects shape (batch=1, n_kv_heads=1, seq, head_dim=8)
+            for (seq_idx, seq_cache) in seq_caches.iter_mut().enumerate() {
+                let n = token_counts[seq_idx];
+                let k = Tensor::zeros((1usize, 1usize, n, 8usize), DType::F32, &self.device)?;
+                let v = Tensor::zeros((1usize, 1usize, n, 8usize), DType::F32, &self.device)?;
+                for layer_cache in seq_cache.iter_mut() {
+                    layer_cache.append(&k, &v)?;
+                }
+            }
+            let forced = (self.forced_token as usize).min(self.vocab_size.saturating_sub(1));
+            let mut logits = vec![0f32; total_tokens * self.vocab_size];
+            for i in 0..total_tokens {
+                logits[i * self.vocab_size + forced] = 1.0;
+            }
+            Tensor::from_vec(logits, (1, total_tokens, self.vocab_size), &self.device)
+        }
+
+        fn vocab_size(&self) -> usize {
+            self.vocab_size
+        }
+
+        fn stop_token_ids(&self) -> &[u32] {
+            &self.stop_tokens
+        }
+
+        fn max_seq_len(&self) -> usize {
+            2048
+        }
+
+        fn device(&self) -> &Device {
+            &self.device
+        }
+
+        fn num_layers(&self) -> usize {
+            self.num_layers
+        }
+
+        fn allocators(&self) -> &[SharedBlockAllocator] {
+            &self.allocators
+        }
+    }
+
     struct ErrorModel {
         device: Device,
         allocators: Vec<SharedBlockAllocator>,
@@ -904,5 +984,55 @@ mod tests {
         assert_eq!(out.completed.len(), 1);
         assert_eq!(out.completed[0].id, seq_id);
         assert_eq!(out.completed[0].finish_reason.as_deref(), Some("stop"));
+    }
+
+    #[test]
+    fn engine_prefix_cache_hits_on_repeated_prompt() {
+        // 64-token shared prefix = exactly 4 full blocks (DEFAULT_BLOCK_SIZE=16).
+        // Request 0 runs alone: cold miss, registers blocks in PrefixCache.
+        // Requests 1-7 are added together: each has 1 uncached token after the
+        // shared prefix, so all 7 find the 4 cached blocks and count as hits.
+        let allocators = make_allocators(1, 256);
+        let model = KvFakeModel::new(vec![31], 1, allocators);
+        let mut engine = Engine::new_with_stop_controls(
+            Box::new(model),
+            SchedulerConfig {
+                max_num_sequences: 8,
+                max_tokens_per_step: 4096,
+            },
+            &[],
+            &[],
+        );
+
+        let shared_prefix: Vec<u32> = vec![42u32; 64];
+
+        // First request — cold miss, populates the prefix cache.
+        let first_prompt: Vec<u32> = shared_prefix.iter().copied().chain([0u32]).collect();
+        engine.add_request(first_prompt, SamplingParams::default(), 5);
+        while engine.has_pending_work() {
+            engine.step().unwrap();
+        }
+
+        for i in 1u32..8 {
+            let prompt: Vec<u32> = shared_prefix.iter().copied().chain([i]).collect();
+            engine.add_request(prompt, SamplingParams::default(), 5);
+        }
+
+        let mut total_hits = 0usize;
+        let mut total_misses = 0usize;
+        while engine.has_pending_work() {
+            let out = engine.step().unwrap();
+            total_hits += out.prefix_cache_hits;
+            total_misses += out.prefix_cache_misses;
+        }
+
+        assert!(
+            total_hits >= 7,
+            "expected >=7 prefix cache hits (7 warm requests), got {total_hits}"
+        );
+        assert_eq!(
+            total_misses, 0,
+            "expected 0 misses for warm requests, got {total_misses}"
+        );
     }
 }

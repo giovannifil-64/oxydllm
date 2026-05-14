@@ -102,29 +102,36 @@ The following model families are not currently supported:
 For using oxydLLM, you can either build from source or use the provided installers.
 
 ### Building from source
-Clone the repository
+Clone the repository and install the [Rust toolchain](https://rust-lang.org/tools/install/):
 ```bash
 git clone https://github.com/giovannifil-64/oxydllm
 cd oxydllm
 ```
 
-Build the project (requires [Rust toolchain](https://rust-lang.org/tools/install/)) with the appropriate feature base on your platform
-
+#### Apple Silicon
 ```bash
-# For Apple Silicon (Metal backend)
 cargo build --release --features metal
-
-# NVIDIA CUDA (set the target compute capability explicitly)
-CUDA_COMPUTE_CAP=89  cargo build --release --features cuda  # Ada (RTX 4090/L40S)
-CUDA_COMPUTE_CAP=90  cargo build --release --features cuda  # Hopper (H100/H200/GH200)
-CUDA_COMPUTE_CAP=100 cargo build --release --features cuda  # Blackwell datacenter (B100/B200/DGX Spark)
-CUDA_COMPUTE_CAP=103 cargo build --release --features cuda  # Blackwell Ultra (B300/GB300) — requires CUDA 12.9+
-CUDA_COMPUTE_CAP=110 cargo build --release --features cuda  # Thor / Jetson Thor — requires CUDA 13.0+
-CUDA_COMPUTE_CAP=120 cargo build --release --features cuda  # Blackwell consumer (RTX 50xx)
 ```
 
+#### NVIDIA CUDA
+```bash
+CUDA_COMPUTE_CAP=<value> cargo build --release --features cuda
+```
+
+Replace `<value>` with the compute capability of your GPU:
+
+| Compute Capability | Data Center | Workstation / Consumer | Jetson |
+|---|---|---|---|
+| 12.1 | | NVIDIA GB10 (DGX Spark) | |
+| 12.0 | NVIDIA RTX PRO 6000 Blackwell Server Edition<br>NVIDIA RTX PRO 4500 Blackwell Server Edition | NVIDIA RTX PRO 6000/5000/4500/4000/2000 Blackwell<br>GeForce RTX 5090, 5080, 5070 Ti, 5070, 5060 Ti, 5060, 5050 | |
+| 11.0 | | | Jetson T5000<br>Jetson T4000 |
+| 10.3 | NVIDIA GB300<br>NVIDIA B300 | | |
+| 10.0 | NVIDIA GB200<br>NVIDIA B200 | | |
+| 9.0 | NVIDIA GH200<br>NVIDIA H200<br>NVIDIA H100 | | |
+| 8.9 | NVIDIA L4<br>NVIDIA L40<br>NVIDIA L40S | NVIDIA RTX 6000/5000/4500/4000/2000 Ada<br>GeForce RTX 4090, 4080, 4070 Ti, 4070, 4060 Ti, 4060, 4050 | |
+
 > [!NOTE]
-> `CUDA_COMPUTE_CAP` is consumed by Candle's CUDA kernel build scripts (`candle-kernels`), not by a direct `oxydllm` build flag. If not set, Candle tries to auto-detect compute capability from `nvidia-smi`.
+> `CUDA_COMPUTE_CAP` is validated at compile time — passing an unsupported value is a build error. If not set, Candle attempts auto-detection via `nvidia-smi`.
 
 Run the server
 
@@ -150,9 +157,9 @@ curl -fsSL https://github.com/giovannifil-64/oxydllm/raw/main/install.sh | sh
 > 
 > ```bash
 > # x86_64
-> OXYDLLM_CUDA_TARGET=ada|hopper|blackwell|blackwell-ultra|blackwell-consumer curl -fsSL https://github.com/giovannifil-64/oxydllm/raw/main/install.sh | sh
+> OXYDLLM_CUDA_TARGET=ada|hopper|blackwell|blackwell-ultra|blackwell-desktop curl -fsSL https://github.com/giovannifil-64/oxydllm/raw/main/install.sh | sh
 > # arm64
-> OXYDLLM_CUDA_TARGET=hopper|blackwell|blackwell-ultra|thor curl -fsSL https://github.com/giovannifil-64/oxydllm/raw/main/install.sh | sh
+> OXYDLLM_CUDA_TARGET=hopper|blackwell|blackwell-ultra|thor|blackwell-desktop curl -fsSL https://github.com/giovannifil-64/oxydllm/raw/main/install.sh | sh
 > ```
 
 If you prefer to manually download the installer, you can find the latest releases on GitHub:
@@ -165,17 +172,18 @@ If you prefer to manually download the installer, you can find the latest releas
 #### Linux (CUDA)
 
 ##### x86_64
-- `oxydllm-linux-x86_64-cuda-ada.tar.gz` for Ada (sm_89, compute 8.9)
-- `oxydllm-linux-x86_64-cuda-hopper.tar.gz` for Hopper (sm_90, compute 9.x)
-- `oxydllm-linux-x86_64-cuda-blackwell.tar.gz` for Blackwell datacenter (sm_100, compute 10.x)
-- `oxydllm-linux-x86_64-cuda-blackwell-ultra.tar.gz` for Blackwell Ultra (sm_103, compute 10.3+)
-- `oxydllm-linux-x86_64-cuda-blackwell-consumer.tar.gz` for Blackwell consumer (sm_120, compute 12.x, RTX 50xx)
+- `oxydllm-linux-x86_64-cuda-ada.tar.gz` for Ada Lovelace (sm_89 — RTX 40xx, L4, L40/L40S)
+- `oxydllm-linux-x86_64-cuda-hopper.tar.gz` for Hopper (sm_90 — H100, H200)
+- `oxydllm-linux-x86_64-cuda-blackwell.tar.gz` for Blackwell datacenter (sm_100 — B100, B200, GB200)
+- `oxydllm-linux-x86_64-cuda-blackwell-ultra.tar.gz` for Blackwell Ultra (sm_103 — B300, GB300)
+- `oxydllm-linux-x86_64-cuda-blackwell-desktop.tar.gz` for Blackwell Desktop (sm_120 — RTX 50xx, RTX PRO)
 
-##### arm64 (GH200 / DGX Spark / GB300 / Jetson Thor)
-- `oxydllm-linux-arm64-cuda-hopper.tar.gz` for Hopper (GH200, sm_90)
-- `oxydllm-linux-arm64-cuda-blackwell.tar.gz` for Blackwell datacenter (DGX Spark/B200, sm_100)
-- `oxydllm-linux-arm64-cuda-blackwell-ultra.tar.gz` for Blackwell Ultra (GB300, sm_103)
-- `oxydllm-linux-arm64-cuda-thor.tar.gz` for Thor / Jetson Thor (sm_110)
+##### arm64 (GH200 / GB300 / Jetson / DGX Spark)
+- `oxydllm-linux-arm64-cuda-hopper.tar.gz` for Hopper (sm_90 — GH200)
+- `oxydllm-linux-arm64-cuda-blackwell.tar.gz` for Blackwell datacenter (sm_100 — B200, GB200)
+- `oxydllm-linux-arm64-cuda-blackwell-ultra.tar.gz` for Blackwell Ultra (sm_103 — GB300)
+- `oxydllm-linux-arm64-cuda-thor.tar.gz` for Jetson GB (sm_110 — T4000, T5000)
+- `oxydllm-linux-arm64-cuda-blackwell-desktop.tar.gz` for Blackwell Desktop (sm_121 — DGX Spark / GB10)
 
 ## Usage
 Download a model from HuggingFace using the `user/model` repo ID. For GGUF repos, an interactive prompt lists available quantizations and lets you pick one; variants already on disk are shown with a check mark and excluded from the numbered choices. Use `--variant Q4_K_M` to skip the prompt, `--token` for gated models, and `--name` to save under a custom local name instead of the default `user/model` path.
@@ -403,15 +411,16 @@ CUDA is currently a functional compatibility path, not a performance-tuned backe
 ### Official CUDA Docker tags
 | Tag | Compute capability | Platform | Target |
 |---|---:|---|---|
-| `cuda-ada` | 89 | amd64 | Ada Lovelace (RTX 40xx, L40S) |
+| `cuda-ada` | 89 | amd64 | Ada Lovelace (RTX 40xx, L4, L40/L40S) |
 | `cuda-hopper` | 90 | amd64 | Hopper (H100, H200) |
-| `cuda-blackwell` | 100 | amd64 | Blackwell datacenter (B100, B200) |
+| `cuda-blackwell` | 100 | amd64 | Blackwell datacenter (B100, B200, GB200) |
 | `cuda-blackwell-ultra` | 103 | amd64 | Blackwell Ultra (B300, GB300) |
-| `cuda-blackwell-consumer` | 120 | amd64 | Blackwell consumer (RTX 50xx) |
+| `cuda-blackwell-desktop` | 120 | amd64 | Blackwell Desktop (RTX 50xx, RTX PRO) |
 | `cuda-hopper-arm64` | 90 | arm64 | Hopper (GH200 Grace Hopper) |
-| `cuda-blackwell-arm64` | 100 | arm64 | Blackwell datacenter (DGX Spark, B200) |
+| `cuda-blackwell-arm64` | 100 | arm64 | Blackwell datacenter (B200, GB200) |
 | `cuda-blackwell-ultra-arm64` | 103 | arm64 | Blackwell Ultra (GB300 NVL72) |
-| `cuda-thor-arm64` | 110 | arm64 | Thor / Jetson Thor |
+| `cuda-thor-arm64` | 110 | arm64 | Jetson GB (T4000, T5000) |
+| `cuda-blackwell-desktop-arm64` | 121 | arm64 | Blackwell Desktop (DGX Spark / GB10) |
 
 - `latest` and `cuda` point to `cuda-ada` (stable default — widest x86_64 compatibility).
 - `nightly` and `nightly-cuda` point to nightly `cuda-ada`.

@@ -11,8 +11,8 @@
 #   OXYDLLM_CHANNEL     - stable (default) or nightly
 #   OXYDLLM_VERSION     - install a specific version tag, e.g. v0.1.0 (ignored for nightly)
 #   OXYDLLM_NO_GPU      - set to 1 to force CPU binary on Linux
-#   OXYDLLM_CUDA_TARGET - auto (default), ada, hopper, blackwell, blackwell-ultra, blackwell-consumer (Linux x86_64);
-#                         hopper, blackwell, blackwell-ultra, thor (Linux arm64)
+#   OXYDLLM_CUDA_TARGET - auto (default), ada, hopper, blackwell, blackwell-ultra, blackwell-desktop (Linux x86_64);
+#                         hopper, blackwell, blackwell-ultra, thor, blackwell-desktop (Linux arm64)
 #   OXYDLLM_INSTALL_DIR - destination directory (default: /usr/local/bin)
 
 main() {
@@ -107,7 +107,7 @@ detect_cuda_target() {
         return 0
     fi
 
-    # Blackwell datacenter (B100/B200/DGX Spark) = sm_100 = compute cap 10.x
+    # Blackwell datacenter (B100/B200/GB200) = sm_100 = compute cap 10.x
     if [ "${CAP_MAJOR}" -eq 10 ]; then
         printf '%s\n' "blackwell"
         return 0
@@ -126,11 +126,11 @@ detect_cuda_target() {
         return 0
     fi
 
-    # Blackwell consumer (RTX 50xx) = sm_120 = compute cap 12.x
-    # Dedicated build target — sm_120 SASS is architecture-specific and will
-    # not run on sm_100 datacenter binaries.
+    # Blackwell Desktop (RTX 50xx / DGX Spark GB10) = sm_120/sm_121 = compute cap 12.x
+    # Covers both x86_64 (sm_120, RTX 50xx) and arm64 (sm_121, DGX Spark GB10).
+    # sm_120/sm_121 SASS is architecture-specific and will not run on sm_100 binaries.
     if [ "${CAP_MAJOR}" -eq 12 ]; then
-        printf '%s\n' "blackwell-consumer"
+        printf '%s\n' "blackwell-desktop"
         return 0
     fi
 
@@ -338,7 +338,7 @@ case "${OS}" in
                             auto)
                                 CUDA_TARGET="$(detect_cuda_target || true)"
                                 ;;
-                            ada|hopper|blackwell|blackwell-ultra|blackwell-consumer)
+                            ada|hopper|blackwell|blackwell-ultra|blackwell-desktop)
                                 CUDA_TARGET="${CUDA_TARGET_OVERRIDE}"
                                 ;;
                             *)
@@ -348,7 +348,7 @@ case "${OS}" in
                         esac
 
                         case "${CUDA_TARGET}" in
-                            ada|hopper|blackwell|blackwell-ultra|blackwell-consumer)
+                            ada|hopper|blackwell|blackwell-ultra|blackwell-desktop)
                                 PLATFORM="linux-x86_64-cuda-${CUDA_TARGET}"
                                 ;;
                             thor)
@@ -361,9 +361,9 @@ case "${OS}" in
                                 ;;
                             unsupported-future)
                                 warn "NVIDIA GPU compute capability (${CAP_RAW:-unknown}) is newer than the"
-                                warn "supported x86_64 targets (Ada 8.9 / Hopper 9.x / Blackwell 10.x / Ultra 10.3+ / 12.x consumer)."
+                                warn "supported x86_64 targets (Ada 8.9 / Hopper 9.x / Blackwell 10.x / Ultra 10.3+ / 12.x desktop)."
                                 warn "Falling back to CPU build."
-                                warn "Override with OXYDLLM_CUDA_TARGET=<ada|hopper|blackwell|blackwell-ultra|blackwell-consumer>"
+                                warn "Override with OXYDLLM_CUDA_TARGET=<ada|hopper|blackwell|blackwell-ultra|blackwell-desktop>"
                                 warn "at your own risk, or build from source with CUDA_COMPUTE_CAP=<target>."
                                 PLATFORM="linux-x86_64-cpu"
                                 ;;
@@ -396,18 +396,18 @@ case "${OS}" in
                             auto)
                                 CUDA_TARGET="$(detect_cuda_target || true)"
                                 ;;
-                            hopper|blackwell|blackwell-ultra|thor)
+                            hopper|blackwell|blackwell-ultra|thor|blackwell-desktop)
                                 CUDA_TARGET="${CUDA_TARGET_OVERRIDE}"
                                 ;;
                             *)
                                 warn "Invalid OXYDLLM_CUDA_TARGET='${CUDA_TARGET_OVERRIDE}' for ARM64. Using auto detection."
-                                warn "Valid ARM64 CUDA targets: hopper, blackwell, blackwell-ultra, thor"
+                                warn "Valid ARM64 CUDA targets: hopper, blackwell, blackwell-ultra, thor, blackwell-desktop"
                                 CUDA_TARGET="$(detect_cuda_target || true)"
                                 ;;
                         esac
 
                         case "${CUDA_TARGET}" in
-                            hopper|blackwell|blackwell-ultra|thor)
+                            hopper|blackwell|blackwell-ultra|thor|blackwell-desktop)
                                 PLATFORM="linux-arm64-cuda-${CUDA_TARGET}"
                                 ;;
                             unsupported)
@@ -416,9 +416,9 @@ case "${OS}" in
                                 ;;
                             unsupported-future)
                                 warn "NVIDIA GPU compute capability (${CAP_RAW:-unknown}) is newer than the"
-                                warn "supported ARM64 targets (Hopper 9.x / Blackwell 10.x / Ultra 10.3+ / Thor 11.x)."
+                                warn "supported ARM64 targets (Hopper 9.x / Blackwell 10.x / Ultra 10.3+ / Thor 11.x / Desktop 12.x)."
                                 warn "Falling back to CPU build."
-                                warn "Override with OXYDLLM_CUDA_TARGET=<hopper|blackwell|blackwell-ultra|thor>"
+                                warn "Override with OXYDLLM_CUDA_TARGET=<hopper|blackwell|blackwell-ultra|thor|blackwell-desktop>"
                                 warn "at your own risk, or build from source with CUDA_COMPUTE_CAP=<target>."
                                 PLATFORM="linux-arm64-cpu"
                                 ;;
@@ -429,8 +429,8 @@ case "${OS}" in
                                 ;;
                             *)
                                 warn "No ARM64 build for detected target '${CUDA_TARGET}'. Falling back to CPU build."
-                                warn "Supported ARM64 CUDA targets: hopper, blackwell, blackwell-ultra, thor"
-                                warn "Override with OXYDLLM_CUDA_TARGET=<hopper|blackwell|blackwell-ultra|thor>"
+                                warn "Supported ARM64 CUDA targets: hopper, blackwell, blackwell-ultra, thor, blackwell-desktop"
+                                warn "Override with OXYDLLM_CUDA_TARGET=<hopper|blackwell|blackwell-ultra|thor|blackwell-desktop>"
                                 PLATFORM="linux-arm64-cpu"
                                 ;;
                         esac
@@ -497,9 +497,9 @@ case "${PLATFORM}" in
         # sm_103 SASS is not guaranteed on sm_100 hardware.
         CANDIDATE_TARBALLS="oxydllm-linux-x86_64-cuda-blackwell-ultra.tar.gz"
         ;;
-    linux-x86_64-cuda-blackwell-consumer)
+    linux-x86_64-cuda-blackwell-desktop)
         # sm_120 is architecture-specific and not guaranteed on any other target.
-        CANDIDATE_TARBALLS="oxydllm-linux-x86_64-cuda-blackwell-consumer.tar.gz"
+        CANDIDATE_TARBALLS="oxydllm-linux-x86_64-cuda-blackwell-desktop.tar.gz"
         ;;
     linux-arm64-cuda-hopper)
         CANDIDATE_TARBALLS="oxydllm-linux-arm64-cuda-hopper.tar.gz"
@@ -512,6 +512,10 @@ case "${PLATFORM}" in
         ;;
     linux-arm64-cuda-thor)
         CANDIDATE_TARBALLS="oxydllm-linux-arm64-cuda-thor.tar.gz"
+        ;;
+    linux-arm64-cuda-blackwell-desktop)
+        # sm_121 (DGX Spark / GB10) — Blackwell Desktop on arm64.
+        CANDIDATE_TARBALLS="oxydllm-linux-arm64-cuda-blackwell-desktop.tar.gz"
         ;;
     *)
         CANDIDATE_TARBALLS="oxydllm-${PLATFORM}.tar.gz"
@@ -546,8 +550,11 @@ if [ -z "${TARBALL}" ]; then
         linux-x86_64-cuda-blackwell-ultra)
             BUILD_CAP=103
             ;;
-        linux-x86_64-cuda-blackwell-consumer)
+        linux-x86_64-cuda-blackwell-desktop)
             BUILD_CAP=120
+            ;;
+        linux-arm64-cuda-blackwell-desktop)
+            BUILD_CAP=121
             ;;
         linux-arm64-cuda-hopper)
             BUILD_CAP=90
@@ -567,7 +574,7 @@ if [ -z "${TARBALL}" ]; then
     esac
 
     case "${PLATFORM}" in
-        linux-x86_64-cuda-hopper|linux-x86_64-cuda-blackwell|linux-x86_64-cuda-blackwell-ultra|linux-x86_64-cuda-blackwell-consumer|linux-arm64-cuda-hopper|linux-arm64-cuda-blackwell|linux-arm64-cuda-blackwell-ultra|linux-arm64-cuda-thor)
+        linux-x86_64-cuda-hopper|linux-x86_64-cuda-blackwell|linux-x86_64-cuda-blackwell-ultra|linux-x86_64-cuda-blackwell-desktop|linux-arm64-cuda-hopper|linux-arm64-cuda-blackwell|linux-arm64-cuda-blackwell-ultra|linux-arm64-cuda-thor|linux-arm64-cuda-blackwell-desktop)
             err "No compatible binary for ${PLATFORM} in release ${OXYDLLM_VERSION}.
 This release may predate multi-architecture CUDA builds.
 Options:

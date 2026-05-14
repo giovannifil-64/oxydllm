@@ -6,11 +6,12 @@
 #   docker build -t oxydllm:cuda-hopper --build-arg CUDA_ARCH=90 .
 #   docker build -t oxydllm:cuda-blackwell --build-arg CUDA_ARCH=100 .
 #   docker build -t oxydllm:cuda-blackwell-ultra --build-arg CUDA_ARCH=103 .
-#   docker build -t oxydllm:cuda-blackwell-consumer --build-arg CUDA_ARCH=120 .
+#   docker build -t oxydllm:cuda-blackwell-desktop --build-arg CUDA_ARCH=120 .
 #
-# Build (arm64 — DGX Spark / GH200 / GB300 / Jetson Thor):
+# Build (arm64 — GH200 / GB300 / Jetson Thor / DGX Spark):
 #   docker buildx build --platform linux/arm64 -t oxydllm:cuda-blackwell-arm64 --build-arg CUDA_ARCH=100 .
 #   docker buildx build --platform linux/arm64 -t oxydllm:cuda-thor-arm64 --build-arg CUDA_ARCH=110 .
+#   docker buildx build --platform linux/arm64 -t oxydllm:cuda-blackwell-desktop-arm64 --build-arg CUDA_ARCH=121 .
 #
 # Run:
 #   docker run --gpus all -p 11313:11313 \

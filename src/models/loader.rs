@@ -480,11 +480,42 @@ pub fn is_gguf_model(model_dir: &str) -> bool {
     find_gguf_file(dir).is_some()
 }
 
+#[cfg(feature = "cuda")]
+fn check_cuda_compute_capability(device: &Device, ordinal: usize) {
+    let Ok(cuda_dev) = device.as_cuda_device() else {
+        return;
+    };
+    match cuda_dev.cuda_stream().context().compute_capability() {
+        Ok((major, minor)) => {
+            let cap = major * 10 + minor;
+            if cap < 89 {
+                tracing::warn!(
+                    compute_capability = format!("{major}.{minor}"),
+                    cuda_device = ordinal,
+                    "GPU compute capability {major}.{minor} is below the minimum supported (8.9 / Ada \
+                     Lovelace). Inference may fail or produce incorrect results. Supported: \
+                     8.9 (Ada Lovelace / RTX 40xx), 9.0 (Hopper / H100), 10.0 (Blackwell / B200), \
+                     10.3 (Blackwell Ultra / GB300), 11.0 (Jetson GB), \
+                     12.0 (Blackwell Desktop / RTX 50xx), 12.1 (DGX Spark / GB10)"
+                );
+            } else {
+                tracing::info!(
+                    compute_capability = format!("{major}.{minor}"),
+                    cuda_device = ordinal,
+                    "CUDA compute capability ok"
+                );
+            }
+        }
+        Err(e) => tracing::debug!(error = %e, "could not query CUDA compute capability"),
+    }
+}
+
 pub fn select_device_at(_cuda_idx: usize, require_gpu: bool) -> anyhow::Result<Device> {
     #[cfg(feature = "cuda")]
     match Device::new_cuda(_cuda_idx) {
         Ok(d) => {
             tracing::info!(device = %format!("CUDA:{}", _cuda_idx), "device selected");
+            check_cuda_compute_capability(&d, _cuda_idx);
             return Ok(d);
         }
         Err(e) => tracing::warn!(cuda_device = _cuda_idx, error = %e, "CUDA device not available"),

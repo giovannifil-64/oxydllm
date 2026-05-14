@@ -141,9 +141,9 @@ jobs:
             arch: "103"
             tar_suffix: cuda-blackwell-ultra
             legacy_alias: false
-          - label: sm_120 (Blackwell consumer, RTX 50xx)
+          - label: sm_120 (Blackwell Desktop, RTX 50xx)
             arch: "120"
-            tar_suffix: cuda-blackwell-consumer
+            tar_suffix: cuda-blackwell-desktop
             legacy_alias: false
     container:
       image: nvidia/cuda:13.2.1-devel-ubuntu22.04
@@ -264,7 +264,7 @@ jobs:
           - label: sm_90 (Hopper / GH200)
             arch: "90"
             tar_suffix: cuda-hopper
-          - label: sm_100 (Blackwell datacenter / DGX Spark)
+          - label: sm_100 (Blackwell datacenter)
             arch: "100"
             tar_suffix: cuda-blackwell
           - label: sm_103 (Blackwell Ultra / GB300)
@@ -273,6 +273,9 @@ jobs:
           - label: sm_110 (Thor / Jetson)
             arch: "110"
             tar_suffix: cuda-thor
+          - label: sm_121 (Blackwell Desktop / DGX Spark)
+            arch: "121"
+            tar_suffix: cuda-blackwell-desktop
     container:
       image: nvidia/cuda:13.2.1-devel-ubuntu22.04
       options: --user root
@@ -560,9 +563,9 @@ jobs:
             arch: "103"
             tag: cuda-blackwell-ultra
             default_aliases: false
-          - label: Blackwell consumer (sm_120, RTX 50xx)
+          - label: Blackwell Desktop (sm_120, RTX 50xx)
             arch: "120"
-            tag: cuda-blackwell-consumer
+            tag: cuda-blackwell-desktop
             default_aliases: false
     permissions:
       contents: read
@@ -662,6 +665,9 @@ jobs:
           - label: Thor (sm_110)
             arch: "110"
             tag: cuda-thor
+          - label: Blackwell Desktop (sm_121, DGX Spark)
+            arch: "121"
+            tag: cuda-blackwell-desktop
     permissions:
       contents: read
       packages: write

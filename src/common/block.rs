@@ -324,6 +324,11 @@ pub fn run_transformer_layers_batch(
         per_token = (per_token * embed_scale)?;
         let (b, s, flat_dim) = per_token.dims3()?;
         let n_layers = c.blocks.len();
+        if flat_dim % n_layers != 0 {
+            candle_core::bail!(
+                "per_layer embed dim {flat_dim} is not divisible by n_layers {n_layers}"
+            );
+        }
         let per_layer_hidden = flat_dim / n_layers;
         let per_token = per_token.reshape((b, s, n_layers, per_layer_hidden))?;
 

@@ -136,7 +136,7 @@ Replace `<value>` with the compute capability of your GPU:
 Run the server
 
 ```bash
-cargo run --release start
+cargo run --release -- start
 ```
 
 Run `cargo run --release -- help` for see all the options.

@@ -1026,7 +1026,7 @@ pub fn apply_chat_template(
                 }
             }
 
-            tracing::warn!(
+            tracing::error!(
                 error = ?e,
                 "chat template rendering failed, falling back to plain text"
             );
@@ -1447,23 +1447,32 @@ pub(super) async fn chat_completions(
             let tool_config_clone = tool_config.clone();
 
             tokio::spawn(async move {
-                let mut handles = Vec::with_capacity(buffered_rxs.len());
-                for rx in buffered_rxs {
-                    handles.push(tokio::spawn(collect_one_completion(rx)));
-                }
+                let mut handles: Vec<_> = buffered_rxs
+                    .into_iter()
+                    .map(|rx| Some(tokio::spawn(collect_one_completion(rx))))
+                    .collect();
 
                 let mut completions = Vec::with_capacity(handles.len());
                 let mut total_completion_tokens = 0usize;
-                for (idx, handle) in handles.into_iter().enumerate() {
+                for idx in 0..handles.len() {
+                    let handle = handles[idx].take().expect("handle consumed once");
                     let data = match handle.await {
                         Ok(Ok(data)) => data,
                         Ok(Err((_, err_json))) => {
+                            for h in handles[idx + 1..].iter_mut().filter_map(|h| h.take()) {
+                                h.abort();
+                            }
                             let _ = sse_tx
                                 .send(Ok(Event::default()
                                     .data(serde_json::to_string(&err_json.0).unwrap())));
                             return;
                         }
-                        Err(_) => return,
+                        Err(_) => {
+                            for h in handles[idx + 1..].iter_mut().filter_map(|h| h.take()) {
+                                h.abort();
+                            }
+                            return;
+                        }
                     };
                     total_completion_tokens += data.completion_tokens;
                     completions.push((idx, data));
@@ -1870,14 +1879,11 @@ pub(super) async fn chat_completions(
                             let err = serde_json::json!({
                                 "error": { "message": msg, "type": "server_error", "param": null, "code": null }
                             });
-                            if sse_tx
-                                .send(Ok(
-                                    Event::default().data(serde_json::to_string(&err).unwrap())
-                                ))
-                                .is_err()
-                            {
-                                break;
-                            }
+                            let _ = sse_tx.send(Ok(
+                                Event::default().data(serde_json::to_string(&err).unwrap())
+                            ));
+                            let _ = sse_tx.send(Ok(Event::default().data("[DONE]")));
+                            break;
                         }
                     }
                 }
@@ -2081,14 +2087,11 @@ pub(super) async fn chat_completions(
                             let err = serde_json::json!({
                                 "error": { "message": msg, "type": "server_error", "param": null, "code": null }
                             });
-                            if sse_tx
-                                .send(Ok(
-                                    Event::default().data(serde_json::to_string(&err).unwrap())
-                                ))
-                                .is_err()
-                            {
-                                break;
-                            }
+                            let _ = sse_tx.send(Ok(
+                                Event::default().data(serde_json::to_string(&err).unwrap())
+                            ));
+                            let _ = sse_tx.send(Ok(Event::default().data("[DONE]")));
+                            break;
                         }
                     }
                 }
@@ -2159,26 +2162,42 @@ pub(super) async fn chat_completions(
                 }
             } else if json_mode {
                 let raw = strip_json_fences(data.content.trim()).to_string();
-                if let (Some(spec), Ok(val)) = (
-                    body.response_format
-                        .as_ref()
-                        .and_then(|rf| rf.json_schema.as_ref())
-                        .and_then(|spec| spec.schema.as_ref()),
-                    serde_json::from_str::<serde_json::Value>(&raw),
-                ) && !validate_against_schema(&val, spec)
-                {
-                    tracing::warn!(
-                        "model output did not match response_format.json_schema; returning raw content"
-                    );
-                }
+                let json_schema_spec = body
+                    .response_format
+                    .as_ref()
+                    .and_then(|rf| rf.json_schema.as_ref());
+                let schema_fail = json_schema_spec
+                    .and_then(|js| js.schema.as_ref())
+                    .and_then(|spec| {
+                        serde_json::from_str::<serde_json::Value>(&raw)
+                            .ok()
+                            .map(|val| !validate_against_schema(&val, spec))
+                    })
+                    .unwrap_or(false);
+                let (response_content, finish_reason) = if schema_fail {
+                    let is_strict = json_schema_spec.and_then(|js| js.strict).unwrap_or(false);
+                    if is_strict {
+                        tracing::warn!(
+                            "model output did not match response_format.json_schema (strict=true)"
+                        );
+                        (None, "content_filter".to_string())
+                    } else {
+                        tracing::warn!(
+                            "model output did not match response_format.json_schema; returning raw content"
+                        );
+                        (Some(raw), data.finish_reason.clone())
+                    }
+                } else {
+                    (Some(raw), data.finish_reason.clone())
+                };
                 (
                     ResponseMessage {
                         role: "assistant".to_string(),
-                        content: Some(raw),
+                        content: response_content,
                         reasoning_content: reasoning_opt,
                         tool_calls: None,
                     },
-                    data.finish_reason.clone(),
+                    finish_reason,
                 )
             } else {
                 (

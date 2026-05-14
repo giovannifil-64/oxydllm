@@ -63,6 +63,10 @@ pub fn sample(
 
     let mut logits_vec: Vec<f32> = logits.to_dtype(candle_core::DType::F32)?.to_vec1()?;
 
+    if logits_vec.iter().any(|l| l.is_nan()) {
+        candle_core::bail!("model returned NaN logits — numerical instability detected");
+    }
+
     if params.repetition_penalty != 1.0 {
         let repetition_tokens = repetition_window_slice(prev_tokens, params.repetition_window);
         let can_use_full_counts = repetition_tokens.len() == prev_tokens.len();

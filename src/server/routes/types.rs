@@ -45,7 +45,7 @@ pub struct FunctionDefinition {
 
 #[derive(Deserialize, Serialize, Clone, Debug)]
 pub struct ToolDefinition {
-    #[serde(rename = "type", default)]
+    #[serde(rename = "type")]
     pub tool_type: String,
     pub function: FunctionDefinition,
 }

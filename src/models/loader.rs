@@ -499,6 +499,20 @@ fn check_cuda_compute_capability(device: &Device, ordinal: usize) {
                      12.0 (Blackwell Desktop / RTX 50xx), 12.1 (DGX Spark / GB10)"
                 );
             } else {
+                if let Some(compiled_cap) =
+                    option_env!("OXYDLLM_COMPILED_CAP").and_then(|s| s.parse::<usize>().ok())
+                {
+                    if compiled_cap < cap {
+                        tracing::warn!(
+                            compiled_cap,
+                            hardware_cap = cap,
+                            cuda_device = ordinal,
+                            "Binary compiled for sm_{compiled_cap} but hardware is sm_{cap}. \
+                             Recompile with CUDA_COMPUTE_CAP={cap} for optimal performance \
+                             (sm_{cap}-specific features such as native flash attention are unavailable)."
+                        );
+                    }
+                }
                 tracing::info!(
                     compute_capability = format!("{major}.{minor}"),
                     cuda_device = ordinal,

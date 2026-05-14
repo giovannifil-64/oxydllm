@@ -17,6 +17,9 @@ fn main() {
 
     if let Ok(cap_str) = std::env::var("CUDA_COMPUTE_CAP") {
         validate_cuda_compute_cap(&cap_str);
+        if let Some(cap) = parse_compute_cap(&cap_str) {
+            println!("cargo:rustc-env=OXYDLLM_COMPILED_CAP={cap}");
+        }
     }
 }
 

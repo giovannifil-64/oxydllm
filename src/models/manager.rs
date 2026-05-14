@@ -15,6 +15,9 @@ use crate::common::paged::{
     GlobalKvBudget, PagedKvCache, SharedGlobalKvBudget, detect_system_kv_budget,
 };
 use crate::engine::Engine;
+use crate::models::estimate::{
+    awq_qweight_expansion, read_quantization_config, sum_safetensors_bytes,
+};
 use crate::models::loader;
 use crate::models::traits::BatchModel;
 use crate::scheduler::SchedulerConfig;
@@ -109,7 +112,7 @@ pub fn save_registry(models_dir: &Path, registry: &BTreeMap<String, RegistryEntr
     if let Ok(json) = serde_json::to_string_pretty(registry)
         && let Err(e) = std::fs::write(&path, &json)
     {
-        tracing::warn!(path = %path.display(), error = %e, "failed to save model registry");
+        tracing::error!(path = %path.display(), error = %e, "failed to save model registry");
     }
 }
 
@@ -293,9 +296,24 @@ impl ModelManager {
         // Case 2: first-ever load — estimate from disk.
         // On GPU we load BF16 (≈ same size as on-disk BF16 safetensors).
         // On CPU we load F32 (2× larger than BF16 on-disk files).
+        // AWQ models dequantize at load time: qweights expand ~4× from 4-bit packed to BF16.
         let disk_bytes = estimate_model_size(model_path);
         let is_cpu = self.cuda_devices.is_empty();
-        let corrected = if is_cpu { disk_bytes * 2 } else { disk_bytes };
+
+        let config_path = model_path.join("config.json");
+        let gpu_bytes = read_quantization_config(&config_path)
+            .and_then(|qi| awq_qweight_expansion(qi.bits.unwrap_or(4)))
+            .and_then(|expansion| {
+                let (total, qweight) = sum_safetensors_bytes(model_path).ok()?;
+                if qweight == 0 {
+                    return None;
+                }
+                let other = total.saturating_sub(qweight);
+                Some(other + (qweight as f64 * expansion) as usize)
+            })
+            .unwrap_or(disk_bytes);
+
+        let corrected = if is_cpu { gpu_bytes * 2 } else { gpu_bytes };
 
         tracing::info!(
             model_id,

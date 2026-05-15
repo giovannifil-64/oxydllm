@@ -1127,7 +1127,8 @@ fn run_interactive(args: &RunArgs) -> anyhow::Result<()> {
             name: None,
         });
 
-        let mut prompt = server::apply_chat_template(&tokenizer, &messages, false, None);
+        let mut prompt = server::apply_chat_template(&tokenizer, &messages, false, None)
+            .unwrap_or_else(|_| crate::chat_template::format_plain_chat(&messages));
         let mut prompt_tokens = tokenizer.encode(&prompt)?;
 
         while prompt_tokens.len() >= max_seq_len && messages.len() > 2 {
@@ -1136,7 +1137,8 @@ fn run_interactive(args: &RunArgs) -> anyhow::Result<()> {
             if messages.len() > 1 && messages[1].role == "assistant" {
                 messages.remove(1);
             }
-            prompt = server::apply_chat_template(&tokenizer, &messages, false, None);
+            prompt = server::apply_chat_template(&tokenizer, &messages, false, None)
+                .unwrap_or_else(|_| crate::chat_template::format_plain_chat(&messages));
             prompt_tokens = tokenizer.encode(&prompt)?;
             tracing::warn!(
                 previous_tokens = prev_len,

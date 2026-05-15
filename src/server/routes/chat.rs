@@ -967,35 +967,35 @@ pub fn apply_chat_template(
     messages: &[ChatMessage],
     enable_thinking: bool,
     tools: Option<serde_json::Value>,
-) -> String {
+) -> anyhow::Result<String> {
     let Some(template) = tokenizer.chat_template() else {
         if tokenizer.special_token_id("<|turn>").is_some()
             && tokenizer.special_token_id("<turn|>").is_some()
         {
-            return chat_template::format_turn_chat(
+            return Ok(chat_template::format_turn_chat(
                 messages,
                 tokenizer.bos_token(),
                 "<|turn>",
                 "<turn|>",
                 true,
                 enable_thinking,
-            );
+            ));
         }
 
         if tokenizer.special_token_id("<start_of_turn>").is_some()
             && tokenizer.special_token_id("<end_of_turn>").is_some()
         {
-            return chat_template::format_turn_chat(
+            return Ok(chat_template::format_turn_chat(
                 messages,
                 tokenizer.bos_token(),
                 "<start_of_turn>",
                 "<end_of_turn>",
                 true,
                 enable_thinking,
-            );
+            ));
         }
 
-        return chat_template::format_plain_chat(messages);
+        return Ok(chat_template::format_plain_chat(messages));
     };
 
     let try_render = |msgs: &[ChatMessage], t: Option<serde_json::Value>| {
@@ -1011,7 +1011,7 @@ pub fn apply_chat_template(
     };
 
     match try_render(messages, tools.clone()) {
-        Ok(prompt) => prompt,
+        Ok(prompt) => Ok(prompt),
         Err(e) => {
             let without_system: Vec<&ChatMessage> =
                 messages.iter().filter(|m| m.role != "system").collect();
@@ -1022,15 +1022,12 @@ pub fn apply_chat_template(
                     tracing::warn!(
                         "system role not supported by this model template; retrying without system message"
                     );
-                    return prompt;
+                    return Ok(prompt);
                 }
             }
 
-            tracing::error!(
-                error = ?e,
-                "chat template rendering failed, falling back to plain text"
-            );
-            chat_template::format_plain_chat(messages)
+            tracing::error!(error = ?e, "chat template rendering failed");
+            Err(e)
         }
     }
 }
@@ -1296,7 +1293,14 @@ pub(super) async fn chat_completions(
         &messages_for_prompt,
         enable_thinking,
         tools_value,
-    );
+    )
+    .map_err(|e| {
+        error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            e.to_string(),
+            "template_render_failed",
+        )
+    })?;
     let template_ms = t_template.elapsed().as_secs_f64() * 1000.0;
 
     let t_encode = std::time::Instant::now();

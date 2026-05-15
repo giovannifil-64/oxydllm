@@ -53,6 +53,13 @@ pub fn sample(
         && params.logit_bias.is_none();
 
     if params.temperature == 0.0 && params.top_logprobs_k == 0 && no_mods {
+        let sum: f32 = logits
+            .to_dtype(candle_core::DType::F32)?
+            .sum_all()?
+            .to_scalar()?;
+        if sum.is_nan() {
+            candle_core::bail!("model returned NaN logits — numerical instability detected");
+        }
         let token = logits.argmax(D::Minus1)?.to_scalar::<u32>()?;
         return Ok(SampleOutput {
             token,
@@ -370,7 +377,7 @@ fn categorical_sample(probs: &[f32], seed: Option<u64>, step: u64) -> Result<u32
             return Ok(i as u32);
         }
     }
-    Ok(0)
+    candle_core::bail!("sampling distribution is empty after filtering (all probs zero)")
 }
 
 fn splitmix64_f32(x: u64) -> f32 {

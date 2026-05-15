@@ -212,6 +212,77 @@ fn strip_gguf_split_suffix(stem: &str) -> &str {
     }
 }
 
+fn gguf_match_keys(stem: &str, parent_dir: &Path) -> Vec<String> {
+    let canonical = canonicalize_gguf_id(stem, parent_dir);
+    if canonical == stem {
+        vec![stem.to_string()]
+    } else {
+        vec![canonical, stem.to_string()]
+    }
+}
+
+fn gguf_model_id_keys(model_id: &str) -> Vec<&str> {
+    match model_id.split_once('/') {
+        Some((_, local_id)) => vec![model_id, local_id],
+        None => vec![model_id],
+    }
+}
+
+fn select_gguf_paths(
+    dir: &Path,
+    model_id: &str,
+    all_gguf_paths: Vec<PathBuf>,
+) -> anyhow::Result<Vec<PathBuf>> {
+    let requested = gguf_model_id_keys(model_id);
+    let mut groups: Vec<(String, Vec<PathBuf>, Vec<String>)> = Vec::new();
+
+    for path in all_gguf_paths {
+        let raw_stem = path
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        let stem = strip_gguf_split_suffix(&raw_stem).to_string();
+        let keys = gguf_match_keys(&stem, dir);
+
+        if let Some((_, paths, _)) = groups
+            .iter_mut()
+            .find(|(group_stem, _, _)| group_stem.eq_ignore_ascii_case(&stem))
+        {
+            paths.push(path);
+        } else {
+            groups.push((stem, vec![path], keys));
+        }
+    }
+
+    for (_, paths, keys) in &groups {
+        let is_match = requested
+            .iter()
+            .any(|needle| keys.iter().any(|key| key.eq_ignore_ascii_case(needle)));
+        if is_match {
+            return Ok(paths.clone());
+        }
+    }
+
+    if groups.len() == 1 {
+        return Ok(groups.remove(0).1);
+    }
+
+    let mut available: Vec<String> = groups
+        .iter()
+        .filter_map(|(_, _, keys)| keys.first().cloned())
+        .collect();
+    available.sort_by_key(|s| s.to_ascii_lowercase());
+    available.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+
+    anyhow::bail!(
+        "GGUF variant '{}' was not found in {}. Available variants: {}",
+        model_id,
+        dir.display(),
+        available.join(", ")
+    )
+}
+
 pub fn resolve_model_path(models_dir: &Path, model_id: &str) -> Option<PathBuf> {
     // Fast path: works for both flat ("ModelName") and nested ("user/ModelName").
     // PathBuf::join resolves the '/' in the id as a subdirectory on all platforms.
@@ -816,25 +887,7 @@ fn load_batch_model_gguf(
     let all_gguf_paths = find_gguf_files(dir)
         .ok_or_else(|| anyhow::anyhow!("No .gguf file found in {}", model_dir))?;
 
-    let gguf_paths: Vec<PathBuf> = all_gguf_paths
-        .iter()
-        .filter(|p| {
-            let raw_stem = p
-                .file_stem()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_string();
-            let stem = strip_gguf_split_suffix(&raw_stem);
-            stem.eq_ignore_ascii_case(model_id)
-        })
-        .cloned()
-        .collect();
-
-    let gguf_paths = if gguf_paths.is_empty() {
-        all_gguf_paths
-    } else {
-        gguf_paths
-    };
+    let gguf_paths = select_gguf_paths(dir, model_id, all_gguf_paths)?;
 
     if gguf_paths.len() == 1 {
         tracing::info!(path = %gguf_paths[0].display(), "loading GGUF model");

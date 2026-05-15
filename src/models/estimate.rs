@@ -617,6 +617,39 @@ fn best_recommendation(files: &[(String, u64)]) -> Option<&str> {
     })
 }
 
+/// Returns the approximate expansion factor from GGUF on-disk size to F32 loaded size.
+///
+/// GGUF on CPU: every tensor is dequantized to F32 at load time.
+/// The factor depends on the quantization — Q4_K_M needs ~7× while Q8_0 needs ~4×.
+/// Only the file header is parsed (metadata + tensor info, not weight data).
+pub fn gguf_cpu_expansion(gguf_path: &Path) -> f64 {
+    let mut file = match std::fs::File::open(gguf_path) {
+        Ok(f) => f,
+        Err(_) => return 7.0, // conservative Q4 default
+    };
+    let content = match gguf_file::Content::read(&mut file) {
+        Ok(c) => c,
+        Err(_) => return 7.0,
+    };
+    // Inspect the dtype of the first available weight tensor.
+    let dtype_debug = content
+        .tensor_infos
+        .get("blk.0.ffn_down.weight")
+        .or_else(|| content.tensor_infos.get("blk.0.attn_q.weight"))
+        .map(|info| format!("{:?}", info.ggml_dtype));
+    match dtype_debug.as_deref() {
+        Some("F32") => 1.0,
+        Some("F16") | Some("BF16") => 2.0,
+        Some("Q8_0") | Some("Q8K") => 4.0,
+        Some("Q6K") => 5.0,
+        Some("Q5_0") | Some("Q5_1") | Some("Q5K") => 6.0,
+        Some("Q4_0") | Some("Q4_1") | Some("Q4K") => 7.5,
+        Some("Q3K") => 10.0,
+        Some("Q2K") => 13.0,
+        _ => 7.0, // unknown / future formats: assume Q4-equivalent
+    }
+}
+
 fn meta_u32(content: &gguf_file::Content, key: &str) -> Option<u32> {
     content.metadata.get(key).and_then(|v| v.to_u32().ok())
 }

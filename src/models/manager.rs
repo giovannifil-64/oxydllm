@@ -104,7 +104,13 @@ pub fn load_registry(models_dir: &Path) -> BTreeMap<String, RegistryEntry> {
         Ok(r) => r,
         Err(_) => return BTreeMap::new(),
     };
-    serde_json::from_str(&raw).unwrap_or_default()
+    match serde_json::from_str(&raw) {
+        Ok(reg) => reg,
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e, "registry JSON is malformed, starting with empty registry");
+            BTreeMap::new()
+        }
+    }
 }
 
 pub fn save_registry(models_dir: &Path, registry: &BTreeMap<String, RegistryEntry>) {
@@ -330,13 +336,25 @@ impl ModelManager {
             })
             .unwrap_or(disk_bytes);
 
-        let corrected = if is_cpu { gpu_bytes * 2 } else { gpu_bytes };
+        // On CPU, safetensors are loaded as F32 (2× BF16 on-disk size).
+        // GGUF models are dequantized to F32 at load time: Q4_K_M needs ~7×, Q8_0 ~4×, etc.
+        // Read the GGUF header (metadata only, no weight data) to get an accurate factor.
+        let (corrected, cpu_expansion) = if is_cpu {
+            if let Some(gguf_path) = crate::models::loader::find_gguf_file(model_path) {
+                let factor = crate::models::estimate::gguf_cpu_expansion(&gguf_path);
+                ((gpu_bytes as f64 * factor) as usize, factor)
+            } else {
+                (gpu_bytes * 2, 2.0) // safetensors BF16 → F32
+            }
+        } else {
+            (gpu_bytes, 1.0)
+        };
 
         tracing::info!(
             model_id,
             projected_gb = round_2(gb(corrected)),
             estimate_source = "disk",
-            corrected_for_cpu_f32 = is_cpu,
+            cpu_expansion_factor = if is_cpu { cpu_expansion } else { 1.0 },
             "model not in registry, using projected memory size"
         );
         corrected

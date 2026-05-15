@@ -139,6 +139,8 @@ fn apply_weight_scale_inv(tensors: &mut FxHashMap<String, Tensor>) -> Result<()>
 
 impl ModelWeights {
     pub fn load(paths: &[&str], device: &Device, dtype: DType) -> Result<Self> {
+        // Safety: the server owns models_dir exclusively; no external process will
+        // truncate or replace these files while the mmap is live.
         let mmap = unsafe {
             MmapedSafetensors::multi(paths).context("Failed to memory-map weight files")?
         };

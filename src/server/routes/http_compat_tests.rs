@@ -87,6 +87,21 @@ fn spawn_scripted_engine(replies: Vec<ScriptedReply>) -> tokio_mpsc::Sender<Inco
     request_tx
 }
 
+/// Engine that accepts requests but never sends any events on `response_tx`.
+/// Used to verify that wall-clock per-request timeouts fire on stuck sequences.
+/// The receiver task holds onto each `IncomingRequest` so that `response_tx`
+/// is not dropped (which would prematurely close the channel).
+fn spawn_stuck_engine() -> tokio_mpsc::Sender<IncomingRequest> {
+    let (request_tx, mut request_rx) = tokio_mpsc::channel::<IncomingRequest>(64);
+    tokio::spawn(async move {
+        let mut held: Vec<IncomingRequest> = Vec::new();
+        while let Some(req) = request_rx.recv().await {
+            held.push(req);
+        }
+    });
+    request_tx
+}
+
 fn build_test_app(replies: Vec<ScriptedReply>) -> anyhow::Result<(Router, TempDir)> {
     let tmp = tempfile::tempdir()?;
     let model_id = "test-model";
@@ -120,6 +135,95 @@ fn build_test_app(replies: Vec<ScriptedReply>) -> anyhow::Result<(Router, TempDi
 
     let state = Arc::new(AppState {
         manager: Arc::new(tokio::sync::Mutex::new(manager)),
+        api_key: None,
+        request_timeout: None,
+    });
+    Ok((build_router(state), tmp))
+}
+
+/// Build a test app with an `OXYDLLM_API_KEY`-style bearer-only configuration.
+fn build_test_app_with_api_key(
+    replies: Vec<ScriptedReply>,
+    api_key: &str,
+) -> anyhow::Result<(Router, TempDir)> {
+    let tmp = tempfile::tempdir()?;
+    let model_id = "test-model";
+    create_test_model_dir(tmp.path(), model_id)?;
+
+    let tokenizer = Arc::new(Tokenizer::from_dir(
+        tmp.path().join(model_id).to_str().expect("utf-8 path"),
+    )?);
+    let request_tx = spawn_scripted_engine(replies);
+
+    let mut manager = ModelManager::new(ModelManagerConfig {
+        models_dir: tmp.path().to_path_buf(),
+        keep_alive: Duration::from_secs(60),
+        memory_budget_bytes: None,
+        cuda_devices: vec![],
+        max_context_len: 4096,
+        kv_quant: KvQuantMode::Off,
+        qjl_quantization: false,
+        require_gpu: false,
+        max_num_seqs: None,
+        max_queued_requests: 200,
+    });
+    manager.insert_ready_for_tests(
+        model_id,
+        ReadyHandle {
+            request_tx,
+            tokenizer,
+            max_seq_len: 4096,
+        },
+    );
+
+    let state = Arc::new(AppState {
+        manager: Arc::new(tokio::sync::Mutex::new(manager)),
+        api_key: Some(api_key.to_string()),
+        request_timeout: None,
+    });
+    Ok((build_router(state), tmp))
+}
+
+/// Build a test app with a per-request wall-clock timeout. The scripted engine
+/// must be the slow variant so the timeout actually fires before the engine
+/// finishes producing tokens.
+fn build_test_app_with_timeout(
+    request_tx: tokio_mpsc::Sender<IncomingRequest>,
+    timeout: Duration,
+) -> anyhow::Result<(Router, TempDir)> {
+    let tmp = tempfile::tempdir()?;
+    let model_id = "test-model";
+    create_test_model_dir(tmp.path(), model_id)?;
+
+    let tokenizer = Arc::new(Tokenizer::from_dir(
+        tmp.path().join(model_id).to_str().expect("utf-8 path"),
+    )?);
+
+    let mut manager = ModelManager::new(ModelManagerConfig {
+        models_dir: tmp.path().to_path_buf(),
+        keep_alive: Duration::from_secs(60),
+        memory_budget_bytes: None,
+        cuda_devices: vec![],
+        max_context_len: 4096,
+        kv_quant: KvQuantMode::Off,
+        qjl_quantization: false,
+        require_gpu: false,
+        max_num_seqs: None,
+        max_queued_requests: 200,
+    });
+    manager.insert_ready_for_tests(
+        model_id,
+        ReadyHandle {
+            request_tx,
+            tokenizer,
+            max_seq_len: 4096,
+        },
+    );
+
+    let state = Arc::new(AppState {
+        manager: Arc::new(tokio::sync::Mutex::new(manager)),
+        api_key: None,
+        request_timeout: Some(timeout),
     });
     Ok((build_router(state), tmp))
 }
@@ -171,6 +275,39 @@ async fn post_chat(app: &Router, body: Value) -> axum::response::Response {
                 .body(Body::from(body.to_string()))
                 .expect("request"),
         )
+        .await
+        .expect("request failed")
+}
+
+async fn post_chat_with_headers(
+    app: &Router,
+    body: Value,
+    headers: &[(&str, &str)],
+) -> axum::response::Response {
+    let mut req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json");
+    for (k, v) in headers {
+        req = req.header(*k, *v);
+    }
+    app.clone()
+        .oneshot(req.body(Body::from(body.to_string())).expect("request"))
+        .await
+        .expect("request failed")
+}
+
+async fn get_request_with_headers(
+    app: &Router,
+    uri: &str,
+    headers: &[(&str, &str)],
+) -> axum::response::Response {
+    let mut req = Request::builder().method("GET").uri(uri);
+    for (k, v) in headers {
+        req = req.header(*k, *v);
+    }
+    app.clone()
+        .oneshot(req.body(Body::empty()).expect("request"))
         .await
         .expect("request failed")
 }
@@ -708,4 +845,638 @@ async fn streaming_tool_calls_emit_incremental_sse_deltas() {
     assert_eq!(aggregated_arguments, r#"{"location":"Paris"}"#);
     assert_eq!(finish_reason.as_deref(), Some("tool_calls"));
     assert!(done_seen, "expected [DONE] marker");
+}
+
+// ---------------------------------------------------------------------------
+// B1 — S3: HTTP API authentication
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn auth_disabled_when_no_api_key_configured() {
+    let (app, _tmp) = build_test_app(vec![ScriptedReply {
+        content: "ok".to_string(),
+        finish_reason: "stop".to_string(),
+    }])
+    .expect("test app");
+
+    let resp = post_chat(
+        &app,
+        json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}]}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn auth_required_request_without_key_returns_401() {
+    let (app, _tmp) = build_test_app_with_api_key(vec![], "secret-key").expect("test app");
+
+    let resp = post_chat(
+        &app,
+        json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}]}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.expect("body"))
+            .expect("json");
+    assert_eq!(body["error"]["type"], "invalid_api_key");
+}
+
+#[tokio::test]
+async fn auth_required_request_with_wrong_key_returns_401() {
+    let (app, _tmp) = build_test_app_with_api_key(vec![], "secret-key").expect("test app");
+
+    let resp = post_chat_with_headers(
+        &app,
+        json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}]}),
+        &[("authorization", "Bearer wrong-key")],
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn auth_request_with_correct_bearer_succeeds() {
+    let (app, _tmp) = build_test_app_with_api_key(
+        vec![ScriptedReply {
+            content: "ok".to_string(),
+            finish_reason: "stop".to_string(),
+        }],
+        "secret-key",
+    )
+    .expect("test app");
+
+    let resp = post_chat_with_headers(
+        &app,
+        json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}]}),
+        &[("authorization", "Bearer secret-key")],
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn auth_request_with_x_api_key_header_succeeds() {
+    let (app, _tmp) = build_test_app_with_api_key(
+        vec![ScriptedReply {
+            content: "ok".to_string(),
+            finish_reason: "stop".to_string(),
+        }],
+        "secret-key",
+    )
+    .expect("test app");
+
+    let resp = post_chat_with_headers(
+        &app,
+        json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}]}),
+        &[("x-api-key", "secret-key")],
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn auth_health_endpoint_remains_unauthenticated() {
+    let (app, _tmp) = build_test_app_with_api_key(vec![], "secret-key").expect("test app");
+
+    // /health must be reachable without any credentials so liveness probes
+    // (k8s, systemd, docker healthcheck) keep working.
+    let resp = get_request(&app, "/health").await;
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn auth_metrics_endpoint_requires_api_key() {
+    let (app, _tmp) = build_test_app_with_api_key(vec![], "secret-key").expect("test app");
+
+    let unauth = get_request(&app, "/metrics").await;
+    assert_eq!(unauth.status(), StatusCode::UNAUTHORIZED);
+
+    let ok =
+        get_request_with_headers(&app, "/metrics", &[("authorization", "Bearer secret-key")]).await;
+    assert_eq!(ok.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn auth_v1_models_endpoint_requires_api_key() {
+    let (app, _tmp) = build_test_app_with_api_key(vec![], "secret-key").expect("test app");
+
+    let unauth = get_request(&app, "/v1/models").await;
+    assert_eq!(unauth.status(), StatusCode::UNAUTHORIZED);
+}
+
+// ---------------------------------------------------------------------------
+// B1 — S4: sampling parameter range validation
+// ---------------------------------------------------------------------------
+
+async fn assert_invalid_request(app: &Router, body: Value, field_hint: &str) {
+    let resp = post_chat(app, body).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "expected 400 for invalid {field_hint}"
+    );
+    let parsed: Value =
+        serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.expect("body"))
+            .expect("json");
+    assert_eq!(
+        parsed["error"]["type"], "invalid_request_error",
+        "expected invalid_request_error type for {field_hint}; got {:?}",
+        parsed["error"]
+    );
+}
+
+#[tokio::test]
+async fn validation_temperature_above_two_rejected() {
+    let (app, _tmp) = build_test_app(vec![]).expect("test app");
+    assert_invalid_request(
+        &app,
+        json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "temperature": 5.0
+        }),
+        "temperature",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn validation_temperature_negative_rejected() {
+    let (app, _tmp) = build_test_app(vec![]).expect("test app");
+    assert_invalid_request(
+        &app,
+        json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "temperature": -0.5
+        }),
+        "temperature",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn validation_top_p_above_one_rejected() {
+    let (app, _tmp) = build_test_app(vec![]).expect("test app");
+    assert_invalid_request(
+        &app,
+        json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "top_p": 2.0
+        }),
+        "top_p",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn validation_min_p_above_one_rejected() {
+    let (app, _tmp) = build_test_app(vec![]).expect("test app");
+    assert_invalid_request(
+        &app,
+        json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "min_p": 1.5
+        }),
+        "min_p",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn validation_frequency_penalty_out_of_range_rejected() {
+    let (app, _tmp) = build_test_app(vec![]).expect("test app");
+    assert_invalid_request(
+        &app,
+        json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "frequency_penalty": 3.0
+        }),
+        "frequency_penalty",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn validation_presence_penalty_out_of_range_rejected() {
+    let (app, _tmp) = build_test_app(vec![]).expect("test app");
+    assert_invalid_request(
+        &app,
+        json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "presence_penalty": -3.0
+        }),
+        "presence_penalty",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn validation_top_logprobs_above_twenty_rejected() {
+    let (app, _tmp) = build_test_app(vec![]).expect("test app");
+    assert_invalid_request(
+        &app,
+        json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "top_logprobs": 100,
+            "logprobs": true
+        }),
+        "top_logprobs",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn validation_repetition_penalty_zero_rejected() {
+    let (app, _tmp) = build_test_app(vec![]).expect("test app");
+    // repetition_penalty=0 would produce division-by-zero NaN logits — must be rejected.
+    assert_invalid_request(
+        &app,
+        json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "repetition_penalty": 0.0
+        }),
+        "repetition_penalty",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn validation_max_tokens_zero_rejected() {
+    let (app, _tmp) = build_test_app(vec![]).expect("test app");
+    assert_invalid_request(
+        &app,
+        json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 0
+        }),
+        "max_tokens",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn validation_n_above_max_rejected() {
+    let (app, _tmp) = build_test_app(vec![]).expect("test app");
+    assert_invalid_request(
+        &app,
+        json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "n": 1000
+        }),
+        "n",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn validation_valid_params_still_accepted() {
+    // Negative regression check: every parameter at the edge of its valid
+    // range must still produce a 200, otherwise the validator over-rejected.
+    let (app, _tmp) = build_test_app(vec![ScriptedReply {
+        content: "ok".to_string(),
+        finish_reason: "stop".to_string(),
+    }])
+    .expect("test app");
+
+    let resp = post_chat(
+        &app,
+        json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "temperature": 2.0,
+            "top_p": 1.0,
+            "min_p": 0.0,
+            "frequency_penalty": -2.0,
+            "presence_penalty": 2.0,
+            "top_logprobs": 20,
+            "logprobs": true,
+            "repetition_penalty": 0.0001,
+            "max_tokens": 1
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+// ---------------------------------------------------------------------------
+// B1 — S5: per-request timeout
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn timeout_non_streaming_returns_408_when_engine_stuck() {
+    let request_tx = spawn_stuck_engine();
+    let (app, _tmp) =
+        build_test_app_with_timeout(request_tx, Duration::from_millis(150)).expect("test app");
+
+    let start = std::time::Instant::now();
+    let resp = post_chat(
+        &app,
+        json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}]}),
+    )
+    .await;
+    let elapsed = start.elapsed();
+
+    assert_eq!(resp.status(), StatusCode::REQUEST_TIMEOUT);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.expect("body"))
+            .expect("json");
+    assert_eq!(body["error"]["type"], "request_timeout");
+    // Sanity: the handler returned promptly after the deadline, not after the
+    // upstream channel happened to close. 5s upper bound is generous.
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "handler should return within a few seconds of the deadline; took {elapsed:?}"
+    );
+}
+
+#[tokio::test]
+async fn timeout_streaming_emits_error_chunk_and_done() {
+    let request_tx = spawn_stuck_engine();
+    let (app, _tmp) =
+        build_test_app_with_timeout(request_tx, Duration::from_millis(150)).expect("test app");
+
+    let resp = post_chat(
+        &app,
+        json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": true
+        }),
+    )
+    .await;
+    // Streaming responses always 200 — the error surfaces in the body.
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body = String::from_utf8(
+        to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("body")
+            .to_vec(),
+    )
+    .expect("utf-8");
+
+    let mut saw_error = false;
+    let mut saw_done = false;
+    for line in body.lines() {
+        let Some(payload) = line.strip_prefix("data: ") else {
+            continue;
+        };
+        if payload == "[DONE]" {
+            saw_done = true;
+            continue;
+        }
+        let parsed: Value = serde_json::from_str(payload).expect("each chunk must be valid JSON");
+        if parsed.get("error").is_some() {
+            assert_eq!(parsed["error"]["type"], "request_timeout");
+            saw_error = true;
+        }
+    }
+    assert!(
+        saw_error,
+        "expected a request_timeout error chunk in stream"
+    );
+    assert!(saw_done, "expected a [DONE] sentinel after the error chunk");
+}
+
+#[tokio::test]
+async fn timeout_does_not_fire_when_engine_responds_promptly() {
+    // Sanity: a request that completes well before the deadline must not be
+    // incorrectly marked as timed out.
+    let request_tx = spawn_scripted_engine(vec![ScriptedReply {
+        content: "fast".to_string(),
+        finish_reason: "stop".to_string(),
+    }]);
+    let (app, _tmp) =
+        build_test_app_with_timeout(request_tx, Duration::from_secs(60)).expect("test app");
+
+    let resp = post_chat(
+        &app,
+        json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}]}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.expect("body"))
+            .expect("json");
+    assert_eq!(body["choices"][0]["message"]["content"], "fast");
+}
+
+// ---------------------------------------------------------------------------
+// B1 — S6: tools-streaming error path emits [DONE] sentinel
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn tools_streaming_error_emits_done_sentinel() {
+    // Spawn an engine that emits an Error event for the tools request, which
+    // is the path that previously omitted [DONE].
+    let (request_tx, mut request_rx) = tokio_mpsc::channel::<IncomingRequest>(64);
+    tokio::spawn(async move {
+        while let Some(req) = request_rx.recv().await {
+            let _ = req
+                .response_tx
+                .send(EngineEvent::Error("synthetic engine failure".to_string()));
+        }
+    });
+
+    let tmp = tempfile::tempdir().expect("tmp");
+    let model_id = "test-model";
+    create_test_model_dir(tmp.path(), model_id).expect("model dir");
+    let tokenizer = Arc::new(
+        Tokenizer::from_dir(tmp.path().join(model_id).to_str().expect("utf-8 path"))
+            .expect("tokenizer"),
+    );
+
+    let mut manager = ModelManager::new(ModelManagerConfig {
+        models_dir: tmp.path().to_path_buf(),
+        keep_alive: Duration::from_secs(60),
+        memory_budget_bytes: None,
+        cuda_devices: vec![],
+        max_context_len: 4096,
+        kv_quant: KvQuantMode::Off,
+        qjl_quantization: false,
+        require_gpu: false,
+        max_num_seqs: None,
+        max_queued_requests: 200,
+    });
+    manager.insert_ready_for_tests(
+        model_id,
+        ReadyHandle {
+            request_tx,
+            tokenizer,
+            max_seq_len: 4096,
+        },
+    );
+    let state = Arc::new(AppState {
+        manager: Arc::new(tokio::sync::Mutex::new(manager)),
+        api_key: None,
+        request_timeout: None,
+    });
+    let app = build_router(state);
+
+    let resp = post_chat(
+        &app,
+        json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": true,
+            "tools": base_tools()
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body = String::from_utf8(
+        to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("body")
+            .to_vec(),
+    )
+    .expect("utf-8");
+
+    let mut saw_done = false;
+    for line in body.lines() {
+        if line.strip_prefix("data: ") == Some("[DONE]") {
+            saw_done = true;
+        }
+    }
+    assert!(
+        saw_done,
+        "tools-streaming error path must end with [DONE]; body was:\n{body}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// B1 — S7: strict-mode JSON schema must catch non-parseable JSON
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn strict_schema_non_parseable_json_returns_content_filter() {
+    // Model output is plain prose — not JSON at all. Under strict mode this
+    // must trip the schema-fail path and produce finish_reason="content_filter"
+    // with null content, not slip through as a normal "stop".
+    let (app, _tmp) = build_test_app(vec![ScriptedReply {
+        content: "this is not JSON".to_string(),
+        finish_reason: "stop".to_string(),
+    }])
+    .expect("test app");
+
+    let resp = post_chat(
+        &app,
+        json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "person",
+                    "strict": true,
+                    "schema": {
+                        "type": "object",
+                        "properties": {"name": {"type": "string"}},
+                        "required": ["name"],
+                        "additionalProperties": false
+                    }
+                }
+            }
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.expect("body"))
+            .expect("json");
+    assert_eq!(body["choices"][0]["finish_reason"], "content_filter");
+    assert!(
+        body["choices"][0]["message"]["content"].is_null(),
+        "content must be null under strict schema fail; got {:?}",
+        body["choices"][0]["message"]["content"]
+    );
+}
+
+#[tokio::test]
+async fn strict_schema_parseable_but_invalid_returns_content_filter() {
+    // Output is valid JSON but doesn't satisfy the schema (missing "name").
+    let (app, _tmp) = build_test_app(vec![ScriptedReply {
+        content: r#"{"age": 30}"#.to_string(),
+        finish_reason: "stop".to_string(),
+    }])
+    .expect("test app");
+
+    let resp = post_chat(
+        &app,
+        json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "person",
+                    "strict": true,
+                    "schema": {
+                        "type": "object",
+                        "properties": {"name": {"type": "string"}},
+                        "required": ["name"],
+                        "additionalProperties": false
+                    }
+                }
+            }
+        }),
+    )
+    .await;
+    let body: Value =
+        serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.expect("body"))
+            .expect("json");
+    assert_eq!(body["choices"][0]["finish_reason"], "content_filter");
+}
+
+#[tokio::test]
+async fn non_strict_schema_non_parseable_passes_through() {
+    // Non-strict mode (`strict: false`): the model output is passed through
+    // verbatim even if it doesn't satisfy the schema. This preserves the
+    // pre-S7 behavior for the non-strict path.
+    let (app, _tmp) = build_test_app(vec![ScriptedReply {
+        content: "this is not JSON".to_string(),
+        finish_reason: "stop".to_string(),
+    }])
+    .expect("test app");
+
+    let resp = post_chat(
+        &app,
+        json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "person",
+                    "strict": false,
+                    "schema": {
+                        "type": "object",
+                        "properties": {"name": {"type": "string"}},
+                        "required": ["name"]
+                    }
+                }
+            }
+        }),
+    )
+    .await;
+    let body: Value =
+        serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.expect("body"))
+            .expect("json");
+    assert_eq!(body["choices"][0]["finish_reason"], "stop");
+    assert_eq!(
+        body["choices"][0]["message"]["content"], "this is not JSON",
+        "non-strict mode must return raw model output"
+    );
 }

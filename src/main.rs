@@ -46,6 +46,8 @@ struct StartArgs {
     require_gpu: bool,
     max_num_seqs: Option<usize>,
     max_queued_requests: usize,
+    api_key: Option<String>,
+    request_timeout: Option<Duration>,
 }
 
 struct RunArgs {
@@ -175,6 +177,8 @@ Server options (start):
   --allow-cpu                Allow CPU fallback when no GPU is available (default: GPU required, env: OXYDLLM_ALLOW_CPU)
   --max-num-seqs <N>         Max concurrent sequences per model (default: auto from KV budget, env: OXYDLLM_MAX_NUM_SEQS)
   --max-queued-requests <N>  Max requests queued per model before returning 429 (default: 200, env: OXYDLLM_MAX_QUEUED_REQUESTS)
+  --api-key <KEY>            Require `Authorization: Bearer <KEY>` (or `X-API-Key`) on /v1/* and /metrics (default: disabled, env: OXYDLLM_API_KEY)
+  --request-timeout <SECS>   Wall-clock timeout per chat completion request; 0 disables (default: 300, env: OXYDLLM_REQUEST_TIMEOUT)
 
 Chat options (run):
   --models-dir <DIR>         Models directory (default: ~/.oxydllm/models/)
@@ -713,6 +717,12 @@ fn parse_start_args(args: &[String]) -> Result<StartArgs, String> {
     let mut require_gpu = !env_allow_cpu;
     let mut max_num_seqs: Option<usize> = env_usize("OXYDLLM_MAX_NUM_SEQS");
     let mut max_queued_requests: usize = env_usize("OXYDLLM_MAX_QUEUED_REQUESTS").unwrap_or(200);
+    let mut api_key: Option<String> = std::env::var("OXYDLLM_API_KEY")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    // Default: 300 seconds; 0 disables the timeout.
+    let mut request_timeout_secs: u64 = env_u64("OXYDLLM_REQUEST_TIMEOUT").unwrap_or(300);
     let mut i = 0;
 
     while i < args.len() {
@@ -805,10 +815,34 @@ fn parse_start_args(args: &[String]) -> Result<StartArgs, String> {
                     return Err("--max-queued-requests must be at least 1".to_string());
                 }
             }
+            "--api-key" => {
+                i += 1;
+                let key = args.get(i).ok_or("--api-key requires a value")?.trim();
+                if key.is_empty() {
+                    return Err("--api-key must not be empty".to_string());
+                }
+                api_key = Some(key.to_string());
+            }
+            "--request-timeout" => {
+                i += 1;
+                request_timeout_secs = args
+                    .get(i)
+                    .ok_or("--request-timeout requires a value")?
+                    .parse()
+                    .map_err(
+                        |_| "Invalid request-timeout value (expected non-negative integer seconds)",
+                    )?;
+            }
             other => return Err(format!("Unknown option: {}", other)),
         }
         i += 1;
     }
+
+    let request_timeout = if request_timeout_secs == 0 {
+        None
+    } else {
+        Some(Duration::from_secs(request_timeout_secs))
+    };
 
     Ok(StartArgs {
         models_dir: models_dir.unwrap_or_else(default_models_dir),
@@ -823,6 +857,8 @@ fn parse_start_args(args: &[String]) -> Result<StartArgs, String> {
         require_gpu,
         max_num_seqs,
         max_queued_requests,
+        api_key,
+        request_timeout,
     })
 }
 
@@ -1296,6 +1332,8 @@ fn main() -> anyhow::Result<()> {
                 require_gpu: start_args.require_gpu,
                 max_num_seqs: start_args.max_num_seqs,
                 max_queued_requests: start_args.max_queued_requests,
+                api_key: start_args.api_key,
+                request_timeout: start_args.request_timeout,
             })?
         }
         "run" => {

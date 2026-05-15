@@ -15,8 +15,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::Router;
-use axum::http::StatusCode;
-use axum::response::Json;
+use axum::body::Body;
+use axum::extract::State;
+use axum::http::{Request, StatusCode, header};
+use axum::middleware::{self, Next};
+use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{get, post};
 
 async fn wait_for_shutdown_signal() {
@@ -40,18 +43,90 @@ async fn wait_for_shutdown_signal() {
 
 use crate::models::manager::{self, ModelManager, ModelManagerConfig, SharedModelManager};
 
-struct AppState {
-    manager: SharedModelManager,
+pub(super) struct AppState {
+    pub(super) manager: SharedModelManager,
+    /// Optional API bearer key. When `Some`, requests must include
+    /// `Authorization: Bearer <key>` (or `X-API-Key: <key>`) on protected
+    /// endpoints. `None` disables authentication entirely.
+    pub(super) api_key: Option<String>,
+    /// Wall-clock per-request timeout. `None` disables the timeout.
+    pub(super) request_timeout: Option<Duration>,
+}
+
+/// Constant-time slice comparison used for API-key checks.
+///
+/// Always inspects every byte of the longer slice so the running time does not
+/// leak the position of the first mismatching byte.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff: u8 = 0;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// Extract a presented API key from `Authorization: Bearer <key>` or the
+/// `X-API-Key` header. The bearer scheme is preferred; the custom header is
+/// kept for clients that cannot set `Authorization`.
+fn extract_api_key(req: &Request<Body>) -> Option<String> {
+    if let Some(auth) = req
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        && let Some(rest) = auth
+            .strip_prefix("Bearer ")
+            .or_else(|| auth.strip_prefix("bearer "))
+    {
+        return Some(rest.trim().to_string());
+    }
+    req.headers()
+        .get("x-api-key")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.trim().to_string())
+}
+
+async fn require_api_key(
+    State(state): State<Arc<AppState>>,
+    req: Request<Body>,
+    next: Next,
+) -> Response {
+    let Some(expected) = state.api_key.as_deref() else {
+        return next.run(req).await;
+    };
+    let presented = extract_api_key(&req);
+    let ok = presented
+        .as_deref()
+        .map(|p| constant_time_eq(p.as_bytes(), expected.as_bytes()))
+        .unwrap_or(false);
+    if !ok {
+        return error_response(
+            StatusCode::UNAUTHORIZED,
+            "missing or invalid API key",
+            "invalid_api_key",
+        )
+        .into_response();
+    }
+    next.run(req).await
 }
 
 fn build_router(state: Arc<AppState>) -> Router {
-    Router::new()
-        .route("/health", get(handlers::health))
+    let protected = Router::new()
         .route("/metrics", get(metrics::serve_metrics))
         .route("/v1/models", get(handlers::list_models))
         .route("/v1/models/running", get(handlers::list_running_models))
         .route("/v1/models/{*model_id}", get(handlers::get_model))
         .route("/v1/chat/completions", post(chat::chat_completions))
+        .route_layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            require_api_key,
+        ));
+
+    Router::new()
+        .route("/health", get(handlers::health))
+        .merge(protected)
         .with_state(state)
 }
 
@@ -86,6 +161,12 @@ pub struct StartServerArgs {
     pub require_gpu: bool,
     pub max_num_seqs: Option<usize>,
     pub max_queued_requests: usize,
+    /// Optional API bearer key. When `Some`, the HTTP API requires
+    /// `Authorization: Bearer <key>` (or `X-API-Key: <key>`) on every endpoint
+    /// except `/health`.
+    pub api_key: Option<String>,
+    /// Wall-clock per-request timeout. `None` disables the timeout.
+    pub request_timeout: Option<Duration>,
 }
 
 pub fn start_server(args: StartServerArgs) -> anyhow::Result<()> {
@@ -102,6 +183,8 @@ pub fn start_server(args: StartServerArgs) -> anyhow::Result<()> {
         require_gpu,
         max_num_seqs,
         max_queued_requests,
+        api_key,
+        request_timeout,
     } = args;
 
     if !models_dir.exists() {
@@ -135,6 +218,8 @@ pub fn start_server(args: StartServerArgs) -> anyhow::Result<()> {
 
     let state = Arc::new(AppState {
         manager: Arc::clone(&manager),
+        api_key,
+        request_timeout,
     });
 
     let app = build_router(state);

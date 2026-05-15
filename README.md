@@ -340,6 +340,8 @@ Every option can be set via a CLI flag or an environment variable. CLI flags tak
 | `--shutdown-timeout <SECS>` | `OXYDLLM_SHUTDOWN_TIMEOUT` | `30` | Grace period for in-flight requests on shutdown |
 | `--qjl-quantization` | — | disabled | Enable Stage-2 QJL key residual quantization |
 | `--allow-cpu` | `OXYDLLM_ALLOW_CPU` | disabled | Permit CPU fallback when no GPU is available. By default startup fails fast on a GPU-less host. |
+| `--api-key <KEY>` | `OXYDLLM_API_KEY` | disabled | When set, every `/v1/*` and `/metrics` request must present the key via `Authorization: Bearer <KEY>` (or `X-API-Key: <KEY>`). `/health` remains unauthenticated for liveness probes. |
+| `--request-timeout <SECS>` | `OXYDLLM_REQUEST_TIMEOUT` | `300` | Wall-clock timeout per `/v1/chat/completions` request. Non-streaming responses are returned as `408 Request Timeout`; streaming responses emit a final `request_timeout` error chunk followed by `[DONE]`. Set to `0` to disable. |
 
 To produce machine-parseable JSON log output (useful with Loki, Datadog, or `jq`), set `LOG_FORMAT=json`. The variable is read at startup and applies to all commands. See the [Observability](#observability) section for details and examples.
 
@@ -373,6 +375,18 @@ OXYDLLM_MAX_NUM_SEQS=16
 OXYDLLM_KV_QUANT=balanced
 LOG_FORMAT=json
 ```
+
+## Security
+
+The HTTP API has **no authentication by default**. Without `--api-key` set, any client that can reach the port can list and invoke loaded models and read Prometheus metrics. For any deployment that is not a single-user local machine:
+
+1. Set `OXYDLLM_API_KEY=<random-token>` (or pass `--api-key <KEY>`). Once configured, every request to `/v1/*` and `/metrics` must include the header `Authorization: Bearer <KEY>`; `X-API-Key: <KEY>` is also accepted. Missing or wrong keys return `401` with `error.type = "invalid_api_key"`. `/health` remains unauthenticated so liveness probes keep working.
+2. Bind the listener to a private address or place it behind a reverse proxy (nginx, Caddy, Traefik). The default bind is `0.0.0.0`, which exposes the server on every interface.
+
+Request-side hardening already enforced by the server (no configuration needed):
+
+- **Per-request wall-clock timeout** (`--request-timeout`, default 300s) bounds the time a single chat-completion request can hold a slot. On expiry the engine sequence is aborted, the client receives `408` (non-streaming) or an error chunk + `[DONE]` (streaming).
+- **Sampling parameter ranges** are validated up-front (`temperature ∈ [0, 2]`, `top_p ∈ [0, 1]`, `frequency_penalty`/`presence_penalty ∈ [-2, 2]`, `top_logprobs ∈ [0, 20]`, `repetition_penalty > 0`, `n ∈ [1, 128]`, `max_tokens ≥ 1`). Out-of-range values return `400 invalid_request_error` rather than silently degrading the sampler.
 
 ## Run Options
 Options specific to the `oxydllm run` interactive chat command (not available in the server):

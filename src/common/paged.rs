@@ -373,8 +373,18 @@ impl BlockAllocator {
                 quantizer,
             } => {
                 let n_tokens = data_k.dim(0)?;
-                let k_f32 = data_k.to_dtype(DType::F32)?.to_device(&Device::Cpu)?;
-                let v_f32 = data_v.to_dtype(DType::F32)?.to_device(&Device::Cpu)?;
+                let k_cpu = data_k.to_device(&Device::Cpu)?;
+                let v_cpu = data_v.to_device(&Device::Cpu)?;
+                let k_f32 = if k_cpu.dtype() == DType::F32 {
+                    k_cpu
+                } else {
+                    k_cpu.to_dtype(DType::F32)?
+                };
+                let v_f32 = if v_cpu.dtype() == DType::F32 {
+                    v_cpu
+                } else {
+                    v_cpu.to_dtype(DType::F32)?
+                };
                 let k_vec: Vec<f32> = k_f32.flatten_all()?.to_vec1()?;
                 let v_vec: Vec<f32> = v_f32.flatten_all()?.to_vec1()?;
 
@@ -496,7 +506,16 @@ impl BlockTable {
     }
 }
 
-/// Deferred block pool write (avoids GPU→CPU sync during forward pass).
+fn contig_buf_capacity(total_needed: usize) -> usize {
+    let cap = if total_needed < 1024 {
+        total_needed * 2
+    } else {
+        total_needed + (total_needed / 4).min(4096)
+    };
+    cap.max(64)
+}
+
+/// Deferred block pool write (avoids GPU -> CPU sync during forward pass).
 struct PendingWrite {
     block_id: usize,
     offset: usize,
@@ -608,7 +627,7 @@ impl PagedKvCache {
                     self.contig_k = Some(k_buf);
                     self.contig_v = Some(v_buf);
                 } else {
-                    let new_cap = (total_needed * 2).max(64);
+                    let new_cap = contig_buf_capacity(total_needed);
                     let (_, n_kv, _, hd) = k_buf.dims4()?;
                     let device = k_buf.device().clone();
                     let dtype = k_buf.dtype();
@@ -627,7 +646,7 @@ impl PagedKvCache {
                 }
             }
             (None, None) => {
-                let init_cap = (total_needed * 2).max(64);
+                let init_cap = contig_buf_capacity(total_needed);
                 let (_, n_kv, _, hd) = new_k.dims4()?;
                 let device = new_k.device().clone();
                 let dtype = new_k.dtype();

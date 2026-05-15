@@ -54,6 +54,8 @@ oxydLLM is built on top of the Candle tensor library. The model layer implements
 
 KV cache quantization uses TurboQuant with MSE-based quantization during the decode phase, reducing memory overhead without significant quality loss. Metal kernels provide fused operations for attention, normalization, and positional embeddings on Apple Silicon.
 
+> **Note on `--kv-quant`:** the quantization step currently runs on CPU, each KV write transfers the new K/V tensors from GPU to CPU and casts them to F32 before packing. On unified-memory Apple Silicon the transfer is cheap, but on discrete CUDA GPUs the per-step roundtrip can dominate. Enable `--kv-quant` for memory-constrained deployments; leave it `off` when throughput matters and KV memory is not the bottleneck. On-device kernels are on the roadmap.
+
 ## Tested Models
 Here you can find a list of models that have been tested, divided by architecture. This is ***not*** an exhaustive list of compatible models.
 

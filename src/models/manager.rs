@@ -209,6 +209,11 @@ impl ModelManager {
         if kv_quant != KvQuantMode::Off {
             tracing::info!(mode = %kv_quant.label(), "KV cache quantization enabled");
             tracing::info!(qjl_quantization, "QJL key quantization configuration");
+            tracing::warn!(
+                "KV quantization currently runs on CPU: each write performs a \
+                 GPU -> CPU transfer + F32 cast. Expect throughput regression vs \
+                 --kv-quant off (most pronounced on discrete CUDA GPUs)."
+            );
         }
 
         Self {

@@ -310,11 +310,18 @@ fn apply_top_k(probs: &[f32], k: usize) -> Vec<f32> {
     });
     let threshold = temp[k];
 
-    let mut filtered: Vec<f32> = probs
-        .iter()
-        .map(|&p| if p > threshold { p } else { 0.0 })
-        .collect();
-    let mut count = filtered.iter().filter(|&&p| p > 0.0).count();
+    let mut filtered: Vec<f32> = Vec::with_capacity(probs.len());
+    let mut count: usize = 0;
+    let mut sum: f32 = 0.0;
+    for &p in probs.iter() {
+        if p > threshold {
+            filtered.push(p);
+            count += 1;
+            sum += p;
+        } else {
+            filtered.push(0.0);
+        }
+    }
 
     if count < k {
         for (i, &p) in probs.iter().enumerate() {
@@ -324,11 +331,16 @@ fn apply_top_k(probs: &[f32], k: usize) -> Vec<f32> {
             if filtered[i] == 0.0 && p == threshold && p > 0.0 {
                 filtered[i] = p;
                 count += 1;
+                sum += p;
             }
         }
     }
 
-    renormalize(&mut filtered);
+    if sum > 0.0 {
+        for p in filtered.iter_mut() {
+            *p /= sum;
+        }
+    }
     filtered
 }
 

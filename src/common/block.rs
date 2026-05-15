@@ -93,7 +93,7 @@ impl TransformerBlock {
                     per_layer_input_gate_name
                 );
             }
-            Some(AnyLinear::from_weight_with_scale_inv(w, scale_inv, None))
+            Some(AnyLinear::from_weight_with_scale_inv(w, scale_inv, None)?)
         } else {
             None
         };
@@ -111,7 +111,7 @@ impl TransformerBlock {
                     per_layer_projection_name
                 );
             }
-            Some(AnyLinear::from_weight_with_scale_inv(w, scale_inv, None))
+            Some(AnyLinear::from_weight_with_scale_inv(w, scale_inv, None)?)
         } else {
             None
         };

@@ -38,7 +38,8 @@ impl FeedForward {
                 down_weight_name
             );
         }
-        let down_proj = AnyLinear::from_weight_with_scale_inv(down_w.clone(), down_scale_inv, None);
+        let down_proj =
+            AnyLinear::from_weight_with_scale_inv(down_w.clone(), down_scale_inv, None)?;
         let intermediate_size = down_w.dim(1)?;
 
         let gate_up = if let (Some(gate_w), Some(up_w)) = (
@@ -85,7 +86,7 @@ impl FeedForward {
                 gate_up_w,
                 gate_up_scale_inv,
                 None,
-            ))
+            )?)
         } else if let Some(gate_up_w) = weights.try_get(&format!("{}.gate_up_proj.weight", p)) {
             let gate_up_w = gate_up_w.clone();
             let packed_out = gate_up_w.dim(0)?;
@@ -110,7 +111,7 @@ impl FeedForward {
                 gate_up_w,
                 gate_up_scale_inv,
                 None,
-            ))
+            )?)
         } else if let Some(up_w) = weights.try_get(&format!("{}.up_proj.weight", p)) {
             let up_w = up_w.clone();
             let up_out = up_w.dim(0)?;
@@ -135,7 +136,7 @@ impl FeedForward {
                 up_w,
                 up_scale_inv,
                 None,
-            ))
+            )?)
         } else {
             candle_core::bail!(
                 "Unsupported FFN layout at {}: expected gate_proj+up_proj, gate_up_proj, or up_proj",
@@ -429,11 +430,11 @@ mod tests {
         let up_w = up_w_fp8.to_dtype(DType::F32)?.broadcast_mul(&up_scale)?;
         let gate_up_w = Tensor::cat(&[&gate_w, &up_w], 0)?;
 
-        let gate_up_out = AnyLinear::from_weight(gate_up_w, None).forward(&x)?;
+        let gate_up_out = AnyLinear::from_weight(gate_up_w, None)?.forward(&x)?;
         let gate = gate_up_out.narrow(D::Minus1, 0, 3)?;
         let up = gate_up_out.narrow(D::Minus1, 3, 3)?;
         let gated = (silu(&gate)? * up)?;
-        let expected = AnyLinear::from_weight(down_w, None).forward(&gated)?;
+        let expected = AnyLinear::from_weight(down_w, None)?.forward(&gated)?;
 
         let out_vals = out.to_vec2::<f32>()?;
         let expected_vals = expected.to_vec2::<f32>()?;

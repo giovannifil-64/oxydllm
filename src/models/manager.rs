@@ -109,10 +109,22 @@ pub fn load_registry(models_dir: &Path) -> BTreeMap<String, RegistryEntry> {
 
 pub fn save_registry(models_dir: &Path, registry: &BTreeMap<String, RegistryEntry>) {
     let path = registry_path(models_dir);
-    if let Ok(json) = serde_json::to_string_pretty(registry)
-        && let Err(e) = std::fs::write(&path, &json)
-    {
-        tracing::error!(path = %path.display(), error = %e, "failed to save model registry");
+    let Ok(json) = serde_json::to_string_pretty(registry) else {
+        return;
+    };
+    let tmp_path = path.with_extension("json.tmp");
+    if let Err(e) = std::fs::write(&tmp_path, &json) {
+        tracing::error!(path = %tmp_path.display(), error = %e, "failed to write registry tmp file");
+        return;
+    }
+    if let Err(e) = std::fs::rename(&tmp_path, &path) {
+        tracing::error!(
+            from = %tmp_path.display(),
+            to = %path.display(),
+            error = %e,
+            "failed to rename registry tmp file"
+        );
+        let _ = std::fs::remove_file(&tmp_path);
     }
 }
 

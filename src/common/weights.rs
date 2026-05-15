@@ -3,6 +3,12 @@ use anyhow::{Context, Result};
 use candle_core::{DType, Device, Tensor, safetensors::MmapedSafetensors};
 use rustc_hash::FxHashMap;
 
+pub const AWQ_DEFAULT_BITS: u8 = 4;
+
+pub const fn awq_pack_factor(bits: u8) -> usize {
+    (32 / bits) as usize
+}
+
 pub struct ModelWeights {
     tensors: FxHashMap<String, Tensor>,
 }
@@ -260,7 +266,7 @@ impl ModelWeights {
                 continue;
             }
             if name.ends_with(".qweight") {
-                total += t.elem_count() * 8 * runtime_elem_bytes;
+                total += t.elem_count() * awq_pack_factor(AWQ_DEFAULT_BITS) * runtime_elem_bytes;
                 continue;
             }
             total += t.dtype().size_in_bytes() * t.elem_count();

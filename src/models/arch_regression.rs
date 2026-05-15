@@ -204,9 +204,9 @@ mod tests {
         let embed_tokens = Embedding::new(weights.get("model.embed_tokens.weight")?.clone());
 
         let lm_head = if spec.tie_weights {
-            AnyLinear::from_weight(weights.get("model.embed_tokens.weight")?.clone(), None)
+            AnyLinear::from_weight(weights.get("model.embed_tokens.weight")?.clone(), None)?
         } else {
-            AnyLinear::from_weight(weights.get("lm_head.weight")?.clone(), None)
+            AnyLinear::from_weight(weights.get("lm_head.weight")?.clone(), None)?
         };
 
         let ropes = (0..LAYERS)

@@ -546,12 +546,13 @@ pub fn select_device_at(_cuda_idx: usize, require_gpu: bool) -> anyhow::Result<D
 
     if require_gpu {
         return Err(anyhow::anyhow!(
-            "[FATAL] No GPU device available and --require-gpu was specified. Exiting."
+            "[FATAL] No GPU device available. Pass --allow-cpu (or set OXYDLLM_ALLOW_CPU=1) \
+             to run on CPU; expect severely degraded inference performance."
         ));
     }
 
     tracing::warn!(
-        "GPU not available; falling back to CPU. Inference performance may be severely degraded"
+        "GPU not available; --allow-cpu set, falling back to CPU. Inference performance may be severely degraded"
     );
     tracing::info!(device = "CPU", "device selected");
     Ok(Device::Cpu)
@@ -668,6 +669,7 @@ fn load_standard_safetensors(
 
         let lm_head = if cfg.tie_word_embeddings {
             AnyLinear::from_weight_with_scale_inv(embed_weight.clone(), lm_head_scale_inv, None)
+                .map_err(|e| anyhow::anyhow!("{e}"))?
         } else if let Some(lm_head_awq) = weights.try_get_awq("lm_head") {
             AnyLinear::from_awq(&lm_head_awq, None, device, dtype)
                 .map_err(|e| anyhow::anyhow!("{e}"))?
@@ -680,6 +682,7 @@ fn load_standard_safetensors(
                 lm_head_scale_inv,
                 None,
             )
+            .map_err(|e| anyhow::anyhow!("{e}"))?
         };
         let embed_tokens = Embedding::new(embed_weight);
 
@@ -746,14 +749,17 @@ fn load_standard_safetensors(
         };
         let per_layer_model_projection = if has_per_layer_stream {
             let per_layer_proj_name = "model.per_layer_model_projection.weight";
-            Some(AnyLinear::from_weight_with_scale_inv(
-                weights
-                    .get(per_layer_proj_name)
-                    .map_err(|e| anyhow::anyhow!("{e}"))?
-                    .clone(),
-                weights.try_get_scale_inv(per_layer_proj_name).cloned(),
-                None,
-            ))
+            Some(
+                AnyLinear::from_weight_with_scale_inv(
+                    weights
+                        .get(per_layer_proj_name)
+                        .map_err(|e| anyhow::anyhow!("{e}"))?
+                        .clone(),
+                    weights.try_get_scale_inv(per_layer_proj_name).cloned(),
+                    None,
+                )
+                .map_err(|e| anyhow::anyhow!("{e}"))?,
+            )
         } else {
             None
         };

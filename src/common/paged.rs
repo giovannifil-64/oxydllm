@@ -607,7 +607,8 @@ impl PagedKvCache {
                 });
             }
 
-            let base = (block_id * block_size) as u32;
+            let base = u32::try_from(block_id * block_size)
+                .expect("slot index overflow: block_id * block_size exceeds u32::MAX");
             for off in current_offset as u32..(current_offset + n) as u32 {
                 self.table.cached_slots.push(base + off);
             }
@@ -850,7 +851,8 @@ impl PagedKvCache {
     pub fn prepopulate_block(&mut self, block_id: usize) {
         self.allocator.lock().unwrap().share(block_id);
         self.table.block_ids.push(block_id);
-        let base = (block_id * self.block_size) as u32;
+        let base = u32::try_from(block_id * self.block_size)
+            .expect("slot index overflow: block_id * block_size exceeds u32::MAX");
         for off in 0..self.block_size as u32 {
             self.table.cached_slots.push(base + off);
         }

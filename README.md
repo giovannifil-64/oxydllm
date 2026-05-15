@@ -339,7 +339,7 @@ Every option can be set via a CLI flag or an environment variable. CLI flags tak
 | `--kv-quant <MODE>` | `OXYDLLM_KV_QUANT` | `off` | KV cache quantization: `off`, `lossless`, `balanced`, `aggressive` |
 | `--shutdown-timeout <SECS>` | `OXYDLLM_SHUTDOWN_TIMEOUT` | `30` | Grace period for in-flight requests on shutdown |
 | `--qjl-quantization` | — | disabled | Enable Stage-2 QJL key residual quantization |
-| `--require-gpu` | — | disabled | Fail startup if no GPU device is available |
+| `--allow-cpu` | `OXYDLLM_ALLOW_CPU` | disabled | Permit CPU fallback when no GPU is available. By default startup fails fast on a GPU-less host. |
 
 To produce machine-parseable JSON log output (useful with Loki, Datadog, or `jq`), set `LOG_FORMAT=json`. The variable is read at startup and applies to all commands. See the [Observability](#observability) section for details and examples.
 
@@ -386,7 +386,7 @@ Options specific to the `oxydllm run` interactive chat command (not available in
 ```
 
 The following options are shared between `start` and `run`:
-`--models-dir`, `--devices`, `--max-context-len`, `--kv-quant`, `--qjl-quantization`, `--require-gpu`.
+`--models-dir`, `--devices`, `--max-context-len`, `--kv-quant`, `--qjl-quantization`, `--allow-cpu`.
 
 ## Known Limitations and Work in Progress
 - **GGUF compatibility**: Support is broad, but some architecture/quantization combinations may still fail depending on checkpoint format.
@@ -396,6 +396,7 @@ The following options are shared between `start` and `run`:
 - **Only function tools are implemented**: OpenAI custom tools are not supported on `/v1/chat/completions` yet.
 - **Gemma4 edge cases**: Some checkpoints may require architecture-specific tuning.
 - **Metal softcap SDPA policy**: The Metal SDPA path with attention softcap is currently hard-disabled in runtime (no experimental toggle) and falls back to the standard attention path.
+- **Metal SDPA head-dim coverage**: The fused Metal SDPA kernel supports head dimensions `32, 64, 72, 80, 96, 128, 256`. Models with other head dimensions remain functionally correct but fall back to the non-fused attention path with a measurable throughput cost.
 - **CUDA optimization**: Support exists but is not optimized for production use.
 - **AWQ runtime memory footprint**: AWQ checkpoints currently dequantize to fp16/bf16 at load time, so resident weight memory matches an equivalent fp16 model rather than the on-disk 4-bit footprint. Inference throughput matches fp16 thanks to fused QKV/gate-up projections.
 

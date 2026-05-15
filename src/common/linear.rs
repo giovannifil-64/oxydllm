@@ -51,9 +51,9 @@ fn matmul_with_bias(x: &Tensor, weight_t: &Tensor, bias: Option<&Tensor>) -> Res
 }
 
 impl Linear {
-    pub fn new(weight: Tensor, bias: Option<Tensor>) -> Self {
-        let weight_t = weight.t().expect("Linear weight must be 2D");
-        Self { weight_t, bias }
+    pub fn new(weight: Tensor, bias: Option<Tensor>) -> Result<Self> {
+        let weight_t = weight.t()?;
+        Ok(Self { weight_t, bias })
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
@@ -229,7 +229,7 @@ pub enum AnyLinear {
 }
 
 impl AnyLinear {
-    pub fn from_weight(weight: Tensor, bias: Option<Tensor>) -> Self {
+    pub fn from_weight(weight: Tensor, bias: Option<Tensor>) -> Result<Self> {
         Self::from_weight_with_scale_inv(weight, None, bias)
     }
 
@@ -237,11 +237,11 @@ impl AnyLinear {
         weight: Tensor,
         scale_inv: Option<Tensor>,
         bias: Option<Tensor>,
-    ) -> Self {
+    ) -> Result<Self> {
         if weight.dtype() == DType::F8E4M3 {
-            Self::Fp8(Fp8Linear::new(weight, scale_inv, bias))
+            Ok(Self::Fp8(Fp8Linear::new(weight, scale_inv, bias)))
         } else {
-            Self::Float(Linear::new(weight, bias))
+            Ok(Self::Float(Linear::new(weight, bias)?))
         }
     }
 
@@ -253,7 +253,7 @@ impl AnyLinear {
     ) -> Result<Self> {
         let weight = dequantize_awq(raw, device, dtype)
             .map_err(|e| candle_core::Error::Msg(format!("AWQ dequantization failed: {e:#}")))?;
-        Ok(Self::Float(Linear::new(weight, bias)))
+        Ok(Self::Float(Linear::new(weight, bias)?))
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
@@ -355,7 +355,7 @@ mod tests {
             }
         }
         let ref_weight_t = Tensor::from_vec(ref_weight, (out_features, in_features), &device)?;
-        let ref_linear = Linear::new(ref_weight_t, Some(bias));
+        let ref_linear = Linear::new(ref_weight_t, Some(bias))?;
 
         let x = Tensor::from_vec(
             (0..in_features)
@@ -381,7 +381,7 @@ mod tests {
         let weight = Tensor::from_vec(vec![0.5f32, -1.0, 1.5, 0.25], (2, 2), &device)?
             .to_dtype(DType::F8E4M3)?;
 
-        let linear = AnyLinear::from_weight(weight, None);
+        let linear = AnyLinear::from_weight(weight, None)?;
         assert!(matches!(linear, AnyLinear::Fp8(_)));
         Ok(())
     }
@@ -401,11 +401,11 @@ mod tests {
             weight_fp8.clone(),
             Some(scale_inv.clone()),
             Some(bias.clone()),
-        )
+        )?
         .forward(&x)?;
 
         let ref_weight = weight_fp8.to_dtype(DType::F32)?.broadcast_mul(&scale_inv)?;
-        let expected = Linear::new(ref_weight, Some(bias)).forward(&x)?;
+        let expected = Linear::new(ref_weight, Some(bias))?.forward(&x)?;
 
         let out_vals = out.to_vec2::<f32>()?;
         let expected_vals = expected.to_vec2::<f32>()?;
@@ -432,12 +432,12 @@ mod tests {
             weight_fp8.clone(),
             Some(scale_inv_rank1.clone()),
             None,
-        )
+        )?
         .forward(&x)?;
 
         let ref_scale = scale_inv_rank1.reshape((2, 1))?;
         let ref_weight = weight_fp8.to_dtype(DType::F32)?.broadcast_mul(&ref_scale)?;
-        let expected = Linear::new(ref_weight, None).forward(&x)?;
+        let expected = Linear::new(ref_weight, None)?.forward(&x)?;
 
         let out_vals = out.to_vec2::<f32>()?;
         let expected_vals = expected.to_vec2::<f32>()?;
@@ -463,13 +463,13 @@ mod tests {
             weight_fp8.clone(),
             Some(scalar_scale_inv.clone()),
             None,
-        )
+        )?
         .forward(&x)?;
 
         let ref_weight = weight_fp8
             .to_dtype(DType::F32)?
             .broadcast_mul(&scalar_scale_inv)?;
-        let expected = Linear::new(ref_weight, None).forward(&x)?;
+        let expected = Linear::new(ref_weight, None)?.forward(&x)?;
 
         let out_vals = out.to_vec2::<f32>()?;
         let expected_vals = expected.to_vec2::<f32>()?;
@@ -491,7 +491,7 @@ mod tests {
         let invalid_scale_inv = Tensor::from_vec(vec![0.5f32, 1.0, 2.0], (3,), &device)?;
         let x = Tensor::from_vec(vec![1.0f32, 2.0, -1.0, 0.5], (2, 2), &device)?;
 
-        let err = AnyLinear::from_weight_with_scale_inv(weight_fp8, Some(invalid_scale_inv), None)
+        let err = AnyLinear::from_weight_with_scale_inv(weight_fp8, Some(invalid_scale_inv), None)?
             .forward(&x)
             .expect_err("expected invalid rank-1 scale_inv shape to fail");
         assert!(

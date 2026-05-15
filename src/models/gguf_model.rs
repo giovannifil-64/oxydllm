@@ -218,7 +218,7 @@ impl StandardTransformer {
                     .map_err(|e| anyhow::anyhow!("dequantize embed for tie: {e}"))?
                     .to_dtype(dtype)
                     .map_err(|e| anyhow::anyhow!("dtype cast: {e}"))?;
-                AnyLinear::from_weight(w, None)
+                AnyLinear::from_weight(w, None).map_err(|e| anyhow::anyhow!("{e}"))?
             }
         };
 

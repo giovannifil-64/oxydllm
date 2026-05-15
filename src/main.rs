@@ -172,7 +172,7 @@ Server options (start):
                              - balanced: 3-bit, near-identical quality
                              - aggressive: 2-bit, maximum compression
   --qjl-quantization         Enable Stage-2 QJL key residual quantization (default: disabled)
-  --require-gpu              Fail startup if no GPU device available (default: disabled)
+  --allow-cpu                Allow CPU fallback when no GPU is available (default: GPU required, env: OXYDLLM_ALLOW_CPU)
   --max-num-seqs <N>         Max concurrent sequences per model (default: auto from KV budget, env: OXYDLLM_MAX_NUM_SEQS)
   --max-queued-requests <N>  Max requests queued per model before returning 429 (default: 200, env: OXYDLLM_MAX_QUEUED_REQUESTS)
 
@@ -182,7 +182,7 @@ Chat options (run):
   --max-context-len <N>      Max tokens per sequence for KV cache (default: 4096)
   --kv-quant <MODE>          KV cache quantization: off, lossless, balanced, aggressive
   --qjl-quantization         Enable Stage-2 QJL key residual quantization (default: disabled)
-  --require-gpu              Fail startup if no GPU device available (default: disabled)
+  --allow-cpu                Allow CPU fallback when no GPU is available (default: GPU required, env: OXYDLLM_ALLOW_CPU)
   --temperature <T>          Sampling temperature (default: 0.7)
   --top-k <K>                Top-k filtering (default: 0, disabled)
   --top-p <P>                Nucleus sampling (default: 1.0)
@@ -706,7 +706,11 @@ fn parse_start_args(args: &[String]) -> Result<StartArgs, String> {
         .transpose()?
         .unwrap_or(common::kv_quant::KvQuantMode::Off);
     let mut qjl_quantization = false;
-    let mut require_gpu = false;
+    let env_allow_cpu = std::env::var("OXYDLLM_ALLOW_CPU")
+        .ok()
+        .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE"))
+        .unwrap_or(false);
+    let mut require_gpu = !env_allow_cpu;
     let mut max_num_seqs: Option<usize> = env_usize("OXYDLLM_MAX_NUM_SEQS");
     let mut max_queued_requests: usize = env_usize("OXYDLLM_MAX_QUEUED_REQUESTS").unwrap_or(200);
     let mut i = 0;
@@ -775,8 +779,8 @@ fn parse_start_args(args: &[String]) -> Result<StartArgs, String> {
             "--qjl-quantization" => {
                 qjl_quantization = true;
             }
-            "--require-gpu" => {
-                require_gpu = true;
+            "--allow-cpu" => {
+                require_gpu = false;
             }
             "--max-num-seqs" => {
                 i += 1;
@@ -829,7 +833,11 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
     let mut max_context_len: usize = 4096;
     let mut kv_quant = common::kv_quant::KvQuantMode::Off;
     let mut qjl_quantization = false;
-    let mut require_gpu = false;
+    let env_allow_cpu = std::env::var("OXYDLLM_ALLOW_CPU")
+        .ok()
+        .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE"))
+        .unwrap_or(false);
+    let mut require_gpu = !env_allow_cpu;
     let mut params = SamplingParams {
         temperature: 0.7,
         ..SamplingParams::default()
@@ -915,8 +923,8 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
             "--qjl-quantization" => {
                 qjl_quantization = true;
             }
-            "--require-gpu" => {
-                require_gpu = true;
+            "--allow-cpu" => {
+                require_gpu = false;
             }
             _ if !args[i].starts_with('-') && model_name.is_empty() => {
                 model_name = args[i].clone();

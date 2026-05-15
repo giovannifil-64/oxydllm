@@ -65,10 +65,15 @@ fn validate_cuda_compute_cap(cap_str: &str) {
 }
 
 fn parse_compute_cap(s: &str) -> Option<usize> {
-    // Accept "8.9" → 89, "121" → 121, "12.1" → 121
+    // Accept "8.9" → 89, "121" → 121, "12.1" → 121.
+    // Minor versions ≥ 10 are rejected: the flat "major*10+minor" encoding
+    // becomes ambiguous (e.g. "12.10" would collide with "13.0").
     if let Some((major, minor)) = s.trim().split_once('.') {
         let maj = major.trim().parse::<usize>().ok()?;
         let min = minor.trim().parse::<usize>().ok()?;
+        if min >= 10 {
+            return None;
+        }
         Some(maj * 10 + min)
     } else {
         s.trim().parse::<usize>().ok()

@@ -173,7 +173,7 @@ impl Attention {
                 qkv_weight_name
             );
         }
-        let qkv_proj = AnyLinear::from_weight_with_scale_inv(qkv_w, qkv_scale_inv, qkv_bias);
+        let qkv_proj = AnyLinear::from_weight_with_scale_inv(qkv_w, qkv_scale_inv, qkv_bias)?;
 
         let o_weight = weights.get(&o_weight_name)?.clone();
         let o_scale_inv = weights.try_get_scale_inv(&o_weight_name).cloned();
@@ -184,7 +184,7 @@ impl Attention {
                 o_weight_name
             );
         }
-        let o_proj = AnyLinear::from_weight_with_scale_inv(o_weight, o_scale_inv, None);
+        let o_proj = AnyLinear::from_weight_with_scale_inv(o_weight, o_scale_inv, None)?;
 
         let q_norm = if cfg.qk_norm {
             Some(RMSNorm::new(
@@ -740,8 +740,8 @@ impl Attention {
         )?;
         let o_w = Tensor::zeros((hidden, q_dim), candle_core::DType::F32, &device)?;
         Ok(Self {
-            qkv: QkvProjection::Fused(AnyLinear::from_weight_with_scale_inv(qkv_w, None, None)),
-            o_proj: AnyLinear::from_weight_with_scale_inv(o_w, None, None),
+            qkv: QkvProjection::Fused(AnyLinear::from_weight_with_scale_inv(qkv_w, None, None)?),
+            o_proj: AnyLinear::from_weight_with_scale_inv(o_w, None, None)?,
             q_norm: None,
             k_norm: None,
             n_heads,

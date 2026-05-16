@@ -644,12 +644,22 @@ struct SpawnLoadParams {
 }
 
 /// Runs dummy forward passes to force the device (Metal/CUDA) to JIT-compile
-/// GPU kernels for **both** prefill (multi-token) and decode (single-token) paths
-/// before the model is marked as Ready.  Without this, the very first real
-/// request pays the compilation cost, causing multi-second TTFT spikes.
+/// GPU kernels for **all** SDPA paths before the model is marked as Ready.
 ///
-/// Uses `forward_batch` — the same code path the engine uses at runtime — so
-/// Metal specialises kernels for the exact shapes encountered during inference.
+/// Without this, the very first real request pays the compilation cost,
+/// causing multi-second TTFT spikes.  More importantly on Metal, a Candle
+/// `candle_metal_kernels` bug makes the first `call_sdpa_full` (prefill,
+/// q_seq > 8) emit NaN logits if it follows a `call_sdpa_vector` call
+/// (q_seq <= 8) without an intervening `call_sdpa_full`. We work around
+/// this by running three warmup phases, terminating with a multi-token
+/// prefill so the last kernel exercised matches the regime real prefill
+/// requests use.
+///
+/// Phases:
+///   1. Prefill n=8   -> SDPA vector (compile path used by 1-8 token prompts)
+///   2. Decode  n=1   -> SDPA vector (compile decode-step path)
+///   3. Prefill n=16  -> SDPA full   (compile path used by 9+ token prompts;
+///      leaves Metal state in the full regime that virtually every real chat hits)
 fn warm_up_model(model: &dyn BatchModel) {
     let device = model.device();
     let allocators = model.allocators();
@@ -664,6 +674,7 @@ fn warm_up_model(model: &dyn BatchModel) {
         .map(|a| PagedKvCache::new(std::sync::Arc::clone(a)))
         .collect();
 
+    // ── Phase 1: SDPA vector prefill (q_seq=8) ──────────────────────────
     {
         let dummy_tokens: Vec<u32> = (1..=8).collect();
         let positions: Vec<u32> = (0..8).collect();
@@ -690,6 +701,7 @@ fn warm_up_model(model: &dyn BatchModel) {
         }
     }
 
+    // ── Phase 2: SDPA vector decode (q_seq=1) ───────────────────────────
     {
         let input = match Tensor::from_vec(vec![1u32], (1, 1), device) {
             Ok(t) => t,
@@ -709,6 +721,47 @@ fn warm_up_model(model: &dyn BatchModel) {
         let mut cache_slices: Vec<&mut [PagedKvCache]> = vec![caches.as_mut_slice()];
         if let Err(e) = model.forward_batch(&input, &position_ids, &mut cache_slices, &[1]) {
             tracing::warn!(error = %e, "warmup decode forward failed (non-fatal)");
+        }
+    }
+
+    // Release the warmup blocks so Phase 3 starts from a clean per-sequence
+    // state (matches what the engine does at request boundaries).
+    for cache in &mut caches {
+        cache.clear();
+    }
+
+    // ── Phase 3: SDPA full prefill (q_seq>8) ────────────────────────────
+    // Must be the LAST forward — fixes Metal-SDPA NaN bug where a fresh
+    // call_sdpa_full following call_sdpa_vector produces NaN logits.
+    const FULL_WARMUP_TOKENS: usize = 16;
+    {
+        let dummy_tokens: Vec<u32> = (1..=FULL_WARMUP_TOKENS as u32).collect();
+        let positions: Vec<u32> = (0..FULL_WARMUP_TOKENS as u32).collect();
+        let input = match Tensor::from_vec(dummy_tokens, (1, FULL_WARMUP_TOKENS), device) {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!(error = %e, "warmup failed to create full-path prefill tensor");
+                return;
+            }
+        };
+        let position_ids = match Tensor::from_vec(positions, (FULL_WARMUP_TOKENS,), device) {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!(error = %e, "warmup failed to create full-path position ids");
+                return;
+            }
+        };
+
+        let mut cache_slices: Vec<&mut [PagedKvCache]> = vec![caches.as_mut_slice()];
+        if let Err(e) = model.forward_batch(
+            &input,
+            &position_ids,
+            &mut cache_slices,
+            &[FULL_WARMUP_TOKENS],
+        ) {
+            tracing::warn!(error = %e, "warmup full-path prefill forward failed (non-fatal)");
+        } else if let Err(e) = crate::common::block::flush_caches(&mut cache_slices) {
+            tracing::warn!(error = %e, "warmup full-path prefill flush failed (non-fatal)");
         }
     }
 

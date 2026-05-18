@@ -18,6 +18,16 @@ fn main() {
     if let Ok(cap_str) = std::env::var("CUDA_COMPUTE_CAP") {
         validate_cuda_compute_cap(&cap_str);
         if let Some(cap) = parse_compute_cap(&cap_str) {
+            // `cargo:rustc-env` exposes the compiled compute cap to runtime via
+            // `env!("OXYDLLM_COMPILED_CAP")`, used by `loader::select_device_at`
+            // to warn when the compiled cap is below the hardware cap. It is
+            // deliberately NOT a `rustc-cfg` because oxydllm doesn't ship
+            // per-arch CUDA kernels — Candle handles arch selection
+            // generically. If anyone later wants to gate per-arch Rust code
+            // with `#[cfg(cuda_cap = "89")]` or similar, emit both:
+            //     println!("cargo:rustc-cfg=cuda_cap=\"{cap}\"");
+            //     println!("cargo::rustc-check-cfg=cfg(cuda_cap, values(...))");
+            // and update `loader::select_device_at` to pick the matching path.
             println!("cargo:rustc-env=OXYDLLM_COMPILED_CAP={cap}");
         }
     }

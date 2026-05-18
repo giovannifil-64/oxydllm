@@ -299,6 +299,14 @@ pub fn run_transformer_layers_batch(
             "seq_caches[{i}].len() must equal number of transformer blocks"
         );
     }
+    // Cross-device tensors would be silently miscomputed by candle ops further
+    // down; surface the misroute here so the panic names the offending input.
+    // Single-device deployments are unaffected — the check is debug-only.
+    debug_assert_eq!(
+        token_ids.device().location(),
+        position_ids.device().location(),
+        "token_ids and position_ids must live on the same device",
+    );
 
     let mut x = c.embed_tokens.forward(token_ids)?;
     if let Some(scale) = c.embed_scale {

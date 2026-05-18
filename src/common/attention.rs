@@ -512,6 +512,24 @@ impl Attention {
         mask: Option<&Tensor>,
         segments: &mut [SegmentInfo],
     ) -> Result<Tensor> {
+        // Pre-empt the "cross-device tensor" failure mode that will become
+        // possible once tensor-parallel inference is added. Debug-only — has
+        // no runtime cost in release builds.
+        if let Some((_, position_ids)) = rope {
+            debug_assert_eq!(
+                x.device().location(),
+                position_ids.device().location(),
+                "attention input and position_ids must share a device",
+            );
+        }
+        if let Some(m) = mask {
+            debug_assert_eq!(
+                x.device().location(),
+                m.device().location(),
+                "attention input and mask must share a device",
+            );
+        }
+
         let (b, total_seq, _) = x.dims3()?;
         let hd = self.head_dim;
 

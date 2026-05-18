@@ -153,23 +153,17 @@ pub fn sample(
             })
         }
     } else {
-        let (log_probs, probs_vec) = compute_log_probs(&logits_vec, params.temperature);
+        let (log_probs, mut probs_vec) = compute_log_probs(&logits_vec, params.temperature);
 
-        let probs_vec = if params.min_p > 0.0 {
-            apply_min_p(&probs_vec, params.min_p)
-        } else {
-            probs_vec
-        };
-        let probs_vec = if params.top_k > 0 {
-            apply_top_k(&probs_vec, params.top_k)
-        } else {
-            probs_vec
-        };
-        let probs_vec = if params.top_p < 1.0 {
-            apply_top_p(&probs_vec, params.top_p)
-        } else {
-            probs_vec
-        };
+        if params.min_p > 0.0 {
+            apply_min_p(&mut probs_vec, params.min_p);
+        }
+        if params.top_k > 0 {
+            apply_top_k(&mut probs_vec, params.top_k);
+        }
+        if params.top_p < 1.0 {
+            apply_top_p(&mut probs_vec, params.top_p);
+        }
 
         let token = categorical_sample(&probs_vec, params.seed, prev_tokens.len() as u64)?;
 
@@ -289,87 +283,92 @@ fn apply_frequency_presence_penalty_with_counts(
     }
 }
 
-fn apply_min_p(probs: &[f32], min_p: f32) -> Vec<f32> {
-    let max_prob = probs.iter().cloned().fold(0.0_f32, f32::max);
-    let threshold = min_p * max_prob;
-    let mut filtered: Vec<f32> = probs
-        .iter()
-        .map(|&p| if p >= threshold { p } else { 0.0 })
-        .collect();
-    renormalize(&mut filtered);
-    filtered
+thread_local! {
+    static F32_SCRATCH: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
+    static IDX_SCRATCH: std::cell::RefCell<Vec<(usize, f32)>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
-fn apply_top_k(probs: &[f32], k: usize) -> Vec<f32> {
-    if k >= probs.len() {
-        return probs.to_vec();
-    }
-    let mut temp: Vec<f32> = probs.to_vec();
-    temp.select_nth_unstable_by(k, |a, b| {
-        b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal)
-    });
-    let threshold = temp[k];
-
-    let mut filtered: Vec<f32> = Vec::with_capacity(probs.len());
-    let mut count: usize = 0;
-    let mut sum: f32 = 0.0;
-    for &p in probs.iter() {
-        if p > threshold {
-            filtered.push(p);
-            count += 1;
-            sum += p;
-        } else {
-            filtered.push(0.0);
-        }
-    }
-
-    if count < k {
-        for (i, &p) in probs.iter().enumerate() {
-            if count >= k {
-                break;
-            }
-            if filtered[i] == 0.0 && p == threshold && p > 0.0 {
-                filtered[i] = p;
-                count += 1;
-                sum += p;
-            }
-        }
-    }
-
-    if sum > 0.0 {
-        for p in filtered.iter_mut() {
-            *p /= sum;
-        }
-    }
-    filtered
-}
-
-fn apply_top_p(probs: &[f32], top_p: f32) -> Vec<f32> {
-    let mut indexed: Vec<(usize, f32)> = probs.iter().enumerate().map(|(i, &p)| (i, p)).collect();
-    indexed.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-
-    let mut cumulative = 0.0;
-    let mut filtered = vec![0.0_f32; probs.len()];
-
-    for (idx, prob) in indexed {
-        if cumulative >= top_p && cumulative > 0.0 {
-            break;
-        }
-        filtered[idx] = prob;
-        cumulative += prob;
-    }
-
-    renormalize(&mut filtered);
-    filtered
-}
-
-fn renormalize(probs: &mut [f32]) {
-    let sum: f32 = probs.iter().sum();
+fn renormalize_in_place(probs: &mut [f32], sum: f32) {
     if sum > 0.0 {
         for p in probs.iter_mut() {
             *p /= sum;
         }
     }
+}
+
+fn apply_min_p(probs: &mut [f32], min_p: f32) {
+    let max_prob = probs.iter().cloned().fold(0.0_f32, f32::max);
+    let threshold = min_p * max_prob;
+    let mut sum = 0.0;
+    for p in probs.iter_mut() {
+        if *p >= threshold {
+            sum += *p;
+        } else {
+            *p = 0.0;
+        }
+    }
+    renormalize_in_place(probs, sum);
+}
+
+fn apply_top_k(probs: &mut [f32], k: usize) {
+    if k >= probs.len() {
+        return;
+    }
+    F32_SCRATCH.with(|s| {
+        let mut scratch = s.borrow_mut();
+        scratch.clear();
+        scratch.extend_from_slice(probs);
+        scratch.select_nth_unstable_by(k, |a, b| {
+            b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let threshold = scratch[k];
+
+        let count_strict = probs.iter().filter(|&&p| p > threshold).count();
+        let need_ties = k.saturating_sub(count_strict);
+
+        let mut sum = 0.0;
+        let mut added_ties = 0;
+        for p in probs.iter_mut() {
+            if *p > threshold {
+                sum += *p;
+            } else if added_ties < need_ties && *p == threshold && *p > 0.0 {
+                added_ties += 1;
+                sum += *p;
+            } else {
+                *p = 0.0;
+            }
+        }
+        renormalize_in_place(probs, sum);
+    });
+}
+
+fn apply_top_p(probs: &mut [f32], top_p: f32) {
+    IDX_SCRATCH.with(|s| {
+        let mut indexed = s.borrow_mut();
+        indexed.clear();
+        indexed.extend(probs.iter().enumerate().map(|(i, &p)| (i, p)));
+        indexed.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        let mut cumulative = 0.0;
+        let mut keep_count = 0;
+        for &(_, prob) in indexed.iter() {
+            if cumulative >= top_p && cumulative > 0.0 {
+                break;
+            }
+            cumulative += prob;
+            keep_count += 1;
+        }
+
+        for p in probs.iter_mut() {
+            *p = 0.0;
+        }
+        let mut sum = 0.0;
+        for &(idx, prob) in indexed.iter().take(keep_count) {
+            probs[idx] = prob;
+            sum += prob;
+        }
+        renormalize_in_place(probs, sum);
+    });
 }
 
 fn categorical_sample(probs: &[f32], seed: Option<u64>, step: u64) -> Result<u32> {
@@ -451,9 +450,9 @@ mod tests {
 
     #[test]
     fn top_k_filters_correctly() {
-        let probs = vec![0.1, 0.5, 0.3, 0.1];
-        let filtered = apply_top_k(&probs, 2);
-        let nonzero: Vec<_> = filtered.iter().filter(|&&p| p > 0.0).collect();
+        let mut probs = vec![0.1, 0.5, 0.3, 0.1];
+        apply_top_k(&mut probs, 2);
+        let nonzero: Vec<_> = probs.iter().filter(|&&p| p > 0.0).collect();
         assert_eq!(nonzero.len(), 2);
     }
 
@@ -520,11 +519,36 @@ mod tests {
 
     #[test]
     fn min_p_filters_low_prob() {
-        let probs = vec![0.5, 0.3, 0.1, 0.05, 0.05];
-        let filtered = apply_min_p(&probs, 0.2);
-        assert_eq!(filtered[3], 0.0);
-        assert_eq!(filtered[4], 0.0);
-        assert!(filtered[0] > 0.0);
+        let mut probs = vec![0.5, 0.3, 0.1, 0.05, 0.05];
+        apply_min_p(&mut probs, 0.2);
+        assert_eq!(probs[3], 0.0);
+        assert_eq!(probs[4], 0.0);
+        assert!(probs[0] > 0.0);
+    }
+
+    #[test]
+    fn top_p_keeps_smallest_prefix_above_cutoff() {
+        let mut probs = vec![0.4_f32, 0.3, 0.2, 0.1];
+        apply_top_p(&mut probs, 0.6);
+        assert!(probs[0] > 0.0);
+        assert!(probs[1] > 0.0);
+        assert_eq!(probs[2], 0.0);
+        assert_eq!(probs[3], 0.0);
+        let sum: f32 = probs.iter().sum();
+        assert!(
+            (sum - 1.0).abs() < 1e-5,
+            "top_p must renormalize: sum={sum}"
+        );
+    }
+
+    #[test]
+    fn top_k_promotes_ties_to_reach_k() {
+        let mut probs = vec![0.1_f32, 0.1, 0.1, 0.7];
+        apply_top_k(&mut probs, 3);
+        let nonzero = probs.iter().filter(|&&p| p > 0.0).count();
+        assert_eq!(nonzero, 3, "top-k must include ties up to k: {probs:?}");
+        let sum: f32 = probs.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-5);
     }
 
     #[test]

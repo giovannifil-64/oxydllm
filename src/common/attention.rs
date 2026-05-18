@@ -611,8 +611,15 @@ impl Attention {
                 seg.num_tokens,
             )?;
 
+            // Metal SDPA "full" mode (q_seq > 1) corrupts the last-position output for
+            // sequences past ~16 tokens, producing NaN that propagates through the residual
+            // stream. Reproduced on Qwen2.5 GGUF: 36-token prefill → NaN at layer 8, then all
+            // subsequent layers; 16-token warmup prefill → NaN at layers 26-27. The vector
+            // path (q_seq == 1, decode) is unaffected.route prefill through the standard
+            // attention fallback.
             #[cfg(feature = "metal")]
             let use_seg_sdpa = sdpa_base_ok
+                && seg.num_tokens == 1
                 && !(seg.num_tokens > 1 && kv_lengths[i] > seg.num_tokens)
                 && (self.attn_softcap.is_none() || seg.num_tokens <= 8);
             #[cfg(not(feature = "metal"))]

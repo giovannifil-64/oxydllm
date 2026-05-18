@@ -12,12 +12,7 @@ pub(super) async fn health() -> impl IntoResponse {
 }
 
 pub(super) async fn list_models(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let mgr = state.manager.lock().await;
-    let models_dir = mgr.models_dir().clone();
-    let registry = mgr.list_registry().clone();
-    drop(mgr);
-
-    let discovered = crate::models::loader::discover_models(&models_dir);
+    let (discovered, registry) = state.manager.lock().await.discovered_with_registry();
 
     let data: Vec<serde_json::Value> = discovered
         .iter()
@@ -53,12 +48,7 @@ pub(super) async fn get_model(
     State(state): State<Arc<AppState>>,
     AxumPath(model_id): AxumPath<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    let mgr = state.manager.lock().await;
-    let models_dir = mgr.models_dir().clone();
-    let registry = mgr.list_registry().clone();
-    drop(mgr);
-
-    let discovered = crate::models::loader::discover_models(&models_dir);
+    let (discovered, registry) = state.manager.lock().await.discovered_with_registry();
     let model = discovered.iter().find(|m| m.id == model_id);
 
     match model {

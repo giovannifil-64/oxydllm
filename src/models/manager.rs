@@ -85,7 +85,15 @@ pub struct ModelManager {
     require_gpu: bool,
     max_num_seqs: Option<usize>,
     max_queued_requests: usize,
+    discovery_cache: Option<DiscoveryCache>,
 }
+
+struct DiscoveryCache {
+    discovered: Vec<loader::DiscoveredModel>,
+    refreshed_at: Instant,
+}
+
+const DISCOVERY_CACHE_TTL: Duration = Duration::from_secs(5);
 
 pub type SharedModelManager = Arc<tokio::sync::Mutex<ModelManager>>;
 
@@ -248,11 +256,8 @@ impl ModelManager {
             require_gpu,
             max_num_seqs,
             max_queued_requests,
+            discovery_cache: None,
         }
-    }
-
-    pub fn models_dir(&self) -> &PathBuf {
-        &self.models_dir
     }
 
     pub fn memory_budget_bytes(&self) -> Option<usize> {
@@ -300,8 +305,49 @@ impl ModelManager {
             .collect()
     }
 
-    pub fn list_registry(&self) -> &BTreeMap<String, RegistryEntry> {
-        &self.registry
+    /// Atomic `(discovered, registry)` snapshot.
+    ///
+    /// Replaces the previous pattern in `handlers.rs` of "lock manager, clone
+    /// registry, drop lock, then `discover_models(...)`" which had two issues:
+    ///   1. **L5** — every `GET /v1/models{,/:id}` re-scanned the filesystem.
+    ///   2. **L6** — between the lock release and the filesystem scan, a
+    ///      registry mutation (model load/unload) could produce an inconsistent
+    ///      response (e.g. a discovered model with `size_bytes: 0`).
+    ///
+    /// Both reads happen under the same manager lock acquisition, and the
+    /// discovery itself is cached for `DISCOVERY_CACHE_TTL` to absorb bursts.
+    /// Manual `oxydllm rm` or operator drops of new model directories are
+    /// reflected within the TTL.
+    pub fn discovered_with_registry(
+        &mut self,
+    ) -> (
+        Vec<loader::DiscoveredModel>,
+        BTreeMap<String, RegistryEntry>,
+    ) {
+        let fresh = self
+            .discovery_cache
+            .as_ref()
+            .is_some_and(|c| c.refreshed_at.elapsed() < DISCOVERY_CACHE_TTL);
+        if !fresh {
+            self.discovery_cache = Some(DiscoveryCache {
+                discovered: loader::discover_models(&self.models_dir),
+                refreshed_at: Instant::now(),
+            });
+        }
+        let discovered = self.discovery_cache.as_ref().unwrap().discovered.clone();
+        (discovered, self.registry.clone())
+    }
+
+    #[cfg(test)]
+    pub fn discovery_cache_age(&self) -> Option<Duration> {
+        self.discovery_cache
+            .as_ref()
+            .map(|c| c.refreshed_at.elapsed())
+    }
+
+    #[cfg(test)]
+    pub fn invalidate_discovery_cache(&mut self) {
+        self.discovery_cache = None;
     }
 
     /// Returns the best pre-load size estimate for eviction decisions.
@@ -1184,7 +1230,7 @@ mod tests {
 
         let mgr = build_test_manager(&tmp, Duration::from_secs(60), None);
         assert!(
-            mgr.list_registry().get("ghost-model").is_none(),
+            mgr.registry.get("ghost-model").is_none(),
             "stale registry entry should be pruned on startup"
         );
     }
@@ -1203,10 +1249,7 @@ mod tests {
             500_000,
         );
 
-        let entry = mgr
-            .list_registry()
-            .get("my-model")
-            .expect("entry must exist");
+        let entry = mgr.registry.get("my-model").expect("entry must exist");
         assert_eq!(entry.architecture, "LlamaForCausalLM");
         assert_eq!(entry.vocab_size, 32000);
         assert_eq!(entry.size_bytes, 1_000_000);
@@ -1216,6 +1259,42 @@ mod tests {
             on_disk.contains_key("my-model"),
             "entry must be written to disk"
         );
+    }
+
+    #[test]
+    fn discovery_cache_serves_repeated_reads_without_rescan() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut mgr = build_test_manager(&tmp, Duration::from_secs(60), None);
+
+        let (_, _) = mgr.discovered_with_registry();
+        let age_after_first = mgr.discovery_cache_age().expect("cache must be populated");
+
+        std::thread::sleep(Duration::from_millis(20));
+        let (_, _) = mgr.discovered_with_registry();
+        let age_after_second = mgr.discovery_cache_age().expect("cache still populated");
+        assert!(
+            age_after_second >= age_after_first,
+            "cached entry should not be refreshed within TTL: first={age_after_first:?} second={age_after_second:?}"
+        );
+
+        mgr.invalidate_discovery_cache();
+        assert!(mgr.discovery_cache_age().is_none());
+        let (_, _) = mgr.discovered_with_registry();
+        assert!(
+            mgr.discovery_cache_age().is_some(),
+            "cache must be re-populated after invalidation"
+        );
+    }
+
+    #[test]
+    fn discovery_cache_snapshot_is_consistent_with_registry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut mgr = build_test_manager(&tmp, Duration::from_secs(60), None);
+
+        mgr.update_registry("registered", "LlamaForCausalLM", 32000, 32, 1_000, 500);
+        let (_, registry) = mgr.discovered_with_registry();
+        assert!(registry.contains_key("registered"));
+        assert_eq!(registry["registered"].size_bytes, 1_000);
     }
 
     #[test]

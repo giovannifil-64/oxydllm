@@ -150,6 +150,324 @@ fn pick_prefill_chunk_split(uncached_lens: &[usize], total_prefill_tokens: usize
     None
 }
 
+// ──────────────────────────────────────────────────────────────────────────────
+// `step()` helpers — pure refactor, no behavior change.
+//
+// Each helper owns one phase of a step: prefix-cache resolution, batch
+// assembly, the forward pass, and per-sequence sampling. `step()` itself stays
+// a short orchestrator that's easy to follow top-to-bottom.
+// ──────────────────────────────────────────────────────────────────────────────
+
+struct PrefillInfo {
+    seq_id: SequenceId,
+    num_cached_tokens: usize,
+    num_cached_blocks: usize,
+    num_full_blocks_total: usize,
+    uncached_len: usize,
+    input_tokens: Vec<u32>,
+}
+
+struct BatchInput {
+    all_token_ids: Vec<u32>,
+    all_positions: Vec<u32>,
+    token_counts: Vec<usize>,
+    total_prefill_tokens: usize,
+}
+
+struct StopRules<'a> {
+    token_ids: &'a HashSet<u32>,
+    sequences: &'a [Vec<u32>],
+}
+
+impl StopRules<'_> {
+    fn matches(&self, token: u32, seq_extra_ids: &[u32], all_tokens: &[u32]) -> bool {
+        self.token_ids.contains(&token)
+            || seq_extra_ids.contains(&token)
+            || has_matching_stop_sequence(all_tokens, self.sequences)
+    }
+}
+
+struct PrefixRegistry<'a> {
+    cache: &'a mut PrefixCache,
+    allocators: &'a [SharedBlockAllocator],
+    block_size: usize,
+}
+
+impl PrefixRegistry<'_> {
+    fn register(
+        &mut self,
+        all_tokens: &[u32],
+        num_cached_blocks: usize,
+        new_block_ids: &[Vec<usize>],
+    ) {
+        self.cache.register(
+            all_tokens,
+            num_cached_blocks,
+            new_block_ids,
+            self.allocators,
+            self.block_size,
+        );
+    }
+}
+
+fn plan_prefill_inputs(
+    scheduler: &mut Scheduler,
+    prefix_cache: &mut PrefixCache,
+    prefill_ids: &[SequenceId],
+    block_size: usize,
+) -> Vec<PrefillInfo> {
+    let mut infos = Vec::with_capacity(prefill_ids.len());
+    for &seq_id in prefill_ids {
+        let seq = scheduler.get_running_mut(seq_id).unwrap();
+        let (all_tokens, _, caches) = seq.tokens_and_caches();
+        let seq_len = all_tokens.len();
+
+        let (mut num_cached_blocks, matched_block_ids) =
+            prefix_cache.lookup(all_tokens, block_size);
+        let max_cacheable = (seq_len.saturating_sub(1)) / block_size;
+        if num_cached_blocks > max_cacheable {
+            num_cached_blocks = max_cacheable;
+        }
+        let num_cached_tokens = num_cached_blocks * block_size;
+
+        if num_cached_blocks > 0 {
+            for (layer_idx, cache) in caches.iter_mut().enumerate() {
+                for layer_block_ids in matched_block_ids[..num_cached_blocks].iter() {
+                    if let Some(&bid) = layer_block_ids.get(layer_idx) {
+                        cache.prepopulate_block(bid);
+                    }
+                }
+            }
+            for cache in caches.iter_mut() {
+                cache.set_num_tokens(num_cached_tokens);
+            }
+            tracing::debug!(
+                seq_id,
+                cached_blocks = num_cached_blocks,
+                total_blocks = seq_len / block_size,
+                skipped_tokens = num_cached_tokens,
+                "prefix cache hit"
+            );
+        }
+
+        let uncached_len = seq_len - num_cached_tokens;
+        let input_tokens = all_tokens[num_cached_tokens..].to_vec();
+        let num_full_blocks_total = seq_len / block_size;
+
+        infos.push(PrefillInfo {
+            seq_id,
+            num_cached_tokens,
+            num_cached_blocks,
+            num_full_blocks_total,
+            uncached_len,
+            input_tokens,
+        });
+    }
+    infos
+}
+
+fn build_batch_input(
+    scheduler: &mut Scheduler,
+    prefill_infos: &[PrefillInfo],
+    decode_ids: &[SequenceId],
+) -> BatchInput {
+    let mut all_token_ids: Vec<u32> = Vec::new();
+    let mut all_positions: Vec<u32> = Vec::new();
+    let mut token_counts: Vec<usize> = Vec::new();
+
+    for info in prefill_infos {
+        all_token_ids.extend_from_slice(&info.input_tokens);
+        for local_idx in 0..info.uncached_len {
+            all_positions.push((info.num_cached_tokens + local_idx) as u32);
+        }
+        token_counts.push(info.uncached_len);
+    }
+
+    let total_prefill_tokens = all_token_ids.len();
+
+    for &seq_id in decode_ids {
+        let seq = scheduler.get_running_mut(seq_id).unwrap();
+        all_token_ids.push(*seq.all_tokens.last().unwrap());
+        all_positions.push(seq.num_processed_tokens as u32);
+        token_counts.push(1);
+    }
+
+    BatchInput {
+        all_token_ids,
+        all_positions,
+        token_counts,
+        total_prefill_tokens,
+    }
+}
+
+fn run_forward_pass(
+    model: &dyn BatchModel,
+    device: &Device,
+    scheduler: &mut Scheduler,
+    prefill_ids: &[SequenceId],
+    decode_ids: &[SequenceId],
+    prefill_uncached_lens: &[usize],
+    batch: BatchInput,
+) -> Result<Tensor> {
+    let BatchInput {
+        all_token_ids,
+        all_positions,
+        token_counts,
+        total_prefill_tokens,
+    } = batch;
+    let total_tokens = all_token_ids.len();
+    let split_seq_idx = pick_prefill_chunk_split(prefill_uncached_lens, total_prefill_tokens);
+
+    let mut cache_guard = CacheRestoreGuard::new(scheduler, prefill_ids, decode_ids);
+    let mut cache_slices = cache_guard.cache_slices();
+
+    let combined_result: Result<Tensor> = (|| {
+        let logits = if let Some(split) = split_seq_idx {
+            let prefill_a_tokens: usize = prefill_uncached_lens[..split].iter().sum();
+            let chunk_b_tokens = total_tokens - prefill_a_tokens;
+
+            let input_a = Tensor::from_vec(
+                all_token_ids[..prefill_a_tokens].to_vec(),
+                (1, prefill_a_tokens),
+                device,
+            )?;
+            let positions_a = Tensor::from_vec(
+                all_positions[..prefill_a_tokens].to_vec(),
+                (prefill_a_tokens,),
+                device,
+            )?;
+            let input_b = Tensor::from_vec(
+                all_token_ids[prefill_a_tokens..].to_vec(),
+                (1, chunk_b_tokens),
+                device,
+            )?;
+            let positions_b = Tensor::from_vec(
+                all_positions[prefill_a_tokens..].to_vec(),
+                (chunk_b_tokens,),
+                device,
+            )?;
+
+            let counts_a: Vec<usize> = token_counts[..split].to_vec();
+            let counts_b: Vec<usize> = token_counts[split..].to_vec();
+
+            let (caches_a, caches_b) = cache_slices.split_at_mut(split);
+
+            let logits_a = model.forward_batch(&input_a, &positions_a, caches_a, &counts_a)?;
+            let logits_b = model.forward_batch(&input_b, &positions_b, caches_b, &counts_b)?;
+
+            Tensor::cat(&[&logits_a, &logits_b], 1)?
+        } else {
+            let input = Tensor::from_vec(all_token_ids, (1, total_tokens), device)?;
+            let position_ids = Tensor::from_vec(all_positions, (total_tokens,), device)?;
+            model.forward_batch(&input, &position_ids, &mut cache_slices, &token_counts)?
+        };
+        flush_caches(&mut cache_slices)?;
+        Ok(logits)
+    })();
+
+    drop(cache_slices);
+    cache_guard.restore();
+    combined_result?.squeeze(0)
+}
+
+fn sample_prefill_outputs(
+    scheduler: &mut Scheduler,
+    prefix: &mut PrefixRegistry,
+    prefill_infos: &[PrefillInfo],
+    batch_logits: &Tensor,
+    stop: &StopRules,
+    new_tokens: &mut Vec<NewToken>,
+) -> Result<()> {
+    let mut logit_offset = 0usize;
+    for info in prefill_infos {
+        let last_idx = logit_offset + info.uncached_len - 1;
+        let seq_logits = batch_logits.get(last_idx)?;
+        logit_offset += info.uncached_len;
+
+        let sample_out = {
+            let seq = scheduler.get_running(info.seq_id).unwrap();
+            sampling::sample(
+                &seq_logits,
+                &seq.sampling_params,
+                &seq.all_tokens,
+                Some(&seq.token_counts),
+            )?
+        };
+        let next_token = sample_out.token;
+        let emit = {
+            let seq = scheduler.get_running_mut(info.seq_id).unwrap();
+            seq.append_token(next_token);
+            seq.num_processed_tokens = seq.all_tokens.len() - 1;
+            seq.phase = SequencePhase::Decode;
+            let is_stop = stop.matches(next_token, &seq.extra_stop_token_ids, &seq.all_tokens);
+            seq.apply_token(next_token, is_stop)
+        };
+
+        if emit {
+            new_tokens.push(NewToken {
+                seq_id: info.seq_id,
+                token: next_token,
+                logprob: sample_out.logprob,
+                top_logprobs: sample_out.top_logprobs,
+            });
+        }
+
+        if info.num_full_blocks_total > info.num_cached_blocks {
+            let new_block_ids: Vec<Vec<usize>> = {
+                let seq = scheduler.get_running_mut(info.seq_id).unwrap();
+                (info.num_cached_blocks..info.num_full_blocks_total)
+                    .map(|block_idx| {
+                        seq.caches
+                            .iter()
+                            .filter_map(|c| c.block_id_at(block_idx))
+                            .collect::<Vec<usize>>()
+                    })
+                    .collect()
+            };
+            let seq = scheduler.get_running(info.seq_id).unwrap();
+            prefix.register(&seq.all_tokens, info.num_cached_blocks, &new_block_ids);
+        }
+    }
+    Ok(())
+}
+
+fn sample_decode_outputs(
+    scheduler: &mut Scheduler,
+    decode_ids: &[SequenceId],
+    batch_logits: &Tensor,
+    total_prefill_tokens: usize,
+    stop: &StopRules,
+    new_tokens: &mut Vec<NewToken>,
+) -> Result<()> {
+    for (i, &seq_id) in decode_ids.iter().enumerate() {
+        let seq_logits = batch_logits.get(total_prefill_tokens + i)?;
+        let sample_out = {
+            let seq = scheduler.get_running(seq_id).unwrap();
+            sampling::sample(
+                &seq_logits,
+                &seq.sampling_params,
+                &seq.all_tokens,
+                Some(&seq.token_counts),
+            )?
+        };
+        let next_token = sample_out.token;
+        let seq = scheduler.get_running_mut(seq_id).unwrap();
+        seq.append_token(next_token);
+        seq.num_processed_tokens = seq.all_tokens.len() - 1;
+        let is_stop = stop.matches(next_token, &seq.extra_stop_token_ids, &seq.all_tokens);
+
+        if seq.apply_token(next_token, is_stop) {
+            new_tokens.push(NewToken {
+                seq_id: seq.id,
+                token: next_token,
+                logprob: sample_out.logprob,
+                top_logprobs: sample_out.top_logprobs,
+            });
+        }
+    }
+    Ok(())
+}
+
 impl Engine {
     pub fn new_with_stop_controls(
         model: Box<dyn BatchModel>,
@@ -236,11 +554,9 @@ impl Engine {
         let block_size = *block_size;
 
         let output = scheduler.schedule(Some(prefix_cache));
-        let mut new_tokens = Vec::new();
 
         let mut prefill_ids: Vec<SequenceId> = Vec::new();
         let mut decode_ids: Vec<SequenceId> = Vec::new();
-
         for sched_seq in &output.scheduled {
             match sched_seq.phase {
                 SequencePhase::Prefill => prefill_ids.push(sched_seq.id),
@@ -248,91 +564,13 @@ impl Engine {
             }
         }
 
-        struct PrefillInfo {
-            seq_id: SequenceId,
-            num_cached_tokens: usize,
-            num_cached_blocks: usize,
-            num_full_blocks_total: usize,
-            uncached_len: usize,
-            input_tokens: Vec<u32>,
-        }
+        let prefill_infos = plan_prefill_inputs(scheduler, prefix_cache, &prefill_ids, block_size);
+        let batch = build_batch_input(scheduler, &prefill_infos, &decode_ids);
 
-        let mut prefill_infos: Vec<PrefillInfo> = Vec::with_capacity(prefill_ids.len());
-
-        for &seq_id in &prefill_ids {
-            let seq = scheduler.get_running_mut(seq_id).unwrap();
-            let (all_tokens, _, caches) = seq.tokens_and_caches();
-            let seq_len = all_tokens.len();
-
-            let (mut num_cached_blocks, matched_block_ids) =
-                prefix_cache.lookup(all_tokens, block_size);
-            let max_cacheable = (seq_len.saturating_sub(1)) / block_size;
-            if num_cached_blocks > max_cacheable {
-                num_cached_blocks = max_cacheable;
-            }
-            let num_cached_tokens = num_cached_blocks * block_size;
-
-            if num_cached_blocks > 0 {
-                for (layer_idx, cache) in caches.iter_mut().enumerate() {
-                    for layer_block_ids in matched_block_ids[..num_cached_blocks].iter() {
-                        if let Some(&bid) = layer_block_ids.get(layer_idx) {
-                            cache.prepopulate_block(bid);
-                        }
-                    }
-                }
-                for cache in caches.iter_mut() {
-                    cache.set_num_tokens(num_cached_tokens);
-                }
-                tracing::debug!(
-                    seq_id,
-                    cached_blocks = num_cached_blocks,
-                    total_blocks = seq_len / block_size,
-                    skipped_tokens = num_cached_tokens,
-                    "prefix cache hit"
-                );
-            }
-
-            let uncached_len = seq_len - num_cached_tokens;
-            let input_tokens = all_tokens[num_cached_tokens..].to_vec();
-            let num_full_blocks_total = seq_len / block_size;
-
-            prefill_infos.push(PrefillInfo {
-                seq_id,
-                num_cached_tokens,
-                num_cached_blocks,
-                num_full_blocks_total,
-                uncached_len,
-                input_tokens,
-            });
-        }
-
-        let mut all_token_ids: Vec<u32> = Vec::new();
-        let mut all_positions: Vec<u32> = Vec::new();
-        let mut token_counts: Vec<usize> = Vec::new();
-
-        for info in &prefill_infos {
-            all_token_ids.extend_from_slice(&info.input_tokens);
-            for local_idx in 0..info.uncached_len {
-                all_positions.push((info.num_cached_tokens + local_idx) as u32);
-            }
-            token_counts.push(info.uncached_len);
-        }
-
-        let total_prefill_tokens = all_token_ids.len();
-
-        for &seq_id in &decode_ids {
-            let seq = scheduler.get_running_mut(seq_id).unwrap();
-            all_token_ids.push(*seq.all_tokens.last().unwrap());
-            all_positions.push(seq.num_processed_tokens as u32);
-            token_counts.push(1);
-        }
-
-        let total_tokens = all_token_ids.len();
-
-        if total_tokens == 0 {
+        if batch.all_token_ids.is_empty() {
             let completed = scheduler.retire_finished();
             return Ok(StepOutput {
-                new_tokens,
+                new_tokens: Vec::new(),
                 completed,
                 prefix_cache_hits: 0,
                 prefix_cache_misses: 0,
@@ -341,156 +579,44 @@ impl Engine {
 
         let prefill_uncached_lens: Vec<usize> =
             prefill_infos.iter().map(|i| i.uncached_len).collect();
-        let split_seq_idx = pick_prefill_chunk_split(&prefill_uncached_lens, total_prefill_tokens);
+        let total_prefill_tokens = batch.total_prefill_tokens;
 
-        // Ensure sequence caches are restored even if forward_batch panics.
-        let logits = {
-            let mut cache_guard = CacheRestoreGuard::new(scheduler, &prefill_ids, &decode_ids);
-            let mut cache_slices = cache_guard.cache_slices();
+        let batch_logits = run_forward_pass(
+            model.as_ref(),
+            device,
+            scheduler,
+            &prefill_ids,
+            &decode_ids,
+            &prefill_uncached_lens,
+            batch,
+        )?;
 
-            let combined_result: Result<Tensor> = (|| {
-                let logits = if let Some(split) = split_seq_idx {
-                    let prefill_a_tokens: usize = prefill_uncached_lens[..split].iter().sum();
-                    let chunk_b_tokens = total_tokens - prefill_a_tokens;
-
-                    let input_a = Tensor::from_vec(
-                        all_token_ids[..prefill_a_tokens].to_vec(),
-                        (1, prefill_a_tokens),
-                        device,
-                    )?;
-                    let positions_a = Tensor::from_vec(
-                        all_positions[..prefill_a_tokens].to_vec(),
-                        (prefill_a_tokens,),
-                        device,
-                    )?;
-                    let input_b = Tensor::from_vec(
-                        all_token_ids[prefill_a_tokens..].to_vec(),
-                        (1, chunk_b_tokens),
-                        device,
-                    )?;
-                    let positions_b = Tensor::from_vec(
-                        all_positions[prefill_a_tokens..].to_vec(),
-                        (chunk_b_tokens,),
-                        device,
-                    )?;
-
-                    let counts_a: Vec<usize> = token_counts[..split].to_vec();
-                    let counts_b: Vec<usize> = token_counts[split..].to_vec();
-
-                    // cache_slices is laid out [prefill_caches..., decode_caches...]
-                    // so split at the prefill seq index gives the right grouping.
-                    let (caches_a, caches_b) = cache_slices.split_at_mut(split);
-
-                    let logits_a =
-                        model.forward_batch(&input_a, &positions_a, caches_a, &counts_a)?;
-                    let logits_b =
-                        model.forward_batch(&input_b, &positions_b, caches_b, &counts_b)?;
-
-                    // Both logits have shape [1, n_chunk, vocab]; concat along seq.
-                    Tensor::cat(&[&logits_a, &logits_b], 1)?
-                } else {
-                    let input = Tensor::from_vec(all_token_ids, (1, total_tokens), device)?;
-                    let position_ids = Tensor::from_vec(all_positions, (total_tokens,), device)?;
-                    model.forward_batch(&input, &position_ids, &mut cache_slices, &token_counts)?
-                };
-                flush_caches(&mut cache_slices)?;
-                Ok(logits)
-            })();
-
-            drop(cache_slices);
-            cache_guard.restore();
-            combined_result?
+        let stop = StopRules {
+            token_ids: stop_token_ids,
+            sequences: stop_token_sequences,
         };
-
-        let batch_logits = logits.squeeze(0)?;
-
-        let mut logit_offset = 0usize;
-        for info in &prefill_infos {
-            let last_idx = logit_offset + info.uncached_len - 1;
-            let seq_logits = batch_logits.get(last_idx)?;
-            logit_offset += info.uncached_len;
-
-            let sample_out = {
-                let seq = scheduler.get_running(info.seq_id).unwrap();
-                sampling::sample(
-                    &seq_logits,
-                    &seq.sampling_params,
-                    &seq.all_tokens,
-                    Some(&seq.token_counts),
-                )?
-            };
-            let next_token = sample_out.token;
-            let emit = {
-                let seq = scheduler.get_running_mut(info.seq_id).unwrap();
-                seq.append_token(next_token);
-                seq.num_processed_tokens = seq.all_tokens.len() - 1;
-                seq.phase = SequencePhase::Decode;
-                let is_stop = stop_token_ids.contains(&next_token)
-                    || seq.extra_stop_token_ids.contains(&next_token)
-                    || has_matching_stop_sequence(&seq.all_tokens, stop_token_sequences);
-                seq.apply_token(next_token, is_stop)
-            };
-
-            if emit {
-                new_tokens.push(NewToken {
-                    seq_id: info.seq_id,
-                    token: next_token,
-                    logprob: sample_out.logprob,
-                    top_logprobs: sample_out.top_logprobs,
-                });
-            }
-
-            if info.num_full_blocks_total > info.num_cached_blocks {
-                let new_block_ids: Vec<Vec<usize>> = {
-                    let seq = scheduler.get_running_mut(info.seq_id).unwrap();
-                    (info.num_cached_blocks..info.num_full_blocks_total)
-                        .map(|block_idx| {
-                            seq.caches
-                                .iter()
-                                .filter_map(|c| c.block_id_at(block_idx))
-                                .collect::<Vec<usize>>()
-                        })
-                        .collect()
-                };
-                let seq = scheduler.get_running(info.seq_id).unwrap();
-                prefix_cache.register(
-                    &seq.all_tokens,
-                    info.num_cached_blocks,
-                    &new_block_ids,
-                    allocators,
-                    block_size,
-                );
-            }
-        }
-
-        for (i, &seq_id) in decode_ids.iter().enumerate() {
-            let seq_logits = batch_logits.get(total_prefill_tokens + i)?;
-            let sample_out = {
-                let seq = scheduler.get_running(seq_id).unwrap();
-                sampling::sample(
-                    &seq_logits,
-                    &seq.sampling_params,
-                    &seq.all_tokens,
-                    Some(&seq.token_counts),
-                )?
-            };
-            let next_token = sample_out.token;
-            let seq = scheduler.get_running_mut(seq_id).unwrap();
-            seq.append_token(next_token);
-            seq.num_processed_tokens = seq.all_tokens.len() - 1;
-            let is_stop = stop_token_ids.contains(&next_token)
-                || seq.extra_stop_token_ids.contains(&next_token)
-                || has_matching_stop_sequence(&seq.all_tokens, stop_token_sequences);
-
-            if seq.apply_token(next_token, is_stop) {
-                new_tokens.push(NewToken {
-                    seq_id: seq.id,
-                    token: next_token,
-                    logprob: sample_out.logprob,
-                    top_logprobs: sample_out.top_logprobs,
-                });
-            }
-        }
+        let mut prefix = PrefixRegistry {
+            cache: prefix_cache,
+            allocators,
+            block_size,
+        };
+        let mut new_tokens = Vec::new();
+        sample_prefill_outputs(
+            scheduler,
+            &mut prefix,
+            &prefill_infos,
+            &batch_logits,
+            &stop,
+            &mut new_tokens,
+        )?;
+        sample_decode_outputs(
+            scheduler,
+            &decode_ids,
+            &batch_logits,
+            total_prefill_tokens,
+            &stop,
+            &mut new_tokens,
+        )?;
 
         let completed = scheduler.retire_finished();
         let prefix_cache_hits = prefill_infos

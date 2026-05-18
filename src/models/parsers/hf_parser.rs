@@ -98,6 +98,15 @@ pub fn parse(config_path: &str) -> Result<StandardTransformerConfig> {
         attention_scale = Some(1.0);
     }
 
+    // `tie_word_embeddings` controls whether `lm_head` is the transpose of the
+    // embedding matrix or a separate weight. Several official Gemma checkpoints
+    // (gemma-2b-it, gemma-2-2b-it, gemma-3-1b-it, ...) ship a `config.json`
+    // that omits the field entirely, so we default to `true` for the Gemma
+    // family — that's the canonical setting for those weights — and `false`
+    // otherwise. The asymmetric-risk scenario (defaulting tied when the file
+    // also ships an explicit `lm_head.weight`) is caught at load time in
+    // `loader::load_standard_safetensors`, which warns loudly when both are
+    // present.
     let tie_word_embeddings = v["tie_word_embeddings"].as_bool().unwrap_or(
         arch == "GemmaForCausalLM"
             || arch == "Gemma2ForCausalLM"
@@ -562,6 +571,66 @@ mod tests {
 
         assert_eq!(cfg.sliding_window, Some(4096));
         assert!(cfg.per_layer_sliding_windows.is_none());
+    }
+
+    #[test]
+    fn missing_tie_word_embeddings_on_gemma_defaults_to_true() {
+        // Official Gemma checkpoints (gemma-2b-it, gemma-2-2b-it, gemma-3-1b-it)
+        // ship a config.json that omits this field; the parser must default to
+        // `true` for the Gemma family to load them. The asymmetric-risk scenario
+        // (default `true` paired with an explicit `lm_head.weight` in the file)
+        // is detected separately in `loader::load_standard_safetensors`.
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("config.json");
+
+        let config = json!({
+            "architectures": ["Gemma2ForCausalLM"],
+            "hidden_size": 2048,
+            "num_hidden_layers": 4,
+            "num_attention_heads": 16,
+            "vocab_size": 256000,
+        });
+        fs::write(&config_path, serde_json::to_string_pretty(&config).unwrap()).unwrap();
+
+        let cfg = parse(config_path.to_string_lossy().as_ref()).unwrap();
+        assert!(cfg.tie_word_embeddings);
+    }
+
+    #[test]
+    fn missing_tie_word_embeddings_on_non_gemma_defaults_to_false() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("config.json");
+
+        let config = json!({
+            "architectures": ["LlamaForCausalLM"],
+            "hidden_size": 2048,
+            "num_hidden_layers": 4,
+            "num_attention_heads": 16,
+            "vocab_size": 32000,
+        });
+        fs::write(&config_path, serde_json::to_string_pretty(&config).unwrap()).unwrap();
+
+        let cfg = parse(config_path.to_string_lossy().as_ref()).unwrap();
+        assert!(!cfg.tie_word_embeddings);
+    }
+
+    #[test]
+    fn explicit_tie_word_embeddings_is_respected_on_gemma() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("config.json");
+
+        let config = json!({
+            "architectures": ["GemmaForCausalLM"],
+            "hidden_size": 2048,
+            "num_hidden_layers": 4,
+            "num_attention_heads": 16,
+            "vocab_size": 256000,
+            "tie_word_embeddings": false
+        });
+        fs::write(&config_path, serde_json::to_string_pretty(&config).unwrap()).unwrap();
+
+        let cfg = parse(config_path.to_string_lossy().as_ref()).unwrap();
+        assert!(!cfg.tie_word_embeddings);
     }
 
     #[test]

@@ -159,7 +159,12 @@ pub fn sample(
             apply_min_p(&mut probs_vec, params.min_p);
         }
         if params.top_k > 0 {
-            apply_top_k(&mut probs_vec, params.top_k);
+            apply_top_k(
+                &mut probs_vec,
+                params.top_k,
+                params.seed,
+                prev_tokens.len() as u64,
+            );
         }
         if params.top_p < 1.0 {
             apply_top_p(&mut probs_vec, params.top_p);
@@ -286,7 +291,10 @@ fn apply_frequency_presence_penalty_with_counts(
 thread_local! {
     static F32_SCRATCH: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
     static IDX_SCRATCH: std::cell::RefCell<Vec<(usize, f32)>> = const { std::cell::RefCell::new(Vec::new()) };
+    static TIE_IDX_SCRATCH: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
 }
+
+const TIE_BREAK_NAMESPACE: u64 = 0xa55a_a55a_1234_5678;
 
 fn renormalize_in_place(probs: &mut [f32], sum: f32) {
     if sum > 0.0 {
@@ -310,7 +318,7 @@ fn apply_min_p(probs: &mut [f32], min_p: f32) {
     renormalize_in_place(probs, sum);
 }
 
-fn apply_top_k(probs: &mut [f32], k: usize) {
+fn apply_top_k(probs: &mut [f32], k: usize, seed: Option<u64>, step: u64) {
     if k >= probs.len() {
         return;
     }
@@ -326,20 +334,69 @@ fn apply_top_k(probs: &mut [f32], k: usize) {
         let count_strict = probs.iter().filter(|&&p| p > threshold).count();
         let need_ties = k.saturating_sub(count_strict);
 
-        let mut sum = 0.0;
-        let mut added_ties = 0;
-        for p in probs.iter_mut() {
-            if *p > threshold {
-                sum += *p;
-            } else if added_ties < need_ties && *p == threshold && *p > 0.0 {
-                added_ties += 1;
-                sum += *p;
-            } else {
-                *p = 0.0;
+        if need_ties == 0 || threshold == 0.0 {
+            let mut sum = 0.0;
+            for p in probs.iter_mut() {
+                if *p > threshold {
+                    sum += *p;
+                } else {
+                    *p = 0.0;
+                }
             }
+            renormalize_in_place(probs, sum);
+            return;
         }
-        renormalize_in_place(probs, sum);
+
+        TIE_IDX_SCRATCH.with(|t| {
+            let mut tied = t.borrow_mut();
+            tied.clear();
+            for (i, &p) in probs.iter().enumerate() {
+                if p == threshold && p > 0.0 {
+                    tied.push(i);
+                }
+            }
+
+            if tied.len() <= need_ties {
+                // Trivial case: every tied position is kept anyway.
+                let mut sum = 0.0;
+                for p in probs.iter_mut() {
+                    if *p >= threshold && *p > 0.0 {
+                        sum += *p;
+                    } else {
+                        *p = 0.0;
+                    }
+                }
+                renormalize_in_place(probs, sum);
+                return;
+            }
+
+            let base = tie_break_seed(seed, step);
+            tied.sort_unstable_by_key(|&i| {
+                std::cmp::Reverse(splitmix64_u64(base.wrapping_add(i as u64)))
+            });
+            tied.truncate(need_ties);
+            tied.sort_unstable();
+
+            let mut sum = 0.0;
+            let mut tie_cursor = 0usize;
+            for (i, p) in probs.iter_mut().enumerate() {
+                if *p > threshold {
+                    sum += *p;
+                } else if tie_cursor < tied.len() && tied[tie_cursor] == i {
+                    tie_cursor += 1;
+                    sum += *p;
+                } else {
+                    *p = 0.0;
+                }
+            }
+            renormalize_in_place(probs, sum);
+        });
     });
+}
+
+fn tie_break_seed(seed: Option<u64>, step: u64) -> u64 {
+    let base = seed.unwrap_or_else(thread_rand_u64);
+    base.wrapping_add(step) ^ TIE_BREAK_NAMESPACE
 }
 
 fn apply_top_p(probs: &mut [f32], top_p: f32) {
@@ -391,36 +448,44 @@ fn categorical_sample(probs: &[f32], seed: Option<u64>, step: u64) -> Result<u32
     candle_core::bail!("sampling distribution is empty after filtering (all probs zero)")
 }
 
-fn splitmix64_f32(x: u64) -> f32 {
+fn splitmix64_u64(x: u64) -> u64 {
     let mut z = x.wrapping_add(0x9e3779b97f4a7c15);
     z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
-    z = z ^ (z >> 31);
-    (z >> 40) as f32 / ((1u64 << 24) as f32)
+    z ^ (z >> 31)
 }
 
-fn thread_rand_f32() -> f32 {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    use std::time::SystemTime;
+fn splitmix64_f32(x: u64) -> f32 {
+    (splitmix64_u64(x) >> 40) as f32 / ((1u64 << 24) as f32)
+}
 
-    thread_local! {
-        static STATE: std::cell::Cell<u64> = std::cell::Cell::new({
-            let mut hasher = DefaultHasher::new();
-            SystemTime::now().hash(&mut hasher);
-            std::thread::current().id().hash(&mut hasher);
-            let s = hasher.finish();
-            if s == 0 { 1 } else { s }
-        });
-    }
-    STATE.with(|s| {
+thread_local! {
+    static THREAD_RNG_STATE: std::cell::Cell<u64> = std::cell::Cell::new({
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        use std::time::SystemTime;
+        let mut hasher = DefaultHasher::new();
+        SystemTime::now().hash(&mut hasher);
+        std::thread::current().id().hash(&mut hasher);
+        let s = hasher.finish();
+        if s == 0 { 1 } else { s }
+    });
+}
+
+fn thread_rand_u64() -> u64 {
+    THREAD_RNG_STATE.with(|s| {
         let mut x = s.get();
+        // xorshift64 — fine here; we don't need cryptographic quality.
         x ^= x << 13;
         x ^= x >> 7;
         x ^= x << 17;
         s.set(x);
-        (x >> 40) as f32 / ((1u64 << 24) as f32)
+        x
     })
+}
+
+fn thread_rand_f32() -> f32 {
+    (thread_rand_u64() >> 40) as f32 / ((1u64 << 24) as f32)
 }
 
 #[cfg(test)]
@@ -451,7 +516,7 @@ mod tests {
     #[test]
     fn top_k_filters_correctly() {
         let mut probs = vec![0.1, 0.5, 0.3, 0.1];
-        apply_top_k(&mut probs, 2);
+        apply_top_k(&mut probs, 2, Some(7), 0);
         let nonzero: Vec<_> = probs.iter().filter(|&&p| p > 0.0).collect();
         assert_eq!(nonzero.len(), 2);
     }
@@ -544,11 +609,43 @@ mod tests {
     #[test]
     fn top_k_promotes_ties_to_reach_k() {
         let mut probs = vec![0.1_f32, 0.1, 0.1, 0.7];
-        apply_top_k(&mut probs, 3);
+        apply_top_k(&mut probs, 3, Some(123), 0);
         let nonzero = probs.iter().filter(|&&p| p > 0.0).count();
         assert_eq!(nonzero, 3, "top-k must include ties up to k: {probs:?}");
         let sum: f32 = probs.iter().sum();
         assert!((sum - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn top_k_tie_break_is_unbiased_over_many_seeds() {
+        let mut counts = [0usize; 4];
+        let trials = 4_000;
+        for step in 0..trials as u64 {
+            let mut probs = vec![0.25_f32, 0.25, 0.25, 0.25];
+            apply_top_k(&mut probs, 2, Some(42), step);
+            for (i, &p) in probs.iter().enumerate() {
+                if p > 0.0 {
+                    counts[i] += 1;
+                }
+            }
+        }
+        let expected = trials / 2;
+        let band = expected / 5;
+        for (i, &c) in counts.iter().enumerate() {
+            assert!(
+                c.abs_diff(expected) < band,
+                "index {i} biased: {c} vs expected ~{expected} (counts={counts:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn top_k_tie_break_is_reproducible_with_seed() {
+        let mut a = vec![0.1_f32, 0.1, 0.1, 0.1, 0.6];
+        let mut b = a.clone();
+        apply_top_k(&mut a, 3, Some(99), 5);
+        apply_top_k(&mut b, 3, Some(99), 5);
+        assert_eq!(a, b, "same seed+step must produce identical tie selection");
     }
 
     #[test]

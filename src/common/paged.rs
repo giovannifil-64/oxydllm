@@ -153,6 +153,76 @@ enum KvPool {
     },
 }
 
+/// One reusable `(k, v)` pair retired from a `PagedKvCache` and held in the pool
+/// for the next sequence. The `cap` field is the buffer's dim-2 length.
+struct ContigBuffer {
+    k: Tensor,
+    v: Tensor,
+    cap: usize,
+}
+
+/// Per-allocator pool of retired contig buffers. `PagedKvCache::append` scales the
+/// contig buffer to sequence length; once a sequence ends (or outgrows its buffer
+/// and reallocates), the old buffer would otherwise be dropped and the next
+/// sequence would pay `Tensor::zeros` again. Returning it here lets the next
+/// sequence take it for free.
+///
+/// Invariants:
+/// - `buffers` is kept sorted ascending by `cap`, so `take(needed)` can find the
+///   smallest fit via a single forward scan and `put` finds its insertion point
+///   via `partition_point` in O(log n).
+/// - Length is capped at `max_buffers`; on overflow the smallest buffer is
+///   evicted, since large buffers are the expensive ones to rebuild.
+struct ContigBufferPool {
+    buffers: Vec<ContigBuffer>,
+    max_buffers: usize,
+}
+
+/// Per-allocator (= per-layer) ceiling on retained contig buffers. With L layers
+/// and S peak-concurrent sequences, the steady-state memory held by all pools at
+/// idle is roughly `L * MAX_POOL_BUFFERS * (sequence_len * 2 * n_kv * hd *
+/// dtype_bytes)`. 4 buffers per layer is enough to absorb typical churn while
+/// keeping the idle footprint modest on Apple Silicon unified memory.
+const MAX_POOL_BUFFERS: usize = 4;
+
+impl ContigBufferPool {
+    fn new(max_buffers: usize) -> Self {
+        Self {
+            buffers: Vec::with_capacity(max_buffers),
+            max_buffers,
+        }
+    }
+
+    /// Smallest buffer with `cap >= needed`, removed from the pool. `None` if no
+    /// suitable buffer exists; caller should allocate fresh.
+    fn take(&mut self, needed: usize) -> Option<ContigBuffer> {
+        let idx = self.buffers.iter().position(|b| b.cap >= needed)?;
+        Some(self.buffers.remove(idx))
+    }
+
+    /// Return a buffer to the pool, evicting the smallest if over the cap.
+    fn put(&mut self, buf: ContigBuffer) {
+        if self.max_buffers == 0 {
+            return;
+        }
+        let pos = self.buffers.partition_point(|b| b.cap < buf.cap);
+        self.buffers.insert(pos, buf);
+        if self.buffers.len() > self.max_buffers {
+            self.buffers.remove(0);
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.buffers.len()
+    }
+
+    #[cfg(test)]
+    fn capacities(&self) -> Vec<usize> {
+        self.buffers.iter().map(|b| b.cap).collect()
+    }
+}
+
 pub struct BlockAllocator {
     pool: KvPool,
     free_list: Vec<usize>,
@@ -163,6 +233,7 @@ pub struct BlockAllocator {
     head_dim: usize,
     dtype: DType,
     device: Device,
+    contig_pool: ContigBufferPool,
 }
 
 pub struct StagedKvData<'a> {
@@ -219,6 +290,7 @@ impl BlockAllocator {
             head_dim,
             dtype,
             device: device.clone(),
+            contig_pool: ContigBufferPool::new(MAX_POOL_BUFFERS),
         })
     }
 
@@ -270,12 +342,43 @@ impl BlockAllocator {
         (self.n_kv_heads, self.head_dim)
     }
 
+    pub fn dtype(&self) -> DType {
+        self.dtype
+    }
+
+    pub fn device(&self) -> &Device {
+        &self.device
+    }
+
     /// Returns a clone of the quantizer Arc if the pool is quantized.
     pub fn get_quantizer(&self) -> Option<Arc<KvQuantizer>> {
         match &self.pool {
             KvPool::Quantized { quantizer, .. } => Some(Arc::clone(quantizer)),
             _ => None,
         }
+    }
+
+    /// Take a contig buffer from the per-allocator pool. Returns `(k, v, cap)`
+    /// if a buffer with `cap >= needed` was available, else `None`.
+    /// Caller is responsible for allocating fresh on `None`.
+    pub fn take_contig_buffer(&mut self, needed: usize) -> Option<(Tensor, Tensor, usize)> {
+        self.contig_pool.take(needed).map(|b| (b.k, b.v, b.cap))
+    }
+
+    /// Return a contig buffer to the pool for reuse by future sequences.
+    /// Drops the buffer if the pool is full and `cap` is the smallest entry.
+    pub fn release_contig_buffer(&mut self, k: Tensor, v: Tensor, cap: usize) {
+        self.contig_pool.put(ContigBuffer { k, v, cap });
+    }
+
+    #[cfg(test)]
+    pub fn contig_pool_len(&self) -> usize {
+        self.contig_pool.len()
+    }
+
+    #[cfg(test)]
+    pub fn contig_pool_capacities(&self) -> Vec<usize> {
+        self.contig_pool.capacities()
     }
 
     /// Copy pre-quantized CPU-staged data into the block pool.
@@ -536,6 +639,12 @@ pub struct PagedKvCache {
     quantizer: Option<Arc<KvQuantizer>>,
     table: BlockTable,
     block_size: usize,
+    /// Cached allocator dims/dtype/device — read once at construction so the
+    /// contig fresh-alloc path never has to relock the allocator.
+    n_kv: usize,
+    head_dim: usize,
+    dtype: DType,
+    device: Device,
     contig_k: Option<Tensor>,
     contig_v: Option<Tensor>,
     contig_len: usize,
@@ -547,17 +656,47 @@ impl PagedKvCache {
         let alloc = allocator.lock().unwrap();
         let block_size = alloc.block_size();
         let quantizer = alloc.get_quantizer();
+        let (n_kv, head_dim) = alloc.dims();
+        let dtype = alloc.dtype();
+        let device = alloc.device().clone();
         drop(alloc);
         Self {
             allocator,
             quantizer,
             table: BlockTable::new(),
             block_size,
+            n_kv,
+            head_dim,
+            dtype,
+            device,
             contig_k: None,
             contig_v: None,
             contig_len: 0,
             pending_writes: Vec::new(),
         }
+    }
+
+    /// Pull a contig `(k, v)` buffer with `cap >= needed` — first from the
+    /// per-allocator pool, otherwise freshly allocated at `contig_buf_capacity(needed)`.
+    /// The allocator lock is released before the `Tensor::zeros` call so that the
+    /// (potentially slow) GPU allocation doesn't serialize with other layers.
+    fn acquire_contig(&self, needed: usize) -> Result<(Tensor, Tensor, usize)> {
+        if let Some(t) = self.allocator.lock().unwrap().take_contig_buffer(needed) {
+            debug_assert!(t.2 >= needed);
+            return Ok(t);
+        }
+        let cap = contig_buf_capacity(needed);
+        let dims = (1, self.n_kv, cap, self.head_dim);
+        let k = Tensor::zeros(dims, self.dtype, &self.device)?;
+        let v = Tensor::zeros(dims, self.dtype, &self.device)?;
+        Ok((k, v, cap))
+    }
+
+    fn release_contig(&self, k: Tensor, v: Tensor, cap: usize) {
+        self.allocator
+            .lock()
+            .unwrap()
+            .release_contig_buffer(k, v, cap);
     }
 
     pub fn append(&mut self, new_k: &Tensor, new_v: &Tensor) -> Result<(Tensor, Tensor)> {
@@ -619,6 +758,9 @@ impl PagedKvCache {
 
         let total_needed = prev_tokens + new_seq;
 
+        // Buffers retired here go back to the per-allocator pool below — the
+        // region past `contig_len` is never observed by callers (every read
+        // narrows to `contig_len`) so reusing dirty memory is safe.
         match (self.contig_k.take(), self.contig_v.take()) {
             (Some(k_buf), Some(v_buf)) => {
                 let cap = k_buf.dim(2)?;
@@ -628,12 +770,7 @@ impl PagedKvCache {
                     self.contig_k = Some(k_buf);
                     self.contig_v = Some(v_buf);
                 } else {
-                    let new_cap = contig_buf_capacity(total_needed);
-                    let (_, n_kv, _, hd) = k_buf.dims4()?;
-                    let device = k_buf.device().clone();
-                    let dtype = k_buf.dtype();
-                    let new_k_buf = Tensor::zeros((1, n_kv, new_cap, hd), dtype, &device)?;
-                    let new_v_buf = Tensor::zeros((1, n_kv, new_cap, hd), dtype, &device)?;
+                    let (new_k_buf, new_v_buf, new_cap) = self.acquire_contig(total_needed)?;
                     if self.contig_len > 0 {
                         let old_k = k_buf.narrow(2, 0, self.contig_len)?.contiguous()?;
                         let old_v = v_buf.narrow(2, 0, self.contig_len)?.contiguous()?;
@@ -642,21 +779,18 @@ impl PagedKvCache {
                     }
                     new_k_buf.slice_set(new_k, 2, prev_tokens)?;
                     new_v_buf.slice_set(new_v, 2, prev_tokens)?;
+                    self.release_contig(k_buf, v_buf, cap);
                     self.contig_k = Some(new_k_buf);
                     self.contig_v = Some(new_v_buf);
+                    let _ = new_cap;
                 }
             }
             (None, None) => {
-                let init_cap = contig_buf_capacity(total_needed);
-                let (_, n_kv, _, hd) = new_k.dims4()?;
-                let device = new_k.device().clone();
-                let dtype = new_k.dtype();
-                let k_buf = Tensor::zeros((1, n_kv, init_cap, hd), dtype, &device)?;
-                let v_buf = Tensor::zeros((1, n_kv, init_cap, hd), dtype, &device)?;
+                let (k_buf, v_buf, _cap) = self.acquire_contig(total_needed)?;
 
                 if prev_tokens > 0 {
                     let prefix_slots = &self.table.cached_slots[..prev_tokens];
-                    let idx = Tensor::from_slice(prefix_slots, (prev_tokens,), &device)?;
+                    let idx = Tensor::from_slice(prefix_slots, (prev_tokens,), &self.device)?;
                     let (pk, pv) = self.allocator.lock().unwrap().gather(&idx)?;
                     k_buf.slice_set(&pk.contiguous()?, 2, 0)?;
                     v_buf.slice_set(&pv.contiguous()?, 2, 0)?;
@@ -834,17 +968,22 @@ impl PagedKvCache {
 
     pub fn clear(&mut self) {
         self.pending_writes.clear();
-        if !self.table.block_ids.is_empty() {
+        let retired_contig = match (self.contig_k.take(), self.contig_v.take()) {
+            (Some(k), Some(v)) => k.dim(2).ok().filter(|&c| c > 0).map(|cap| (k, v, cap)),
+            _ => None,
+        };
+        if !self.table.block_ids.is_empty() || retired_contig.is_some() {
             let mut alloc = self.allocator.lock().unwrap();
             for &bid in &self.table.block_ids {
                 alloc.free(bid);
+            }
+            if let Some((k, v, cap)) = retired_contig {
+                alloc.release_contig_buffer(k, v, cap);
             }
         }
         self.table.block_ids.clear();
         self.table.num_tokens = 0;
         self.table.cached_slots.clear();
-        self.contig_k = None;
-        self.contig_v = None;
         self.contig_len = 0;
     }
 
@@ -1042,6 +1181,110 @@ mod tests {
         let k1 = Tensor::zeros((1, 2, 1, 4), DType::F32, &dev).unwrap();
         let v1 = Tensor::zeros((1, 2, 1, 4), DType::F32, &dev).unwrap();
         assert!(cache.append(&k1, &v1).is_err());
+    }
+
+    #[test]
+    fn contig_buffer_is_recycled_across_sequences() {
+        let alloc = make_allocator(8, 2);
+        let dev = Device::Cpu;
+
+        // Pool starts empty.
+        assert_eq!(alloc.lock().unwrap().contig_pool_len(), 0);
+
+        // First sequence: pool is empty so this triggers a fresh allocation.
+        let mut cache_a = PagedKvCache::new(Arc::clone(&alloc));
+        let k = Tensor::zeros((1, 2, 4, 4), DType::F32, &dev).unwrap();
+        let v = Tensor::zeros((1, 2, 4, 4), DType::F32, &dev).unwrap();
+        cache_a.append(&k, &v).unwrap();
+        // While the cache holds the buffer, the pool is still empty.
+        assert_eq!(alloc.lock().unwrap().contig_pool_len(), 0);
+
+        // Clearing the cache retires the buffer into the pool.
+        cache_a.clear();
+        assert_eq!(alloc.lock().unwrap().contig_pool_len(), 1);
+        let pooled_cap = alloc.lock().unwrap().contig_pool_capacities()[0];
+        assert!(pooled_cap >= 4);
+
+        // A second sequence reuses the pooled buffer — no fresh allocation.
+        let mut cache_b = PagedKvCache::new(Arc::clone(&alloc));
+        let k = Tensor::zeros((1, 2, 3, 4), DType::F32, &dev).unwrap();
+        let v = Tensor::zeros((1, 2, 3, 4), DType::F32, &dev).unwrap();
+        cache_b.append(&k, &v).unwrap();
+        assert_eq!(
+            alloc.lock().unwrap().contig_pool_len(),
+            0,
+            "second sequence should have drained the pool"
+        );
+    }
+
+    #[test]
+    fn contig_pool_evicts_smallest_on_overflow() {
+        let alloc = make_allocator(64, 2);
+        // Force a tiny capacity to exercise eviction without going through `append`.
+        {
+            let mut a = alloc.lock().unwrap();
+            for cap in [10usize, 50, 30, 100, 70] {
+                let k = Tensor::zeros((1, 2, cap, 4), DType::F32, &Device::Cpu).unwrap();
+                let v = Tensor::zeros((1, 2, cap, 4), DType::F32, &Device::Cpu).unwrap();
+                a.release_contig_buffer(k, v, cap);
+            }
+        }
+        // MAX_POOL_BUFFERS = 4 so smallest (10) is evicted; remaining are sorted asc.
+        let caps = alloc.lock().unwrap().contig_pool_capacities();
+        assert_eq!(caps, vec![30, 50, 70, 100]);
+    }
+
+    #[test]
+    fn contig_pool_take_picks_smallest_fit() {
+        let alloc = make_allocator(64, 2);
+        {
+            let mut a = alloc.lock().unwrap();
+            for cap in [32usize, 64, 256] {
+                let k = Tensor::zeros((1, 2, cap, 4), DType::F32, &Device::Cpu).unwrap();
+                let v = Tensor::zeros((1, 2, cap, 4), DType::F32, &Device::Cpu).unwrap();
+                a.release_contig_buffer(k, v, cap);
+            }
+        }
+        let mut a = alloc.lock().unwrap();
+        // Needs 50 → smallest fit is 64.
+        let (_, _, cap) = a.take_contig_buffer(50).expect("expected hit");
+        assert_eq!(cap, 64);
+        // Needs 200 → smallest fit is 256.
+        let (_, _, cap) = a.take_contig_buffer(200).expect("expected hit");
+        assert_eq!(cap, 256);
+        // Remaining: just 32; need 100 → miss.
+        assert!(a.take_contig_buffer(100).is_none());
+        // 32 still there for a tiny request.
+        let (_, _, cap) = a.take_contig_buffer(16).expect("expected hit");
+        assert_eq!(cap, 32);
+    }
+
+    #[test]
+    fn contig_buffer_growth_retires_old_to_pool() {
+        // 256 blocks × 4 slots = 1024 tokens of headroom — comfortably above the
+        // 64-token minimum capacity baked into `contig_buf_capacity`.
+        let alloc = Arc::new(Mutex::new(
+            BlockAllocator::new(256, 4, 2, 4, DType::F32, &Device::Cpu, None).unwrap(),
+        ));
+        let dev = Device::Cpu;
+        let mut cache = PagedKvCache::new(Arc::clone(&alloc));
+
+        // Initial prefill. With `total_needed = 32`, cap is clamped to the 64-token floor.
+        let k = Tensor::zeros((1, 2, 32, 4), DType::F32, &dev).unwrap();
+        let v = Tensor::zeros((1, 2, 32, 4), DType::F32, &dev).unwrap();
+        cache.append(&k, &v).unwrap();
+        let first_cap = contig_buf_capacity(32);
+        assert_eq!(alloc.lock().unwrap().contig_pool_len(), 0);
+
+        // Second append crosses the cap (32 + 50 = 82 > 64) so the buffer grows.
+        let big_k = Tensor::zeros((1, 2, 50, 4), DType::F32, &dev).unwrap();
+        let big_v = Tensor::zeros((1, 2, 50, 4), DType::F32, &dev).unwrap();
+        cache.append(&big_k, &big_v).unwrap();
+
+        // The old (smaller) buffer should have been retired to the pool.
+        let caps = alloc.lock().unwrap().contig_pool_capacities();
+        assert_eq!(caps.len(), 1, "growth path must retire the old buffer");
+        assert_eq!(caps[0], first_cap);
     }
 
     #[test]

@@ -475,15 +475,17 @@ impl CustomOp3 for RopeOp {
 //
 // Two complementary kernels cover every FFN variant:
 //
-//   GatedSiluOp  — takes the combined matmul output [*, 2*N] produced by
-//                  Fused/Packed gate_up projections and computes
-//                  silu(gate)*up in a single pass, avoiding two extra
-//                  encoder creations and an intermediate buffer.
+//   GatedSiluOp       — takes the combined matmul output [*, 2*N] produced by
+//                       Fused/Packed gate_up projections and computes
+//                       silu(gate)*up in a single pass, avoiding two extra
+//                       encoder creations and an intermediate buffer.
+//   SiluMulOp         — takes two separate contiguous tensors [*, N] (from the
+//                       GGUF Separate path) and computes silu(gate)*up in-place.
+//   GatedGeluTanhOp   — same shape contract as GatedSiluOp but applies the
+//                       tanh approximation of GeLU; used by Gemma family FFNs.
+//   GeluTanhMulOp     — same shape contract as SiluMulOp with GeLU-tanh.
 //
-//   SiluMulOp    — takes two separate contiguous tensors [*, N] (from the
-//                  GGUF Separate path) and computes silu(gate)*up in-place.
-//
-// Both kernels promote F16/BF16 arithmetic to F32 for the SiLU computation
+// All kernels promote F16/BF16 arithmetic to F32 for the activation computation
 // and cast back, matching the precision of the scalar fallback path.
 
 const FFN_METAL_SOURCE: &str = include_str!("ffn_kernels.metal");
@@ -692,6 +694,154 @@ impl CustomOp2 for SiluMulOp {
     }
 }
 
+// ─── GatedGeluTanhOp ─────────────────────────────────────────────────────────
+//
+// Same shape contract as GatedSiluOp: reads a single contiguous [*, 2*N] tensor
+// and writes [*, N] = gelu_tanh(gate) * up.  Used by Gemma family FFNs.
+
+struct GatedGeluTanhOp {
+    intermediate_size: usize,
+}
+
+impl CustomOp1 for GatedGeluTanhOp {
+    fn name(&self) -> &'static str {
+        "metal-gated-gelu-tanh"
+    }
+
+    fn cpu_fwd(&self, _s: &CpuStorage, _l: &Layout) -> Result<(CpuStorage, Shape)> {
+        candle_core::bail!("GatedGeluTanhOp: Metal-only")
+    }
+
+    fn metal_fwd(&self, x: &MetalStorage, lx: &Layout) -> Result<(MetalStorage, Shape)> {
+        if !lx.is_contiguous() {
+            candle_core::bail!("GatedGeluTanhOp: input must be contiguous");
+        }
+        let rank = lx.shape().rank();
+        let last_dim = lx.dims()[rank - 1];
+        if last_dim != 2 * self.intermediate_size {
+            candle_core::bail!(
+                "GatedGeluTanhOp: last dim {last_dim} != 2*intermediate_size={}",
+                2 * self.intermediate_size
+            );
+        }
+
+        let out_elems = lx.shape().elem_count() / 2;
+        let mut out_dims = lx.dims().to_vec();
+        *out_dims.last_mut().unwrap() = self.intermediate_size;
+        let out_shape = Shape::from_dims(&out_dims);
+
+        let kernel_name: &'static str = match x.dtype() {
+            DType::F32 => "gated_gelu_tanh_f32",
+            DType::F16 => "gated_gelu_tanh_f16",
+            DType::BF16 => "gated_gelu_tanh_bf16",
+            other => candle_core::bail!("GatedGeluTanhOp: unsupported dtype {other:?}"),
+        };
+
+        let device = x.device();
+        let output = device.new_buffer(out_elems, x.dtype(), "gated_gelu_tanh_out")?;
+        let pipeline = get_or_compile_ffn_pipeline(device.device(), kernel_name)?;
+        let encoder = device.command_encoder()?;
+
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(
+            0,
+            Some(x.buffer()),
+            lx.start_offset() * x.dtype().size_in_bytes(),
+        );
+        encoder.set_buffer(1, Some(&*output), 0);
+        encoder.set_bytes(2, &(out_elems as u32));
+        encoder.set_bytes(3, &(self.intermediate_size as u32));
+        encoder.use_resource(x.buffer(), MTLResourceUsage::Read);
+        encoder.use_resource(&*output, MTLResourceUsage::Write);
+        ffn_dispatch(&pipeline, &encoder, out_elems);
+
+        Ok((
+            MetalStorage::new(output, device.clone(), out_elems, x.dtype()),
+            out_shape,
+        ))
+    }
+}
+
+// ─── GeluTanhMulOp ───────────────────────────────────────────────────────────
+//
+// Same shape contract as SiluMulOp with GeLU-tanh as the gate activation.
+
+struct GeluTanhMulOp;
+
+impl CustomOp2 for GeluTanhMulOp {
+    fn name(&self) -> &'static str {
+        "metal-gelu-tanh-mul"
+    }
+
+    fn cpu_fwd(
+        &self,
+        _s1: &CpuStorage,
+        _l1: &Layout,
+        _s2: &CpuStorage,
+        _l2: &Layout,
+    ) -> Result<(CpuStorage, Shape)> {
+        candle_core::bail!("GeluTanhMulOp: Metal-only")
+    }
+
+    fn metal_fwd(
+        &self,
+        gate: &MetalStorage,
+        lg: &Layout,
+        up: &MetalStorage,
+        lu: &Layout,
+    ) -> Result<(MetalStorage, Shape)> {
+        if !lg.is_contiguous() || !lu.is_contiguous() {
+            candle_core::bail!("GeluTanhMulOp: both inputs must be contiguous");
+        }
+        if gate.dtype() != up.dtype() {
+            candle_core::bail!(
+                "GeluTanhMulOp: dtype mismatch {:?} vs {:?}",
+                gate.dtype(),
+                up.dtype()
+            );
+        }
+        let elem_count = lg.shape().elem_count();
+        if elem_count != lu.shape().elem_count() {
+            candle_core::bail!("GeluTanhMulOp: shape mismatch");
+        }
+
+        let kernel_name: &'static str = match gate.dtype() {
+            DType::F32 => "gelu_tanh_mul_f32",
+            DType::F16 => "gelu_tanh_mul_f16",
+            DType::BF16 => "gelu_tanh_mul_bf16",
+            other => candle_core::bail!("GeluTanhMulOp: unsupported dtype {other:?}"),
+        };
+
+        let device = gate.device();
+        let output = device.new_buffer(elem_count, gate.dtype(), "gelu_tanh_mul_out")?;
+        let pipeline = get_or_compile_ffn_pipeline(device.device(), kernel_name)?;
+        let encoder = device.command_encoder()?;
+
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(
+            0,
+            Some(gate.buffer()),
+            lg.start_offset() * gate.dtype().size_in_bytes(),
+        );
+        encoder.set_buffer(
+            1,
+            Some(up.buffer()),
+            lu.start_offset() * up.dtype().size_in_bytes(),
+        );
+        encoder.set_buffer(2, Some(&*output), 0);
+        encoder.set_bytes(3, &(elem_count as u32));
+        encoder.use_resource(gate.buffer(), MTLResourceUsage::Read);
+        encoder.use_resource(up.buffer(), MTLResourceUsage::Read);
+        encoder.use_resource(&*output, MTLResourceUsage::Write);
+        ffn_dispatch(&pipeline, &encoder, elem_count);
+
+        Ok((
+            MetalStorage::new(output, device.clone(), elem_count, gate.dtype()),
+            lg.shape().clone(),
+        ))
+    }
+}
+
 // ─── SoftcapOp ───────────────────────────────────────────────────────────────
 //
 // Element-wise out[i] = cap * tanh(x[i] / cap).  Replaces the 3-op fallback
@@ -828,6 +978,22 @@ pub fn silu_mul_fused(gate: &Tensor, up: &Tensor) -> Result<Tensor> {
     gate.apply_op2_no_bwd(up, &SiluMulOp)
 }
 
+/// Fused gated GeLU-tanh via Metal kernel.
+///
+/// Same shape contract as [`gated_silu_fused`] but uses the tanh approximation
+/// of GeLU as the gate activation.  Used by Gemma family FFNs.
+pub fn gated_gelu_tanh_fused(x: &Tensor, intermediate_size: usize) -> Result<Tensor> {
+    x.apply_op1_no_bwd(&GatedGeluTanhOp { intermediate_size })
+}
+
+/// Fused GeLU-tanh-Mul via Metal kernel.
+///
+/// Both `gate` and `up` must be contiguous tensors of the same shape.
+/// Returns a tensor of the same shape with values `gelu_tanh(gate[i]) * up[i]`.
+pub fn gelu_tanh_mul_fused(gate: &Tensor, up: &Tensor) -> Result<Tensor> {
+    gate.apply_op2_no_bwd(up, &GeluTanhMulOp)
+}
+
 /// Fused softcap via Metal kernel: `out[i] = cap * tanh(x[i] / cap)`.
 ///
 /// `x` must be contiguous.  Returns a tensor of the same shape and dtype.
@@ -952,6 +1118,88 @@ mod fused_kernel_parity_tests {
         // intermediate_size=4 → expects last dim = 8, but we have 7.
         let res = gated_silu_fused(&x, 4);
         assert!(res.is_err());
+    }
+
+    #[test]
+    fn gated_gelu_tanh_matches_scalar_path_f32() {
+        let Some(dev) = metal_device_or_skip() else {
+            return;
+        };
+
+        let n = 8usize;
+        let data: Vec<f32> = (0..1 * 4 * 2 * n)
+            .map(|i| (i as f32 - 32.0) * 0.05)
+            .collect();
+        let x = Tensor::from_vec(data, (1, 4, 2 * n), &dev).unwrap();
+
+        let fused = gated_gelu_tanh_fused(&x, n).unwrap();
+
+        let gate = x.narrow(D::Minus1, 0, n).unwrap();
+        let up = x.narrow(D::Minus1, n, n).unwrap();
+        let scalar = (gate.gelu().unwrap() * up).unwrap();
+
+        let f = fused.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let s = scalar.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let diff = max_abs_diff_f32(&f, &s);
+        assert!(diff < 1e-5, "max_abs_diff = {diff}");
+    }
+
+    #[test]
+    fn gated_gelu_tanh_matches_scalar_path_bf16() {
+        let Some(dev) = metal_device_or_skip() else {
+            return;
+        };
+
+        let n = 4usize;
+        let data: Vec<f32> = (0..1 * 2 * 2 * n).map(|i| (i as f32 - 8.0) * 0.1).collect();
+        let x = Tensor::from_vec(data, (1, 2, 2 * n), &dev)
+            .unwrap()
+            .to_dtype(DType::BF16)
+            .unwrap();
+
+        let fused = gated_gelu_tanh_fused(&x, n).unwrap();
+
+        let gate = x.narrow(D::Minus1, 0, n).unwrap();
+        let up = x.narrow(D::Minus1, n, n).unwrap();
+        let scalar = (gate.gelu().unwrap() * up).unwrap();
+
+        let f = fused
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let s = scalar
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let diff = max_abs_diff_f32(&f, &s);
+        assert!(diff < 0.05, "max_abs_diff (bf16) = {diff}");
+    }
+
+    #[test]
+    fn gelu_tanh_mul_matches_scalar_path_f32() {
+        let Some(dev) = metal_device_or_skip() else {
+            return;
+        };
+
+        let n = 16usize;
+        let gate_data: Vec<f32> = (0..n).map(|i| (i as f32 - 8.0) * 0.1).collect();
+        let up_data: Vec<f32> = (0..n).map(|i| (i as f32 - 4.0) * 0.2).collect();
+        let gate = Tensor::from_vec(gate_data, (1, n), &dev).unwrap();
+        let up = Tensor::from_vec(up_data, (1, n), &dev).unwrap();
+
+        let fused = gelu_tanh_mul_fused(&gate, &up).unwrap();
+        let scalar = (gate.gelu().unwrap() * &up).unwrap();
+
+        let f = fused.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let s = scalar.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let diff = max_abs_diff_f32(&f, &s);
+        assert!(diff < 1e-5, "max_abs_diff = {diff}");
     }
 
     #[test]

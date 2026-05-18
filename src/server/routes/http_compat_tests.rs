@@ -1480,3 +1480,214 @@ async fn non_strict_schema_non_parseable_passes_through() {
         "non-strict mode must return raw model output"
     );
 }
+
+#[tokio::test]
+async fn stream_error_mid_stream_emits_done_after_error_chunk() {
+    let (request_tx, mut request_rx) = tokio_mpsc::channel::<IncomingRequest>(64);
+    tokio::spawn(async move {
+        while let Some(req) = request_rx.recv().await {
+            let _ = req.response_tx.send(EngineEvent::Token {
+                text: "partial".to_string(),
+                logprob_entries: vec![],
+            });
+            let _ = req.response_tx.send(EngineEvent::Error(
+                "synthetic mid-stream failure".to_string(),
+            ));
+        }
+    });
+
+    let tmp = tempfile::tempdir().expect("tmp");
+    let model_id = "test-model";
+    create_test_model_dir(tmp.path(), model_id).expect("model dir");
+    let tokenizer = Arc::new(
+        Tokenizer::from_dir(tmp.path().join(model_id).to_str().expect("utf-8 path"))
+            .expect("tokenizer"),
+    );
+
+    let mut manager = ModelManager::new(ModelManagerConfig {
+        models_dir: tmp.path().to_path_buf(),
+        keep_alive: Duration::from_secs(60),
+        memory_budget_bytes: None,
+        cuda_devices: vec![],
+        max_context_len: 4096,
+        kv_quant: KvQuantMode::Off,
+        qjl_quantization: false,
+        require_gpu: false,
+        max_num_seqs: None,
+        max_queued_requests: 200,
+    });
+    manager.insert_ready_for_tests(
+        model_id,
+        ReadyHandle {
+            request_tx,
+            tokenizer,
+            max_seq_len: 4096,
+        },
+    );
+    let state = Arc::new(AppState {
+        manager: Arc::new(tokio::sync::Mutex::new(manager)),
+        api_key: None,
+        request_timeout: None,
+    });
+    let app = build_router(state);
+
+    let resp = post_chat(
+        &app,
+        json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": true
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body = String::from_utf8(
+        to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("body")
+            .to_vec(),
+    )
+    .expect("utf-8");
+
+    let mut saw_content = false;
+    let mut saw_error = false;
+    let mut saw_done = false;
+    for line in body.lines() {
+        if let Some(payload) = line.strip_prefix("data: ") {
+            if payload == "[DONE]" {
+                saw_done = true;
+                continue;
+            }
+            let Ok(parsed) = serde_json::from_str::<Value>(payload) else {
+                continue;
+            };
+            if parsed["choices"][0]["delta"]["content"].as_str() == Some("partial") {
+                saw_content = true;
+            }
+            if parsed.get("error").is_some() {
+                saw_error = true;
+            }
+        }
+    }
+    assert!(
+        saw_content,
+        "expected the content chunk emitted before the error, body was:\n{body}"
+    );
+    assert!(
+        saw_error,
+        "expected an error chunk after the Token, body was:\n{body}"
+    );
+    assert!(
+        saw_done,
+        "non-tools streaming must end with [DONE] even after an error, body was:\n{body}"
+    );
+}
+
+#[tokio::test]
+async fn n_above_one_non_streaming_returns_n_distinct_choices() {
+    let (app, _tmp) = build_test_app(vec![
+        ScriptedReply {
+            content: "alpha".to_string(),
+            finish_reason: "stop".to_string(),
+        },
+        ScriptedReply {
+            content: "beta".to_string(),
+            finish_reason: "stop".to_string(),
+        },
+    ])
+    .expect("test app");
+
+    let resp = post_chat(
+        &app,
+        json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "n": 2
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.expect("body"))
+            .expect("json");
+
+    let choices = body["choices"].as_array().expect("choices array");
+    assert_eq!(choices.len(), 2, "expected exactly 2 choices for n=2");
+
+    let mut indices: Vec<i64> = choices
+        .iter()
+        .map(|c| c["index"].as_i64().expect("index"))
+        .collect();
+    indices.sort();
+    assert_eq!(
+        indices,
+        vec![0, 1],
+        "choices must carry distinct sequential indices"
+    );
+
+    let mut contents: Vec<String> = choices
+        .iter()
+        .map(|c| c["message"]["content"].as_str().unwrap_or("").to_string())
+        .collect();
+    contents.sort();
+    assert_eq!(contents, vec!["alpha".to_string(), "beta".to_string()]);
+}
+
+#[tokio::test]
+async fn stream_options_include_usage_emits_trailing_usage_chunk() {
+    let (app, _tmp) = build_test_app(vec![ScriptedReply {
+        content: "hi".to_string(),
+        finish_reason: "stop".to_string(),
+    }])
+    .expect("test app");
+
+    let resp = post_chat(
+        &app,
+        json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": true,
+            "stream_options": {"include_usage": true}
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body = String::from_utf8(
+        to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("body")
+            .to_vec(),
+    )
+    .expect("utf-8");
+
+    let chunks: Vec<Value> = body
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .filter(|payload| *payload != "[DONE]")
+        .filter_map(|payload| serde_json::from_str::<Value>(payload).ok())
+        .collect();
+
+    let usage_chunk = chunks
+        .iter()
+        .rev()
+        .find(|c| c.get("usage").map(|u| !u.is_null()).unwrap_or(false))
+        .expect("expected a usage chunk before [DONE]");
+
+    let usage = &usage_chunk["usage"];
+    assert!(usage["prompt_tokens"].as_u64().is_some());
+    assert!(usage["completion_tokens"].as_u64().is_some());
+    assert!(usage["total_tokens"].as_u64().is_some());
+    assert!(
+        usage_chunk["choices"]
+            .as_array()
+            .map(|c| c.is_empty())
+            .unwrap_or(false),
+        "the usage chunk must carry an empty `choices` array per the OpenAI spec, got: {usage_chunk}"
+    );
+    assert!(
+        body.contains("data: [DONE]"),
+        "stream must terminate with [DONE], body was:\n{body}"
+    );
+}

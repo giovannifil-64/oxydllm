@@ -739,6 +739,19 @@ fn load_standard_safetensors(
         };
 
         let lm_head = if cfg.tie_word_embeddings {
+            // Catch the asymmetric-risk scenario the hf_parser default cannot
+            // see: config (or default) says tie, but the file actually ships
+            // its own lm_head — the file's head will be silently ignored. This
+            // is the only known path to "loads cleanly, outputs garbage" for
+            // tied/untied resolution.
+            if weights.try_get(lm_head_weight_name).is_some() {
+                tracing::warn!(
+                    model_dir,
+                    "config has tie_word_embeddings=true but file also contains explicit \
+                     `lm_head.weight` — the file's lm_head will be ignored. If the model \
+                     produces wrong output, set `tie_word_embeddings: false` in config.json."
+                );
+            }
             AnyLinear::from_weight_with_scale_inv(embed_weight.clone(), lm_head_scale_inv, None)
                 .map_err(|e| anyhow::anyhow!("{e}"))?
         } else if let Some(lm_head_awq) = weights.try_get_awq("lm_head") {

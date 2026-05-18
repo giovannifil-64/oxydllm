@@ -426,6 +426,10 @@ CUDA is currently a functional compatibility path, not a performance-tuned backe
 - Contributions and testing reports from NVIDIA hardware owners are welcome.
 
 ### Official CUDA Docker tags
+
+> [!IMPORTANT]
+> Every tag below is **unvalidated**, the images compile and pass CPU tests in CI, but no inference run has been verified on physical NVIDIA hardware. Treat the table as a build matrix, not a compatibility guarantee.
+
 | Tag | Compute capability | Platform | Target |
 |---|---:|---|---|
 | `cuda-ada` | 89 | amd64 | Ada Lovelace (RTX 40xx, L4, L40/L40S) |
@@ -442,7 +446,6 @@ CUDA is currently a functional compatibility path, not a performance-tuned backe
 - `latest` and `cuda` point to `cuda-ada` (stable default — widest x86_64 compatibility).
 - `nightly` and `nightly-cuda` point to nightly `cuda-ada`.
 - Cross-generation SASS is **not** compatible: a Hopper binary will not run on Blackwell and vice versa. Pick the tag that matches your GPU.
-- No CUDA target has been validated on real hardware — all targets carry the same caveat.
 
 
 ## Contributing

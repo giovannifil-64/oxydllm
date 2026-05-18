@@ -342,13 +342,20 @@ fn validate_quantization_config(v: &Value) -> Result<()> {
             );
             Ok(())
         }
+        "fp8" => {
+            tracing::info!(
+                quant = "fp8",
+                "FP8 checkpoint detected; weights will be dequantized at load time (CPU path on Metal)"
+            );
+            Ok(())
+        }
         "gptq" => anyhow::bail!(
             "GPTQ checkpoints are not yet supported. AWQ is supported; GPTQ requires a separate loader."
         ),
         "" => Ok(()),
         other => anyhow::bail!(
             "Unknown quantization method '{other}' in quantization_config. \
-             Supported: awq (gemm, 4-bit)."
+             Supported: awq (gemm, 4-bit), fp8."
         ),
     }
 }

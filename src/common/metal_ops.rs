@@ -913,6 +913,22 @@ pub fn sdpa(
     scale: f32,
     softcapping: f32,
 ) -> Result<Tensor> {
+    if !q.device().is_metal() || !k.device().is_metal() || !v.device().is_metal() {
+        candle_core::bail!(
+            "metal_ops::sdpa requires all of q, k, v on a Metal device (got q={:?}, k={:?}, v={:?})",
+            q.device().location(),
+            k.device().location(),
+            v.device().location(),
+        );
+    }
+    if let Some(m) = mask
+        && !m.device().is_metal()
+    {
+        candle_core::bail!(
+            "metal_ops::sdpa requires `mask` on a Metal device (got {:?})",
+            m.device().location(),
+        );
+    }
     q.apply_op3_no_bwd(
         k,
         v,
@@ -1023,6 +1039,21 @@ mod fused_kernel_parity_tests {
             .zip(b.iter())
             .map(|(x, y)| (x - y).abs())
             .fold(0.0f32, f32::max)
+    }
+
+    #[test]
+    fn sdpa_rejects_cpu_tensors_at_call_site() {
+        let dev = Device::Cpu;
+        let q = Tensor::zeros((1, 4, 4, 64), DType::F32, &dev).unwrap();
+        let k = Tensor::zeros((1, 4, 4, 64), DType::F32, &dev).unwrap();
+        let v = Tensor::zeros((1, 4, 4, 64), DType::F32, &dev).unwrap();
+
+        let err = sdpa(&q, &k, &v, None, false, 1.0, 1.0).expect_err("must reject CPU tensors");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("Metal"),
+            "expected device-mismatch error, got: {msg}"
+        );
     }
 
     #[test]

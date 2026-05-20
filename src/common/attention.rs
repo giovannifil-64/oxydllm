@@ -27,6 +27,15 @@ fn log_sdpa_fallback_once(head_dim: usize, dtype: candle_core::DType) {
     });
 }
 
+/// Minimum KV length for the custom Metal Flash Attention prefill kernel.
+///
+/// Below this the standard fallback (candle matmul → softmax → matmul) is used:
+/// for short prefills the materialised QKᵀ still fits in cache, so the FA
+/// kernel's IO-aware tiling provides no benefit and loses to MPS GEMM.  FA only
+/// pulls ahead once the score matrix exceeds L1/L2 cache.
+#[cfg(feature = "metal")]
+const METAL_FA_MIN_KV: usize = 1024;
+
 pub struct SegmentInfo<'a> {
     pub num_tokens: usize,
     pub cache: &'a mut PagedKvCache,
@@ -606,18 +615,27 @@ impl Attention {
         };
         let mut q_offset = 0usize;
 
-        // ── Per-segment routing: Metal SDPA or standard fallback ────────
-        // SDPA eligibility per segment:
-        //   - Metal available + supported head_dim (base)
-        //   - no cached-prefix prefill bug (kv_len > num_tokens for multi-token seg)
-        //   - softcap: only the vector kernel (num_tokens ≤ 8) supports it;
-        //     decode steps always qualify, prefill with softcap falls back
+        // ── Per-segment routing: Metal FA prefill, Metal SDPA decode, or fallback ────
+        // Priority order:
+        //   1. Metal Flash Attention (custom kernel) — prefill path (num_tokens > 1)
+        //      Replaces the fallback for multi-token attention when supported.
+        //   2. Metal SDPA — decode path (num_tokens == 1) via candle-metal-kernels.
+        //   3. Standard fallback — anything else (CPU, F64, external mask, etc.).
+        //
+        // Metal SDPA "full" mode (q_seq > 1) corrupts outputs on sequences past ~16
+        // tokens (NaN propagation), so it stays disabled for prefill regardless of
+        // FA availability.  Decode keeps using SDPA vector path which works correctly.
         #[cfg(feature = "metal")]
         let sdpa_base_ok = super::metal_ops::sdpa_available(&q, self.head_dim);
         #[cfg(feature = "metal")]
         if !sdpa_base_ok {
             log_sdpa_fallback_once(self.head_dim, q.dtype());
         }
+
+        #[cfg(feature = "metal")]
+        let metal_fa_base_ok = device.is_metal()
+            && super::metal_ops::flash_attention_metal_available(self.head_dim)
+            && matches!(q.dtype(), DType::F16 | DType::BF16 | DType::F32);
 
         for (i, seg) in segments.iter().enumerate() {
             let q_seg = q.narrow(2, q_offset, seg.num_tokens)?;
@@ -629,21 +647,70 @@ impl Attention {
                 seg.num_tokens,
             )?;
 
-            // Metal SDPA "full" mode (q_seq > 1) corrupts the last-position output for
-            // sequences past ~16 tokens, producing NaN that propagates through the residual
-            // stream. Reproduced on Qwen2.5 GGUF: 36-token prefill → NaN at layer 8, then all
-            // subsequent layers; 16-token warmup prefill → NaN at layers 26-27. The vector
-            // path (q_seq == 1, decode) is unaffected.route prefill through the standard
-            // attention fallback.
+            // ── Metal FA prefill eligibility (per segment) ──────────────────
+            // - Multi-token Q (prefill)
+            // - No external mask (the kernel applies causal+prefix mask itself)
+            // - No sliding-window applied to current segment (kernel assumes
+            //   standard causal pattern; sliding-window prefill is rare).
+            // - prefix_len + T_q == T_kv (sanity)
+            // - kv_len >= METAL_FA_MIN_KV  (short prefills lose to MPS GEMM in
+            //   the fallback path; FA only pays off past the cache threshold).
+            #[cfg(feature = "metal")]
+            let use_metal_fa = metal_fa_base_ok
+                && seg.num_tokens > 1
+                && mask.is_none()
+                && self.sliding_window.is_none()
+                && kv_len >= seg.num_tokens
+                && kv_len >= METAL_FA_MIN_KV;
+            #[cfg(not(feature = "metal"))]
+            let use_metal_fa = false;
+
             #[cfg(feature = "metal")]
             let use_seg_sdpa = sdpa_base_ok
+                && !use_metal_fa
                 && seg.num_tokens == 1
                 && !(seg.num_tokens > 1 && kv_lengths[i] > seg.num_tokens)
                 && (self.attn_softcap.is_none() || seg.num_tokens <= 8);
             #[cfg(not(feature = "metal"))]
             let use_seg_sdpa = false;
 
-            if use_seg_sdpa {
+            if use_metal_fa {
+                #[cfg(feature = "metal")]
+                {
+                    let q_c_owned;
+                    let q_c = if q_seg.is_contiguous() {
+                        &q_seg
+                    } else {
+                        q_c_owned = q_seg.contiguous()?;
+                        &q_c_owned
+                    };
+                    let k_c_owned;
+                    let k_c = if k_seg.is_contiguous() {
+                        &k_seg
+                    } else {
+                        k_c_owned = k_seg.contiguous()?;
+                        &k_c_owned
+                    };
+                    let v_c_owned;
+                    let v_c = if v_seg.is_contiguous() {
+                        &v_seg
+                    } else {
+                        v_c_owned = v_seg.contiguous()?;
+                        &v_c_owned
+                    };
+
+                    let prefix_len = kv_len - seg.num_tokens;
+                    let seg_out = super::metal_ops::flash_attention_metal_prefill(
+                        q_c,
+                        k_c,
+                        v_c,
+                        self.scale as f32,
+                        self.attn_softcap.map(|s| s as f32),
+                        prefix_len,
+                    )?;
+                    out_buf.slice_set(&seg_out.contiguous()?, 2, q_offset)?;
+                }
+            } else if use_seg_sdpa {
                 #[cfg(feature = "metal")]
                 {
                     // SDPA handles GQA natively — no repeat_kv needed.

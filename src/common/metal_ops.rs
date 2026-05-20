@@ -22,6 +22,7 @@ use candle_metal_kernels::{
     SdpaDType,
     metal::{ComputeCommandEncoder, ComputePipeline},
 };
+use objc2_metal::{MTLDevice, MTLGPUFamily};
 use objc2_metal::{MTLResourceUsage, MTLSize};
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
@@ -898,6 +899,281 @@ impl CustomOp1 for SoftcapOp {
     }
 }
 
+// ─── Flash Attention prefill kernel ──────────────────────────────────────────
+//
+// Custom Metal FA2-style kernel for the prefill path (num_tokens > 1).
+// Implements tiled QKᵀ → online softmax → PV with causal+prefix masking and
+// GQA support, all in one dispatch.  The decode path (num_tokens == 1)
+// continues to use candle's SDPA vector kernel.
+//
+// Algorithm derived from FlashAttention (Dao et al., BSD-3-Clause).  See the
+// attribution header in `flash_attn.metal`.
+
+const FA_METAL_SOURCE: &str = include_str!("flash_attn.metal");
+
+static FA_PIPELINES: OnceLock<Mutex<HashMap<(u64, &'static str), ComputePipeline>>> =
+    OnceLock::new();
+
+fn get_or_compile_fa_pipeline(
+    device: &candle_metal_kernels::metal::Device,
+    kernel_name: &'static str,
+) -> Result<ComputePipeline> {
+    let cache = FA_PIPELINES.get_or_init(|| Mutex::new(HashMap::new()));
+    let key = (device.registry_id(), kernel_name);
+
+    let mut guard = cache
+        .lock()
+        .map_err(|e| candle_core::Error::Msg(format!("FA pipeline cache poisoned: {e}")))?;
+
+    if let Some(p) = guard.get(&key) {
+        return Ok(p.clone());
+    }
+
+    let lib = device
+        .new_library_with_source(FA_METAL_SOURCE, None)
+        .map_err(|e| candle_core::Error::Msg(format!("FA Metal compile: {e}")))?;
+
+    let func = lib
+        .get_function(kernel_name, None)
+        .map_err(|e| candle_core::Error::Msg(format!("FA kernel '{kernel_name}': {e}")))?;
+
+    let pipeline = device
+        .new_compute_pipeline_state_with_function(&func)
+        .map_err(|e| candle_core::Error::Msg(format!("FA pipeline: {e}")))?;
+
+    guard.insert(key, pipeline.clone());
+    Ok(pipeline)
+}
+
+/// Tile sizes (Br, Bc) chosen to fit threadgroup memory budget on Apple GPUs
+/// (~32 KB conservative).  Computed as:
+///   (Br*D + 2*Br + Br*Bc)*4   (fp32 accumulators)
+///   + (Br + Bc)*D*sizeof(T)   (Q tile + KV tile)
+fn fa_tile_sizes(head_dim: usize) -> (usize, usize) {
+    match head_dim {
+        64 => (32, 32),
+        128 => (16, 32),
+        256 => (8, 16),
+        _ => (16, 16), // conservative fallback
+    }
+}
+
+/// Returns true if the device supports the hardware Matrix Multiply Accumulate
+/// units present on Apple GPU family 8 and later (M3, M4, …).  On older Apple
+/// silicon (M1/M2 = family 7) simdgroup_matrix is software-emulated and slower
+/// than the scalar 4-way-unrolled kernel, so we explicitly opt-in here.
+fn metal_supports_mma(device: &candle_metal_kernels::metal::Device) -> bool {
+    // Cache the answer per device to avoid the Obj-C dispatch on every kernel call.
+    static CACHE: OnceLock<Mutex<HashMap<u64, bool>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let key = device.registry_id();
+    if let Ok(map) = cache.lock()
+        && let Some(&v) = map.get(&key)
+    {
+        return v;
+    }
+    let supported = device.as_ref().supportsFamily(MTLGPUFamily::Apple8);
+    if let Ok(mut map) = cache.lock() {
+        map.insert(key, supported);
+    }
+    supported
+}
+
+/// Layout (in fp32 equivalents — keep in sync with `flash_attn.metal`):
+///   o_acc     : Br * D            fp32
+///   m_row     : Br                fp32
+///   l_row     : Br                fp32
+///   s_scratch : Br * Bc           fp32
+///   p_tile    : Br * Bc           T   (MMA variant only — for converted P)
+///   q_tile    : Br * D            T
+///   kv_tile   : Bc * (D + KV_PAD) T  (K and V share the same area)
+///
+/// KV_PAD = 4 / sizeof(T) adds exactly 1 word per row to break the 32-way
+/// SIMD-group bank conflict on kv_tile reads in the QKᵀ inner loop.
+///
+/// The MMA variant needs `p_tile` for the bfloat/half P operand of the PV
+/// MMA (the scalar kernel re-reads from float s_scratch directly).  Pass
+/// `with_p_tile = true` for the MMA kernel allocation.
+fn fa_threadgroup_bytes(
+    br: usize,
+    bc: usize,
+    d: usize,
+    dtype_bytes: usize,
+    with_p_tile: bool,
+) -> usize {
+    let kv_pad = 4 / dtype_bytes; // 1 element for f32, 2 elements for f16/bf16
+    let kv_stride = d + kv_pad;
+    let fp32_bytes = (br * d + 2 * br + br * bc) * 4;
+    let p_tile_bytes = if with_p_tile {
+        br * bc * dtype_bytes
+    } else {
+        0
+    };
+    let tile_bytes = (br * d + bc * kv_stride) * dtype_bytes + p_tile_bytes;
+    fp32_bytes + tile_bytes
+}
+
+/// Must match the `FlashAttnParams` struct in `flash_attn.metal`.
+#[repr(C)]
+struct FlashAttnParams {
+    t_q: u32,
+    t_kv: u32,
+    h: u32,
+    h_kv: u32,
+    d: u32,
+    br: u32,
+    bc: u32,
+    scale: f32,
+    softcap: f32,
+    prefix_len: u32,
+}
+
+struct FlashAttnPrefill {
+    scale: f32,
+    softcap: f32, // 0.0 = disabled
+    prefix_len: usize,
+    br: usize,
+    bc: usize,
+}
+
+impl CustomOp3 for FlashAttnPrefill {
+    fn name(&self) -> &'static str {
+        "metal-flash-attn-prefill"
+    }
+
+    fn cpu_fwd(
+        &self,
+        _s1: &CpuStorage,
+        _l1: &Layout,
+        _s2: &CpuStorage,
+        _l2: &Layout,
+        _s3: &CpuStorage,
+        _l3: &Layout,
+    ) -> Result<(CpuStorage, Shape)> {
+        candle_core::bail!("FlashAttnPrefill: Metal-only — use standard attention path on CPU")
+    }
+
+    fn metal_fwd(
+        &self,
+        q: &MetalStorage,
+        q_l: &Layout,
+        k: &MetalStorage,
+        k_l: &Layout,
+        v: &MetalStorage,
+        v_l: &Layout,
+    ) -> Result<(MetalStorage, Shape)> {
+        if !q_l.is_contiguous() {
+            candle_core::bail!("FlashAttnPrefill: q must be contiguous");
+        }
+        if !k_l.is_contiguous() {
+            candle_core::bail!("FlashAttnPrefill: k must be contiguous");
+        }
+        if !v_l.is_contiguous() {
+            candle_core::bail!("FlashAttnPrefill: v must be contiguous");
+        }
+        if q.dtype() != k.dtype() || q.dtype() != v.dtype() {
+            candle_core::bail!("FlashAttnPrefill: q, k, v dtypes must match");
+        }
+
+        let q_dims = q_l.dims();
+        let k_dims = k_l.dims();
+        let v_dims = v_l.dims();
+        if q_dims.len() != 4 || k_dims.len() != 4 || v_dims.len() != 4 {
+            candle_core::bail!("FlashAttnPrefill: q, k, v must be 4-D [B, H, T, D]");
+        }
+        let (b, h, t_q, d) = (q_dims[0], q_dims[1], q_dims[2], q_dims[3]);
+        let h_kv = k_dims[1];
+        let t_kv = k_dims[2];
+        if k_dims[0] != b || v_dims[0] != b {
+            candle_core::bail!("FlashAttnPrefill: batch dim mismatch");
+        }
+        if v_dims[1] != h_kv || v_dims[2] != t_kv {
+            candle_core::bail!("FlashAttnPrefill: k and v must share head and seq dims");
+        }
+        if k_dims[3] != d || v_dims[3] != d {
+            candle_core::bail!("FlashAttnPrefill: head_dim must match across q, k, v");
+        }
+        if h % h_kv != 0 {
+            candle_core::bail!("FlashAttnPrefill: n_heads must be divisible by n_kv_heads");
+        }
+        if self.prefix_len + t_q != t_kv {
+            candle_core::bail!(
+                "FlashAttnPrefill: prefix_len ({}) + T_q ({t_q}) != T_kv ({t_kv})",
+                self.prefix_len
+            );
+        }
+
+        let dtype_bytes = q.dtype().size_in_bytes();
+        let elem_count = b * h * t_q * d;
+        let device = q.device();
+        let use_mma = metal_supports_mma(device.device());
+        let kernel_name: &'static str = match (q.dtype(), use_mma) {
+            (DType::F32, true) => "flash_attention_prefill_mma_f32",
+            (DType::F16, true) => "flash_attention_prefill_mma_f16",
+            (DType::BF16, true) => "flash_attention_prefill_mma_bf16",
+            (DType::F32, false) => "flash_attention_prefill_f32",
+            (DType::F16, false) => "flash_attention_prefill_f16",
+            (DType::BF16, false) => "flash_attention_prefill_bf16",
+            (other, _) => candle_core::bail!("FlashAttnPrefill: unsupported dtype {other:?}"),
+        };
+        let output = device.new_buffer(elem_count, q.dtype(), "flash_attn_out")?;
+
+        let params = FlashAttnParams {
+            t_q: t_q as u32,
+            t_kv: t_kv as u32,
+            h: h as u32,
+            h_kv: h_kv as u32,
+            d: d as u32,
+            br: self.br as u32,
+            bc: self.bc as u32,
+            scale: self.scale,
+            softcap: self.softcap,
+            prefix_len: self.prefix_len as u32,
+        };
+
+        let tg_bytes = fa_threadgroup_bytes(self.br, self.bc, d, dtype_bytes, use_mma);
+        let n_q_blocks = t_q.div_ceil(self.br);
+        let grid_x = b * h * n_q_blocks;
+        let threads_per_group: usize = 128;
+
+        let pipeline = get_or_compile_fa_pipeline(device.device(), kernel_name)?;
+        // Cap threads at pipeline's reported maximum (typically 1024 on M-series).
+        let max_threads = pipeline.max_total_threads_per_threadgroup();
+        let tg_size = threads_per_group.min(max_threads);
+
+        let encoder = device.command_encoder()?;
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(q.buffer()), q_l.start_offset() * dtype_bytes);
+        encoder.set_buffer(1, Some(k.buffer()), k_l.start_offset() * dtype_bytes);
+        encoder.set_buffer(2, Some(v.buffer()), v_l.start_offset() * dtype_bytes);
+        encoder.set_buffer(3, Some(&*output), 0);
+        encoder.set_bytes(4, &params);
+        encoder.set_threadgroup_memory_length(0, tg_bytes);
+        encoder.use_resource(q.buffer(), MTLResourceUsage::Read);
+        encoder.use_resource(k.buffer(), MTLResourceUsage::Read);
+        encoder.use_resource(v.buffer(), MTLResourceUsage::Read);
+        encoder.use_resource(&*output, MTLResourceUsage::Write);
+
+        encoder.dispatch_thread_groups(
+            MTLSize {
+                width: grid_x,
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: tg_size,
+                height: 1,
+                depth: 1,
+            },
+        );
+
+        Ok((
+            MetalStorage::new(output, device.clone(), elem_count, q.dtype()),
+            Shape::from_dims(&[b, h, t_q, d]),
+        ))
+    }
+}
+
 // ─── Public API ──────────────────────────────────────────────────────────────
 
 /// Scaled Dot Product Attention via Metal fused kernels.
@@ -1015,6 +1291,56 @@ pub fn gelu_tanh_mul_fused(gate: &Tensor, up: &Tensor) -> Result<Tensor> {
 /// `x` must be contiguous.  Returns a tensor of the same shape and dtype.
 pub fn softcap_fused(x: &Tensor, softcap: f32) -> Result<Tensor> {
     x.apply_op1_no_bwd(&SoftcapOp { softcap })
+}
+
+/// Flash Attention prefill via Metal custom kernel.
+///
+/// Computes scaled dot-product attention for the prefill path (multi-token Q)
+/// using a tiled FA2-style kernel with online softmax — never materialises the
+/// full QKᵀ matrix in unified memory.
+///
+/// Tensor layout (head counts are taken from the tensor shapes):
+/// - `q`: `[B, H,    T_q,  D]`  contiguous
+/// - `k`: `[B, H_kv, T_kv, D]`  contiguous
+/// - `v`: `[B, H_kv, T_kv, D]`  contiguous
+///
+/// Where `T_kv = prefix_len + T_q` and `H % H_kv == 0` (GQA supported natively).
+/// Causal masking is always applied; `softcap` of `Some(cap)` enables Gemma-style
+/// score capping inline in the kernel.
+pub fn flash_attention_metal_prefill(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    scale: f32,
+    softcap: Option<f32>,
+    prefix_len: usize,
+) -> Result<Tensor> {
+    if !q.device().is_metal() || !k.device().is_metal() || !v.device().is_metal() {
+        candle_core::bail!("flash_attention_metal_prefill: q, k, v must all be on a Metal device");
+    }
+    let head_dim = q.dim(D::Minus1)?;
+    let (br, bc) = fa_tile_sizes(head_dim);
+    q.apply_op3_no_bwd(
+        k,
+        v,
+        &FlashAttnPrefill {
+            scale,
+            softcap: softcap.unwrap_or(0.0),
+            prefix_len,
+            br,
+            bc,
+        },
+    )
+}
+
+/// Check whether the custom Metal Flash Attention prefill kernel can handle
+/// the given configuration.
+///
+/// Returns `true` for head dims 64, 128, 256 (the configurations with vetted
+/// threadgroup memory budgets).  Other head dims fall back to the standard
+/// attention path.
+pub fn flash_attention_metal_available(head_dim: usize) -> bool {
+    matches!(head_dim, 64 | 128 | 256)
 }
 
 #[cfg(test)]
@@ -1301,5 +1627,346 @@ mod fused_kernel_parity_tests {
             .unwrap();
         let diff = max_abs_diff_f32(&f, &s);
         assert!(diff < 0.5, "max_abs_diff (bf16) = {diff}");
+    }
+
+    // ── Flash Attention prefill parity tests ─────────────────────────────────
+    //
+    // Compare the custom Metal FA kernel against a naive `matmul + softmax +
+    // matmul` reference computed on the same Metal device.  Both paths use
+    // F32 internal accumulation so the numerical agreement should be tight
+    // (<1e-3 for F32, ~1e-2 for BF16).
+
+    fn naive_attention_reference(
+        q: &Tensor, // [B, H, T_q, D]
+        k: &Tensor, // [B, H_kv, T_kv, D]
+        v: &Tensor, // [B, H_kv, T_kv, D]
+        scale: f32,
+        softcap: Option<f32>,
+        prefix_len: usize,
+    ) -> Result<Tensor> {
+        let (b, h, t_q, _d) = q.dims4()?;
+        let (_, h_kv, t_kv, _) = k.dims4()?;
+        let n_rep = h / h_kv;
+
+        // Expand KV to match Q heads if GQA
+        let k_exp = if n_rep == 1 {
+            k.clone()
+        } else {
+            k.unsqueeze(2)?
+                .expand((b, h_kv, n_rep, t_kv, k.dim(3)?))?
+                .reshape((b, h, t_kv, k.dim(3)?))?
+        };
+        let v_exp = if n_rep == 1 {
+            v.clone()
+        } else {
+            v.unsqueeze(2)?
+                .expand((b, h_kv, n_rep, t_kv, v.dim(3)?))?
+                .reshape((b, h, t_kv, v.dim(3)?))?
+        };
+
+        // Compute scores: Q @ K^T * scale
+        let mut scores = q
+            .matmul(&k_exp.transpose(D::Minus1, D::Minus2)?)?
+            .affine(scale as f64, 0.0)?;
+        if let Some(cap) = softcap {
+            scores = (scores / (cap as f64))?.tanh()?.affine(cap as f64, 0.0)?;
+        }
+
+        // Build causal mask shifted by prefix_len:
+        //   mask[i, j] = -INF if j > prefix + i, else 0
+        let device = q.device();
+        let mut mask_data = vec![0.0f32; t_q * t_kv];
+        for i in 0..t_q {
+            for j in 0..t_kv {
+                if j > prefix_len + i {
+                    mask_data[i * t_kv + j] = f32::NEG_INFINITY;
+                }
+            }
+        }
+        let mask =
+            Tensor::from_vec(mask_data, (1, 1, t_q, t_kv), device)?.to_dtype(scores.dtype())?;
+        let masked = scores.broadcast_add(&mask)?;
+
+        let attn = crate::common::linear::softmax_last_dim(&masked)?;
+        attn.matmul(&v_exp)
+    }
+
+    /// Shape of a Flash Attention parity test case.
+    struct FaCase {
+        b: usize,
+        h: usize,
+        h_kv: usize,
+        t_q: usize,
+        t_kv: usize,
+        d: usize,
+    }
+
+    fn run_fa_parity(
+        dev: &Device,
+        dtype: DType,
+        case: FaCase,
+        softcap: Option<f32>,
+        tol: f32,
+        label: &str,
+    ) {
+        let FaCase {
+            b,
+            h,
+            h_kv,
+            t_q,
+            t_kv,
+            d,
+        } = case;
+        let prefix = t_kv - t_q;
+        let scale = 1.0 / (d as f32).sqrt();
+
+        // Deterministic small values to keep softmax well-conditioned and BF16
+        // accumulation stable across the two paths.
+        let n_q = b * h * t_q * d;
+        let n_kv = b * h_kv * t_kv * d;
+        let q_data: Vec<f32> = (0..n_q).map(|i| ((i % 17) as f32 - 8.0) * 0.04).collect();
+        let k_data: Vec<f32> = (0..n_kv).map(|i| ((i % 19) as f32 - 9.0) * 0.03).collect();
+        let v_data: Vec<f32> = (0..n_kv).map(|i| ((i % 23) as f32 - 11.0) * 0.05).collect();
+        let q = Tensor::from_vec(q_data, (b, h, t_q, d), dev)
+            .unwrap()
+            .to_dtype(dtype)
+            .unwrap();
+        let k = Tensor::from_vec(k_data, (b, h_kv, t_kv, d), dev)
+            .unwrap()
+            .to_dtype(dtype)
+            .unwrap();
+        let v = Tensor::from_vec(v_data, (b, h_kv, t_kv, d), dev)
+            .unwrap()
+            .to_dtype(dtype)
+            .unwrap();
+
+        let out_fa = flash_attention_metal_prefill(&q, &k, &v, scale, softcap, prefix)
+            .expect("FA kernel must not error");
+
+        let out_ref = naive_attention_reference(&q, &k, &v, scale, softcap, prefix)
+            .expect("naive reference must not error");
+
+        let f = out_fa
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let r = out_ref
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        assert_eq!(f.len(), r.len(), "{label}: size mismatch");
+        let diff = max_abs_diff_f32(&f, &r);
+        let all_finite_fa = f.iter().all(|x| x.is_finite());
+        let all_finite_ref = r.iter().all(|x| x.is_finite());
+        assert!(all_finite_fa, "{label}: FA output not finite");
+        assert!(all_finite_ref, "{label}: ref output not finite");
+        assert!(diff < tol, "{label}: max_abs_diff = {diff} (tol {tol})");
+    }
+
+    #[test]
+    fn flash_attn_f32_d64_prefill_matches_naive() {
+        let Some(dev) = metal_device_or_skip() else {
+            return;
+        };
+        run_fa_parity(
+            &dev,
+            DType::F32,
+            FaCase {
+                b: 1,
+                h: 2,
+                h_kv: 2,
+                t_q: 16,
+                t_kv: 16,
+                d: 64,
+            },
+            None,
+            1e-4,
+            "f32/d64/no-prefix",
+        );
+    }
+
+    #[test]
+    fn flash_attn_bf16_d64_prefill_matches_naive() {
+        let Some(dev) = metal_device_or_skip() else {
+            return;
+        };
+        run_fa_parity(
+            &dev,
+            DType::BF16,
+            FaCase {
+                b: 1,
+                h: 4,
+                h_kv: 4,
+                t_q: 16,
+                t_kv: 16,
+                d: 64,
+            },
+            None,
+            0.05,
+            "bf16/d64/no-prefix",
+        );
+    }
+
+    #[test]
+    fn flash_attn_bf16_d128_prefill_matches_naive() {
+        let Some(dev) = metal_device_or_skip() else {
+            return;
+        };
+        run_fa_parity(
+            &dev,
+            DType::BF16,
+            FaCase {
+                b: 1,
+                h: 4,
+                h_kv: 4,
+                t_q: 8,
+                t_kv: 8,
+                d: 128,
+            },
+            None,
+            0.05,
+            "bf16/d128/no-prefix",
+        );
+    }
+
+    #[test]
+    fn flash_attn_bf16_d64_gqa_matches_naive() {
+        // n_heads=8, n_kv_heads=2 (GQA factor 4)
+        let Some(dev) = metal_device_or_skip() else {
+            return;
+        };
+        run_fa_parity(
+            &dev,
+            DType::BF16,
+            FaCase {
+                b: 1,
+                h: 8,
+                h_kv: 2,
+                t_q: 8,
+                t_kv: 8,
+                d: 64,
+            },
+            None,
+            0.05,
+            "bf16/d64/gqa",
+        );
+    }
+
+    #[test]
+    fn flash_attn_bf16_d64_softcap_matches_naive() {
+        // Gemma2-style softcap
+        let Some(dev) = metal_device_or_skip() else {
+            return;
+        };
+        run_fa_parity(
+            &dev,
+            DType::BF16,
+            FaCase {
+                b: 1,
+                h: 4,
+                h_kv: 4,
+                t_q: 16,
+                t_kv: 16,
+                d: 64,
+            },
+            Some(30.0),
+            0.05,
+            "bf16/d64/softcap",
+        );
+    }
+
+    #[test]
+    fn flash_attn_bf16_d64_with_prefix_cache_matches_naive() {
+        // prefix_len = 24, t_q = 8 → t_kv = 32 (simulates 24-token KV cache hit)
+        let Some(dev) = metal_device_or_skip() else {
+            return;
+        };
+        run_fa_parity(
+            &dev,
+            DType::BF16,
+            FaCase {
+                b: 1,
+                h: 4,
+                h_kv: 4,
+                t_q: 8,
+                t_kv: 32,
+                d: 64,
+            },
+            None,
+            0.05,
+            "bf16/d64/prefix=24",
+        );
+    }
+
+    #[test]
+    fn flash_attn_f16_d64_prefill_matches_naive() {
+        let Some(dev) = metal_device_or_skip() else {
+            return;
+        };
+        run_fa_parity(
+            &dev,
+            DType::F16,
+            FaCase {
+                b: 1,
+                h: 4,
+                h_kv: 4,
+                t_q: 16,
+                t_kv: 16,
+                d: 64,
+            },
+            None,
+            0.02,
+            "f16/d64/no-prefix",
+        );
+    }
+
+    #[test]
+    fn flash_attn_rejects_cpu_tensors() {
+        let dev = Device::Cpu;
+        let q = Tensor::zeros((1, 4, 4, 64), DType::F32, &dev).unwrap();
+        let k = Tensor::zeros((1, 4, 4, 64), DType::F32, &dev).unwrap();
+        let v = Tensor::zeros((1, 4, 4, 64), DType::F32, &dev).unwrap();
+        let err = flash_attention_metal_prefill(&q, &k, &v, 0.125, None, 0)
+            .expect_err("must reject CPU tensors");
+        assert!(format!("{err}").contains("Metal"));
+    }
+
+    #[test]
+    fn flash_attn_available_for_supported_head_dims() {
+        assert!(flash_attention_metal_available(64));
+        assert!(flash_attention_metal_available(128));
+        assert!(flash_attention_metal_available(256));
+        assert!(!flash_attention_metal_available(80));
+        assert!(!flash_attention_metal_available(96));
+    }
+
+    #[test]
+    fn flash_attn_bf16_long_prefix_matches_naive() {
+        // Stress test: short prefill, long prefix cache (decode-after-prefill scenario)
+        // T_q=4, T_kv=128 (prefix=124), exercises the n_block_max optimization.
+        let Some(dev) = metal_device_or_skip() else {
+            return;
+        };
+        run_fa_parity(
+            &dev,
+            DType::BF16,
+            FaCase {
+                b: 1,
+                h: 4,
+                h_kv: 4,
+                t_q: 4,
+                t_kv: 128,
+                d: 64,
+            },
+            None,
+            0.05,
+            "bf16/d64/long-prefix",
+        );
     }
 }

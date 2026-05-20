@@ -225,27 +225,96 @@ pub fn dequantize_awq(raw: &AwqRawTensors, device: &Device, out_dtype: DType) ->
         }
     }
 
-    let mut weight = vec![0f32; out_features * in_features];
-    for i in 0..in_features {
-        let g = i / group_size;
-        for j in 0..packed_out {
-            let packed = qweight_vec[i * packed_out + j];
-            for (k, &offset) in AWQ_PACK_ORDER.iter().enumerate() {
-                let nibble = ((packed >> (4 * k as u32)) & 0xF) as i32;
-                let out_idx = j * AWQ_PACK_FACTOR + offset;
-                let zero = zeros[g * out_features + out_idx] as i32;
-                let scale = scales_vec[g * out_features + out_idx];
-                let dequant = (nibble - zero) as f32 * scale;
-                weight[out_idx * in_features + i] = dequant;
-            }
-        }
+    // For a given out_idx, the packed source nibble lives at
+    //   qweight[i][j], bit-offset 4*k   where  j = out_idx / 8
+    // and k is the index into AWQ_PACK_ORDER whose value equals out_idx % 8.
+    // `inv_pack_order` is that inverse map.
+    let mut inv_pack_order = [0u32; AWQ_PACK_FACTOR];
+    for (k, &offset) in AWQ_PACK_ORDER.iter().enumerate() {
+        inv_pack_order[offset] = k as u32;
     }
 
-    let weight_cpu = Tensor::from_vec(weight, (out_features, in_features), &Device::Cpu)?;
+    // Dequantize directly into the target dtype.  Producing the final dtype
+    // here (rather than an f32 intermediate + a GPU `to_dtype` cast) halves
+    // both the host buffer and the CPU→GPU upload: the upload of the F32
+    // intermediate was the dominant cost of AWQ model loading.
+    let plan = AwqDequantPlan {
+        in_features,
+        out_features,
+        packed_out,
+        group_size,
+        qweight: &qweight_vec,
+        zeros: &zeros,
+        scales: &scales_vec,
+        inv_pack_order,
+    };
+    let weight_cpu = match out_dtype {
+        DType::F32 => {
+            let mut w = vec![0f32; out_features * in_features];
+            fill_awq_weight(&mut w, &plan, |x| x);
+            Tensor::from_vec(w, (out_features, in_features), &Device::Cpu)?
+        }
+        DType::BF16 => {
+            let mut w = vec![half::bf16::ZERO; out_features * in_features];
+            fill_awq_weight(&mut w, &plan, half::bf16::from_f32);
+            Tensor::from_vec(w, (out_features, in_features), &Device::Cpu)?
+        }
+        DType::F16 => {
+            let mut w = vec![half::f16::ZERO; out_features * in_features];
+            fill_awq_weight(&mut w, &plan, half::f16::from_f32);
+            Tensor::from_vec(w, (out_features, in_features), &Device::Cpu)?
+        }
+        other => anyhow::bail!("AWQ dequantize: unsupported out_dtype {other:?}"),
+    };
+
     weight_cpu
-        .to_device(device)?
-        .to_dtype(out_dtype)
-        .context("AWQ dequantized weight dtype cast")
+        .to_device(device)
+        .context("AWQ dequantized weight → device")
+}
+
+/// Bundled inputs for one AWQ weight-matrix dequantization, shared by the
+/// per-dtype calls to [`fill_awq_weight`].
+struct AwqDequantPlan<'a> {
+    in_features: usize,
+    out_features: usize,
+    packed_out: usize,
+    group_size: usize,
+    qweight: &'a [u32],
+    zeros: &'a [u8],
+    scales: &'a [f32],
+    /// Maps an output column's `% 8` offset back to its nibble index `k`.
+    inv_pack_order: [u32; AWQ_PACK_FACTOR],
+}
+
+/// Fill a row-major `[out_features, in_features]` weight buffer from AWQ data.
+///
+/// Parallelized over OUTPUT ROWS (out_idx): each rayon worker fills one
+/// contiguous `in_features`-long row, keeping writes sequential for good
+/// memory bandwidth.  (An earlier version parallelized over input columns,
+/// which scattered writes across a 100-200 MB buffer and bottlenecked the
+/// memory controller.)  The `convert` closure casts each f32 result to the
+/// final element type.
+fn fill_awq_weight<T: candle_core::WithDType + Send>(
+    out: &mut [T],
+    plan: &AwqDequantPlan,
+    convert: impl Fn(f32) -> T + Sync,
+) {
+    use rayon::prelude::*;
+    out.par_chunks_mut(plan.in_features)
+        .enumerate()
+        .for_each(|(out_idx, row)| {
+            let j = out_idx / AWQ_PACK_FACTOR;
+            let offset = out_idx % AWQ_PACK_FACTOR;
+            let shift = 4 * plan.inv_pack_order[offset];
+            for (i, slot) in row.iter_mut().enumerate() {
+                let g = i / plan.group_size;
+                let packed = plan.qweight[i * plan.packed_out + j];
+                let nibble = ((packed >> shift) & 0xF) as i32;
+                let zero = plan.zeros[g * plan.out_features + out_idx] as i32;
+                let scale = plan.scales[g * plan.out_features + out_idx];
+                *slot = convert((nibble - zero) as f32 * scale);
+            }
+        });
 }
 
 #[cfg(test)]

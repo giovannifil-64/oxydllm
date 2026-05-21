@@ -28,6 +28,10 @@ fn load_tensor_with_dtype(
         return Ok(t);
     }
 
+    if t.dtype() == target_dtype {
+        return Ok(t);
+    }
+
     if t.dtype() == DType::F8E4M3 {
         // Metal has no F8E4M3 compute kernels (not even type conversion), so the on-the-fly
         // dequant path used by Fp8Linear is unavailable. Always dequantize at load time on
@@ -182,8 +186,9 @@ impl ModelWeights {
             .cloned()
             .collect();
 
-        let mut tensors: FxHashMap<String, Tensor> = names
-            .iter()
+        use rayon::prelude::*;
+        let entries: Vec<(String, Tensor)> = names
+            .par_iter()
             .map(|name| {
                 let preserve_fp8_weight = name.ends_with(".weight")
                     && scale_inv_names.contains(&format!("{}_scale_inv", name));
@@ -196,9 +201,14 @@ impl ModelWeights {
                     preserve_fp8_weight,
                     force_f32,
                 )?;
-                Ok((name.clone(), t))
+                Ok::<_, anyhow::Error>((name.clone(), t))
             })
-            .collect::<Result<_>>()?;
+            .collect::<Result<Vec<_>>>()?;
+        let mut tensors: FxHashMap<String, Tensor> =
+            FxHashMap::with_capacity_and_hasher(entries.len(), Default::default());
+        for (n, t) in entries {
+            tensors.insert(n, t);
+        }
 
         apply_weight_scale_inv(&mut tensors)?;
 
@@ -280,6 +290,10 @@ impl ModelWeights {
             qzeros,
             scales,
         })
+    }
+
+    pub fn has_packed_quantized_weights(&self) -> bool {
+        self.tensors.keys().any(|k| k.ends_with(".qweight"))
     }
 
     pub fn runtime_size_bytes(&self) -> usize {

@@ -668,6 +668,7 @@ fn load_standard_safetensors(
     let weight_path_refs: Vec<&str> = weight_paths.iter().map(|s| s.as_str()).collect();
     let weights = ModelWeights::load(&weight_path_refs, device, dtype)?;
     let weights_size = weights.runtime_size_bytes();
+    let has_packed_quantized_weights = weights.has_packed_quantized_weights();
 
     let num_layers = cfg.num_hidden_layers;
     let per_layer_head_dims = cfg
@@ -752,8 +753,12 @@ fn load_standard_safetensors(
                      produces wrong output, set `tie_word_embeddings: false` in config.json."
                 );
             }
+
             #[cfg(feature = "metal")]
-            if device.is_metal() && matches!(dtype, DType::F16 | DType::BF16) {
+            if has_packed_quantized_weights
+                && device.is_metal()
+                && matches!(dtype, DType::F16 | DType::BF16)
+            {
                 let raw = crate::common::awq::rtn_quantize_awq(&embed_weight, 128)?;
                 let extra = raw.runtime_size_bytes();
                 (

@@ -98,6 +98,42 @@ fn load_tensor_with_dtype(
     }
 }
 
+/// Multiply an FP8 weight (already cast to a float dtype) by its inverse-scale tensor.
+///
+/// FP8 checkpoints store `weight_scale_inv` at one of three granularities:
+///   * per-tensor / per-channel — the scale broadcasts directly onto the weight;
+///   * block-wise (`weight_block_size`, DeepSeek- / Qwen3-FP8 style) — the scale is a
+///     `[out/block, in/block]` grid with one entry per weight tile, which `broadcast_mul`
+///     cannot expand. The grid is repeated up to the weight shape, then multiplied.
+pub(crate) fn apply_scale_inv(weight: &Tensor, scale_inv: &Tensor) -> candle_core::Result<Tensor> {
+    if let Ok(scaled) = weight.broadcast_mul(scale_inv) {
+        return Ok(scaled);
+    }
+
+    let (out, inn) = weight.dims2()?;
+    let Ok((s_out, s_in)) = scale_inv.dims2() else {
+        candle_core::bail!(
+            "weight_scale_inv {:?} does not broadcast onto weight [{out}, {inn}] \
+             and is not a 2-D block-scale grid",
+            scale_inv.dims(),
+        );
+    };
+    if s_out == 0 || s_in == 0 || out % s_out != 0 || inn % s_in != 0 {
+        candle_core::bail!(
+            "block-wise FP8 weight_scale_inv [{s_out}, {s_in}] does not tile \
+             weight [{out}, {inn}] evenly"
+        );
+    }
+
+    let (block_out, block_in) = (out / s_out, inn / s_in);
+    scale_inv
+        .reshape((s_out, 1, s_in, 1))?
+        .broadcast_as((s_out, block_out, s_in, block_in))?
+        .contiguous()?
+        .reshape((out, inn))?
+        .mul(weight)
+}
+
 fn apply_weight_scale_inv(tensors: &mut FxHashMap<String, Tensor>) -> Result<()> {
     let weight_names: Vec<String> = tensors
         .keys()
@@ -125,7 +161,7 @@ fn apply_weight_scale_inv(tensors: &mut FxHashMap<String, Tensor>) -> Result<()>
         let scale_inv = scale_inv
             .to_dtype(weight.dtype())
             .with_context(|| format!("Failed to cast '{}' to {:?}", scale_name, weight.dtype()))?;
-        let scaled = weight.broadcast_mul(&scale_inv).with_context(|| {
+        let scaled = apply_scale_inv(&weight, &scale_inv).with_context(|| {
             format!(
                 "Failed to apply '{}' dequantization factor to '{}'",
                 scale_name, weight_name
@@ -311,6 +347,42 @@ mod tests {
             .expect("scaled tensor should exist")
             .to_vec2::<f32>()?;
         assert_eq!(scaled, vec![vec![2.0, 4.0], vec![1.5, 2.0]]);
+        Ok(())
+    }
+
+    #[test]
+    fn apply_weight_scale_inv_expands_block_wise_scales() -> Result<()> {
+        let device = Device::Cpu;
+        let mut tensors = FxHashMap::default();
+
+        tensors.insert(
+            "layer.weight".to_string(),
+            Tensor::from_vec(
+                (1..=16).map(|v| v as f32).collect::<Vec<_>>(),
+                (4, 4),
+                &device,
+            )?,
+        );
+        tensors.insert(
+            "layer.weight_scale_inv".to_string(),
+            Tensor::from_vec(vec![10.0f32, 100.0, 1000.0, 10000.0], (2, 2), &device)?,
+        );
+
+        apply_weight_scale_inv(&mut tensors)?;
+
+        let scaled = tensors
+            .get("layer.weight")
+            .expect("scaled tensor should exist")
+            .to_vec2::<f32>()?;
+        assert_eq!(
+            scaled,
+            vec![
+                vec![10.0, 20.0, 300.0, 400.0],
+                vec![50.0, 60.0, 700.0, 800.0],
+                vec![9_000.0, 10_000.0, 110_000.0, 120_000.0],
+                vec![13_000.0, 14_000.0, 150_000.0, 160_000.0],
+            ]
+        );
         Ok(())
     }
 

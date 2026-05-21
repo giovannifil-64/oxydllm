@@ -1,4 +1,5 @@
 use crate::common::awq::{AwqRawTensors, dequantize_awq};
+use crate::common::weights::apply_scale_inv;
 use candle_core::quantized::{QMatMul, QTensor};
 use candle_core::{DType, Device, Result, Tensor};
 use std::sync::Arc;
@@ -116,7 +117,7 @@ impl Fp8Linear {
                 }
             };
 
-            weight_f32 = weight_f32.broadcast_mul(&scale_for_mul)?;
+            weight_f32 = apply_scale_inv(&weight_f32, &scale_for_mul)?;
         }
 
         let weight_t = weight_f32.to_dtype(x.dtype())?.t()?;
@@ -499,6 +500,39 @@ mod tests {
             "unexpected error: {err}"
         );
 
+        Ok(())
+    }
+
+    #[test]
+    fn fp8_linear_dequantizes_block_wise_scale_grid() -> Result<()> {
+        let device = Device::Cpu;
+
+        let weight_fp8 = Tensor::from_vec(
+            (1..=16).map(|v| v as f32).collect::<Vec<_>>(),
+            (4, 4),
+            &device,
+        )?
+        .to_dtype(DType::F8E4M3)?;
+        let scale_inv = Tensor::from_vec(vec![0.5f32, 2.0, 4.0, 0.25], (2, 2), &device)?;
+        let x = Tensor::ones((1, 4), DType::F32, &device)?;
+
+        let out = AnyLinear::from_weight_with_scale_inv(
+            weight_fp8.clone(),
+            Some(scale_inv.clone()),
+            None,
+        )?
+        .forward(&x)?;
+
+        let expanded = scale_inv
+            .reshape((2, 1, 2, 1))?
+            .broadcast_as((2, 2, 2, 2))?
+            .contiguous()?
+            .reshape((4, 4))?;
+        let ref_weight = weight_fp8.to_dtype(DType::F32)?.mul(&expanded)?;
+        let ref_out = x.matmul(&ref_weight.t()?)?;
+
+        let diff = (out - ref_out)?.abs()?.max_all()?.to_scalar::<f32>()?;
+        assert!(diff < 1e-4, "block-wise FP8 output diverged: {diff}");
         Ok(())
     }
 }

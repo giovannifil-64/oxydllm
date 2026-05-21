@@ -50,6 +50,13 @@ impl AwqRawTensors {
         Ok(in_features / groups)
     }
 
+    pub fn runtime_size_bytes(&self) -> usize {
+        [&self.qweight, &self.qzeros, &self.scales]
+            .iter()
+            .map(|t| t.dtype().size_in_bytes() * t.elem_count())
+            .sum()
+    }
+
     pub fn to_device(&self, device: &Device) -> Result<Self> {
         Ok(Self {
             qweight: self
@@ -334,9 +341,250 @@ fn fill_awq_weight<T: candle_core::WithDType + Send>(
         });
 }
 
+/// Round-to-nearest 4-bit group-wise quantization of a `[out_features, in_features]`
+/// weight into AWQ-format packed tensors (asymmetric, grouped along `in_features`).
+///
+/// Used to quantize an otherwise-fp16 weight (e.g. a tied `lm_head`) so it can run
+/// through the W4A16 path. The output is bit-compatible with `dequantize_awq` and the
+/// `w4a16` Metal kernels — same packing as autoawq's GEMM format. `out_features` must
+/// be a multiple of 8 and `in_features` a multiple of `group_size`.
+pub fn rtn_quantize_awq(weight: &Tensor, group_size: usize) -> Result<AwqRawTensors> {
+    use rayon::prelude::*;
+
+    let (out_features, in_features) = weight
+        .dims2()
+        .context("rtn_quantize_awq: weight must be 2-D [out, in]")?;
+    if out_features % AWQ_PACK_FACTOR != 0 {
+        anyhow::bail!(
+            "rtn_quantize_awq: out_features ({out_features}) must be a multiple of {AWQ_PACK_FACTOR}"
+        );
+    }
+    if group_size == 0 || in_features % group_size != 0 {
+        anyhow::bail!(
+            "rtn_quantize_awq: in_features ({in_features}) not divisible by group_size ({group_size})"
+        );
+    }
+    let groups = in_features / group_size;
+    let packed_out = out_features / AWQ_PACK_FACTOR;
+
+    let w: Vec<f32> = weight
+        .to_device(&Device::Cpu)
+        .context("rtn_quantize_awq: weight → CPU")?
+        .to_dtype(DType::F32)
+        .context("rtn_quantize_awq: cast weight to F32")?
+        .flatten_all()?
+        .to_vec1()?;
+    if w.len() != out_features * in_features {
+        anyhow::bail!("rtn_quantize_awq: weight numel mismatch");
+    }
+
+    // Pass 1 — quantize each group (parallel over output rows; rows are independent).
+    // qnib[o][i] = 4-bit value, znib[o][g] = 4-bit zero-point, scl[o][g] = scale.
+    let mut qnib = vec![0u8; out_features * in_features];
+    let mut znib = vec![0u8; out_features * groups];
+    let mut scl = vec![0f32; out_features * groups];
+    qnib.par_chunks_mut(in_features)
+        .zip(znib.par_chunks_mut(groups))
+        .zip(scl.par_chunks_mut(groups))
+        .enumerate()
+        .for_each(|(o, ((q_row, z_row), s_row))| {
+            let w_row = &w[o * in_features..(o + 1) * in_features];
+            for g in 0..groups {
+                let grp = &w_row[g * group_size..(g + 1) * group_size];
+                let mut xmin = grp[0];
+                let mut xmax = grp[0];
+                for &v in grp {
+                    xmin = xmin.min(v);
+                    xmax = xmax.max(v);
+                }
+                // `(q - zero) * scale` with q, zero in [0, 15] always spans a
+                // range that includes 0. Extend the group range to 0 so groups
+                // that don't straddle 0 quantize correctly rather than clamping
+                // the zero-point (which destroys the reconstruction).
+                let xmin = xmin.min(0.0);
+                let xmax = xmax.max(0.0);
+                if xmax - xmin < 1e-12 {
+                    // Constant group: dequant (q - zero) * scale must yield the constant.
+                    s_row[g] = xmin;
+                    z_row[g] = 0;
+                    for q in &mut q_row[g * group_size..(g + 1) * group_size] {
+                        *q = 1;
+                    }
+                } else {
+                    let scale = (xmax - xmin) / 15.0;
+                    let zero = (-xmin / scale).round().clamp(0.0, 15.0);
+                    s_row[g] = scale;
+                    z_row[g] = zero as u8;
+                    for (idx, &v) in grp.iter().enumerate() {
+                        q_row[g * group_size + idx] =
+                            (v / scale + zero).round().clamp(0.0, 15.0) as u8;
+                    }
+                }
+            }
+        });
+    drop(w);
+
+    // Pass 2 — pack into AWQ words (parallel over packed-output columns; each owns
+    // distinct words). qweight/qzeros built out-major then transposed to AWQ layout.
+    let mut qw_om = vec![0i32; packed_out * in_features]; // [out/8, in]
+    let mut qz_om = vec![0i32; packed_out * groups]; // [out/8, groups]
+    qw_om
+        .par_chunks_mut(in_features)
+        .zip(qz_om.par_chunks_mut(groups))
+        .enumerate()
+        .for_each(|(j, (qw_col, qz_col))| {
+            for (k, &off) in AWQ_PACK_ORDER.iter().enumerate() {
+                let o = j * AWQ_PACK_FACTOR + off;
+                let shift = 4 * k as u32;
+                for (i, qw) in qw_col.iter_mut().enumerate() {
+                    *qw |= (qnib[o * in_features + i] as i32) << shift;
+                }
+                for (g, qz) in qz_col.iter_mut().enumerate() {
+                    *qz |= (znib[o * groups + g] as i32) << shift;
+                }
+            }
+        });
+
+    let cpu = Device::Cpu;
+    let qweight = Tensor::from_vec(qw_om, (packed_out, in_features), &cpu)?
+        .t()?
+        .contiguous()?;
+    let qzeros = Tensor::from_vec(qz_om, (packed_out, groups), &cpu)?
+        .t()?
+        .contiguous()?;
+    let scales = Tensor::from_vec(scl, (out_features, groups), &cpu)?
+        .t()?
+        .contiguous()?;
+
+    Ok(AwqRawTensors {
+        qweight,
+        qzeros,
+        scales,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rtn_quantize_awq_round_trips() -> Result<()> {
+        let device = Device::Cpu;
+        let (out_f, in_f, group) = (16usize, 64usize, 32usize);
+        let data: Vec<f32> = (0..out_f * in_f)
+            .map(|i| (i as f32 * 0.013).sin())
+            .collect();
+        let weight = Tensor::from_vec(data.clone(), (out_f, in_f), &device)?;
+
+        let raw = rtn_quantize_awq(&weight, group)?;
+        assert_eq!(raw.qweight.dims(), [in_f, out_f / 8]);
+        assert_eq!(raw.qzeros.dims(), [in_f / group, out_f / 8]);
+        assert_eq!(raw.scales.dims(), [in_f / group, out_f]);
+
+        let dq: Vec<f32> = dequantize_awq(&raw, &device, DType::F32)?
+            .flatten_all()?
+            .to_vec1()?;
+        assert_eq!(dq.len(), data.len());
+        let mut sq_err = 0f64;
+        let mut sq = 0f64;
+        for (q, w) in dq.iter().zip(data.iter()) {
+            sq_err += ((q - w) as f64).powi(2);
+            sq += (*w as f64).powi(2);
+        }
+        let rel = (sq_err / sq).sqrt();
+        // Correct 4-bit group-wise packing → a few % error; a wrong layout would
+        // scramble the weights and blow this far past 5%.
+        assert!(
+            rel < 0.05,
+            "RTN 4-bit relative error {rel} — packing likely wrong"
+        );
+        Ok(())
+    }
+
+    /// Quality measurement for option A (4-bit lm_head). Run explicitly:
+    ///   cargo test --release --bin oxydllm -- rtn_lm_head_quality --ignored --nocapture
+    #[test]
+    #[ignore = "A quality measurement — needs the Qwen3-4B-AWQ model on disk"]
+    fn rtn_lm_head_quality_measurement() {
+        let dir = std::path::Path::new("/Users/giovanni/.oxydllm/models/Qwen/Qwen3-4B-AWQ");
+        if !dir.exists() {
+            eprintln!("[rtn-measure] model dir not found — skipping");
+            return;
+        }
+        let device = Device::Cpu;
+        let paths: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().map(|x| x == "safetensors").unwrap_or(false))
+            .collect();
+        let path_refs: Vec<&str> = paths.iter().map(|p| p.to_str().unwrap()).collect();
+        let mmap =
+            unsafe { candle_core::safetensors::MmapedSafetensors::multi(&path_refs).unwrap() };
+        let w_ref = mmap
+            .load("model.embed_tokens.weight", &device)
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap();
+        let (out_f, in_f) = w_ref.dims2().unwrap();
+        eprintln!("[rtn-measure] embed_tokens [{out_f}, {in_f}]");
+
+        let raw = rtn_quantize_awq(&w_ref, 128).unwrap();
+        let w_q = dequantize_awq(&raw, &device, DType::F32).unwrap();
+
+        // Weight reconstruction error on the real lm_head weight.
+        let wv: Vec<f32> = w_ref.flatten_all().unwrap().to_vec1().unwrap();
+        let qv: Vec<f32> = w_q.flatten_all().unwrap().to_vec1().unwrap();
+        let (mut sq_err, mut sq, mut max_e) = (0f64, 0f64, 0f32);
+        for (a, b) in wv.iter().zip(qv.iter()) {
+            sq_err += ((a - b) as f64).powi(2);
+            sq += (*a as f64).powi(2);
+            max_e = max_e.max((a - b).abs());
+        }
+        eprintln!(
+            "[rtn-measure] weight: rel-L2 {:.4}  max-abs {:.5}",
+            (sq_err / sq).sqrt(),
+            max_e
+        );
+
+        // Logit-level: synthetic post-RMSNorm-like activations (per-row RMS = 1).
+        let n = 256usize;
+        let xd: Vec<f32> = (0..n * in_f)
+            .map(|i| {
+                let h = (i as u64).wrapping_mul(2654435761) >> 8;
+                (h & 0xffff) as f32 / 32768.0 - 1.0
+            })
+            .collect();
+        let x = Tensor::from_vec(xd, (n, in_f), &device).unwrap();
+        let rms = x.sqr().unwrap().mean_keepdim(1).unwrap().sqrt().unwrap();
+        let x = x.broadcast_div(&rms).unwrap();
+
+        let l_ref = x.matmul(&w_ref.t().unwrap().contiguous().unwrap()).unwrap();
+        let l_q = x.matmul(&w_q.t().unwrap().contiguous().unwrap()).unwrap();
+        let agree = l_ref
+            .argmax(candle_core::D::Minus1)
+            .unwrap()
+            .eq(&l_q.argmax(candle_core::D::Minus1).unwrap())
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap()
+            .sum_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        let max_dl = (l_ref - l_q)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        eprintln!(
+            "[rtn-measure] logits (n={n}): top-1 agreement {:.1}%  max-abs-err {:.4}",
+            agree / n as f32 * 100.0,
+            max_dl
+        );
+    }
 
     fn pack_awq_qweight(matrix: &[Vec<u8>], in_features: usize, out_features: usize) -> Vec<i32> {
         assert_eq!(out_features % AWQ_PACK_FACTOR, 0);

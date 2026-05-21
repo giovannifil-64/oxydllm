@@ -738,7 +738,7 @@ fn load_standard_safetensors(
             weights.try_get_scale_inv(lm_head_weight_name).cloned()
         };
 
-        let lm_head = if cfg.tie_word_embeddings {
+        let (lm_head, lm_head_extra_bytes): (AnyLinear, usize) = if cfg.tie_word_embeddings {
             // Catch the asymmetric-risk scenario the hf_parser default cannot
             // see: config (or default) says tie, but the file actually ships
             // its own lm_head — the file's head will be silently ignored. This
@@ -752,22 +752,57 @@ fn load_standard_safetensors(
                      produces wrong output, set `tie_word_embeddings: false` in config.json."
                 );
             }
-            AnyLinear::from_weight_with_scale_inv(embed_weight.clone(), lm_head_scale_inv, None)
-                .map_err(|e| anyhow::anyhow!("{e}"))?
-        } else if let Some(lm_head_awq) = weights.try_get_awq("lm_head") {
-            AnyLinear::from_awq(&lm_head_awq, None, device, dtype)
-                .map_err(|e| anyhow::anyhow!("{e}"))?
-        } else {
-            AnyLinear::from_weight_with_scale_inv(
-                weights
-                    .get(lm_head_weight_name)
-                    .map_err(|e| anyhow::anyhow!("{e}"))?
-                    .clone(),
-                lm_head_scale_inv,
-                None,
+            #[cfg(feature = "metal")]
+            if device.is_metal() && matches!(dtype, DType::F16 | DType::BF16) {
+                let raw = crate::common::awq::rtn_quantize_awq(&embed_weight, 128)?;
+                let extra = raw.runtime_size_bytes();
+                (
+                    AnyLinear::from_awq(&raw, None, device, dtype)
+                        .map_err(|e| anyhow::anyhow!("{e}"))?,
+                    extra,
+                )
+            } else {
+                (
+                    AnyLinear::from_weight_with_scale_inv(
+                        embed_weight.clone(),
+                        lm_head_scale_inv,
+                        None,
+                    )
+                    .map_err(|e| anyhow::anyhow!("{e}"))?,
+                    0usize,
+                )
+            }
+            #[cfg(not(feature = "metal"))]
+            (
+                AnyLinear::from_weight_with_scale_inv(
+                    embed_weight.clone(),
+                    lm_head_scale_inv,
+                    None,
+                )
+                .map_err(|e| anyhow::anyhow!("{e}"))?,
+                0usize,
             )
-            .map_err(|e| anyhow::anyhow!("{e}"))?
+        } else if let Some(lm_head_awq) = weights.try_get_awq("lm_head") {
+            (
+                AnyLinear::from_awq(&lm_head_awq, None, device, dtype)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?,
+                0usize,
+            )
+        } else {
+            (
+                AnyLinear::from_weight_with_scale_inv(
+                    weights
+                        .get(lm_head_weight_name)
+                        .map_err(|e| anyhow::anyhow!("{e}"))?
+                        .clone(),
+                    lm_head_scale_inv,
+                    None,
+                )
+                .map_err(|e| anyhow::anyhow!("{e}"))?,
+                0usize,
+            )
         };
+        let weights_size = weights_size + lm_head_extra_bytes;
         let embed_tokens = Embedding::new(embed_weight);
 
         let blocks = (0..cfg.num_hidden_layers)

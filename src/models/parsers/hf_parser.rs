@@ -347,7 +347,7 @@ fn validate_quantization_config(v: &Value) -> Result<()> {
                 version = "gemm",
                 bits = 4,
                 group_size = group_size.unwrap_or(128),
-                "AWQ 4-bit checkpoint detected; weights will be dequantized at load time"
+                "AWQ 4-bit checkpoint detected (W4A16 fused matmul on Metal)"
             );
             Ok(())
         }

@@ -15,8 +15,8 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 use candle_core::{
-    CpuStorage, CustomOp1, CustomOp2, CustomOp3, D, DType, Layout, MetalStorage, Result, Shape,
-    Tensor, backend::BackendStorage,
+    CpuStorage, CustomOp1, CustomOp2, CustomOp3, D, DType, InplaceOp1, Layout, MetalStorage,
+    Result, Shape, Tensor, backend::BackendStorage,
 };
 use candle_metal_kernels::{
     SdpaDType,
@@ -1343,6 +1343,376 @@ pub fn flash_attention_metal_available(head_dim: usize) -> bool {
     matches!(head_dim, 64 | 128 | 256)
 }
 
+// ─── W4A16 quantized matmul ──────────────────────────────────────────────────
+//
+// Fused dequantize + matmul for AWQ 4-bit weight-only checkpoints. The packed
+// weight triplet (qweight/qzeros u32, scales T) stays resident; the unpack is
+// done inline in the kernel. See `quant_kernels.metal` for the AWQ layout.
+
+const QUANT_METAL_SOURCE: &str = include_str!("quant_kernels.metal");
+
+static QUANT_PIPELINES: OnceLock<Mutex<HashMap<(u64, &'static str), ComputePipeline>>> =
+    OnceLock::new();
+
+fn get_or_compile_quant_pipeline(
+    device: &candle_metal_kernels::metal::Device,
+    kernel_name: &'static str,
+) -> Result<ComputePipeline> {
+    let cache = QUANT_PIPELINES.get_or_init(|| Mutex::new(HashMap::new()));
+    let key = (device.registry_id(), kernel_name);
+
+    let mut guard = cache
+        .lock()
+        .map_err(|e| candle_core::Error::Msg(format!("quant pipeline cache poisoned: {e}")))?;
+
+    if let Some(p) = guard.get(&key) {
+        return Ok(p.clone());
+    }
+
+    let lib = device
+        .new_library_with_source(QUANT_METAL_SOURCE, None)
+        .map_err(|e| candle_core::Error::Msg(format!("quant Metal compile: {e}")))?;
+    let func = lib
+        .get_function(kernel_name, None)
+        .map_err(|e| candle_core::Error::Msg(format!("quant kernel '{kernel_name}': {e}")))?;
+    let pipeline = device
+        .new_compute_pipeline_state_with_function(&func)
+        .map_err(|e| candle_core::Error::Msg(format!("quant pipeline: {e}")))?;
+
+    guard.insert(key, pipeline.clone());
+    Ok(pipeline)
+}
+
+/// Must match `W4A16Params` in `quant_kernels.metal`.
+#[repr(C)]
+struct W4A16Params {
+    in_features: u32,
+    out_features: u32,
+    packed_out: u32,
+    group_size: u32,
+    group_shift: u32,
+    k_splits: u32,
+    chunk: u32,
+}
+
+/// Geometry of an AWQ weight triplet, validated once per dispatch.
+struct AwqShape {
+    in_features: usize,
+    out_features: usize,
+    group_size: usize,
+    packed_out: usize,
+}
+
+impl AwqShape {
+    fn new(
+        in_features: usize,
+        packed_out: usize,
+        groups: usize,
+        out_features: usize,
+    ) -> Result<Self> {
+        if packed_out * 8 != out_features {
+            candle_core::bail!(
+                "W4A16: qweight packed_out {packed_out} (×8) != scales out {out_features}"
+            );
+        }
+        if groups == 0 || !in_features.is_multiple_of(groups) {
+            candle_core::bail!("W4A16: in_features {in_features} not divisible by groups {groups}");
+        }
+        Ok(Self {
+            in_features,
+            out_features,
+            group_size: in_features / groups,
+            packed_out,
+        })
+    }
+
+    /// `group_shift`/`k_splits`/`chunk` are gemv-only; pass 0 for the dequant kernel.
+    fn params(&self, group_shift: usize, k_splits: usize, chunk: usize) -> W4A16Params {
+        W4A16Params {
+            in_features: self.in_features as u32,
+            out_features: self.out_features as u32,
+            packed_out: self.packed_out as u32,
+            group_size: self.group_size as u32,
+            group_shift: group_shift as u32,
+            k_splits: k_splits as u32,
+            chunk: chunk as u32,
+        }
+    }
+}
+
+/// Fused W4A16 GEMV. An `InplaceOp1` that atomically accumulates the split-K
+/// partials into a pre-zeroed `[1, out]` F32 buffer; `x` and the AWQ triplet
+/// are carried as fields (the trait passes only the in-place tensor).
+struct W4A16Matmul {
+    x: Tensor,
+    qweight: Tensor,
+    qzeros: Tensor,
+    scales: Tensor,
+}
+
+impl InplaceOp1 for W4A16Matmul {
+    fn name(&self) -> &'static str {
+        "w4a16-matmul"
+    }
+
+    fn cpu_fwd(&self, _s: &mut CpuStorage, _l: &Layout) -> Result<()> {
+        candle_core::bail!("W4A16Matmul: Metal-only — use the CPU dequantize_awq path")
+    }
+
+    fn metal_fwd(&self, out: &mut MetalStorage, out_l: &Layout) -> Result<()> {
+        if out.dtype() != DType::F32 {
+            candle_core::bail!(
+                "W4A16Matmul: accumulator must be F32, got {:?}",
+                out.dtype()
+            );
+        }
+
+        let x_sl = self.x.storage_and_layout();
+        let x_l = x_sl.1;
+        if !x_l.is_contiguous() {
+            candle_core::bail!("W4A16Matmul: x must be contiguous");
+        }
+        let x_dims = x_l.dims();
+        if x_dims.len() != 2 || x_dims[0] != 1 {
+            candle_core::bail!("W4A16Matmul: x must be [1, in] (M=1 decode path), got {x_dims:?}");
+        }
+        let in_features = x_dims[1];
+
+        let (qw_in, packed_out) = self.qweight.dims2()?;
+        let (groups, out_features) = self.scales.dims2()?;
+        if self.qzeros.dims() != [groups, packed_out] {
+            candle_core::bail!(
+                "W4A16Matmul: qzeros shape {:?} != [{groups}, {packed_out}]",
+                self.qzeros.dims()
+            );
+        }
+        let shape = AwqShape::new(qw_in, packed_out, groups, out_features)?;
+        if in_features != shape.in_features {
+            candle_core::bail!(
+                "W4A16Matmul: x in_features {in_features} != weight in_features {}",
+                shape.in_features
+            );
+        }
+        if out_l.dims() != [1, shape.out_features] {
+            candle_core::bail!(
+                "W4A16Matmul: accumulator shape {:?} != [1, {}]",
+                out_l.dims(),
+                shape.out_features
+            );
+        }
+        if self.scales.dtype() != self.x.dtype() {
+            candle_core::bail!(
+                "W4A16Matmul: scales dtype {:?} must match x dtype {:?}",
+                self.scales.dtype(),
+                self.x.dtype()
+            );
+        }
+        if !shape.group_size.is_power_of_two() {
+            candle_core::bail!(
+                "W4A16Matmul: group_size {} must be a power of two",
+                shape.group_size
+            );
+        }
+
+        let kernel_name = match self.x.dtype() {
+            DType::F16 => "w4a16_gemv_f16",
+            DType::BF16 => "w4a16_gemv_bf16",
+            other => candle_core::bail!("W4A16Matmul: unsupported dtype {other:?}"),
+        };
+
+        // Split the in_features reduction so enough simdgroups are resident to
+        // hide HBM latency. Chunks are contiguous, so each thread stays inside a
+        // quant group and the scale/zero reload is amortised. The split-K
+        // partials are accumulated straight into `out` with atomic adds — no
+        // partial buffer, no separate reduction pass.
+        const TARGET_THREADS: usize = 32768;
+        let k_splits = (TARGET_THREADS / shape.packed_out.max(1))
+            .clamp(1, 256)
+            .min(shape.in_features.max(1));
+        let chunk = shape.in_features.div_ceil(k_splits);
+        let k_splits = shape.in_features.div_ceil(chunk);
+        let group_shift = shape.group_size.trailing_zeros() as usize;
+        let params = shape.params(group_shift, k_splits, chunk);
+
+        let dtype_bytes = self.x.dtype().size_in_bytes();
+        let device = out.device();
+
+        let x_buf = match &*x_sl.0 {
+            candle_core::Storage::Metal(ms) => ms.buffer(),
+            _ => candle_core::bail!("W4A16Matmul: x must be Metal-resident"),
+        };
+        let qw_sl = self.qweight.storage_and_layout();
+        let qz_sl = self.qzeros.storage_and_layout();
+        let sc_sl = self.scales.storage_and_layout();
+        let qweight_buf = match &*qw_sl.0 {
+            candle_core::Storage::Metal(ms) => ms.buffer(),
+            _ => candle_core::bail!("W4A16Matmul: qweight must be Metal-resident"),
+        };
+        let qzeros_buf = match &*qz_sl.0 {
+            candle_core::Storage::Metal(ms) => ms.buffer(),
+            _ => candle_core::bail!("W4A16Matmul: qzeros must be Metal-resident"),
+        };
+        let scales_buf = match &*sc_sl.0 {
+            candle_core::Storage::Metal(ms) => ms.buffer(),
+            _ => candle_core::bail!("W4A16Matmul: scales must be Metal-resident"),
+        };
+
+        let pipeline = get_or_compile_quant_pipeline(device.device(), kernel_name)?;
+        let encoder = device.command_encoder()?;
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(x_buf), x_l.start_offset() * dtype_bytes);
+        encoder.set_buffer(1, Some(qweight_buf), qw_sl.1.start_offset() * 4);
+        encoder.set_buffer(2, Some(qzeros_buf), qz_sl.1.start_offset() * 4);
+        encoder.set_buffer(3, Some(scales_buf), sc_sl.1.start_offset() * dtype_bytes);
+        encoder.set_buffer(4, Some(out.buffer()), out_l.start_offset() * 4);
+        encoder.set_bytes(5, &params);
+        encoder.use_resource(x_buf, MTLResourceUsage::Read);
+        encoder.use_resource(qweight_buf, MTLResourceUsage::Read);
+        encoder.use_resource(qzeros_buf, MTLResourceUsage::Read);
+        encoder.use_resource(scales_buf, MTLResourceUsage::Read);
+        encoder.use_resource(out.buffer(), MTLResourceUsage::Write);
+
+        const TG_WIDTH: usize = 64;
+        encoder.dispatch_thread_groups(
+            MTLSize {
+                width: shape.packed_out.div_ceil(TG_WIDTH),
+                height: k_splits,
+                depth: 1,
+            },
+            MTLSize {
+                width: TG_WIDTH,
+                height: 1,
+                depth: 1,
+            },
+        );
+
+        Ok(())
+    }
+}
+
+/// Dequantize an AWQ triplet to a plain `[in, out]` weight. `CustomOp1` over
+/// `qweight`; `qzeros`/`scales` carried as fields. Used for the prefill path
+/// where a tuned GEMM on the dequantized weight beats a custom kernel.
+struct DequantizeW4 {
+    qzeros: Tensor,
+    scales: Tensor,
+}
+
+impl CustomOp1 for DequantizeW4 {
+    fn name(&self) -> &'static str {
+        "dequantize-w4"
+    }
+
+    fn cpu_fwd(&self, _s: &CpuStorage, _l: &Layout) -> Result<(CpuStorage, Shape)> {
+        candle_core::bail!("DequantizeW4: Metal-only — use the CPU dequantize_awq path")
+    }
+
+    fn metal_fwd(&self, qweight: &MetalStorage, qw_l: &Layout) -> Result<(MetalStorage, Shape)> {
+        if !qw_l.is_contiguous() {
+            candle_core::bail!("DequantizeW4: qweight must be contiguous");
+        }
+        let qw_dims = qw_l.dims();
+        if qw_dims.len() != 2 {
+            candle_core::bail!("DequantizeW4: qweight must be 2-D [in, out/8]");
+        }
+        let (in_features, packed_out) = (qw_dims[0], qw_dims[1]);
+        let (groups, out_features) = self.scales.dims2()?;
+        if self.qzeros.dims() != [groups, packed_out] {
+            candle_core::bail!(
+                "DequantizeW4: qzeros shape {:?} != [{groups}, {packed_out}]",
+                self.qzeros.dims()
+            );
+        }
+        let shape = AwqShape::new(in_features, packed_out, groups, out_features)?;
+
+        let out_dtype = self.scales.dtype();
+        let kernel_name = match out_dtype {
+            DType::F16 => "dequantize_w4_f16",
+            DType::BF16 => "dequantize_w4_bf16",
+            other => candle_core::bail!("DequantizeW4: unsupported dtype {other:?}"),
+        };
+        let dtype_bytes = out_dtype.size_in_bytes();
+        let out_elems = in_features * out_features;
+        let device = qweight.device();
+        let output = device.new_buffer(out_elems, out_dtype, "dequant_w4")?;
+        let params = shape.params(0, 0, 0);
+
+        let qz_sl = self.qzeros.storage_and_layout();
+        let sc_sl = self.scales.storage_and_layout();
+        let qzeros_buf = match &*qz_sl.0 {
+            candle_core::Storage::Metal(ms) => ms.buffer(),
+            _ => candle_core::bail!("DequantizeW4: qzeros must be Metal-resident"),
+        };
+        let scales_buf = match &*sc_sl.0 {
+            candle_core::Storage::Metal(ms) => ms.buffer(),
+            _ => candle_core::bail!("DequantizeW4: scales must be Metal-resident"),
+        };
+
+        let pipeline = get_or_compile_quant_pipeline(device.device(), kernel_name)?;
+        let encoder = device.command_encoder()?;
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(qweight.buffer()), qw_l.start_offset() * 4);
+        encoder.set_buffer(1, Some(qzeros_buf), qz_sl.1.start_offset() * 4);
+        encoder.set_buffer(2, Some(scales_buf), sc_sl.1.start_offset() * dtype_bytes);
+        encoder.set_buffer(3, Some(&*output), 0);
+        encoder.set_bytes(4, &params);
+        encoder.use_resource(qweight.buffer(), MTLResourceUsage::Read);
+        encoder.use_resource(qzeros_buf, MTLResourceUsage::Read);
+        encoder.use_resource(scales_buf, MTLResourceUsage::Read);
+        encoder.use_resource(&*output, MTLResourceUsage::Write);
+
+        const TG_WIDTH: usize = 64;
+        encoder.dispatch_thread_groups(
+            MTLSize {
+                width: in_features.div_ceil(TG_WIDTH),
+                height: packed_out,
+                depth: 1,
+            },
+            MTLSize {
+                width: TG_WIDTH,
+                height: 1,
+                depth: 1,
+            },
+        );
+
+        Ok((
+            MetalStorage::new(output, device.clone(), out_elems, out_dtype),
+            Shape::from_dims(&[in_features, out_features]),
+        ))
+    }
+}
+
+/// Fused W4A16 matmul: `x [M, in] @ dequant(AWQ)ᵀ → [M, out]`.
+///
+/// `x` must be 2-D, contiguous, F16/BF16 on a Metal device; the AWQ triplet
+/// must be Metal-resident with `scales` in the same dtype as `x`.
+pub fn w4a16_matmul(
+    x: &Tensor,
+    qweight: &Tensor,
+    qzeros: &Tensor,
+    scales: &Tensor,
+) -> Result<Tensor> {
+    // Zero-initialised F32 accumulator; the kernel atomic-adds the split-K
+    // partials straight into it (no partial buffer, no reduction pass).
+    let out_features = scales.dim(1)?;
+    let out = Tensor::zeros((1, out_features), DType::F32, x.device())?;
+    out.inplace_op1(&W4A16Matmul {
+        x: x.clone(),
+        qweight: qweight.clone(),
+        qzeros: qzeros.clone(),
+        scales: scales.clone(),
+    })?;
+    out.to_dtype(x.dtype())
+}
+
+/// Dequantize an AWQ triplet to a plain `[in, out]` weight in the scales' dtype.
+pub fn dequantize_w4(qweight: &Tensor, qzeros: &Tensor, scales: &Tensor) -> Result<Tensor> {
+    qweight.apply_op1_no_bwd(&DequantizeW4 {
+        qzeros: qzeros.clone(),
+        scales: scales.clone(),
+    })
+}
+
 #[cfg(test)]
 mod fused_kernel_parity_tests {
     //! Numerical parity between fused Metal kernels and the scalar reference
@@ -1354,6 +1724,7 @@ mod fused_kernel_parity_tests {
     //! intermediate) and scalar (F16/BF16-native) paths.
 
     use super::*;
+    use crate::common::awq::{AWQ_PACK_ORDER, AwqRawTensors, dequantize_awq};
     use candle_core::{D, Device};
 
     fn metal_device_or_skip() -> Option<Device> {
@@ -1968,5 +2339,298 @@ mod fused_kernel_parity_tests {
             0.05,
             "bf16/d64/long-prefix",
         );
+    }
+
+    // ── W4A16 quantized matmul parity ────────────────────────────────────────
+
+    /// Pack a `[rows][out]` 4-bit-nibble matrix into AWQ `[rows, out/8]` words.
+    fn pack_awq(matrix: &[Vec<u8>], rows: usize, out_features: usize) -> Vec<i32> {
+        let packed_out = out_features / 8;
+        let mut words = vec![0u32; rows * packed_out];
+        for (i, row) in matrix.iter().enumerate().take(rows) {
+            for j in 0..packed_out {
+                let mut word = 0u32;
+                for (k, &off) in AWQ_PACK_ORDER.iter().enumerate() {
+                    word |= ((row[j * 8 + off] as u32) & 0xF) << (4 * k as u32);
+                }
+                words[i * packed_out + j] = word;
+            }
+        }
+        words.into_iter().map(|w| w as i32).collect()
+    }
+
+    /// Deterministic synthetic AWQ triplet on `dev`, `scales` cast to `dtype`.
+    fn build_awq_triplet(
+        dev: &Device,
+        dtype: DType,
+        in_features: usize,
+        out_features: usize,
+        group_size: usize,
+    ) -> AwqRawTensors {
+        let groups = in_features / group_size;
+        let iweight: Vec<Vec<u8>> = (0..in_features)
+            .map(|i| {
+                (0..out_features)
+                    .map(|j| ((i * 5 + j * 3 + 1) & 0xF) as u8)
+                    .collect()
+            })
+            .collect();
+        let izero: Vec<Vec<u8>> = (0..groups)
+            .map(|g| {
+                (0..out_features)
+                    .map(|j| ((g * 7 + j + 2) & 0xF) as u8)
+                    .collect()
+            })
+            .collect();
+        let scales: Vec<f32> = (0..groups)
+            .flat_map(|g| (0..out_features).map(move |j| 0.01 + 0.003 * ((g + j) % 5) as f32))
+            .collect();
+
+        let qweight = Tensor::from_vec(
+            pack_awq(&iweight, in_features, out_features),
+            (in_features, out_features / 8),
+            dev,
+        )
+        .unwrap();
+        let qzeros = Tensor::from_vec(
+            pack_awq(&izero, groups, out_features),
+            (groups, out_features / 8),
+            dev,
+        )
+        .unwrap();
+        let scales = Tensor::from_vec(scales, (groups, out_features), dev)
+            .unwrap()
+            .to_dtype(dtype)
+            .unwrap();
+        AwqRawTensors {
+            qweight,
+            qzeros,
+            scales,
+        }
+    }
+
+    /// Tolerance dominated by the kernel's single F16/BF16 output rounding.
+    fn parity_tol(reference: &[f32]) -> f32 {
+        let max_abs = reference.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
+        0.06 * max_abs + 1e-2
+    }
+
+    fn run_w4a16_gemv_parity(
+        dev: &Device,
+        dtype: DType,
+        in_features: usize,
+        out_features: usize,
+        group_size: usize,
+        label: &str,
+    ) {
+        // The fused GEMV kernel is the M=1 (decode) path.
+        let raw = build_awq_triplet(dev, dtype, in_features, out_features, group_size);
+        let x_data: Vec<f32> = (0..in_features)
+            .map(|i| ((i % 13) as f32 - 6.0) * 0.03)
+            .collect();
+        let x = Tensor::from_vec(x_data, (1, in_features), dev)
+            .unwrap()
+            .to_dtype(dtype)
+            .unwrap();
+
+        let y_kernel = w4a16_matmul(&x, &raw.qweight, &raw.qzeros, &raw.scales)
+            .expect("w4a16 kernel must not error");
+
+        // Golden: dequantize + matmul in F32 (x keeps its F16/BF16 precision).
+        let w_ref = dequantize_awq(&raw, dev, DType::F32).unwrap(); // [out, in]
+        let x_f32 = x.to_dtype(DType::F32).unwrap();
+        let y_ref = x_f32
+            .matmul(&w_ref.t().unwrap().contiguous().unwrap())
+            .unwrap();
+
+        assert_eq!(
+            y_kernel.dims2().unwrap(),
+            (1, out_features),
+            "{label}: shape"
+        );
+        let f = y_kernel
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let r = y_ref.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        assert!(
+            f.iter().all(|v| v.is_finite()),
+            "{label}: non-finite output"
+        );
+        let diff = max_abs_diff_f32(&f, &r);
+        let tol = parity_tol(&r);
+        assert!(diff < tol, "{label}: max_abs_diff = {diff} (tol {tol})");
+    }
+
+    fn run_dequant_w4_parity(
+        dev: &Device,
+        dtype: DType,
+        in_features: usize,
+        out_features: usize,
+        group_size: usize,
+        label: &str,
+    ) {
+        let raw = build_awq_triplet(dev, dtype, in_features, out_features, group_size);
+        let w_kernel = dequantize_w4(&raw.qweight, &raw.qzeros, &raw.scales)
+            .expect("dequantize_w4 must not error"); // [in, out]
+        let w_ref = dequantize_awq(&raw, dev, DType::F32).unwrap(); // [out, in]
+        let w_ref_t = w_ref.t().unwrap().contiguous().unwrap(); // [in, out]
+
+        assert_eq!(
+            w_kernel.dims2().unwrap(),
+            (in_features, out_features),
+            "{label}: shape"
+        );
+        let f = w_kernel
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let r = w_ref_t.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let diff = max_abs_diff_f32(&f, &r);
+        let tol = parity_tol(&r);
+        assert!(diff < tol, "{label}: max_abs_diff = {diff} (tol {tol})");
+    }
+
+    #[test]
+    fn w4a16_gemv_bf16_g128_matches_reference() {
+        let Some(dev) = metal_device_or_skip() else {
+            return;
+        };
+        run_w4a16_gemv_parity(&dev, DType::BF16, 256, 128, 128, "bf16/g128");
+    }
+
+    #[test]
+    fn w4a16_gemv_bf16_g64_matches_reference() {
+        let Some(dev) = metal_device_or_skip() else {
+            return;
+        };
+        run_w4a16_gemv_parity(&dev, DType::BF16, 256, 128, 64, "bf16/g64");
+    }
+
+    #[test]
+    fn w4a16_gemv_bf16_wide_matches_reference() {
+        let Some(dev) = metal_device_or_skip() else {
+            return;
+        };
+        run_w4a16_gemv_parity(&dev, DType::BF16, 512, 256, 128, "bf16/wide");
+    }
+
+    #[test]
+    fn w4a16_gemv_f16_matches_reference() {
+        let Some(dev) = metal_device_or_skip() else {
+            return;
+        };
+        run_w4a16_gemv_parity(&dev, DType::F16, 256, 128, 64, "f16/g64");
+    }
+
+    #[test]
+    fn dequantize_w4_bf16_matches_reference() {
+        let Some(dev) = metal_device_or_skip() else {
+            return;
+        };
+        run_dequant_w4_parity(&dev, DType::BF16, 256, 128, 128, "bf16/g128");
+    }
+
+    #[test]
+    fn dequantize_w4_f16_matches_reference() {
+        let Some(dev) = metal_device_or_skip() else {
+            return;
+        };
+        run_dequant_w4_parity(&dev, DType::F16, 256, 128, 64, "f16/g64");
+    }
+
+    #[test]
+    fn w4a16_matmul_rejects_cpu_tensors() {
+        let dev = Device::Cpu;
+        let raw = build_awq_triplet(&dev, DType::F32, 64, 64, 32);
+        let x = Tensor::zeros((1, 64), DType::F32, &dev).unwrap();
+        let err = w4a16_matmul(&x, &raw.qweight, &raw.qzeros, &raw.scales)
+            .expect_err("must reject CPU tensors");
+        assert!(
+            format!("{err}").contains("Metal"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// Perf diagnostic (not a correctness gate): times the W4A16 matmul against
+    /// the bf16 `matmul` it replaces, both as independent calls (the GPU can
+    /// overlap them) and as a dependent chain (mirrors the decode loop, where
+    /// each op feeds the next and the GPU cannot overlap). Run explicitly:
+    ///   cargo test --release --bin oxydllm -- w4a16_decode_perf --ignored --nocapture
+    #[test]
+    #[ignore = "perf diagnostic"]
+    fn w4a16_decode_perf_diagnostic() {
+        let Some(dev) = metal_device_or_skip() else {
+            return;
+        };
+        use std::time::Instant;
+
+        let dtype = DType::BF16;
+        let n = 2560; // square so W4A16 calls can be chained directly
+        let group_size = 128;
+        let iters = 144; // ~quantized matmuls per Qwen3-4B decode token
+
+        let raw = build_awq_triplet(&dev, dtype, n, n, group_size);
+        // bf16 [n, n] weight = exactly what the old dequant-at-load path used.
+        let w_bf16 = dequantize_awq(&raw, &dev, dtype)
+            .unwrap()
+            .t()
+            .unwrap()
+            .contiguous()
+            .unwrap();
+        let x0 = Tensor::zeros((1, n), dtype, &dev).unwrap();
+
+        for _ in 0..10 {
+            let _ = w4a16_matmul(&x0, &raw.qweight, &raw.qzeros, &raw.scales).unwrap();
+            let _ = x0.matmul(&w_bf16).unwrap();
+        }
+        x0.matmul(&w_bf16).unwrap().to_device(&Device::Cpu).unwrap();
+
+        let per_call = |t: Instant| t.elapsed().as_secs_f64() * 1e6 / iters as f64;
+
+        // Independent calls — the GPU may overlap successive dispatches.
+        let t = Instant::now();
+        let mut sink = Vec::with_capacity(iters);
+        for _ in 0..iters {
+            sink.push(w4a16_matmul(&x0, &raw.qweight, &raw.qzeros, &raw.scales).unwrap());
+        }
+        sink.last().unwrap().to_device(&Device::Cpu).unwrap();
+        let w4_indep = per_call(t);
+
+        let t = Instant::now();
+        let mut sink = Vec::with_capacity(iters);
+        for _ in 0..iters {
+            sink.push(x0.matmul(&w_bf16).unwrap());
+        }
+        sink.last().unwrap().to_device(&Device::Cpu).unwrap();
+        let bf16_indep = per_call(t);
+        drop(sink);
+
+        // Dependent chain — each call feeds the next, as in the decode loop.
+        let t = Instant::now();
+        let mut x = x0.clone();
+        for _ in 0..iters {
+            x = w4a16_matmul(&x, &raw.qweight, &raw.qzeros, &raw.scales).unwrap();
+        }
+        x.to_device(&Device::Cpu).unwrap();
+        let w4_chain = per_call(t);
+
+        let t = Instant::now();
+        let mut x = x0.clone();
+        for _ in 0..iters {
+            x = x.matmul(&w_bf16).unwrap();
+        }
+        x.to_device(&Device::Cpu).unwrap();
+        let bf16_chain = per_call(t);
+
+        println!("[w4a16 {n}x{n}] per-call us  (iters={iters}):");
+        println!("  independent : w4a16 {w4_indep:8.1}   bf16 {bf16_indep:8.1}");
+        println!("  chained     : w4a16 {w4_chain:8.1}   bf16 {bf16_chain:8.1}");
     }
 }

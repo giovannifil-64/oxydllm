@@ -3,12 +3,6 @@ use anyhow::{Context, Result};
 use candle_core::{DType, Device, Tensor, safetensors::MmapedSafetensors};
 use rustc_hash::FxHashMap;
 
-pub const AWQ_DEFAULT_BITS: u8 = 4;
-
-pub const fn awq_pack_factor(bits: u8) -> usize {
-    (32 / bits) as usize
-}
-
 pub struct ModelWeights {
     tensors: FxHashMap<String, Tensor>,
 }
@@ -289,27 +283,10 @@ impl ModelWeights {
     }
 
     pub fn runtime_size_bytes(&self) -> usize {
-        let runtime_dtype = self
-            .tensors
+        self.tensors
             .values()
-            .find(|t| matches!(t.dtype(), DType::F16 | DType::BF16 | DType::F32))
-            .map(|t| t.dtype())
-            .unwrap_or(DType::BF16);
-        let runtime_elem_bytes = runtime_dtype.size_in_bytes();
-
-        let mut total = 0usize;
-        for (name, t) in &self.tensors {
-            if name.ends_with(".qzeros") || name.ends_with(".scales") {
-                // Folded into the dequantized weight; not retained after load.
-                continue;
-            }
-            if name.ends_with(".qweight") {
-                total += t.elem_count() * awq_pack_factor(AWQ_DEFAULT_BITS) * runtime_elem_bytes;
-                continue;
-            }
-            total += t.dtype().size_in_bytes() * t.elem_count();
-        }
-        total
+            .map(|t| t.dtype().size_in_bytes() * t.elem_count())
+            .sum()
     }
 }
 
@@ -387,7 +364,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_size_bytes_expands_qweight_and_drops_qzeros_scales() -> Result<()> {
+    fn runtime_size_bytes_sums_packed_awq_tensors() -> Result<()> {
         let device = Device::Cpu;
         let mut tensors = FxHashMap::default();
 
@@ -405,7 +382,9 @@ mod tests {
 
         let weights = ModelWeights::from_tensors(tensors);
 
-        assert_eq!(weights.runtime_size_bytes(), 64 + 64 + 16);
+        // W4A16 keeps AWQ tensors packed: qweight 4·4 + qzeros 4·4 + scales 32·2
+        // + bias 32·2 + layernorm 8·2.
+        assert_eq!(weights.runtime_size_bytes(), 16 + 16 + 64 + 64 + 16);
         Ok(())
     }
 

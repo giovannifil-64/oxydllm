@@ -365,7 +365,7 @@ impl ModelManager {
         // Case 2: first-ever load — estimate from disk.
         // On GPU we load BF16 (≈ same size as on-disk BF16 safetensors).
         // On CPU we load F32 (2× larger than BF16 on-disk files).
-        // AWQ models dequantize at load time: qweights expand ~4× from 4-bit packed to BF16.
+        // AWQ models keep packed 4-bit weights resident (W4A16): no load-time expansion.
         let disk_bytes = estimate_model_size(model_path);
         let is_cpu = self.cuda_devices.is_empty();
 

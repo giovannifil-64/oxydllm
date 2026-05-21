@@ -49,6 +49,23 @@ impl AwqRawTensors {
         }
         Ok(in_features / groups)
     }
+
+    pub fn to_device(&self, device: &Device) -> Result<Self> {
+        Ok(Self {
+            qweight: self
+                .qweight
+                .to_device(device)
+                .context("AWQ qweight → device")?,
+            qzeros: self
+                .qzeros
+                .to_device(device)
+                .context("AWQ qzeros → device")?,
+            scales: self
+                .scales
+                .to_device(device)
+                .context("AWQ scales → device")?,
+        })
+    }
 }
 
 fn read_packed_to_u32(t: &Tensor) -> Result<Vec<u32>> {

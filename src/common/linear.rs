@@ -223,10 +223,71 @@ impl QLinear {
     }
 }
 
+#[cfg(feature = "metal")]
+pub struct PackedQuantLinear {
+    qweight: Tensor,
+    qzeros: Tensor,
+    scales: Tensor,
+    bias: Option<Tensor>,
+    in_features: usize,
+    out_features: usize,
+}
+
+#[cfg(feature = "metal")]
+impl PackedQuantLinear {
+    pub fn new(raw: AwqRawTensors, bias: Option<Tensor>, dtype: DType) -> Result<Self> {
+        let (in_features, _packed_out) = raw.qweight.dims2()?;
+        let (_groups, out_features) = raw.scales.dims2()?;
+        // The kernel reads `scales` in the activation dtype.
+        let scales = raw.scales.to_dtype(dtype)?;
+        Ok(Self {
+            qweight: raw.qweight,
+            qzeros: raw.qzeros,
+            scales,
+            bias,
+            in_features,
+            out_features,
+        })
+    }
+
+    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let dims = x.dims().to_vec();
+        let in_features = *dims.last().unwrap();
+        if in_features != self.in_features {
+            candle_core::bail!(
+                "PackedQuantLinear: input last dim {in_features} != in_features {}",
+                self.in_features
+            );
+        }
+        let m: usize = dims[..dims.len() - 1].iter().product();
+        let x_2d = x.reshape((m, in_features))?.contiguous()?;
+
+        // M=1 (decode) → fused GEMV kernel; M>1 (prefill / batched) → dequantize
+        // to a transient weight and use the tuned matmul.
+        let y_2d = if m == 1 {
+            super::metal_ops::w4a16_matmul(&x_2d, &self.qweight, &self.qzeros, &self.scales)?
+        } else {
+            let weight =
+                super::metal_ops::dequantize_w4(&self.qweight, &self.qzeros, &self.scales)?;
+            x_2d.matmul(&weight)?
+        };
+
+        let mut out_dims = dims;
+        *out_dims.last_mut().unwrap() = self.out_features;
+        let y = y_2d.reshape(out_dims)?;
+        match &self.bias {
+            Some(b) => y.broadcast_add(b),
+            None => Ok(y),
+        }
+    }
+}
+
 pub enum AnyLinear {
     Float(Linear),
     Fp8(Fp8Linear),
     Quantized(QLinear),
+    #[cfg(feature = "metal")]
+    PackedQuant(PackedQuantLinear),
 }
 
 impl AnyLinear {
@@ -252,6 +313,15 @@ impl AnyLinear {
         device: &Device,
         dtype: DType,
     ) -> Result<Self> {
+        #[cfg(feature = "metal")]
+        if device.is_metal() && matches!(dtype, DType::F16 | DType::BF16) {
+            let resident = raw
+                .to_device(device)
+                .map_err(|e| candle_core::Error::Msg(format!("AWQ → Metal failed: {e:#}")))?;
+            return Ok(Self::PackedQuant(PackedQuantLinear::new(
+                resident, bias, dtype,
+            )?));
+        }
         let weight = dequantize_awq(raw, device, dtype)
             .map_err(|e| candle_core::Error::Msg(format!("AWQ dequantization failed: {e:#}")))?;
         Ok(Self::Float(Linear::new(weight, bias)?))
@@ -262,6 +332,8 @@ impl AnyLinear {
             Self::Float(l) => l.forward(x),
             Self::Fp8(l) => l.forward(x),
             Self::Quantized(q) => q.forward(x),
+            #[cfg(feature = "metal")]
+            Self::PackedQuant(q) => q.forward(x),
         }
     }
 }

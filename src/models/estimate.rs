@@ -158,7 +158,7 @@ fn estimate_local_safetensors(dir: &Path, ctx_len: usize, num_seqs: usize) -> Re
                 .unwrap_or_else(|| "gemm".to_string())
                 .to_lowercase();
             let label = format!(
-                "AWQ {bits}-bit ({version}, group_size={gs}) safetensors  (load-time dequant: qweight expands {expansion:.0}×)"
+                "AWQ {bits}-bit ({version}, group_size={gs}) safetensors  (W4A16: 4-bit weights stay resident)"
             );
             (
                 runtime_bytes,
@@ -330,7 +330,7 @@ fn estimate_remote(
             .is_some();
 
         let (runtime_weight_bytes, approx) = if is_awq {
-            ((safetensors_bytes as f64 * 3.1) as usize, true)
+            (safetensors_bytes as usize, true)
         } else {
             (safetensors_bytes as usize, false)
         };
@@ -690,8 +690,7 @@ pub fn read_quantization_config(config_path: &Path) -> Option<QuantInfo> {
 
 pub fn awq_qweight_expansion(bits: u64) -> Option<f64> {
     match bits {
-        4 => Some(4.0),
-        8 => Some(2.0),
+        4 | 8 => Some(1.0),
         _ => None,
     }
 }

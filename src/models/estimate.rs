@@ -149,7 +149,11 @@ fn estimate_local_safetensors(dir: &Path, ctx_len: usize, num_seqs: usize) -> Re
             let (total_bytes, qweight_bytes) =
                 sum_safetensors_bytes(dir).unwrap_or((weights_bytes, 0));
             let other_bytes = total_bytes.saturating_sub(qweight_bytes);
-            let runtime_bytes = other_bytes + (qweight_bytes as f64 * expansion) as usize;
+            let mut runtime_bytes = other_bytes + (qweight_bytes as f64 * expansion) as usize;
+            let tied_extra = tied_lm_head_extra_bytes_from_file(&config_path);
+            if let Some(extra) = tied_extra {
+                runtime_bytes += extra;
+            }
             let bits = qi.bits.unwrap_or(4);
             let gs = qi.group_size.unwrap_or(128);
             let version = qi
@@ -157,8 +161,13 @@ fn estimate_local_safetensors(dir: &Path, ctx_len: usize, num_seqs: usize) -> Re
                 .clone()
                 .unwrap_or_else(|| "gemm".to_string())
                 .to_lowercase();
+            let resident_note = if tied_extra.is_some() {
+                "W4A16 + tied lm_head quantised to 4-bit"
+            } else {
+                "W4A16: 4-bit weights stay resident"
+            };
             let label = format!(
-                "AWQ {bits}-bit ({version}, group_size={gs}) safetensors  (W4A16: 4-bit weights stay resident)"
+                "AWQ {bits}-bit ({version}, group_size={gs}) safetensors  ({resident_note})"
             );
             (
                 runtime_bytes,
@@ -329,8 +338,14 @@ fn estimate_remote(
             .and_then(|qi| awq_qweight_expansion(qi.bits.unwrap_or(4)))
             .is_some();
 
+        let tied_extra = if is_awq {
+            config_json.as_ref().and_then(tied_lm_head_extra_bytes)
+        } else {
+            None
+        };
+
         let (runtime_weight_bytes, approx) = if is_awq {
-            (safetensors_bytes as usize, true)
+            (safetensors_bytes as usize + tied_extra.unwrap_or(0), true)
         } else {
             (safetensors_bytes as usize, false)
         };
@@ -343,27 +358,27 @@ fn estimate_remote(
         let total_str = total.map(fmt_bytes).unwrap_or_else(|| "?".to_string());
         println!("  {}", "─".repeat(72));
         let (label, accuracy) = if is_awq {
-            (
-                format!(
-                    "AWQ {}-bit safetensors",
-                    quant_info.as_ref().and_then(|qi| qi.bits).unwrap_or(4)
-                ),
-                "~lossy",
-            )
+            let bits = quant_info.as_ref().and_then(|qi| qi.bits).unwrap_or(4);
+            let label = if tied_extra.is_some() {
+                format!("AWQ {bits}-bit safetensors  (+ 4-bit tied lm_head)")
+            } else {
+                format!("AWQ {bits}-bit safetensors")
+            };
+            (label, "~lossy")
         } else {
             ("safetensors (F32/BF16)".to_string(), "100%")
         };
         println!(
             "  {:<26}  {:>9}  {:>9}  {:>10}  {}",
             label,
-            fmt_bytes(safetensors_bytes as usize),
+            fmt_bytes(runtime_weight_bytes),
             kv_str,
             total_str,
             accuracy,
         );
         if approx {
             println!(
-                "  (AWQ runtime weights ≈ {}, dequantized to BF16 at load. Approximate — pull then re-estimate locally for an exact figure)",
+                "  (AWQ runtime weights ≈ {} — W4A16 keeps the packed 4-bit weights resident on Metal. Approximate — pull then re-estimate locally for an exact figure.)",
                 fmt_bytes(runtime_weight_bytes)
             );
         }
@@ -693,6 +708,43 @@ pub fn awq_qweight_expansion(bits: u64) -> Option<f64> {
         4 | 8 => Some(1.0),
         _ => None,
     }
+}
+
+fn tied_lm_head_extra_bytes(config_json: &serde_json::Value) -> Option<usize> {
+    let root = if config_json["text_config"].is_object() {
+        let mut merged = config_json.clone();
+        if let (Some(obj), Some(text)) = (
+            merged.as_object_mut(),
+            config_json["text_config"].as_object(),
+        ) {
+            for (k, v) in text {
+                obj.entry(k).or_insert_with(|| v.clone());
+            }
+        }
+        std::borrow::Cow::Owned(merged)
+    } else {
+        std::borrow::Cow::Borrowed(config_json)
+    };
+    if !root["tie_word_embeddings"].as_bool().unwrap_or(false) {
+        return None;
+    }
+    let vocab = root["vocab_size"].as_u64()? as usize;
+    let hidden = root["hidden_size"].as_u64()? as usize;
+    const GROUP_SIZE: usize = 128;
+    if hidden == 0 || vocab == 0 || !hidden.is_multiple_of(GROUP_SIZE) || !vocab.is_multiple_of(8) {
+        return None;
+    }
+    let groups = hidden / GROUP_SIZE;
+    let qw = hidden.checked_mul(vocab / 8)?.checked_mul(4)?;
+    let qz = groups.checked_mul(vocab / 8)?.checked_mul(4)?;
+    let sc = groups.checked_mul(vocab)?.checked_mul(2)?;
+    Some(qw + qz + sc)
+}
+
+fn tied_lm_head_extra_bytes_from_file(path: &Path) -> Option<usize> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let json: serde_json::Value = serde_json::from_str(&content).ok()?;
+    tied_lm_head_extra_bytes(&json)
 }
 
 pub fn sum_safetensors_bytes(dir: &Path) -> Result<(usize, usize)> {

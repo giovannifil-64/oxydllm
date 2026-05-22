@@ -35,6 +35,7 @@ prometheus = "0.14.0"
 uuid = { version = "1.23.1", features = ["v4"] }
 rayon = "1.12.0"
 half = "2.7.1"
+memmap2 = "0.9.10"
 
 [dev-dependencies]
 tokio = { version = "1.52.2", features = ["rt-multi-thread", "macros", "time"] }

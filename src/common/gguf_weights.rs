@@ -1,41 +1,50 @@
 use std::collections::HashMap;
+use std::io::Cursor;
 use std::sync::Arc;
 
 use anyhow::Context;
 use candle_core::Device;
 use candle_core::quantized::QTensor;
 use candle_core::quantized::gguf_file;
+use memmap2::Mmap;
+use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 
 pub struct GgufWeights {
     tensors: FxHashMap<String, Arc<QTensor>>,
     pub metadata: HashMap<String, gguf_file::Value>,
+    _mmaps: Vec<Mmap>,
 }
 
 impl GgufWeights {
     pub fn load(path: &str, device: &Device) -> anyhow::Result<Self> {
-        let mut file = std::fs::File::open(path)
+        let file = std::fs::File::open(path)
             .with_context(|| format!("Failed to open GGUF file: {}", path))?;
-        let content = gguf_file::Content::read(&mut file)
+        let mmap = unsafe { Mmap::map(&file) }
+            .with_context(|| format!("Failed to mmap GGUF file: {}", path))?;
+
+        let mut cursor = Cursor::new(&mmap[..]);
+        let content = gguf_file::Content::read(&mut cursor)
             .map_err(|e| anyhow::anyhow!("Failed to parse GGUF header: {}", e))?;
 
         tracing::info!(
             tensors = content.tensor_infos.len(),
             metadata_entries = content.metadata.len(),
-            "GGUF metadata parsed"
+            file_bytes = mmap.len(),
+            "GGUF mmap+header parsed"
         );
 
-        let mut tensors = FxHashMap::default();
-        for name in content.tensor_infos.keys() {
-            let qt = content
-                .tensor(&mut file, name, device)
-                .map_err(|e| anyhow::anyhow!("Failed to load GGUF tensor '{}': {}", name, e))?;
-            tensors.insert(name.clone(), Arc::new(qt));
-        }
+        let tensors = parallelise_tensor_load(
+            &mmap,
+            content.tensor_data_offset,
+            &content.tensor_infos,
+            device,
+        )?;
 
         Ok(Self {
             tensors,
             metadata: content.metadata,
+            _mmaps: vec![mmap],
         })
     }
 
@@ -103,12 +112,16 @@ impl GgufWeights {
         }
         let mut tensors = FxHashMap::default();
         let mut metadata = HashMap::new();
+        let mut mmaps = Vec::with_capacity(paths.len());
         let total_shards = paths.len();
         let mut total_tensors = 0usize;
         for (shard_idx, path) in paths.iter().enumerate() {
-            let mut file = std::fs::File::open(path)
+            let file = std::fs::File::open(path)
                 .with_context(|| format!("Failed to open GGUF shard: {}", path))?;
-            let content = gguf_file::Content::read(&mut file)
+            let mmap = unsafe { Mmap::map(&file) }
+                .with_context(|| format!("Failed to mmap GGUF shard: {}", path))?;
+            let mut cursor = Cursor::new(&mmap[..]);
+            let content = gguf_file::Content::read(&mut cursor)
                 .map_err(|e| anyhow::anyhow!("Failed to parse GGUF shard '{}': {}", path, e))?;
             if shard_idx == 0 {
                 metadata = content.metadata.clone();
@@ -117,35 +130,37 @@ impl GgufWeights {
                     total_shards,
                     tensors = content.tensor_infos.len(),
                     metadata_entries = content.metadata.len(),
-                    "GGUF shard parsed"
+                    "GGUF shard mmap+header parsed"
                 );
             } else {
                 tracing::info!(
                     shard = shard_idx + 1,
                     total_shards,
                     tensors = content.tensor_infos.len(),
-                    "GGUF shard parsed"
+                    "GGUF shard mmap+header parsed"
                 );
             }
             total_tensors += content.tensor_infos.len();
-            for name in content.tensor_infos.keys() {
-                let qt = content.tensor(&mut file, name, device).map_err(|e| {
-                    anyhow::anyhow!(
-                        "Failed to load tensor '{}' from shard '{}': {}",
-                        name,
-                        path,
-                        e
-                    )
-                })?;
-                tensors.insert(name.clone(), Arc::new(qt));
-            }
+            let shard_tensors = parallelise_tensor_load(
+                &mmap,
+                content.tensor_data_offset,
+                &content.tensor_infos,
+                device,
+            )
+            .with_context(|| format!("Failed to load tensors from shard '{}'", path))?;
+            tensors.extend(shard_tensors);
+            mmaps.push(mmap);
         }
         tracing::info!(
             total_tensors,
             total_shards,
-            "GGUF tensors loaded from shards"
+            "GGUF tensors loaded from mmapped shards"
         );
-        Ok(Self { tensors, metadata })
+        Ok(Self {
+            tensors,
+            metadata,
+            _mmaps: mmaps,
+        })
     }
 
     pub fn architecture(&self) -> anyhow::Result<String> {
@@ -170,4 +185,63 @@ impl GgufWeights {
         }
         ids
     }
+}
+
+fn parallelise_tensor_load(
+    mmap: &Mmap,
+    data_offset: u64,
+    tensor_infos: &HashMap<String, gguf_file::TensorInfo>,
+    device: &Device,
+) -> anyhow::Result<FxHashMap<String, Arc<QTensor>>> {
+    let infos: Vec<(&String, &gguf_file::TensorInfo)> = tensor_infos.iter().collect();
+    let pairs: anyhow::Result<Vec<(String, Arc<QTensor>)>> = infos
+        .par_iter()
+        .map(|(name, info)| {
+            let qt = build_qtensor_from_mmap(mmap, data_offset, info, device)
+                .with_context(|| format!("Failed to load GGUF tensor '{}'", name))?;
+            Ok(((*name).clone(), Arc::new(qt)))
+        })
+        .collect();
+    let pairs = pairs?;
+    let mut tensors = FxHashMap::with_capacity_and_hasher(pairs.len(), Default::default());
+    tensors.extend(pairs);
+    Ok(tensors)
+}
+
+fn build_qtensor_from_mmap(
+    mmap: &Mmap,
+    data_offset: u64,
+    info: &gguf_file::TensorInfo,
+    device: &Device,
+) -> anyhow::Result<QTensor> {
+    let tensor_elems = info.shape.elem_count();
+    let block_size = info.ggml_dtype.block_size();
+    if !tensor_elems.is_multiple_of(block_size) {
+        anyhow::bail!(
+            "tensor elements {} not divisible by block size {}",
+            tensor_elems,
+            block_size
+        );
+    }
+    let size_in_bytes = tensor_elems / block_size * info.ggml_dtype.type_size();
+    let start = (data_offset + info.offset) as usize;
+    let end = start
+        .checked_add(size_in_bytes)
+        .ok_or_else(|| anyhow::anyhow!("tensor offset overflow"))?;
+    if end > mmap.len() {
+        anyhow::bail!(
+            "tensor slice ({}..{}) out of mmap bounds ({})",
+            start,
+            end,
+            mmap.len()
+        );
+    }
+    let slice = &mmap[start..end];
+    candle_core::quantized::ggml_file::qtensor_from_ggml(
+        info.ggml_dtype,
+        slice,
+        info.shape.dims().to_vec(),
+        device,
+    )
+    .map_err(|e| anyhow::anyhow!("qtensor_from_ggml failed: {}", e))
 }

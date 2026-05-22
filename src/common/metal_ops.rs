@@ -2655,81 +2655,160 @@ struct GgufParams {
     out_features: u32,
 }
 
-const GGUF_N_DST: usize = 4;
-const GGUF_N_SIMDGROUP: usize = 2;
-const GGUF_N_SIMDWIDTH: usize = 32;
-const Q5_0_BLOCK_BYTES: usize = 22;
-const Q5_0_BLOCK_ELEMS: usize = 32;
+// Per-quant geometry lives in `GgufFastQuant::dispatch_geometry`.
 
-struct GgufQ5_0Matmul {
+/// Supported GGUF dtype variants for the bf16 fast path. Each variant carries
+/// its (block_elems, block_bytes, kernel_name, dequant_kernel_name) tuple via
+/// the helpers below.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum GgufFastQuant {
+    Q5_0,
+    Q8_0,
+    Q4K,
+}
+
+impl GgufFastQuant {
+    /// (block_elems, block_bytes) — elements per quant block and bytes per block.
+    pub fn block_layout(self) -> (usize, usize) {
+        match self {
+            // d:f16 (2) + qh:u32 (4) + qs[16] = 22 bytes / 32 elements
+            Self::Q5_0 => (32, 22),
+            // d:f16 (2) + qs[32] = 34 bytes / 32 elements
+            Self::Q8_0 => (32, 34),
+            // d:f16 (2) + dmin:f16 (2) + scales[12] + qs[128] = 144 bytes / 256 elements
+            Self::Q4K => (256, 144),
+        }
+    }
+
+    fn gemv_kernel(self) -> &'static str {
+        match self {
+            Self::Q5_0 => "gguf_q5_0_gemv_bf16",
+            Self::Q8_0 => "gguf_q8_0_gemv_bf16",
+            Self::Q4K => "gguf_q4k_gemv_bf16",
+        }
+    }
+
+    fn mul_mm_kernel(self) -> &'static str {
+        match self {
+            Self::Q5_0 => "gguf_q5_0_mul_mm_bf16",
+            Self::Q8_0 => "gguf_q8_0_mul_mm_bf16",
+            Self::Q4K => "gguf_q4k_mul_mm_bf16",
+        }
+    }
+
+    fn op_name(self) -> &'static str {
+        match self {
+            Self::Q5_0 => "gguf-q5_0-matmul",
+            Self::Q8_0 => "gguf-q8_0-matmul",
+            Self::Q4K => "gguf-q4k-matmul",
+        }
+    }
+
+    /// Dispatch geometry: `(threads_per_TG, rows_per_TG)`.
+    ///
+    /// Q5_0 / Q8_0 follow the `mul_vec_q_n_f32` template: 2 simdgroups × 32
+    /// threads = 64 threads, 2 simdgroups × N_DST=4 rows = 8 rows per TG.
+    ///
+    /// Q4_K follows `kernel_mul_mv_q4_K_f32` which uses ONLY 1 simdgroup
+    /// (`first_row = r0 * N_DST`, ignores `sgitg`): 32 threads × 4 rows per TG.
+    /// Dispatching with 2 simdgroups would race-condition both simdgroups on
+    /// the same output rows.
+    fn dispatch_geometry(self) -> (usize, usize) {
+        const N_DST: usize = 4;
+        const SIMDWIDTH: usize = 32;
+        match self {
+            Self::Q5_0 | Self::Q8_0 => {
+                let simdgroups = 2;
+                (simdgroups * SIMDWIDTH, simdgroups * N_DST)
+            }
+            Self::Q4K => (SIMDWIDTH, N_DST),
+        }
+    }
+}
+
+struct GgufQuantMatmul {
     x: Tensor,
     weight_bytes: Tensor,
     in_features: usize,
     out_features: usize,
+    quant: GgufFastQuant,
 }
 
-impl InplaceOp1 for GgufQ5_0Matmul {
+impl InplaceOp1 for GgufQuantMatmul {
     fn name(&self) -> &'static str {
-        "gguf-q5_0-matmul"
+        self.quant.op_name()
     }
 
     fn cpu_fwd(&self, _s: &mut CpuStorage, _l: &Layout) -> Result<()> {
-        candle_core::bail!("GgufQ5_0Matmul: Metal-only path")
+        candle_core::bail!("GgufQuantMatmul ({:?}): Metal-only path", self.quant)
     }
 
     fn metal_fwd(&self, out: &mut MetalStorage, out_l: &Layout) -> Result<()> {
         if out.dtype() != DType::BF16 {
-            candle_core::bail!("GgufQ5_0Matmul: out must be BF16, got {:?}", out.dtype());
+            candle_core::bail!(
+                "GgufQuantMatmul ({:?}): out must be BF16, got {:?}",
+                self.quant,
+                out.dtype()
+            );
         }
         if self.x.dtype() != DType::BF16 {
-            candle_core::bail!("GgufQ5_0Matmul: x must be BF16, got {:?}", self.x.dtype());
+            candle_core::bail!(
+                "GgufQuantMatmul ({:?}): x must be BF16, got {:?}",
+                self.quant,
+                self.x.dtype()
+            );
         }
         if self.weight_bytes.dtype() != DType::U8 {
             candle_core::bail!(
-                "GgufQ5_0Matmul: weight_bytes must be U8, got {:?}",
+                "GgufQuantMatmul ({:?}): weight_bytes must be U8, got {:?}",
+                self.quant,
                 self.weight_bytes.dtype()
             );
         }
-        if !self.in_features.is_multiple_of(Q5_0_BLOCK_ELEMS) {
+        let (block_elems, block_bytes) = self.quant.block_layout();
+        if !self.in_features.is_multiple_of(block_elems) {
             candle_core::bail!(
-                "GgufQ5_0Matmul: in_features {} must be a multiple of {} (Q5_0 block size)",
+                "GgufQuantMatmul ({:?}): in_features {} must be a multiple of {}",
+                self.quant,
                 self.in_features,
-                Q5_0_BLOCK_ELEMS,
+                block_elems,
             );
         }
 
         let x_sl = self.x.storage_and_layout();
         let x_l = x_sl.1;
         if !x_l.is_contiguous() {
-            candle_core::bail!("GgufQ5_0Matmul: x must be contiguous");
+            candle_core::bail!("GgufQuantMatmul ({:?}): x must be contiguous", self.quant);
         }
         let x_dims = x_l.dims();
         if x_dims.len() != 2 || x_dims[0] != 1 || x_dims[1] != self.in_features {
             candle_core::bail!(
-                "GgufQ5_0Matmul: x shape {:?} != [1, {}]",
+                "GgufQuantMatmul ({:?}): x shape {:?} != [1, {}]",
+                self.quant,
                 x_dims,
                 self.in_features
             );
         }
         if out_l.dims() != [1, self.out_features] {
             candle_core::bail!(
-                "GgufQ5_0Matmul: output shape {:?} != [1, {}]",
+                "GgufQuantMatmul ({:?}): output shape {:?} != [1, {}]",
+                self.quant,
                 out_l.dims(),
                 self.out_features
             );
         }
-        let expected_bytes =
-            self.out_features * (self.in_features / Q5_0_BLOCK_ELEMS) * Q5_0_BLOCK_BYTES;
+        let expected_bytes = self.out_features * (self.in_features / block_elems) * block_bytes;
         let w_dims = self.weight_bytes.dims();
         let w_elems: usize = w_dims.iter().product();
         if w_elems != expected_bytes {
             candle_core::bail!(
-                "GgufQ5_0Matmul: weight_bytes has {} bytes, expected {} (out={} × blocks_per_row={} × {})",
+                "GgufQuantMatmul ({:?}): weight_bytes has {} bytes, expected {} (out={} × blocks_per_row={} × {})",
+                self.quant,
                 w_elems,
                 expected_bytes,
                 self.out_features,
-                self.in_features / Q5_0_BLOCK_ELEMS,
-                Q5_0_BLOCK_BYTES,
+                self.in_features / block_elems,
+                block_bytes,
             );
         }
 
@@ -2741,37 +2820,43 @@ impl InplaceOp1 for GgufQ5_0Matmul {
         let device = out.device();
         let x_buf = match &*x_sl.0 {
             candle_core::Storage::Metal(ms) => ms.buffer(),
-            _ => candle_core::bail!("GgufQ5_0Matmul: x must be Metal-resident"),
+            _ => candle_core::bail!(
+                "GgufQuantMatmul ({:?}): x must be Metal-resident",
+                self.quant
+            ),
         };
         let w_sl = self.weight_bytes.storage_and_layout();
         let w_buf = match &*w_sl.0 {
             candle_core::Storage::Metal(ms) => ms.buffer(),
-            _ => candle_core::bail!("GgufQ5_0Matmul: weight_bytes must be Metal-resident"),
+            _ => candle_core::bail!(
+                "GgufQuantMatmul ({:?}): weight_bytes must be Metal-resident",
+                self.quant
+            ),
         };
 
-        let pipeline = get_or_compile_quant_pipeline(device.device(), "gguf_q5_0_gemv_bf16")?;
+        let pipeline = get_or_compile_quant_pipeline(device.device(), self.quant.gemv_kernel())?;
         let encoder = device.command_encoder()?;
         encoder.set_compute_pipeline_state(&pipeline);
-        encoder.set_buffer(0, Some(x_buf), x_l.start_offset() * 2); // bf16 = 2 bytes
-        encoder.set_buffer(1, Some(w_buf), w_sl.1.start_offset()); // u8 = 1 byte
-        encoder.set_buffer(2, Some(out.buffer()), out_l.start_offset() * 2); // bf16 = 2 bytes
+        encoder.set_buffer(0, Some(x_buf), x_l.start_offset() * 2);
+        encoder.set_buffer(1, Some(w_buf), w_sl.1.start_offset());
+        encoder.set_buffer(2, Some(out.buffer()), out_l.start_offset() * 2);
         encoder.set_bytes(3, &params);
         encoder.use_resource(x_buf, MTLResourceUsage::Read);
         encoder.use_resource(w_buf, MTLResourceUsage::Read);
         encoder.use_resource(out.buffer(), MTLResourceUsage::Write);
 
-        // 1 threadgroup = N_SIMDGROUP simdgroups × N_SIMDWIDTH threads
-        //               = 2 × 32 = 64 threads, covering N_SIMDGROUP × N_DST = 8 rows
-        const TG_THREADS: usize = GGUF_N_SIMDGROUP * GGUF_N_SIMDWIDTH;
-        const ROWS_PER_TG: usize = GGUF_N_SIMDGROUP * GGUF_N_DST;
+        // Geometry depends on the quant's template: Q5_0/Q8_0 use 2 simdgroups
+        // (`mul_vec_q_n` pattern), Q4_K uses 1 simdgroup (its `kernel_mul_mv_q4_K`
+        // hard-codes `first_row = r0 * N_DST`, ignoring `sgitg`).
+        let (tg_threads, rows_per_tg) = self.quant.dispatch_geometry();
         encoder.dispatch_thread_groups(
             MTLSize {
-                width: self.out_features.div_ceil(ROWS_PER_TG),
+                width: self.out_features.div_ceil(rows_per_tg),
                 height: 1,
                 depth: 1,
             },
             MTLSize {
-                width: TG_THREADS,
+                width: tg_threads,
                 height: 1,
                 depth: 1,
             },
@@ -2781,22 +2866,179 @@ impl InplaceOp1 for GgufQ5_0Matmul {
     }
 }
 
-/// Q5_0 GEMV: `out = x @ W.T`, where `W` is a GGUF Q5_0 quantized weight stored
-/// as a raw byte stream in `weight_bytes` (shape `[N * K/32 * 22]`, dtype `U8`).
-/// `x` must be BF16, shape `[1, K]`. Returns `[1, N]` in BF16.
-pub fn gguf_q5_0_matmul(
+/// GGUF quantized GEMV (M=1 decode path). `out = x @ W.T`, where `W` is laid
+/// out as a packed byte stream in `weight_bytes`. Dispatches the right Metal
+/// kernel based on `quant`. `x` must be BF16 `[1, K]`. Returns BF16 `[1, N]`.
+pub fn gguf_quant_matmul(
     x: &Tensor,
     weight_bytes: &Tensor,
     in_features: usize,
     out_features: usize,
+    quant: GgufFastQuant,
 ) -> Result<Tensor> {
     let device = x.device();
     let out = Tensor::zeros((1, out_features), DType::BF16, device)?;
-    out.inplace_op1(&GgufQ5_0Matmul {
+    out.inplace_op1(&GgufQuantMatmul {
         x: x.clone(),
         weight_bytes: weight_bytes.clone(),
         in_features,
         out_features,
+        quant,
     })?;
     Ok(out)
+}
+
+// ─── GGUF quantized GEMM (M>1 prefill path) ─────────────────────────────────
+//
+// Fused dequantize + matmul: the packed block stream is read straight from
+// HBM, dequantized inline in threadgroup memory per K-strip, and the result
+// is accumulated into the output tile without ever materialising a full bf16
+// weight tensor. See `quant_kernels.metal` for the kernel body.
+//
+// Geometry must match the kernel side: GGUF_MM_BM rows × GGUF_MM_BN cols per
+// TG.  Each thread of the TG owns one output element.
+
+const GGUF_MM_BM: usize = 16;
+const GGUF_MM_BN: usize = 16;
+
+#[repr(C)]
+struct GgufMatmulParams {
+    m_total: u32,
+    n_total: u32,
+    k_total: u32,
+}
+
+struct GgufQuantMulMM {
+    weight_bytes: Tensor,
+    n: usize,
+    k: usize,
+    quant: GgufFastQuant,
+}
+
+impl CustomOp1 for GgufQuantMulMM {
+    fn name(&self) -> &'static str {
+        match self.quant {
+            GgufFastQuant::Q5_0 => "gguf-q5_0-mul-mm",
+            GgufFastQuant::Q8_0 => "gguf-q8_0-mul-mm",
+            GgufFastQuant::Q4K => "gguf-q4k-mul-mm",
+        }
+    }
+
+    fn cpu_fwd(&self, _s: &CpuStorage, _l: &Layout) -> Result<(CpuStorage, Shape)> {
+        candle_core::bail!("GgufQuantMulMM ({:?}): Metal-only path", self.quant)
+    }
+
+    fn metal_fwd(&self, x: &MetalStorage, x_l: &Layout) -> Result<(MetalStorage, Shape)> {
+        if x.dtype() != DType::BF16 {
+            candle_core::bail!(
+                "GgufQuantMulMM ({:?}): x must be BF16, got {:?}",
+                self.quant,
+                x.dtype()
+            );
+        }
+        if !x_l.is_contiguous() {
+            candle_core::bail!("GgufQuantMulMM ({:?}): x must be contiguous", self.quant);
+        }
+        let x_dims = x_l.dims();
+        if x_dims.len() != 2 || x_dims[1] != self.k {
+            candle_core::bail!(
+                "GgufQuantMulMM ({:?}): x shape {:?} != [M, {}]",
+                self.quant,
+                x_dims,
+                self.k
+            );
+        }
+        let m = x_dims[0];
+        let (block_elems, block_bytes) = self.quant.block_layout();
+        if !self.k.is_multiple_of(block_elems) {
+            candle_core::bail!(
+                "GgufQuantMulMM ({:?}): K {} must be a multiple of {}",
+                self.quant,
+                self.k,
+                block_elems,
+            );
+        }
+        let w_sl = self.weight_bytes.storage_and_layout();
+        if self.weight_bytes.dtype() != DType::U8 {
+            candle_core::bail!(
+                "GgufQuantMulMM ({:?}): weight_bytes must be U8, got {:?}",
+                self.quant,
+                self.weight_bytes.dtype()
+            );
+        }
+        let w_elems: usize = w_sl.1.dims().iter().product();
+        let expected_w = self.n * (self.k / block_elems) * block_bytes;
+        if w_elems != expected_w {
+            candle_core::bail!(
+                "GgufQuantMulMM ({:?}): weight_bytes has {} bytes, expected {}",
+                self.quant,
+                w_elems,
+                expected_w,
+            );
+        }
+
+        let params = GgufMatmulParams {
+            m_total: m as u32,
+            n_total: self.n as u32,
+            k_total: self.k as u32,
+        };
+
+        let device = x.device();
+        let out_elems = m * self.n;
+        let output = device.new_buffer(out_elems, DType::BF16, "gguf-mul-mm")?;
+
+        let x_buf = x.buffer();
+        let w_buf = match &*w_sl.0 {
+            candle_core::Storage::Metal(ms) => ms.buffer(),
+            _ => candle_core::bail!(
+                "GgufQuantMulMM ({:?}): weight_bytes must be Metal-resident",
+                self.quant
+            ),
+        };
+
+        let pipeline = get_or_compile_quant_pipeline(device.device(), self.quant.mul_mm_kernel())?;
+        let encoder = device.command_encoder()?;
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(x_buf), x_l.start_offset() * 2); // bf16 = 2 bytes
+        encoder.set_buffer(1, Some(w_buf), w_sl.1.start_offset()); // u8 = 1 byte
+        encoder.set_buffer(2, Some(&*output), 0);
+        encoder.set_bytes(3, &params);
+        encoder.use_resource(x_buf, MTLResourceUsage::Read);
+        encoder.use_resource(w_buf, MTLResourceUsage::Read);
+        encoder.use_resource(&*output, MTLResourceUsage::Write);
+
+        encoder.dispatch_thread_groups(
+            MTLSize {
+                width: self.n.div_ceil(GGUF_MM_BN),
+                height: m.div_ceil(GGUF_MM_BM),
+                depth: 1,
+            },
+            MTLSize {
+                width: GGUF_MM_BN,
+                height: GGUF_MM_BM,
+                depth: 1,
+            },
+        );
+
+        let storage = MetalStorage::new(output, device.clone(), out_elems, DType::BF16);
+        Ok((storage, Shape::from(vec![m, self.n])))
+    }
+}
+
+/// Fused GGUF GEMM for `out = x @ W.T`, M>1. `weight_bytes` carries the GGUF
+/// packed block stream; the kernel dequantizes inline (no intermediate bf16
+/// weight tensor). `x` is BF16 `[M, K]`; output is BF16 `[M, N]`.
+pub fn gguf_quant_mul_mm(
+    x: &Tensor,
+    weight_bytes: &Tensor,
+    in_features: usize,
+    out_features: usize,
+    quant: GgufFastQuant,
+) -> Result<Tensor> {
+    x.apply_op1(GgufQuantMulMM {
+        weight_bytes: weight_bytes.clone(),
+        n: out_features,
+        k: in_features,
+        quant,
+    })
 }

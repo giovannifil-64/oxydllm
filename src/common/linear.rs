@@ -151,7 +151,11 @@ pub fn softmax_last_dim(x: &Tensor) -> Result<Tensor> {
 }
 
 pub struct QLinear {
-    inner: QMatMul,
+    /// Candle `QMatMul` fallback. `None` when `gguf_fast` is set — the bf16
+    /// path owns its own packed weight stream (M=1 GEMV + M>1 fused GEMM,
+    /// both dequant-inline) and the original `QTensor` is released, removing
+    /// the 2× memory residency that the M=1-only pilot incurred.
+    inner: Option<QMatMul>,
     #[cfg(feature = "metal")]
     gguf_fast: Option<GgufFastPath>,
     bias: Option<Tensor>,
@@ -160,21 +164,10 @@ pub struct QLinear {
 
 #[cfg(feature = "metal")]
 struct GgufFastPath {
-    dtype: GgmlDType,
+    quant: super::metal_ops::GgufFastQuant,
     weight_bytes: Tensor,
     in_features: usize,
     out_features: usize,
-}
-
-#[cfg(feature = "metal")]
-fn gguf_fast_path_enabled() -> bool {
-    use std::sync::OnceLock;
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("OXYDLLM_GGUF_FAST_PATH")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false)
-    })
 }
 
 #[cfg(feature = "metal")]
@@ -183,53 +176,90 @@ impl GgufFastPath {
         if !matches!(qt.device(), Device::Metal(_)) || out_dtype != DType::BF16 {
             return Ok(None);
         }
-        let dtype = qt.dtype();
-        if !matches!(dtype, GgmlDType::Q5_0) {
-            return Ok(None);
-        }
+        // Map candle's GgmlDType → our fast-path enum. Returning None for
+        // unsupported quants keeps the existing QMatMul path as fallback.
+        let quant = match qt.dtype() {
+            GgmlDType::Q5_0 => super::metal_ops::GgufFastQuant::Q5_0,
+            GgmlDType::Q8_0 => super::metal_ops::GgufFastQuant::Q8_0,
+            GgmlDType::Q4K => super::metal_ops::GgufFastQuant::Q4K,
+            _ => return Ok(None),
+        };
         let shape_dims = qt.shape().dims();
         if shape_dims.len() != 2 {
             return Ok(None);
         }
         let (out_features, in_features) = (shape_dims[0], shape_dims[1]);
-        if !in_features.is_multiple_of(32) {
+        let (block_elems, block_bytes) = quant.block_layout();
+        if !in_features.is_multiple_of(block_elems) {
             return Ok(None);
         }
 
         let device = qt.device();
         let bytes = qt
             .data()
-            .map_err(|e| candle_core::Error::Msg(format!("Q5_0 fast path: qt.data() failed: {e}")))?
+            .map_err(|e| candle_core::Error::Msg(format!("GGUF fast path: qt.data() failed: {e}")))?
             .into_owned();
-        let weight_bytes =
-            Tensor::from_vec(bytes, (out_features * (in_features / 32) * 22,), &device)?;
+        let expected = out_features * (in_features / block_elems) * block_bytes;
+        if bytes.len() != expected {
+            candle_core::bail!(
+                "GGUF fast path: qt.data() returned {} bytes, expected {} for shape [{}, {}] dtype {:?}",
+                bytes.len(),
+                expected,
+                out_features,
+                in_features,
+                qt.dtype()
+            );
+        }
+        let weight_bytes = Tensor::from_vec(bytes, (expected,), &device)?;
         Ok(Some(Self {
-            dtype,
+            quant,
             weight_bytes,
             in_features,
             out_features,
         }))
     }
 
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+    /// M=1 decode: dispatch the bf16 GEMV kernel.
+    fn forward_decode(&self, x: &Tensor) -> Result<Tensor> {
         let dims = x.dims().to_vec();
         let in_features = *dims.last().unwrap();
         let m: usize = dims[..dims.len() - 1].iter().product();
-        debug_assert_eq!(m, 1, "GgufFastPath::forward must only be called for M=1");
+        debug_assert_eq!(
+            m, 1,
+            "GgufFastPath::forward_decode must only be called for M=1"
+        );
         debug_assert_eq!(in_features, self.in_features);
         let x_2d = x.reshape((1, in_features))?.contiguous()?;
-        let y_2d = match self.dtype {
-            GgmlDType::Q5_0 => super::metal_ops::gguf_q5_0_matmul(
-                &x_2d,
-                &self.weight_bytes,
-                self.in_features,
-                self.out_features,
-            )?,
-            _ => candle_core::bail!("GgufFastPath: unsupported dtype {:?}", self.dtype),
-        };
+        let y_2d = super::metal_ops::gguf_quant_matmul(
+            &x_2d,
+            &self.weight_bytes,
+            self.in_features,
+            self.out_features,
+            self.quant,
+        )?;
         let mut out_dims = dims;
         *out_dims.last_mut().unwrap() = self.out_features;
         y_2d.reshape(out_dims)
+    }
+
+    /// M>1 prefill: fused dequant + GEMM in a single Metal kernel — no
+    /// intermediate bf16 weight tensor is ever materialised.
+    fn forward_prefill(&self, x: &Tensor) -> Result<Tensor> {
+        let original_dims = x.dims().to_vec();
+        let in_features = *original_dims.last().unwrap();
+        debug_assert_eq!(in_features, self.in_features);
+        let batch_flat: usize = original_dims[..original_dims.len() - 1].iter().product();
+        let x_2d = x.reshape((batch_flat, in_features))?.contiguous()?;
+        let y_2d = super::metal_ops::gguf_quant_mul_mm(
+            &x_2d,
+            &self.weight_bytes,
+            self.in_features,
+            self.out_features,
+            self.quant,
+        )?;
+        let mut new_dims = original_dims;
+        *new_dims.last_mut().unwrap() = self.out_features;
+        y_2d.reshape(new_dims)
     }
 }
 
@@ -244,21 +274,39 @@ impl QLinear {
         out_dtype: DType,
     ) -> Result<Self> {
         #[cfg(feature = "metal")]
-        let gguf_fast = GgufFastPath::build(&qtensor, out_dtype)?;
-        let inner = QMatMul::from_arc(qtensor)?;
-        Ok(Self {
-            inner,
-            #[cfg(feature = "metal")]
-            gguf_fast,
-            bias,
-            out_dtype,
-        })
+        {
+            let gguf_fast = GgufFastPath::build(&qtensor, out_dtype)?;
+            // When the bf16 fast path owns the packed weight, drop the
+            // candle-side QTensor to free its Metal buffer (~2× pesi saved).
+            let inner = if gguf_fast.is_some() {
+                drop(qtensor);
+                None
+            } else {
+                Some(QMatMul::from_arc(qtensor)?)
+            };
+            Ok(Self {
+                inner,
+                gguf_fast,
+                bias,
+                out_dtype,
+            })
+        }
+        #[cfg(not(feature = "metal"))]
+        {
+            let inner = Some(QMatMul::from_arc(qtensor)?);
+            Ok(Self {
+                inner,
+                bias,
+                out_dtype,
+            })
+        }
     }
 
-    /// M=1 (decode) uses the bf16-aware GGUF fast path when available
-    /// (`gguf_fast`); M>1 (prefill / batched) falls back to candle's
-    /// `QMatMul` which operates in F32 — that path performs a BF16→F32
-    /// input cast and F32→BF16 output cast (two cast kernels per call).
+    /// When `gguf_fast` is available, both M=1 (decode → bf16 GEMV) and M>1
+    /// (prefill → fused dequant+GEMM in a single kernel) take the bf16-aware
+    /// path. The candle `QMatMul` fallback handles unsupported dtypes (Q2_K,
+    /// Q6_K, …) and non-Metal builds — that path runs in F32, adding two
+    /// dtype casts (BF16→F32 input, F32→BF16 output) per call.
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let original_dims = x.dims().to_vec();
         let in_features = *original_dims.last().unwrap();
@@ -266,12 +314,14 @@ impl QLinear {
 
         #[cfg(feature = "metal")]
         if let Some(ref fast) = self.gguf_fast
-            && m == 1
             && in_features == fast.in_features
             && x.dtype() == DType::BF16
-            && gguf_fast_path_enabled()
         {
-            let out = fast.forward(x)?;
+            let out = if m == 1 {
+                fast.forward_decode(x)?
+            } else {
+                fast.forward_prefill(x)?
+            };
             let out = if out.dtype() != self.out_dtype {
                 out.to_dtype(self.out_dtype)?
             } else {
@@ -282,6 +332,13 @@ impl QLinear {
                 None => Ok(out),
             };
         }
+
+        let inner = self.inner.as_ref().ok_or_else(|| {
+            candle_core::Error::Msg(
+                "QLinear: candle QMatMul was released but the GGUF fast path is not engaged"
+                    .to_string(),
+            )
+        })?;
 
         let x_f32_owned;
         let x_f32: &Tensor = if x.dtype() != DType::F32 {
@@ -298,7 +355,7 @@ impl QLinear {
             x_f32.clone()
         };
 
-        let out = candle_core::Module::forward(&self.inner, &x_2d)?;
+        let out = candle_core::Module::forward(inner, &x_2d)?;
 
         let out = if original_dims.len() > 2 {
             let out_features = out.dim(candle_core::D::Minus1)?;

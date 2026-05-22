@@ -2634,3 +2634,169 @@ mod fused_kernel_parity_tests {
         println!("  chained     : w4a16 {w4_chain:8.1}   bf16 {bf16_chain:8.1}");
     }
 }
+
+// ─── GGUF quantized matmul (Q5_0 first; Q4_K and Q2_K to follow) ────────────
+//
+// Bf16-aware GEMV kernels for GGUF-quantized weights. The packed block stream
+// (e.g. 22 bytes per 32 elements for Q5_0) is carried as a `Tensor` of `U8`
+// scalars Metal-resident — see `GgufFastPath` in `linear.rs` for the loader
+// side. Algorithm is a port of `mul_vec_q_n_f32` from llama.cpp / candle
+// (MIT) adapted to bf16 I/O (no host-side casts; bf16 read + bf16 write).
+// Geometry: N_SIMDGROUP=2 simdgroups × N_DST=4 rows → 8 rows per threadgroup;
+// each simdgroup loops over the row's K blocks with simd_sum at the end and
+// one writer per row (no atomics, no split-K).
+//
+// Forward is M=1 only; the caller (QLinear) falls back to candle `QMatMul`
+// for M>1 prefill.
+
+#[repr(C)]
+struct GgufParams {
+    in_features: u32,
+    out_features: u32,
+}
+
+const GGUF_N_DST: usize = 4;
+const GGUF_N_SIMDGROUP: usize = 2;
+const GGUF_N_SIMDWIDTH: usize = 32;
+const Q5_0_BLOCK_BYTES: usize = 22;
+const Q5_0_BLOCK_ELEMS: usize = 32;
+
+struct GgufQ5_0Matmul {
+    x: Tensor,
+    weight_bytes: Tensor,
+    in_features: usize,
+    out_features: usize,
+}
+
+impl InplaceOp1 for GgufQ5_0Matmul {
+    fn name(&self) -> &'static str {
+        "gguf-q5_0-matmul"
+    }
+
+    fn cpu_fwd(&self, _s: &mut CpuStorage, _l: &Layout) -> Result<()> {
+        candle_core::bail!("GgufQ5_0Matmul: Metal-only path")
+    }
+
+    fn metal_fwd(&self, out: &mut MetalStorage, out_l: &Layout) -> Result<()> {
+        if out.dtype() != DType::BF16 {
+            candle_core::bail!("GgufQ5_0Matmul: out must be BF16, got {:?}", out.dtype());
+        }
+        if self.x.dtype() != DType::BF16 {
+            candle_core::bail!("GgufQ5_0Matmul: x must be BF16, got {:?}", self.x.dtype());
+        }
+        if self.weight_bytes.dtype() != DType::U8 {
+            candle_core::bail!(
+                "GgufQ5_0Matmul: weight_bytes must be U8, got {:?}",
+                self.weight_bytes.dtype()
+            );
+        }
+        if !self.in_features.is_multiple_of(Q5_0_BLOCK_ELEMS) {
+            candle_core::bail!(
+                "GgufQ5_0Matmul: in_features {} must be a multiple of {} (Q5_0 block size)",
+                self.in_features,
+                Q5_0_BLOCK_ELEMS,
+            );
+        }
+
+        let x_sl = self.x.storage_and_layout();
+        let x_l = x_sl.1;
+        if !x_l.is_contiguous() {
+            candle_core::bail!("GgufQ5_0Matmul: x must be contiguous");
+        }
+        let x_dims = x_l.dims();
+        if x_dims.len() != 2 || x_dims[0] != 1 || x_dims[1] != self.in_features {
+            candle_core::bail!(
+                "GgufQ5_0Matmul: x shape {:?} != [1, {}]",
+                x_dims,
+                self.in_features
+            );
+        }
+        if out_l.dims() != [1, self.out_features] {
+            candle_core::bail!(
+                "GgufQ5_0Matmul: output shape {:?} != [1, {}]",
+                out_l.dims(),
+                self.out_features
+            );
+        }
+        let expected_bytes =
+            self.out_features * (self.in_features / Q5_0_BLOCK_ELEMS) * Q5_0_BLOCK_BYTES;
+        let w_dims = self.weight_bytes.dims();
+        let w_elems: usize = w_dims.iter().product();
+        if w_elems != expected_bytes {
+            candle_core::bail!(
+                "GgufQ5_0Matmul: weight_bytes has {} bytes, expected {} (out={} × blocks_per_row={} × {})",
+                w_elems,
+                expected_bytes,
+                self.out_features,
+                self.in_features / Q5_0_BLOCK_ELEMS,
+                Q5_0_BLOCK_BYTES,
+            );
+        }
+
+        let params = GgufParams {
+            in_features: self.in_features as u32,
+            out_features: self.out_features as u32,
+        };
+
+        let device = out.device();
+        let x_buf = match &*x_sl.0 {
+            candle_core::Storage::Metal(ms) => ms.buffer(),
+            _ => candle_core::bail!("GgufQ5_0Matmul: x must be Metal-resident"),
+        };
+        let w_sl = self.weight_bytes.storage_and_layout();
+        let w_buf = match &*w_sl.0 {
+            candle_core::Storage::Metal(ms) => ms.buffer(),
+            _ => candle_core::bail!("GgufQ5_0Matmul: weight_bytes must be Metal-resident"),
+        };
+
+        let pipeline = get_or_compile_quant_pipeline(device.device(), "gguf_q5_0_gemv_bf16")?;
+        let encoder = device.command_encoder()?;
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(x_buf), x_l.start_offset() * 2); // bf16 = 2 bytes
+        encoder.set_buffer(1, Some(w_buf), w_sl.1.start_offset()); // u8 = 1 byte
+        encoder.set_buffer(2, Some(out.buffer()), out_l.start_offset() * 2); // bf16 = 2 bytes
+        encoder.set_bytes(3, &params);
+        encoder.use_resource(x_buf, MTLResourceUsage::Read);
+        encoder.use_resource(w_buf, MTLResourceUsage::Read);
+        encoder.use_resource(out.buffer(), MTLResourceUsage::Write);
+
+        // 1 threadgroup = N_SIMDGROUP simdgroups × N_SIMDWIDTH threads
+        //               = 2 × 32 = 64 threads, covering N_SIMDGROUP × N_DST = 8 rows
+        const TG_THREADS: usize = GGUF_N_SIMDGROUP * GGUF_N_SIMDWIDTH;
+        const ROWS_PER_TG: usize = GGUF_N_SIMDGROUP * GGUF_N_DST;
+        encoder.dispatch_thread_groups(
+            MTLSize {
+                width: self.out_features.div_ceil(ROWS_PER_TG),
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: TG_THREADS,
+                height: 1,
+                depth: 1,
+            },
+        );
+
+        Ok(())
+    }
+}
+
+/// Q5_0 GEMV: `out = x @ W.T`, where `W` is a GGUF Q5_0 quantized weight stored
+/// as a raw byte stream in `weight_bytes` (shape `[N * K/32 * 22]`, dtype `U8`).
+/// `x` must be BF16, shape `[1, K]`. Returns `[1, N]` in BF16.
+pub fn gguf_q5_0_matmul(
+    x: &Tensor,
+    weight_bytes: &Tensor,
+    in_features: usize,
+    out_features: usize,
+) -> Result<Tensor> {
+    let device = x.device();
+    let out = Tensor::zeros((1, out_features), DType::BF16, device)?;
+    out.inplace_op1(&GgufQ5_0Matmul {
+        x: x.clone(),
+        weight_bytes: weight_bytes.clone(),
+        in_features,
+        out_features,
+    })?;
+    Ok(out)
+}

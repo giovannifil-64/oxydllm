@@ -206,3 +206,124 @@ kernel void dequantize_w4_bf16(
 {
     awq_dequantize_impl<bfloat, 4>(qweight, qzeros, scales, weight, p, gid);
 }
+
+// =============================================================================
+// GGUF quantized GEMV kernels (Q5_0 first; Q4_K and Q2_K to follow).
+//
+// Bf16-aware port of llama.cpp's `mul_vec_q_n_f32` template (MIT) via
+// candle-metal-kernels (MIT). The candle path runs in F32 only — the host
+// wrapper has to cast bf16 activations to f32 and the f32 output back to bf16
+// per call. Here we read bf16 activations directly, do the reduction in
+// register float, and write bf16 directly to dst — eliminating both cast
+// kernels.
+//
+// Algorithm (per simdgroup of N_SIMDWIDTH=32 threads):
+//   • Each simdgroup owns N_DST=4 consecutive output rows.
+//   • Each threadgroup contains N_SIMDGROUP=2 simdgroups → 8 rows/TG.
+//   • Within a simdgroup, threads `tiisg` (0..31) cooperate over a row's
+//     `nb = K/32` blocks: thread `tiisg` handles block `tiisg/2`, half `il`
+//     (0 or 8), striding by `N_SIMDWIDTH/2 = 16` blocks per pass.
+//   • Per-thread partials accumulate into `sumf[N_DST]`, then `simd_sum`
+//     reduces across the simdgroup; thread 0 writes one bf16 per row.
+//   • No atomics, no split-K — one writer per output row.
+// =============================================================================
+
+#define QK5_0 32
+#define GGUF_N_SIMDWIDTH 32
+#define GGUF_N_DST 4
+#define GGUF_N_SIMDGROUP 2
+
+struct GgufParams {
+    uint in_features;   // K — must be a multiple of block_elems
+    uint out_features;  // N
+};
+
+typedef struct {
+    half     d;             // delta (offset 0,  2 bytes)
+    uint8_t  qh[4];         // 5-th bit per element (offset 2, 4 bytes)
+    uint8_t  qs[QK5_0/2];   // low 4 bits, 2 elements per byte (offset 6, 16 bytes)
+} block_q5_0;
+
+// Inner product of one Q5_0 block-half with 16 pre-scaled activations.
+// `yl[]` were pre-scaled in the caller so that the qs[] bits can be ANDed at
+// their native positions without further shifting (1, 1/16, 1/256, 1/4096).
+// `sumy` is the sum of the 16 raw activations, used for the -16 offset.
+inline float gguf_q5_0_dot_y(device const block_q5_0 *qb,
+                              float sumy,
+                              thread float *yl,
+                              int il)
+{
+    float d = qb->d;
+    float2 acc = 0.f;
+    device const uint16_t *qs = ((device const uint16_t *)qb + 3 + il/2);
+    const uint32_t qh = *((device const uint32_t *)qb->qh);
+
+    for (int i = 0; i < 8; i += 2) {
+        acc[0] += yl[i+0] * ((qs[i/2] & 0x000F) | ((qh >> (i+0+il        ) << 4 ) & 0x00010))
+                + yl[i+1] * ((qs[i/2] & 0x0F00) | ((qh >> (i+1+il        ) << 12) & 0x01000));
+        acc[1] += yl[i+8] * ((qs[i/2] & 0x00F0) | ((qh >> (i+0+il+QK5_0/2) << 8 ) & 0x00100))
+                + yl[i+9] * ((qs[i/2] & 0xF000) | ((qh >> (i+1+il+QK5_0/2) << 16) & 0x10000));
+    }
+    return d * (sumy * -16.f + acc[0] + acc[1]);
+}
+
+// Q5_0 GEMV bf16: M=1 decode path. Weight is laid out as a contiguous block
+// stream `[N * (K/32) * 22]` bytes (the GGUF on-disk format); we cast to
+// `block_q5_0*` for typed access.
+kernel void gguf_q5_0_gemv_bf16(
+    device const bfloat       *x        [[buffer(0)]],   // [K]
+    device const void         *weight   [[buffer(1)]],   // [N * K/32 * 22] raw bytes
+    device       bfloat       *out      [[buffer(2)]],   // [N]
+    constant     GgufParams   &p        [[buffer(3)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    uint tiisg  [[thread_index_in_simdgroup]],
+    uint sgitg  [[simdgroup_index_in_threadgroup]])
+{
+    const uint N  = p.out_features;
+    const uint K  = p.in_features;
+    const uint nb = K / QK5_0;
+
+    const uint r0 = tgpig.x;
+    const uint first_row = (r0 * GGUF_N_SIMDGROUP + sgitg) * GGUF_N_DST;
+    if (first_row >= N) return;
+
+    device const block_q5_0 *x_blocks =
+        (device const block_q5_0 *)weight + (ulong)first_row * (ulong)nb;
+
+    float yl[16];
+    float sumf[GGUF_N_DST] = {0.f};
+
+    const uint ix = (tiisg / 2);          // which block (0..15)
+    const uint il = (tiisg % 2) * 8;      // 0 or 8 — which half of the block
+
+    device const bfloat *yb = x + ix * QK5_0 + il;
+
+    for (uint ib = ix; ib < nb; ib += GGUF_N_SIMDWIDTH/2) {
+        float sumy = 0.f;
+        for (int i = 0; i < 8; i += 2) {
+            const float a0  = (float)yb[i+0];
+            const float a1  = (float)yb[i+1];
+            const float a16 = (float)yb[i+16];
+            const float a17 = (float)yb[i+17];
+            sumy   += a0 + a1 + a16 + a17;
+            yl[i+0] = a0;
+            yl[i+1] = a1  / 256.f;
+            yl[i+8] = a16 / 16.f;
+            yl[i+9] = a17 / 4096.f;
+        }
+        for (uint row = 0; row < GGUF_N_DST; ++row) {
+            if (first_row + row < N) {
+                sumf[row] += gguf_q5_0_dot_y(x_blocks + ib + row * nb, sumy, yl, il);
+            }
+        }
+        yb += (ulong)QK5_0 * (ulong)(GGUF_N_SIMDWIDTH / 2);
+    }
+
+    for (uint row = 0; row < GGUF_N_DST; ++row) {
+        const float tot = simd_sum(sumf[row]);
+        const uint r = first_row + row;
+        if (tiisg == 0 && r < N) {
+            out[r] = (bfloat)tot;
+        }
+    }
+}

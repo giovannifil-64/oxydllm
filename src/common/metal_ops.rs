@@ -1783,6 +1783,378 @@ pub fn dequantize_w8(qweight: &Tensor, qzeros: &Tensor, scales: &Tensor) -> Resu
     })
 }
 
+// ── GPTQ resident path (auto-gptq layout) ───────────────────────────────────
+
+/// Must match `GptqParams` in `quant_kernels.metal`.
+#[repr(C)]
+struct GptqParams {
+    in_features: u32,
+    out_features: u32,
+    group_size: u32,
+    group_shift: u32,
+    k_splits: u32,
+    chunk: u32,
+}
+
+/// Validated GPTQ shape. Unlike [`AwqShape`] there's no `packed_out` because
+/// qweight is packed along *in_features*; the only derived value we cache is
+/// `packed_in = in_features / pack_factor`.
+struct GptqShape {
+    in_features: usize,
+    out_features: usize,
+    group_size: usize,
+    packed_in: usize,
+}
+
+impl GptqShape {
+    fn new_bits(packed_in: usize, out_features: usize, groups: usize, bits: u32) -> Result<Self> {
+        let pack_factor = (32 / bits) as usize;
+        let in_features = packed_in * pack_factor;
+        if groups == 0 || !in_features.is_multiple_of(groups) {
+            candle_core::bail!(
+                "GPTQ-W{bits}A16: in_features {in_features} not divisible by groups {groups}"
+            );
+        }
+        if !out_features.is_multiple_of(pack_factor) {
+            candle_core::bail!(
+                "GPTQ-W{bits}A16: out_features {out_features} not divisible by pack_factor {pack_factor}"
+            );
+        }
+        Ok(Self {
+            in_features,
+            out_features,
+            group_size: in_features / groups,
+            packed_in,
+        })
+    }
+
+    fn params(&self, group_shift: usize, k_splits: usize, chunk: usize) -> GptqParams {
+        GptqParams {
+            in_features: self.in_features as u32,
+            out_features: self.out_features as u32,
+            group_size: self.group_size as u32,
+            group_shift: group_shift as u32,
+            k_splits: k_splits as u32,
+            chunk: chunk as u32,
+        }
+    }
+}
+
+/// Fused GPTQ-W{4,8}A16 GEMV. Mirror of [`W4A16Matmul`] but for the
+/// auto-gptq pack layout (`qweight[i_word, o]`, PlusOne zero point).
+struct GptqMatmul {
+    x: Tensor,
+    qweight: Tensor,
+    qzeros: Tensor,
+    scales: Tensor,
+    bits: u32,
+}
+
+impl InplaceOp1 for GptqMatmul {
+    fn name(&self) -> &'static str {
+        match self.bits {
+            8 => "gptq8-matmul",
+            _ => "gptq4-matmul",
+        }
+    }
+
+    fn cpu_fwd(&self, _s: &mut CpuStorage, _l: &Layout) -> Result<()> {
+        candle_core::bail!(
+            "GptqMatmul (bits={}): Metal-only — use the CPU dequantize_gptq path",
+            self.bits
+        )
+    }
+
+    fn metal_fwd(&self, out: &mut MetalStorage, out_l: &Layout) -> Result<()> {
+        if out.dtype() != DType::F32 {
+            candle_core::bail!("GptqMatmul: accumulator must be F32, got {:?}", out.dtype());
+        }
+        let pack_factor = (32 / self.bits) as usize;
+        let x_sl = self.x.storage_and_layout();
+        let x_l = x_sl.1;
+        if !x_l.is_contiguous() {
+            candle_core::bail!("GptqMatmul: x must be contiguous");
+        }
+        let x_dims = x_l.dims();
+        if x_dims.len() != 2 || x_dims[0] != 1 {
+            candle_core::bail!("GptqMatmul: x must be [1, in] (M=1 decode path), got {x_dims:?}");
+        }
+        let in_features = x_dims[1];
+
+        let (packed_in, qw_out) = self.qweight.dims2()?;
+        let (groups, out_features) = self.scales.dims2()?;
+        if qw_out != out_features {
+            candle_core::bail!(
+                "GptqMatmul: qweight dim1 {qw_out} != scales out_features {out_features}"
+            );
+        }
+        let qz_dims = self.qzeros.dims();
+        if qz_dims.len() != 2 || qz_dims[0] != groups || qz_dims[1] * pack_factor != out_features {
+            candle_core::bail!(
+                "GptqMatmul: qzeros shape {:?} != [{groups}, {}]",
+                qz_dims,
+                out_features / pack_factor
+            );
+        }
+
+        let shape = GptqShape::new_bits(packed_in, out_features, groups, self.bits)?;
+        if in_features != shape.in_features {
+            candle_core::bail!(
+                "GptqMatmul: x in_features {in_features} != weight in_features {}",
+                shape.in_features
+            );
+        }
+        if out_l.dims() != [1, shape.out_features] {
+            candle_core::bail!(
+                "GptqMatmul: accumulator shape {:?} != [1, {}]",
+                out_l.dims(),
+                shape.out_features
+            );
+        }
+        if self.scales.dtype() != self.x.dtype() {
+            candle_core::bail!(
+                "GptqMatmul: scales dtype {:?} must match x dtype {:?}",
+                self.scales.dtype(),
+                self.x.dtype()
+            );
+        }
+        if !shape.group_size.is_power_of_two() {
+            candle_core::bail!(
+                "GptqMatmul: group_size {} must be a power of two",
+                shape.group_size
+            );
+        }
+
+        let kernel_name = match (self.bits, self.x.dtype()) {
+            (4, DType::F16) => "gptq4_gemv_f16",
+            (4, DType::BF16) => "gptq4_gemv_bf16",
+            (8, DType::F16) => "gptq8_gemv_f16",
+            (8, DType::BF16) => "gptq8_gemv_bf16",
+            (bits, other) => candle_core::bail!(
+                "GptqMatmul: unsupported (bits, dtype) combo ({bits}, {other:?})"
+            ),
+        };
+
+        // Split-K sizing: aim for ~32k threads = `out_features × k_splits`.
+        // `chunk` must be a multiple of `pack_factor` so each thread iterates
+        // whole qweight words (no per-element boundary check inside the loop).
+        const TARGET_THREADS: usize = 32768;
+        let k_splits = (TARGET_THREADS / shape.out_features.max(1))
+            .clamp(1, 256)
+            .min(shape.in_features.max(1));
+        let raw_chunk = shape.in_features.div_ceil(k_splits);
+        // Round chunk up to next pack_factor boundary.
+        let chunk = raw_chunk.div_ceil(pack_factor) * pack_factor;
+        let k_splits = shape.in_features.div_ceil(chunk);
+        let group_shift = shape.group_size.trailing_zeros() as usize;
+        let params = shape.params(group_shift, k_splits, chunk);
+
+        let dtype_bytes = self.x.dtype().size_in_bytes();
+        let device = out.device();
+
+        let x_buf = match &*x_sl.0 {
+            candle_core::Storage::Metal(ms) => ms.buffer(),
+            _ => candle_core::bail!("GptqMatmul: x must be Metal-resident"),
+        };
+        let qw_sl = self.qweight.storage_and_layout();
+        let qz_sl = self.qzeros.storage_and_layout();
+        let sc_sl = self.scales.storage_and_layout();
+        let qweight_buf = match &*qw_sl.0 {
+            candle_core::Storage::Metal(ms) => ms.buffer(),
+            _ => candle_core::bail!("GptqMatmul: qweight must be Metal-resident"),
+        };
+        let qzeros_buf = match &*qz_sl.0 {
+            candle_core::Storage::Metal(ms) => ms.buffer(),
+            _ => candle_core::bail!("GptqMatmul: qzeros must be Metal-resident"),
+        };
+        let scales_buf = match &*sc_sl.0 {
+            candle_core::Storage::Metal(ms) => ms.buffer(),
+            _ => candle_core::bail!("GptqMatmul: scales must be Metal-resident"),
+        };
+
+        let pipeline = get_or_compile_quant_pipeline(device.device(), kernel_name)?;
+        let encoder = device.command_encoder()?;
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(x_buf), x_l.start_offset() * dtype_bytes);
+        encoder.set_buffer(1, Some(qweight_buf), qw_sl.1.start_offset() * 4);
+        encoder.set_buffer(2, Some(qzeros_buf), qz_sl.1.start_offset() * 4);
+        encoder.set_buffer(3, Some(scales_buf), sc_sl.1.start_offset() * dtype_bytes);
+        encoder.set_buffer(4, Some(out.buffer()), out_l.start_offset() * 4);
+        encoder.set_bytes(5, &params);
+        encoder.use_resource(x_buf, MTLResourceUsage::Read);
+        encoder.use_resource(qweight_buf, MTLResourceUsage::Read);
+        encoder.use_resource(qzeros_buf, MTLResourceUsage::Read);
+        encoder.use_resource(scales_buf, MTLResourceUsage::Read);
+        encoder.use_resource(out.buffer(), MTLResourceUsage::Write);
+
+        const TG_WIDTH: usize = 64;
+        encoder.dispatch_thread_groups(
+            MTLSize {
+                width: shape.out_features.div_ceil(TG_WIDTH),
+                height: k_splits,
+                depth: 1,
+            },
+            MTLSize {
+                width: TG_WIDTH,
+                height: 1,
+                depth: 1,
+            },
+        );
+
+        Ok(())
+    }
+}
+
+struct DequantizeGptqPacked {
+    qzeros: Tensor,
+    scales: Tensor,
+    bits: u32,
+}
+
+impl CustomOp1 for DequantizeGptqPacked {
+    fn name(&self) -> &'static str {
+        match self.bits {
+            8 => "dequantize-gptq8",
+            _ => "dequantize-gptq4",
+        }
+    }
+
+    fn cpu_fwd(&self, _s: &CpuStorage, _l: &Layout) -> Result<(CpuStorage, Shape)> {
+        candle_core::bail!(
+            "DequantizeGptq{}: Metal-only — use the CPU dequantize_gptq path",
+            self.bits
+        )
+    }
+
+    fn metal_fwd(&self, qweight: &MetalStorage, qw_l: &Layout) -> Result<(MetalStorage, Shape)> {
+        if !qw_l.is_contiguous() {
+            candle_core::bail!("DequantizeGptq{}: qweight must be contiguous", self.bits);
+        }
+        let pack_factor = (32 / self.bits) as usize;
+        let qw_dims = qw_l.dims();
+        if qw_dims.len() != 2 {
+            candle_core::bail!(
+                "DequantizeGptq{}: qweight must be 2-D [in/pack_factor, out]",
+                self.bits
+            );
+        }
+        let (packed_in, out_features) = (qw_dims[0], qw_dims[1]);
+        let (groups, sc_out) = self.scales.dims2()?;
+        if sc_out != out_features {
+            candle_core::bail!(
+                "DequantizeGptq{}: scales dim1 {sc_out} != qweight dim1 {out_features}",
+                self.bits
+            );
+        }
+        let qz_dims = self.qzeros.dims();
+        if qz_dims.len() != 2 || qz_dims[0] != groups || qz_dims[1] * pack_factor != out_features {
+            candle_core::bail!(
+                "DequantizeGptq{}: qzeros shape {:?} != [{groups}, {}]",
+                self.bits,
+                qz_dims,
+                out_features / pack_factor
+            );
+        }
+        let shape = GptqShape::new_bits(packed_in, out_features, groups, self.bits)?;
+
+        let out_dtype = self.scales.dtype();
+        let kernel_name = match (self.bits, out_dtype) {
+            (4, DType::F16) => "dequantize_gptq4_f16",
+            (4, DType::BF16) => "dequantize_gptq4_bf16",
+            (8, DType::F16) => "dequantize_gptq8_f16",
+            (8, DType::BF16) => "dequantize_gptq8_bf16",
+            (bits, other) => candle_core::bail!(
+                "DequantizeGptq{bits}: unsupported (bits, dtype) combo ({bits}, {other:?})"
+            ),
+        };
+        let dtype_bytes = out_dtype.size_in_bytes();
+        let out_elems = shape.in_features * shape.out_features;
+        let device = qweight.device();
+        let output = device.new_buffer(out_elems, out_dtype, "dequant_gptq")?;
+        let params = shape.params(0, 0, 0);
+
+        let qz_sl = self.qzeros.storage_and_layout();
+        let sc_sl = self.scales.storage_and_layout();
+        let qzeros_buf = match &*qz_sl.0 {
+            candle_core::Storage::Metal(ms) => ms.buffer(),
+            _ => candle_core::bail!("DequantizeGptq: qzeros must be Metal-resident"),
+        };
+        let scales_buf = match &*sc_sl.0 {
+            candle_core::Storage::Metal(ms) => ms.buffer(),
+            _ => candle_core::bail!("DequantizeGptq: scales must be Metal-resident"),
+        };
+
+        let pipeline = get_or_compile_quant_pipeline(device.device(), kernel_name)?;
+        let encoder = device.command_encoder()?;
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(qweight.buffer()), qw_l.start_offset() * 4);
+        encoder.set_buffer(1, Some(qzeros_buf), qz_sl.1.start_offset() * 4);
+        encoder.set_buffer(2, Some(scales_buf), sc_sl.1.start_offset() * dtype_bytes);
+        encoder.set_buffer(3, Some(&*output), 0);
+        encoder.set_bytes(4, &params);
+        encoder.use_resource(qweight.buffer(), MTLResourceUsage::Read);
+        encoder.use_resource(qzeros_buf, MTLResourceUsage::Read);
+        encoder.use_resource(scales_buf, MTLResourceUsage::Read);
+        encoder.use_resource(&*output, MTLResourceUsage::Write);
+
+        const TG_WIDTH: usize = 64;
+        encoder.dispatch_thread_groups(
+            MTLSize {
+                width: shape.packed_in.div_ceil(TG_WIDTH),
+                height: shape.out_features,
+                depth: 1,
+            },
+            MTLSize {
+                width: TG_WIDTH,
+                height: 1,
+                depth: 1,
+            },
+        );
+
+        Ok((
+            MetalStorage::new(output, device.clone(), out_elems, out_dtype),
+            Shape::from_dims(&[shape.in_features, shape.out_features]),
+        ))
+    }
+}
+
+/// Fused GPTQ-W{4,8}A16 matmul: `x [1, in] @ dequant(GPTQ)ᵀ → [1, out]`. The
+/// caller picks `bits` based on the quantization config; group size must be a
+/// power of two.
+pub fn gptq_matmul(
+    x: &Tensor,
+    qweight: &Tensor,
+    qzeros: &Tensor,
+    scales: &Tensor,
+    bits: u32,
+) -> Result<Tensor> {
+    let out_features = scales.dim(1)?;
+    let out = Tensor::zeros((1, out_features), DType::F32, x.device())?;
+    out.inplace_op1(&GptqMatmul {
+        x: x.clone(),
+        qweight: qweight.clone(),
+        qzeros: qzeros.clone(),
+        scales: scales.clone(),
+        bits,
+    })?;
+    out.to_dtype(x.dtype())
+}
+
+/// Dequantize a GPTQ packed weight to a plain `[in, out]` tensor in the scales'
+/// dtype on Metal. Used by `PackedQuantLinear` for the prefill (M>1) path.
+pub fn dequantize_gptq_packed(
+    qweight: &Tensor,
+    qzeros: &Tensor,
+    scales: &Tensor,
+    bits: u32,
+) -> Result<Tensor> {
+    qweight.apply_op1_no_bwd(&DequantizeGptqPacked {
+        qzeros: qzeros.clone(),
+        scales: scales.clone(),
+        bits,
+    })
+}
+
 #[cfg(test)]
 mod fused_kernel_parity_tests {
     //! Numerical parity between fused Metal kernels and the scalar reference
@@ -2824,6 +3196,199 @@ mod fused_kernel_parity_tests {
             return;
         };
         run_dequant_w8_parity(&dev, DType::BF16, 256, 128, 128, "w8/bf16/g128");
+    }
+
+    // ── GPTQ resident kernel parity ──────────────────────────────────────────
+    // Drives `gptq_matmul` and `dequantize_gptq_packed` against the CPU
+    // reference `dequantize_gptq` (asymmetric PlusOne, sequential pack).
+
+    /// Build a synthetic GPTQ triplet (4 or 8 bits, asym/PlusOne) on `dev`
+    /// matching the auto-gptq layout: qweight `[in/pf, out]`, qzeros
+    /// `[groups, out/pf]`, scales `[groups, out]`.
+    fn build_gptq_triplet(
+        dev: &Device,
+        dtype: DType,
+        bits: u32,
+        in_features: usize,
+        out_features: usize,
+        group_size: usize,
+    ) -> crate::common::awq::QuantWeight {
+        let pf = 32usize / bits as usize;
+        let groups = in_features / group_size;
+        let mask = (1u32 << bits) - 1;
+
+        // Pack qweight along IN: word at [iw, o] holds rows iw*pf..iw*pf+pf for column o.
+        let packed_in = in_features / pf;
+        let mut qw = vec![0i32; packed_in * out_features];
+        for iw in 0..packed_in {
+            for o in 0..out_features {
+                let mut w = 0u32;
+                for k in 0..pf {
+                    let i = iw * pf + k;
+                    let v = ((i * 13 + o * 7) as u32) & mask;
+                    w |= v << (bits as u32 * k as u32);
+                }
+                qw[iw * out_features + o] = w as i32;
+            }
+        }
+        // Pack qzeros along OUT: word at [g, ow] holds zero-1 for cols ow*pf..ow*pf+pf.
+        let packed_out = out_features / pf;
+        let mut qz = vec![0i32; groups * packed_out];
+        for g in 0..groups {
+            for ow in 0..packed_out {
+                let mut w = 0u32;
+                for k in 0..pf {
+                    let o = ow * pf + k;
+                    let v = ((g * 31 + o * 17 + 1) as u32) & mask;
+                    w |= v << (bits as u32 * k as u32);
+                }
+                qz[g * packed_out + ow] = w as i32;
+            }
+        }
+        let scales: Vec<f32> = (0..groups)
+            .flat_map(|g| (0..out_features).map(move |o| 0.002 + 0.0005 * ((g + o) % 11) as f32))
+            .collect();
+
+        let qweight = Tensor::from_vec(qw, (packed_in, out_features), dev).unwrap();
+        let qzeros = Tensor::from_vec(qz, (groups, packed_out), dev).unwrap();
+        let scales_t = Tensor::from_vec(scales, (groups, out_features), dev)
+            .unwrap()
+            .to_dtype(dtype)
+            .unwrap();
+        crate::common::awq::QuantWeight::new_gptq(
+            bits,
+            false,
+            qweight,
+            Some(qzeros),
+            scales_t,
+            None,
+        )
+    }
+
+    fn run_gptq_gemv_parity(
+        dev: &Device,
+        dtype: DType,
+        bits: u32,
+        in_features: usize,
+        out_features: usize,
+        group_size: usize,
+        label: &str,
+    ) {
+        let raw = build_gptq_triplet(dev, dtype, bits, in_features, out_features, group_size);
+        let x_data: Vec<f32> = (0..in_features)
+            .map(|i| ((i % 17) as f32 - 8.0) * 0.02)
+            .collect();
+        let x = Tensor::from_vec(x_data, (1, in_features), dev)
+            .unwrap()
+            .to_dtype(dtype)
+            .unwrap();
+
+        let y_kernel = gptq_matmul(
+            &x,
+            &raw.qweight,
+            raw.qzeros.as_ref().expect("GPTQ qzeros"),
+            &raw.scales,
+            bits,
+        )
+        .expect("gptq kernel must not error");
+
+        // Golden: CPU dequant → matmul. Reference path returns [out, in].
+        let w_ref = crate::common::awq::dequantize_gptq(&raw, dev, DType::F32).unwrap();
+        let x_f32 = x.to_dtype(DType::F32).unwrap();
+        let y_ref = x_f32
+            .matmul(&w_ref.t().unwrap().contiguous().unwrap())
+            .unwrap();
+
+        assert_eq!(
+            y_kernel.dims2().unwrap(),
+            (1, out_features),
+            "{label}: shape"
+        );
+        let f = y_kernel
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let r = y_ref.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        assert!(
+            f.iter().all(|v| v.is_finite()),
+            "{label}: non-finite output"
+        );
+        let diff = max_abs_diff_f32(&f, &r);
+        let tol = parity_tol(&r);
+        assert!(diff < tol, "{label}: max_abs_diff = {diff} (tol {tol})");
+    }
+
+    fn run_gptq_dequant_parity(
+        dev: &Device,
+        dtype: DType,
+        bits: u32,
+        in_features: usize,
+        out_features: usize,
+        group_size: usize,
+        label: &str,
+    ) {
+        let raw = build_gptq_triplet(dev, dtype, bits, in_features, out_features, group_size);
+        let w_kernel = dequantize_gptq_packed(
+            &raw.qweight,
+            raw.qzeros.as_ref().expect("GPTQ qzeros"),
+            &raw.scales,
+            bits,
+        )
+        .expect("dequantize_gptq_packed must not error"); // [in, out]
+        let w_ref = crate::common::awq::dequantize_gptq(&raw, dev, DType::F32).unwrap(); // [out, in]
+        let w_ref_t = w_ref.t().unwrap().contiguous().unwrap();
+
+        assert_eq!(
+            w_kernel.dims2().unwrap(),
+            (in_features, out_features),
+            "{label}: shape"
+        );
+        let f = w_kernel
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let r = w_ref_t.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let diff = max_abs_diff_f32(&f, &r);
+        let tol = parity_tol(&r);
+        assert!(diff < tol, "{label}: max_abs_diff = {diff} (tol {tol})");
+    }
+
+    #[test]
+    fn gptq4_gemv_bf16_g128_matches_reference() {
+        let Some(dev) = metal_device_or_skip() else {
+            return;
+        };
+        run_gptq_gemv_parity(&dev, DType::BF16, 4, 256, 128, 128, "gptq4/bf16/g128");
+    }
+
+    #[test]
+    fn gptq8_gemv_bf16_g128_matches_reference() {
+        let Some(dev) = metal_device_or_skip() else {
+            return;
+        };
+        run_gptq_gemv_parity(&dev, DType::BF16, 8, 256, 128, 128, "gptq8/bf16/g128");
+    }
+
+    #[test]
+    fn gptq4_gemv_f16_g64_matches_reference() {
+        let Some(dev) = metal_device_or_skip() else {
+            return;
+        };
+        run_gptq_gemv_parity(&dev, DType::F16, 4, 256, 128, 64, "gptq4/f16/g64");
+    }
+
+    #[test]
+    fn gptq8_dequantize_bf16_matches_reference() {
+        let Some(dev) = metal_device_or_skip() else {
+            return;
+        };
+        run_gptq_dequant_parity(&dev, DType::BF16, 8, 256, 128, 128, "gptq8/bf16/g128");
     }
 
     /// Perf diagnostic (not a correctness gate): times the W4A16 matmul against

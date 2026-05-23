@@ -259,6 +259,237 @@ kernel void dequantize_w8_bf16(
 }
 
 // =============================================================================
+// GPTQ (auto-gptq) resident kernels — bit-parametric W{4,8}A16
+//
+// Layout differs from AWQ along TWO axes:
+//   1. qweight is packed along *in_features* — `qweight[i_word, o]` (u32) holds
+//      `PACK_FACTOR` consecutive input rows for one output column.
+//   2. Zero-point convention is `(q - (z + 1))` (auto-gptq stores `zero - 1`).
+//   3. qzeros pack order is sequential along *out_features* — slot `k` of
+//      `qzeros[g, o_word]` corresponds to output column `o_word * pf + k`.
+//
+// Grid: `(out_features, k_splits)` — one thread per output column. Compared
+// to AWQ which uses `(packed_out, k_splits)`, GPTQ launches `PACK_FACTOR×`
+// more threads per output row, which helps hide HBM latency when out_features
+// is small (decode time). The trade-off is fewer FMAs per thread (1 vs
+// PACK_FACTOR), so AWQ amortises scale/zero loads better when out_features is
+// large.
+//
+// Chunks are aligned to PACK_FACTOR (host responsibility); inside the kernel
+// we walk `i_word` and unpack PACK_FACTOR rows per word.
+// =============================================================================
+
+struct GptqParams {
+    uint in_features;
+    uint out_features;
+    uint group_size;    // dequant kernel only
+    uint group_shift;   // log2(group_size) — gemv only
+    uint k_splits;      // gemv only
+    uint chunk;         // ceil(in_features / k_splits), pf-aligned — gemv only
+};
+
+template<typename T, uint BITS>
+inline void gptq_gemv_impl(
+    device const T*       x,
+    device const uint*    qweight,    // [in_features/PACK_FACTOR, out_features]
+    device const uint*    qzeros,     // [groups, out_features/PACK_FACTOR]
+    device const T*       scales,     // [groups, out_features]
+    device atomic_float*  out,        // [out_features], F32 accumulator
+    constant GptqParams&  p,
+    uint2 gid)
+{
+    constexpr uint PACK_FACTOR = 32u / BITS;
+    constexpr uint MASK = (1u << BITS) - 1u;
+
+    uint o = gid.x;
+    if (o >= p.out_features) {
+        return;
+    }
+    uint ks = gid.y;
+    if (ks >= p.k_splits) {
+        return;
+    }
+
+    uint i_start = ks * p.chunk;
+    uint i_end = min(i_start + p.chunk, p.in_features);
+    if (i_start >= i_end) {
+        return;
+    }
+    // Caller ensures `chunk` is a multiple of PACK_FACTOR, so the slice falls
+    // on word boundaries and we can iterate `i_word` without per-element checks.
+    uint w_start = i_start / PACK_FACTOR;
+    uint w_end = (i_end + PACK_FACTOR - 1u) / PACK_FACTOR;
+
+    // Per-output qzeros slot is the same across all input rows (qzeros is
+    // strided along OUT, not IN). Compute once.
+    uint o_word = o / PACK_FACTOR;
+    uint o_slot = o % PACK_FACTOR;
+    uint o_shift = BITS * o_slot;
+    uint qzeros_inner = p.out_features / PACK_FACTOR;
+
+    float acc = 0.0f;
+    float scale_v = 0.0f;
+    float zp1 = 0.0f;       // = z + 1, applied as q - zp1
+    uint last_g = 0xFFFFFFFFu;
+
+    for (uint iw = w_start; iw < w_end; ++iw) {
+        // All PACK_FACTOR rows of this word share a group when group_size is a
+        // multiple of PACK_FACTOR (true for all real GPTQ checkpoints).
+        uint i_base = iw * PACK_FACTOR;
+        uint g = i_base >> p.group_shift;
+        if (g != last_g) {
+            uint zw = qzeros[g * qzeros_inner + o_word];
+            uint z = (zw >> o_shift) & MASK;
+            zp1 = float(z) + 1.0f;
+            scale_v = float(scales[g * p.out_features + o]);
+            last_g = g;
+        }
+
+        uint ww = qweight[iw * p.out_features + o];
+        // Manually unroll the inner loop. The compiler also unrolls but being
+        // explicit makes the access pattern obvious.
+        for (uint k = 0; k < PACK_FACTOR; ++k) {
+            uint q = (ww >> (BITS * k)) & MASK;
+            uint i = i_base + k;
+            acc += float(x[i]) * scale_v * (float(q) - zp1);
+        }
+    }
+
+    atomic_fetch_add_explicit(&out[o], acc, memory_order_relaxed);
+}
+
+template<typename T, uint BITS>
+inline void gptq_dequantize_impl(
+    device const uint*    qweight,    // [in_features/PACK_FACTOR, out_features]
+    device const uint*    qzeros,     // [groups, out_features/PACK_FACTOR]
+    device const T*       scales,     // [groups, out_features]
+    device       T*       weight,     // [in_features, out_features]
+    constant GptqParams&  p,
+    uint2 gid)
+{
+    constexpr uint PACK_FACTOR = 32u / BITS;
+    constexpr uint MASK = (1u << BITS) - 1u;
+
+    uint iw = gid.x;
+    uint o = gid.y;
+    uint packed_in = p.in_features / PACK_FACTOR;
+    if (iw >= packed_in || o >= p.out_features) {
+        return;
+    }
+
+    uint i_base = iw * PACK_FACTOR;
+    uint g = i_base / p.group_size;
+
+    uint o_word = o / PACK_FACTOR;
+    uint o_slot = o % PACK_FACTOR;
+    uint o_shift = BITS * o_slot;
+    uint qzeros_inner = p.out_features / PACK_FACTOR;
+
+    uint ww = qweight[iw * p.out_features + o];
+    uint zw = qzeros[g * qzeros_inner + o_word];
+    float zp1 = float((zw >> o_shift) & MASK) + 1.0f;
+    float scale_v = float(scales[g * p.out_features + o]);
+
+    for (uint k = 0; k < PACK_FACTOR; ++k) {
+        uint q = (ww >> (BITS * k)) & MASK;
+        uint i = i_base + k;
+        weight[i * p.out_features + o] = T(scale_v * (float(q) - zp1));
+    }
+}
+
+kernel void gptq4_gemv_f16(
+    device const half*    x        [[buffer(0)]],
+    device const uint*    qweight  [[buffer(1)]],
+    device const uint*    qzeros   [[buffer(2)]],
+    device const half*    scales   [[buffer(3)]],
+    device atomic_float*  out      [[buffer(4)]],
+    constant GptqParams&  p        [[buffer(5)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    gptq_gemv_impl<half, 4>(x, qweight, qzeros, scales, out, p, gid);
+}
+
+kernel void gptq4_gemv_bf16(
+    device const bfloat*  x        [[buffer(0)]],
+    device const uint*    qweight  [[buffer(1)]],
+    device const uint*    qzeros   [[buffer(2)]],
+    device const bfloat*  scales   [[buffer(3)]],
+    device atomic_float*  out      [[buffer(4)]],
+    constant GptqParams&  p        [[buffer(5)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    gptq_gemv_impl<bfloat, 4>(x, qweight, qzeros, scales, out, p, gid);
+}
+
+kernel void gptq8_gemv_f16(
+    device const half*    x        [[buffer(0)]],
+    device const uint*    qweight  [[buffer(1)]],
+    device const uint*    qzeros   [[buffer(2)]],
+    device const half*    scales   [[buffer(3)]],
+    device atomic_float*  out      [[buffer(4)]],
+    constant GptqParams&  p        [[buffer(5)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    gptq_gemv_impl<half, 8>(x, qweight, qzeros, scales, out, p, gid);
+}
+
+kernel void gptq8_gemv_bf16(
+    device const bfloat*  x        [[buffer(0)]],
+    device const uint*    qweight  [[buffer(1)]],
+    device const uint*    qzeros   [[buffer(2)]],
+    device const bfloat*  scales   [[buffer(3)]],
+    device atomic_float*  out      [[buffer(4)]],
+    constant GptqParams&  p        [[buffer(5)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    gptq_gemv_impl<bfloat, 8>(x, qweight, qzeros, scales, out, p, gid);
+}
+
+kernel void dequantize_gptq4_f16(
+    device const uint*    qweight  [[buffer(0)]],
+    device const uint*    qzeros   [[buffer(1)]],
+    device const half*    scales   [[buffer(2)]],
+    device       half*    weight   [[buffer(3)]],
+    constant GptqParams&  p        [[buffer(4)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    gptq_dequantize_impl<half, 4>(qweight, qzeros, scales, weight, p, gid);
+}
+
+kernel void dequantize_gptq4_bf16(
+    device const uint*    qweight  [[buffer(0)]],
+    device const uint*    qzeros   [[buffer(1)]],
+    device const bfloat*  scales   [[buffer(2)]],
+    device       bfloat*  weight   [[buffer(3)]],
+    constant GptqParams&  p        [[buffer(4)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    gptq_dequantize_impl<bfloat, 4>(qweight, qzeros, scales, weight, p, gid);
+}
+
+kernel void dequantize_gptq8_f16(
+    device const uint*    qweight  [[buffer(0)]],
+    device const uint*    qzeros   [[buffer(1)]],
+    device const half*    scales   [[buffer(2)]],
+    device       half*    weight   [[buffer(3)]],
+    constant GptqParams&  p        [[buffer(4)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    gptq_dequantize_impl<half, 8>(qweight, qzeros, scales, weight, p, gid);
+}
+
+kernel void dequantize_gptq8_bf16(
+    device const uint*    qweight  [[buffer(0)]],
+    device const uint*    qzeros   [[buffer(1)]],
+    device const bfloat*  scales   [[buffer(2)]],
+    device       bfloat*  weight   [[buffer(3)]],
+    constant GptqParams&  p        [[buffer(4)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    gptq_dequantize_impl<bfloat, 8>(qweight, qzeros, scales, weight, p, gid);
+}
+
+// =============================================================================
 // GGUF quantized GEMV kernels (Q5_0 first; Q4_K and Q2_K to follow).
 //
 // Bf16-aware port of llama.cpp's `mul_vec_q_n_f32` template (MIT) via

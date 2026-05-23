@@ -394,28 +394,44 @@ pub struct PackedQuantLinear {
     bias: Option<Tensor>,
     in_features: usize,
     out_features: usize,
-    /// 4 or 8 — selects the W4A16 vs W8A16 kernel instantiation in `forward`.
+    /// 4 or 8 — bit width of the packed quants.
     bits: u32,
+    /// AWQ (`Out`) vs GPTQ (`In`) layout. Determines which kernel family
+    /// `forward()` dispatches to.
+    pack_dim: PackDim,
 }
 
 #[cfg(feature = "metal")]
 impl PackedQuantLinear {
     pub fn new(raw: AwqRawTensors, bias: Option<Tensor>, dtype: DType) -> Result<Self> {
-        // PackedQuantLinear is the W{4,8}A16 resident path. GPTQ (PackDim::In)
-        // goes through the dequant-at-load path via `AnyLinear::from_quant`.
-        if !matches!(raw.pack_dim, crate::common::awq::PackDim::Out) || !matches!(raw.bits, 4 | 8) {
-            candle_core::bail!(
-                "PackedQuantLinear: only AWQ 4-bit and 8-bit (PackDim::Out) are supported \
-                 in the resident path; got bits={} pack_dim={:?}",
-                raw.bits,
-                raw.pack_dim,
-            );
+        // PackedQuantLinear is the resident path for both AWQ (W{4,8}A16,
+        // PackDim::Out) and GPTQ (PackDim::In). Both go through fused Metal
+        // kernels; CPU and non-bf16/f16 paths take the dequant-at-load route
+        // via `AnyLinear::from_quant`.
+        if !matches!(raw.bits, 4 | 8) {
+            candle_core::bail!("PackedQuantLinear: bits must be 4 or 8, got {}", raw.bits,);
         }
         let qzeros = raw
             .qzeros
             .ok_or_else(|| candle_core::Error::Msg("PackedQuantLinear: qzeros missing".into()))?;
-        let (in_features, _packed_out) = raw.qweight.dims2()?;
-        let (_groups, out_features) = raw.scales.dims2()?;
+        let pack_factor = 32usize / raw.bits as usize;
+        let (qw_dim0, qw_dim1) = raw.qweight.dims2()?;
+        let (in_features, out_features) = match raw.pack_dim {
+            PackDim::Out => {
+                // AWQ: qweight = [in_features, out_features / pack_factor]
+                (qw_dim0, qw_dim1 * pack_factor)
+            }
+            PackDim::In => {
+                // GPTQ: qweight = [in_features / pack_factor, out_features]
+                (qw_dim0 * pack_factor, qw_dim1)
+            }
+        };
+        let (_groups, scales_out) = raw.scales.dims2()?;
+        if scales_out != out_features {
+            candle_core::bail!(
+                "PackedQuantLinear: scales out_features {scales_out} != derived {out_features}"
+            );
+        }
         // The kernel reads `scales` in the activation dtype.
         let scales = raw.scales.to_dtype(dtype)?;
         Ok(Self {
@@ -426,6 +442,7 @@ impl PackedQuantLinear {
             in_features,
             out_features,
             bits: raw.bits,
+            pack_dim: raw.pack_dim,
         })
     }
 
@@ -442,22 +459,39 @@ impl PackedQuantLinear {
         let x_2d = x.reshape((m, in_features))?.contiguous()?;
 
         // M=1 (decode) → fused GEMV kernel; M>1 (prefill / batched) → dequantize
-        // to a transient weight and use the tuned matmul. Both paths fork on
-        // `self.bits` to pick the W4A16 or W8A16 instantiation of the
-        // bit-parametric AWQ template.
-        let y_2d = if m == 1 {
-            if self.bits == 8 {
+        // to a transient weight and use the tuned matmul. Two kernel families
+        // (AWQ out-packed vs GPTQ in-packed), each bits-parameterised.
+        let y_2d = match (self.pack_dim, self.bits, m) {
+            (PackDim::Out, 8, 1) => {
                 super::metal_ops::w8a16_matmul(&x_2d, &self.qweight, &self.qzeros, &self.scales)?
-            } else {
+            }
+            (PackDim::Out, _, 1) => {
                 super::metal_ops::w4a16_matmul(&x_2d, &self.qweight, &self.qzeros, &self.scales)?
             }
-        } else {
-            let weight = if self.bits == 8 {
-                super::metal_ops::dequantize_w8(&self.qweight, &self.qzeros, &self.scales)?
-            } else {
-                super::metal_ops::dequantize_w4(&self.qweight, &self.qzeros, &self.scales)?
-            };
-            x_2d.matmul(&weight)?
+            (PackDim::In, bits, 1) => super::metal_ops::gptq_matmul(
+                &x_2d,
+                &self.qweight,
+                &self.qzeros,
+                &self.scales,
+                bits,
+            )?,
+            (PackDim::Out, 8, _) => {
+                let w = super::metal_ops::dequantize_w8(&self.qweight, &self.qzeros, &self.scales)?;
+                x_2d.matmul(&w)?
+            }
+            (PackDim::Out, _, _) => {
+                let w = super::metal_ops::dequantize_w4(&self.qweight, &self.qzeros, &self.scales)?;
+                x_2d.matmul(&w)?
+            }
+            (PackDim::In, bits, _) => {
+                let w = super::metal_ops::dequantize_gptq_packed(
+                    &self.qweight,
+                    &self.qzeros,
+                    &self.scales,
+                    bits,
+                )?;
+                x_2d.matmul(&w)?
+            }
         };
 
         let mut out_dims = dims;
@@ -516,26 +550,31 @@ impl AnyLinear {
     }
 
     /// Generic packed-quant entrypoint. Routes:
-    /// - AWQ (`pack_dim == Out`) on Metal + bf16/f16 ⇒ resident W4A16 path.
-    /// - AWQ elsewhere ⇒ dequant-at-load to a plain `Linear`.
-    /// - GPTQ (`pack_dim == In`) ⇒ always dequant-at-load (no resident GPU
-    ///   kernel yet — the bit-parametric W4/W8A16 template assumes AWQ
-    ///   packing along out_features).
+    /// - AWQ (`pack_dim == Out`) on Metal + bf16/f16 ⇒ resident W{4,8}A16 path.
+    /// - GPTQ (`pack_dim == In`) on Metal + bf16/f16 ⇒ resident GPTQ-W{4,8}A16
+    ///   path (fused GEMV for M=1, dequant+matmul for M>1).
+    /// - Elsewhere (CPU, F32) ⇒ dequant-at-load to a plain `Linear`.
     pub fn from_quant(
         raw: &QuantWeight,
         bias: Option<Tensor>,
         device: &Device,
         dtype: DType,
     ) -> Result<Self> {
-        match raw.pack_dim {
-            PackDim::Out => Self::from_awq(raw, bias, device, dtype),
-            PackDim::In => {
-                let weight = dequantize_quant(raw, device, dtype).map_err(|e| {
-                    candle_core::Error::Msg(format!("GPTQ dequantization failed: {e:#}"))
-                })?;
-                Ok(Self::Float(Linear::new(weight, bias)?))
-            }
+        #[cfg(feature = "metal")]
+        if device.is_metal() && matches!(dtype, DType::F16 | DType::BF16) {
+            let resident = raw.to_device(device).map_err(|e| {
+                candle_core::Error::Msg(format!("packed-quant → Metal failed: {e:#}"))
+            })?;
+            return Ok(Self::PackedQuant(PackedQuantLinear::new(
+                resident, bias, dtype,
+            )?));
         }
+        // CPU / F32 fallback — dispatch on pack_dim because the dequant code
+        // paths differ between AWQ (out-packed) and GPTQ (in-packed).
+        let weight = dequantize_quant(raw, device, dtype).map_err(|e| {
+            candle_core::Error::Msg(format!("packed-quant dequantization failed: {e:#}"))
+        })?;
+        Ok(Self::Float(Linear::new(weight, bias)?))
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {

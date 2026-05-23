@@ -2662,8 +2662,12 @@ struct GgufParams {
 /// the helpers below.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum GgufFastQuant {
+    Q4_0,
+    Q4_1,
     Q5_0,
+    Q5_1,
     Q8_0,
+    Q2K,
     Q4K,
     Q5K,
     Q6K,
@@ -2673,8 +2677,13 @@ impl GgufFastQuant {
     /// (block_elems, block_bytes) — elements per quant block and bytes per block.
     pub fn block_layout(self) -> (usize, usize) {
         match self {
+            Self::Q4_0 => (32, 18),
+            Self::Q4_1 => (32, 20),
             Self::Q5_0 => (32, 22),
+            Self::Q5_1 => (32, 24),
             Self::Q8_0 => (32, 34),
+            // K-quant super-block 256.
+            Self::Q2K => (256, 84),
             Self::Q4K => (256, 144),
             Self::Q5K => (256, 176),
             Self::Q6K => (256, 210),
@@ -2683,8 +2692,12 @@ impl GgufFastQuant {
 
     fn gemv_kernel(self) -> &'static str {
         match self {
+            Self::Q4_0 => "gguf_q4_0_gemv_bf16",
+            Self::Q4_1 => "gguf_q4_1_gemv_bf16",
             Self::Q5_0 => "gguf_q5_0_gemv_bf16",
+            Self::Q5_1 => "gguf_q5_1_gemv_bf16",
             Self::Q8_0 => "gguf_q8_0_gemv_bf16",
+            Self::Q2K => "gguf_q2k_gemv_bf16",
             Self::Q4K => "gguf_q4k_gemv_bf16",
             Self::Q5K => "gguf_q5k_gemv_bf16",
             Self::Q6K => "gguf_q6k_gemv_bf16",
@@ -2693,8 +2706,12 @@ impl GgufFastQuant {
 
     fn mul_mm_kernel(self) -> &'static str {
         match self {
+            Self::Q4_0 => "gguf_q4_0_mul_mm_bf16",
+            Self::Q4_1 => "gguf_q4_1_mul_mm_bf16",
             Self::Q5_0 => "gguf_q5_0_mul_mm_bf16",
+            Self::Q5_1 => "gguf_q5_1_mul_mm_bf16",
             Self::Q8_0 => "gguf_q8_0_mul_mm_bf16",
+            Self::Q2K => "gguf_q2k_mul_mm_bf16",
             Self::Q4K => "gguf_q4k_mul_mm_bf16",
             Self::Q5K => "gguf_q5k_mul_mm_bf16",
             Self::Q6K => "gguf_q6k_mul_mm_bf16",
@@ -2703,8 +2720,12 @@ impl GgufFastQuant {
 
     fn op_name(self) -> &'static str {
         match self {
+            Self::Q4_0 => "gguf-q4_0-matmul",
+            Self::Q4_1 => "gguf-q4_1-matmul",
             Self::Q5_0 => "gguf-q5_0-matmul",
+            Self::Q5_1 => "gguf-q5_1-matmul",
             Self::Q8_0 => "gguf-q8_0-matmul",
+            Self::Q2K => "gguf-q2k-matmul",
             Self::Q4K => "gguf-q4k-matmul",
             Self::Q5K => "gguf-q5k-matmul",
             Self::Q6K => "gguf-q6k-matmul",
@@ -2714,17 +2735,20 @@ impl GgufFastQuant {
     /// Dispatch geometry: `(threads_per_TG, rows_per_TG)`. Each candle
     /// template has its own row-per-simdgroup ratio:
     ///
-    /// | Quant | simdgroups/TG | rows/simdgroup | rows/TG | threads/TG |
-    /// |-------|---------------|----------------|---------|------------|
-    /// | Q5_0  | 2             | 4              | 8       | 64         |
-    /// | Q8_0  | 2             | 4              | 8       | 64         |
-    /// | Q4_K  | 1             | 4              | 4       | 32         |
-    /// | Q5_K  | 2             | 2              | 4       | 64         |
-    /// | Q6_K  | 2             | 1              | 2       | 64         |
+    /// | Quant       | simdgroups/TG | rows/simdgroup | rows/TG | threads/TG |
+    /// |-------------|---------------|----------------|---------|------------|
+    /// | Q4_0..Q5_1  | 2             | 4              | 8       | 64         |
+    /// | Q8_0        | 2             | 4              | 8       | 64         |
+    /// | Q2_K        | 2             | 4              | 8       | 64         |
+    /// | Q4_K        | 1             | 4              | 4       | 32         |
+    /// | Q5_K        | 2             | 2              | 4       | 64         |
+    /// | Q6_K        | 2             | 1              | 2       | 64         |
     fn dispatch_geometry(self) -> (usize, usize) {
         const SIMDWIDTH: usize = 32;
         match self {
-            Self::Q5_0 | Self::Q8_0 => (2 * SIMDWIDTH, 2 * 4),
+            Self::Q4_0 | Self::Q4_1 | Self::Q5_0 | Self::Q5_1 | Self::Q8_0 | Self::Q2K => {
+                (2 * SIMDWIDTH, 2 * 4)
+            }
             Self::Q4K => (SIMDWIDTH, 4),
             Self::Q5K => (2 * SIMDWIDTH, 2 * 2),
             Self::Q6K => (2 * SIMDWIDTH, 2),
@@ -2924,8 +2948,12 @@ struct GgufQuantMulMM {
 impl CustomOp1 for GgufQuantMulMM {
     fn name(&self) -> &'static str {
         match self.quant {
+            GgufFastQuant::Q4_0 => "gguf-q4_0-mul-mm",
+            GgufFastQuant::Q4_1 => "gguf-q4_1-mul-mm",
             GgufFastQuant::Q5_0 => "gguf-q5_0-mul-mm",
+            GgufFastQuant::Q5_1 => "gguf-q5_1-mul-mm",
             GgufFastQuant::Q8_0 => "gguf-q8_0-mul-mm",
+            GgufFastQuant::Q2K => "gguf-q2k-mul-mm",
             GgufFastQuant::Q4K => "gguf-q4k-mul-mm",
             GgufFastQuant::Q5K => "gguf-q5k-mul-mm",
             GgufFastQuant::Q6K => "gguf-q6k-mul-mm",

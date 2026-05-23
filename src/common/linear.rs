@@ -179,8 +179,12 @@ impl GgufFastPath {
         // Map candle's GgmlDType → our fast-path enum. Returning None for
         // unsupported quants keeps the existing QMatMul path as fallback.
         let quant = match qt.dtype() {
+            GgmlDType::Q4_0 => super::metal_ops::GgufFastQuant::Q4_0,
+            GgmlDType::Q4_1 => super::metal_ops::GgufFastQuant::Q4_1,
             GgmlDType::Q5_0 => super::metal_ops::GgufFastQuant::Q5_0,
+            GgmlDType::Q5_1 => super::metal_ops::GgufFastQuant::Q5_1,
             GgmlDType::Q8_0 => super::metal_ops::GgufFastQuant::Q8_0,
+            GgmlDType::Q2K => super::metal_ops::GgufFastQuant::Q2K,
             GgmlDType::Q4K => super::metal_ops::GgufFastQuant::Q4K,
             GgmlDType::Q5K => super::metal_ops::GgufFastQuant::Q5K,
             GgmlDType::Q6K => super::metal_ops::GgufFastQuant::Q6K,

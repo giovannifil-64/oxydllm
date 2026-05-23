@@ -1,4 +1,4 @@
-use super::awq::{AwqRawTensors, concat_awq_along_out};
+use super::awq::{AwqRawTensors, PackDim, concat_awq_along_out};
 use super::config::BlockConfig;
 use super::gguf_weights::GgufWeights;
 use super::linear::{AnyLinear, QLinear, softmax_last_dim};
@@ -110,7 +110,7 @@ impl Attention {
         let kv_dim = cfg.n_kv_heads * hd;
         let q_prefix = format!("{}.q_proj", p);
 
-        if let Some(q_raw) = weights.try_get_awq(&q_prefix) {
+        if let Some(q_raw) = weights.try_get_quant(&q_prefix) {
             return Self::load_awq(cfg, &p, q_raw, weights, layer_idx);
         }
 
@@ -253,20 +253,20 @@ impl Attention {
         let v_prefix = format!("{p}.v_proj");
         let o_prefix = format!("{p}.o_proj");
 
-        let k_raw = weights.try_get_awq(&k_prefix).ok_or_else(|| {
+        let k_raw = weights.try_get_quant(&k_prefix).ok_or_else(|| {
             candle_core::Error::Msg(format!(
-                "Mixed quantization at {p}: q_proj is AWQ but k_proj.qweight is missing. \
+                "Mixed quantization at {p}: q_proj is packed but k_proj.qweight is missing. \
                  oxydllm requires every projection in a layer to share the same format."
             ))
         })?;
-        let v_raw = weights.try_get_awq(&v_prefix).ok_or_else(|| {
+        let v_raw = weights.try_get_quant(&v_prefix).ok_or_else(|| {
             candle_core::Error::Msg(format!(
-                "Mixed quantization at {p}: q_proj is AWQ but v_proj.qweight is missing."
+                "Mixed quantization at {p}: q_proj is packed but v_proj.qweight is missing."
             ))
         })?;
-        let o_raw = weights.try_get_awq(&o_prefix).ok_or_else(|| {
+        let o_raw = weights.try_get_quant(&o_prefix).ok_or_else(|| {
             candle_core::Error::Msg(format!(
-                "Mixed quantization at {p}: q_proj is AWQ but o_proj.qweight is missing."
+                "Mixed quantization at {p}: q_proj is packed but o_proj.qweight is missing."
             ))
         })?;
 
@@ -294,7 +294,11 @@ impl Attention {
             (Some(_), Some(_), Some(_)) | (None, None, None)
         );
         let dims_fusable = q_dim.is_multiple_of(8) && kv_dim.is_multiple_of(8);
-        let qkv_fused = bias_fusable && dims_fusable;
+        // GPTQ packs along in_features, so the out-dim concat used by
+        // `concat_awq_along_out` doesn't apply. Take the Separate path; the
+        // dequant-at-load cost dominates, fusion only saves matmul launches.
+        let is_awq = q_raw.pack_dim == PackDim::Out;
+        let qkv_fused = bias_fusable && dims_fusable && is_awq;
         let group_size = q_raw
             .group_size()
             .map_err(|e| candle_core::Error::Msg(format!("AWQ q_proj group_size at {p}: {e:#}")))?;
@@ -303,7 +307,8 @@ impl Attention {
                 group_size,
                 qkv_fused,
                 bias_present = q_bias.is_some(),
-                "AWQ attention loader engaged"
+                quant = if is_awq { "awq" } else { "gptq" },
+                "Packed-quant attention loader engaged"
             );
         }
 
@@ -314,15 +319,17 @@ impl Attention {
                 (Some(qb), Some(kb), Some(vb)) => Some(Tensor::cat(&[&qb, &kb, &vb], 0)?),
                 _ => None,
             };
-            QkvProjection::Fused(AnyLinear::from_awq(&fused_raw, fused_bias, &device, dtype)?)
+            QkvProjection::Fused(AnyLinear::from_quant(
+                &fused_raw, fused_bias, &device, dtype,
+            )?)
         } else {
             QkvProjection::Separate {
-                q: AnyLinear::from_awq(&q_raw, q_bias, &device, dtype)?,
-                k: AnyLinear::from_awq(&k_raw, k_bias, &device, dtype)?,
-                v: AnyLinear::from_awq(&v_raw, v_bias, &device, dtype)?,
+                q: AnyLinear::from_quant(&q_raw, q_bias, &device, dtype)?,
+                k: AnyLinear::from_quant(&k_raw, k_bias, &device, dtype)?,
+                v: AnyLinear::from_quant(&v_raw, v_bias, &device, dtype)?,
             }
         };
-        let o_proj = AnyLinear::from_awq(&o_raw, o_bias, &device, dtype)?;
+        let o_proj = AnyLinear::from_quant(&o_raw, o_bias, &device, dtype)?;
 
         let q_norm = if cfg.qk_norm {
             Some(RMSNorm::new(

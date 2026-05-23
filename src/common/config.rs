@@ -64,6 +64,11 @@ pub struct StandardTransformerConfig {
     pub per_layer_input_embed_scale: Option<f64>,
     pub per_layer_model_projection_scale: Option<f64>,
     pub per_layer_input_scale: Option<f64>,
+
+    /// Packed-int quantization scheme detected from `quantization_config`.
+    /// `None` ⇒ plain float / FP8 weights. AWQ / GPTQ checkpoints set this so
+    /// the weight loader can dispatch the right `try_get_quant`.
+    pub quant_scheme: Option<crate::common::weights::QuantScheme>,
 }
 
 impl StandardTransformerConfig {

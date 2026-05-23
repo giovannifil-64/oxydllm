@@ -666,7 +666,8 @@ fn load_standard_safetensors(
 ) -> anyhow::Result<(Box<dyn BatchModel>, usize)> {
     let weight_paths = resolve_weight_paths(model_dir)?;
     let weight_path_refs: Vec<&str> = weight_paths.iter().map(|s| s.as_str()).collect();
-    let weights = ModelWeights::load(&weight_path_refs, device, dtype)?;
+    let weights =
+        ModelWeights::load(&weight_path_refs, device, dtype)?.with_quant_scheme(cfg.quant_scheme);
     let weights_size = weights.runtime_size_bytes();
     let has_packed_quantized_weights = weights.has_packed_quantized_weights();
 
@@ -754,10 +755,17 @@ fn load_standard_safetensors(
                 );
             }
 
+            // Option A (4-bit tied lm_head via RTN) only makes sense when the
+            // model is already AWQ — for GPTQ the tied lm_head is shared with
+            // the embedding tensor (plain bf16/fp16), no need to re-quantize.
             #[cfg(feature = "metal")]
             if has_packed_quantized_weights
                 && device.is_metal()
                 && matches!(dtype, DType::F16 | DType::BF16)
+                && matches!(
+                    weights.quant_scheme(),
+                    Some(crate::common::weights::QuantScheme::Awq)
+                )
             {
                 let raw = crate::common::awq::rtn_quantize_awq(&embed_weight, 128)?;
                 let extra = raw.runtime_size_bytes();
@@ -787,9 +795,9 @@ fn load_standard_safetensors(
                 .map_err(|e| anyhow::anyhow!("{e}"))?,
                 0usize,
             )
-        } else if let Some(lm_head_awq) = weights.try_get_awq("lm_head") {
+        } else if let Some(lm_head_quant) = weights.try_get_quant("lm_head") {
             (
-                AnyLinear::from_awq(&lm_head_awq, None, device, dtype)
+                AnyLinear::from_quant(&lm_head_quant, None, device, dtype)
                     .map_err(|e| anyhow::anyhow!("{e}"))?,
                 0usize,
             )

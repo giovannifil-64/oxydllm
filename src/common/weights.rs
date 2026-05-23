@@ -1,10 +1,23 @@
-use crate::common::awq::AwqRawTensors;
+use crate::common::awq::{AwqRawTensors, QuantWeight};
 use anyhow::{Context, Result};
 use candle_core::{DType, Device, Tensor, safetensors::MmapedSafetensors};
 use rustc_hash::FxHashMap;
 
+/// Quantization scheme of a model's packed tensors. `None` ⇒ no `.qweight`
+/// tensors present (plain fp16/bf16/fp8 model).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QuantScheme {
+    Awq,
+    /// GPTQ; `sym` ⇒ no `qzeros` (implicit zero = `2^(bits-1)`).
+    Gptq {
+        bits: u32,
+        sym: bool,
+    },
+}
+
 pub struct ModelWeights {
     tensors: FxHashMap<String, Tensor>,
+    quant_scheme: Option<QuantScheme>,
 }
 
 fn load_tensor_with_dtype(
@@ -212,7 +225,19 @@ impl ModelWeights {
 
         apply_weight_scale_inv(&mut tensors)?;
 
-        Ok(Self { tensors })
+        Ok(Self {
+            tensors,
+            quant_scheme: None,
+        })
+    }
+
+    pub fn with_quant_scheme(mut self, scheme: Option<QuantScheme>) -> Self {
+        self.quant_scheme = scheme;
+        self
+    }
+
+    pub fn quant_scheme(&self) -> Option<QuantScheme> {
+        self.quant_scheme
     }
 
     fn resolve_name<'a>(&'a self, name: &str) -> Option<&'a Tensor> {
@@ -285,11 +310,35 @@ impl ModelWeights {
         let qweight = self.try_get(&format!("{prefix}.qweight"))?.clone();
         let qzeros = self.try_get(&format!("{prefix}.qzeros"))?.clone();
         let scales = self.try_get(&format!("{prefix}.scales"))?.clone();
-        Some(AwqRawTensors {
-            qweight,
-            qzeros,
-            scales,
-        })
+        Some(QuantWeight::new_awq(qweight, qzeros, scales))
+    }
+
+    /// GPTQ variant: `qweight` is packed along **in_features**, `g_idx` is
+    /// optional (act-order). With `sym=true` `qzeros` is still on-disk in
+    /// auto-gptq but holds the same value at every slot — we still load it
+    /// for the dequant path's convenience, treating it as `PlusOne` semantics
+    /// (sym=true checkpoints set zero = `2^(bits-1) - 1` so the formula
+    /// `q - (zero + 1)` collapses to `q - 2^(bits-1)`).
+    pub fn try_get_gptq(&self, prefix: &str, bits: u32, sym: bool) -> Option<QuantWeight> {
+        let qweight = self.try_get(&format!("{prefix}.qweight"))?.clone();
+        let scales = self.try_get(&format!("{prefix}.scales"))?.clone();
+        // qzeros may be absent for some sym checkpoints; load if present.
+        let qzeros = self.try_get(&format!("{prefix}.qzeros")).cloned();
+        let g_idx = self.try_get(&format!("{prefix}.g_idx")).cloned();
+        Some(QuantWeight::new_gptq(
+            bits, sym, qweight, qzeros, scales, g_idx,
+        ))
+    }
+
+    /// Dispatcher: picks AWQ or GPTQ based on the model-level scheme set via
+    /// [`Self::with_quant_scheme`]. Returns `None` when the prefix has no
+    /// packed-int tensors *or* the model has no quant scheme.
+    pub fn try_get_quant(&self, prefix: &str) -> Option<QuantWeight> {
+        match self.quant_scheme {
+            Some(QuantScheme::Awq) => self.try_get_awq(prefix),
+            Some(QuantScheme::Gptq { bits, sym }) => self.try_get_gptq(prefix, bits, sym),
+            None => None,
+        }
     }
 
     pub fn has_packed_quantized_weights(&self) -> bool {
@@ -309,7 +358,10 @@ impl ModelWeights {
     /// Build ModelWeights from a pre-built tensor map (test-only).
     /// Allows regression tests to construct synthetic models without safetensors files.
     pub fn from_tensors(tensors: FxHashMap<String, Tensor>) -> Self {
-        Self { tensors }
+        Self {
+            tensors,
+            quant_scheme: None,
+        }
     }
 }
 

@@ -1404,19 +1404,23 @@ struct AwqShape {
 }
 
 impl AwqShape {
-    fn new(
+    fn new_bits(
         in_features: usize,
         packed_out: usize,
         groups: usize,
         out_features: usize,
+        bits: u32,
     ) -> Result<Self> {
-        if packed_out * 8 != out_features {
+        let pack_factor = (32 / bits) as usize;
+        if packed_out * pack_factor != out_features {
             candle_core::bail!(
-                "W4A16: qweight packed_out {packed_out} (×8) != scales out {out_features}"
+                "W{bits}A16: qweight packed_out {packed_out} (×{pack_factor}) != scales out {out_features}"
             );
         }
         if groups == 0 || !in_features.is_multiple_of(groups) {
-            candle_core::bail!("W4A16: in_features {in_features} not divisible by groups {groups}");
+            candle_core::bail!(
+                "W{bits}A16: in_features {in_features} not divisible by groups {groups}"
+            );
         }
         Ok(Self {
             in_features,
@@ -1440,23 +1444,32 @@ impl AwqShape {
     }
 }
 
-/// Fused W4A16 GEMV. An `InplaceOp1` that atomically accumulates the split-K
-/// partials into a pre-zeroed `[1, out]` F32 buffer; `x` and the AWQ triplet
-/// are carried as fields (the trait passes only the in-place tensor).
+/// Fused W{4,8}A16 GEMV. An `InplaceOp1` that atomically accumulates the
+/// split-K partials into a pre-zeroed `[1, out]` F32 buffer; `x` and the
+/// packed triplet are carried as fields (the trait passes only the in-place
+/// tensor). `bits` selects between the 4-bit and 8-bit kernel instantiations
+/// of the bit-parametric AWQ template.
 struct W4A16Matmul {
     x: Tensor,
     qweight: Tensor,
     qzeros: Tensor,
     scales: Tensor,
+    bits: u32,
 }
 
 impl InplaceOp1 for W4A16Matmul {
     fn name(&self) -> &'static str {
-        "w4a16-matmul"
+        match self.bits {
+            8 => "w8a16-matmul",
+            _ => "w4a16-matmul",
+        }
     }
 
     fn cpu_fwd(&self, _s: &mut CpuStorage, _l: &Layout) -> Result<()> {
-        candle_core::bail!("W4A16Matmul: Metal-only — use the CPU dequantize_awq path")
+        candle_core::bail!(
+            "W{}A16Matmul: Metal-only — use the CPU dequantize_awq path",
+            self.bits
+        )
     }
 
     fn metal_fwd(&self, out: &mut MetalStorage, out_l: &Layout) -> Result<()> {
@@ -1486,38 +1499,46 @@ impl InplaceOp1 for W4A16Matmul {
                 self.qzeros.dims()
             );
         }
-        let shape = AwqShape::new(qw_in, packed_out, groups, out_features)?;
+        let shape = AwqShape::new_bits(qw_in, packed_out, groups, out_features, self.bits)?;
         if in_features != shape.in_features {
             candle_core::bail!(
-                "W4A16Matmul: x in_features {in_features} != weight in_features {}",
+                "W{}A16Matmul: x in_features {in_features} != weight in_features {}",
+                self.bits,
                 shape.in_features
             );
         }
         if out_l.dims() != [1, shape.out_features] {
             candle_core::bail!(
-                "W4A16Matmul: accumulator shape {:?} != [1, {}]",
+                "W{}A16Matmul: accumulator shape {:?} != [1, {}]",
+                self.bits,
                 out_l.dims(),
                 shape.out_features
             );
         }
         if self.scales.dtype() != self.x.dtype() {
             candle_core::bail!(
-                "W4A16Matmul: scales dtype {:?} must match x dtype {:?}",
+                "W{}A16Matmul: scales dtype {:?} must match x dtype {:?}",
+                self.bits,
                 self.scales.dtype(),
                 self.x.dtype()
             );
         }
         if !shape.group_size.is_power_of_two() {
             candle_core::bail!(
-                "W4A16Matmul: group_size {} must be a power of two",
+                "W{}A16Matmul: group_size {} must be a power of two",
+                self.bits,
                 shape.group_size
             );
         }
 
-        let kernel_name = match self.x.dtype() {
-            DType::F16 => "w4a16_gemv_f16",
-            DType::BF16 => "w4a16_gemv_bf16",
-            other => candle_core::bail!("W4A16Matmul: unsupported dtype {other:?}"),
+        let kernel_name = match (self.bits, self.x.dtype()) {
+            (4, DType::F16) => "w4a16_gemv_f16",
+            (4, DType::BF16) => "w4a16_gemv_bf16",
+            (8, DType::F16) => "w8a16_gemv_f16",
+            (8, DType::BF16) => "w8a16_gemv_bf16",
+            (bits, other) => candle_core::bail!(
+                "W{bits}A16Matmul: unsupported (bits, dtype) combo ({bits}, {other:?})"
+            ),
         };
 
         // Split the in_features reduction so enough simdgroups are resident to
@@ -1596,40 +1617,55 @@ impl InplaceOp1 for W4A16Matmul {
 struct DequantizeW4 {
     qzeros: Tensor,
     scales: Tensor,
+    bits: u32,
 }
 
 impl CustomOp1 for DequantizeW4 {
     fn name(&self) -> &'static str {
-        "dequantize-w4"
+        match self.bits {
+            8 => "dequantize-w8",
+            _ => "dequantize-w4",
+        }
     }
 
     fn cpu_fwd(&self, _s: &CpuStorage, _l: &Layout) -> Result<(CpuStorage, Shape)> {
-        candle_core::bail!("DequantizeW4: Metal-only — use the CPU dequantize_awq path")
+        candle_core::bail!(
+            "DequantizeW{}: Metal-only — use the CPU dequantize_awq path",
+            self.bits
+        )
     }
 
     fn metal_fwd(&self, qweight: &MetalStorage, qw_l: &Layout) -> Result<(MetalStorage, Shape)> {
         if !qw_l.is_contiguous() {
-            candle_core::bail!("DequantizeW4: qweight must be contiguous");
+            candle_core::bail!("DequantizeW{}: qweight must be contiguous", self.bits);
         }
         let qw_dims = qw_l.dims();
         if qw_dims.len() != 2 {
-            candle_core::bail!("DequantizeW4: qweight must be 2-D [in, out/8]");
+            candle_core::bail!(
+                "DequantizeW{}: qweight must be 2-D [in, out/pack_factor]",
+                self.bits
+            );
         }
         let (in_features, packed_out) = (qw_dims[0], qw_dims[1]);
         let (groups, out_features) = self.scales.dims2()?;
         if self.qzeros.dims() != [groups, packed_out] {
             candle_core::bail!(
-                "DequantizeW4: qzeros shape {:?} != [{groups}, {packed_out}]",
+                "DequantizeW{}: qzeros shape {:?} != [{groups}, {packed_out}]",
+                self.bits,
                 self.qzeros.dims()
             );
         }
-        let shape = AwqShape::new(in_features, packed_out, groups, out_features)?;
+        let shape = AwqShape::new_bits(in_features, packed_out, groups, out_features, self.bits)?;
 
         let out_dtype = self.scales.dtype();
-        let kernel_name = match out_dtype {
-            DType::F16 => "dequantize_w4_f16",
-            DType::BF16 => "dequantize_w4_bf16",
-            other => candle_core::bail!("DequantizeW4: unsupported dtype {other:?}"),
+        let kernel_name = match (self.bits, out_dtype) {
+            (4, DType::F16) => "dequantize_w4_f16",
+            (4, DType::BF16) => "dequantize_w4_bf16",
+            (8, DType::F16) => "dequantize_w8_f16",
+            (8, DType::BF16) => "dequantize_w8_bf16",
+            (bits, other) => candle_core::bail!(
+                "DequantizeW{bits}: unsupported (bits, dtype) combo ({bits}, {other:?})"
+            ),
         };
         let dtype_bytes = out_dtype.size_in_bytes();
         let out_elems = in_features * out_features;
@@ -1692,6 +1728,29 @@ pub fn w4a16_matmul(
     qzeros: &Tensor,
     scales: &Tensor,
 ) -> Result<Tensor> {
+    wna16_matmul_inner(x, qweight, qzeros, scales, 4)
+}
+
+/// Fused W8A16 matmul: same as [`w4a16_matmul`] but for 8-bit AWQ-style packed
+/// weights (`pack_factor = 4`, sequential pack order). Currently exercised
+/// only by the parity tests; ready for AWQ-8bit checkpoints once one ships.
+#[allow(dead_code)]
+pub fn w8a16_matmul(
+    x: &Tensor,
+    qweight: &Tensor,
+    qzeros: &Tensor,
+    scales: &Tensor,
+) -> Result<Tensor> {
+    wna16_matmul_inner(x, qweight, qzeros, scales, 8)
+}
+
+fn wna16_matmul_inner(
+    x: &Tensor,
+    qweight: &Tensor,
+    qzeros: &Tensor,
+    scales: &Tensor,
+    bits: u32,
+) -> Result<Tensor> {
     // Zero-initialised F32 accumulator; the kernel atomic-adds the split-K
     // partials straight into it (no partial buffer, no reduction pass).
     let out_features = scales.dim(1)?;
@@ -1701,15 +1760,27 @@ pub fn w4a16_matmul(
         qweight: qweight.clone(),
         qzeros: qzeros.clone(),
         scales: scales.clone(),
+        bits,
     })?;
     out.to_dtype(x.dtype())
 }
 
-/// Dequantize an AWQ triplet to a plain `[in, out]` weight in the scales' dtype.
+/// Dequantize an AWQ-4bit triplet to a plain `[in, out]` weight in the scales' dtype.
 pub fn dequantize_w4(qweight: &Tensor, qzeros: &Tensor, scales: &Tensor) -> Result<Tensor> {
     qweight.apply_op1_no_bwd(&DequantizeW4 {
         qzeros: qzeros.clone(),
         scales: scales.clone(),
+        bits: 4,
+    })
+}
+
+/// 8-bit variant of [`dequantize_w4`]. Same dead-code rationale as [`w8a16_matmul`].
+#[allow(dead_code)]
+pub fn dequantize_w8(qweight: &Tensor, qzeros: &Tensor, scales: &Tensor) -> Result<Tensor> {
+    qweight.apply_op1_no_bwd(&DequantizeW4 {
+        qzeros: qzeros.clone(),
+        scales: scales.clone(),
+        bits: 8,
     })
 }
 
@@ -2402,11 +2473,7 @@ mod fused_kernel_parity_tests {
             .unwrap()
             .to_dtype(dtype)
             .unwrap();
-        AwqRawTensors {
-            qweight,
-            qzeros,
-            scales,
-        }
+        AwqRawTensors::new_awq(qweight, qzeros, scales)
     }
 
     /// Tolerance dominated by the kernel's single F16/BF16 output rounding.
@@ -2433,8 +2500,13 @@ mod fused_kernel_parity_tests {
             .to_dtype(dtype)
             .unwrap();
 
-        let y_kernel = w4a16_matmul(&x, &raw.qweight, &raw.qzeros, &raw.scales)
-            .expect("w4a16 kernel must not error");
+        let y_kernel = w4a16_matmul(
+            &x,
+            &raw.qweight,
+            raw.qzeros.as_ref().expect("AWQ qzeros"),
+            &raw.scales,
+        )
+        .expect("w4a16 kernel must not error");
 
         // Golden: dequantize + matmul in F32 (x keeps its F16/BF16 precision).
         let w_ref = dequantize_awq(&raw, dev, DType::F32).unwrap(); // [out, in]
@@ -2474,8 +2546,12 @@ mod fused_kernel_parity_tests {
         label: &str,
     ) {
         let raw = build_awq_triplet(dev, dtype, in_features, out_features, group_size);
-        let w_kernel = dequantize_w4(&raw.qweight, &raw.qzeros, &raw.scales)
-            .expect("dequantize_w4 must not error"); // [in, out]
+        let w_kernel = dequantize_w4(
+            &raw.qweight,
+            raw.qzeros.as_ref().expect("AWQ qzeros"),
+            &raw.scales,
+        )
+        .expect("dequantize_w4 must not error"); // [in, out]
         let w_ref = dequantize_awq(&raw, dev, DType::F32).unwrap(); // [out, in]
         let w_ref_t = w_ref.t().unwrap().contiguous().unwrap(); // [in, out]
 
@@ -2550,12 +2626,205 @@ mod fused_kernel_parity_tests {
         let dev = Device::Cpu;
         let raw = build_awq_triplet(&dev, DType::F32, 64, 64, 32);
         let x = Tensor::zeros((1, 64), DType::F32, &dev).unwrap();
-        let err = w4a16_matmul(&x, &raw.qweight, &raw.qzeros, &raw.scales)
-            .expect_err("must reject CPU tensors");
+        let err = w4a16_matmul(
+            &x,
+            &raw.qweight,
+            raw.qzeros.as_ref().expect("AWQ qzeros"),
+            &raw.scales,
+        )
+        .expect_err("must reject CPU tensors");
         assert!(
             format!("{err}").contains("Metal"),
             "unexpected error: {err}"
         );
+    }
+
+    // ── W8A16 parity ─────────────────────────────────────────────────────────
+    // The 4-bit AWQ layout doubles to 8-bit via `pack_factor = 4` (sequential
+    // pack order, no AWQ_PACK_ORDER interleave because the template makes
+    // `pack_position<8>` return identity). No real AWQ-8bit checkpoint ships
+    // today, so the parity tests below drive the kernels with synthetic data.
+
+    /// Pack `[rows][out]` of 8-bit values (0..255) into `[rows, out/4]` u32
+    /// words, sequential order (matches `pack_position<8>` = identity).
+    fn pack_awq_8bit(matrix: &[Vec<u8>], rows: usize, out_features: usize) -> Vec<i32> {
+        let packed_out = out_features / 4;
+        let mut words = vec![0u32; rows * packed_out];
+        for (i, row) in matrix.iter().enumerate().take(rows) {
+            for j in 0..packed_out {
+                let mut word = 0u32;
+                for k in 0..4 {
+                    word |= (row[j * 4 + k] as u32) << (8 * k as u32);
+                }
+                words[i * packed_out + j] = word;
+            }
+        }
+        words.into_iter().map(|w| w as i32).collect()
+    }
+
+    /// Build a synthetic 8-bit triplet + the manually-computed reference
+    /// `[out, in]` F32 weight matrix for parity.
+    fn build_w8a16_triplet(
+        dev: &Device,
+        dtype: DType,
+        in_features: usize,
+        out_features: usize,
+        group_size: usize,
+    ) -> (Tensor, Tensor, Tensor, Vec<f32>) {
+        let groups = in_features / group_size;
+        let iweight: Vec<Vec<u8>> = (0..in_features)
+            .map(|i| {
+                (0..out_features)
+                    .map(|j| ((i * 11 + j * 7) & 0xFF) as u8)
+                    .collect()
+            })
+            .collect();
+        let izero: Vec<Vec<u8>> = (0..groups)
+            .map(|g| {
+                (0..out_features)
+                    .map(|j| ((g * 31 + j * 5 + 2) & 0xFF) as u8)
+                    .collect()
+            })
+            .collect();
+        let scales_f: Vec<f32> = (0..groups)
+            .flat_map(|g| (0..out_features).map(move |j| 0.001 + 0.0007 * ((g + j) % 17) as f32))
+            .collect();
+
+        // Reference weight [out, in] = scale * (q - zero) (Signed convention,
+        // mirroring AWQ).
+        let mut ref_w = vec![0f32; out_features * in_features];
+        for i in 0..in_features {
+            let g = i / group_size;
+            for j in 0..out_features {
+                let v = (iweight[i][j] as i32 - izero[g][j] as i32) as f32
+                    * scales_f[g * out_features + j];
+                ref_w[j * in_features + i] = v;
+            }
+        }
+
+        let qweight = Tensor::from_vec(
+            pack_awq_8bit(&iweight, in_features, out_features),
+            (in_features, out_features / 4),
+            dev,
+        )
+        .unwrap();
+        let qzeros = Tensor::from_vec(
+            pack_awq_8bit(&izero, groups, out_features),
+            (groups, out_features / 4),
+            dev,
+        )
+        .unwrap();
+        let scales = Tensor::from_vec(scales_f, (groups, out_features), dev)
+            .unwrap()
+            .to_dtype(dtype)
+            .unwrap();
+        (qweight, qzeros, scales, ref_w)
+    }
+
+    fn run_w8a16_gemv_parity(
+        dev: &Device,
+        dtype: DType,
+        in_features: usize,
+        out_features: usize,
+        group_size: usize,
+        label: &str,
+    ) {
+        let (qw, qz, sc, ref_w) =
+            build_w8a16_triplet(dev, dtype, in_features, out_features, group_size);
+        let x_data: Vec<f32> = (0..in_features)
+            .map(|i| ((i % 13) as f32 - 6.0) * 0.03)
+            .collect();
+        let x = Tensor::from_vec(x_data.clone(), (1, in_features), dev)
+            .unwrap()
+            .to_dtype(dtype)
+            .unwrap();
+
+        let y_kernel = w8a16_matmul(&x, &qw, &qz, &sc).expect("w8a16 kernel must not error");
+
+        // Reference: x_f32 @ ref_w.T
+        let w_ref = Tensor::from_vec(ref_w.clone(), (out_features, in_features), dev).unwrap();
+        let x_f32 = x.to_dtype(DType::F32).unwrap();
+        let y_ref = x_f32
+            .matmul(&w_ref.t().unwrap().contiguous().unwrap())
+            .unwrap();
+
+        assert_eq!(
+            y_kernel.dims2().unwrap(),
+            (1, out_features),
+            "{label}: shape"
+        );
+        let f = y_kernel
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let r = y_ref.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        assert!(
+            f.iter().all(|v| v.is_finite()),
+            "{label}: non-finite output"
+        );
+        let diff = max_abs_diff_f32(&f, &r);
+        let tol = parity_tol(&r);
+        assert!(diff < tol, "{label}: max_abs_diff = {diff} (tol {tol})");
+    }
+
+    fn run_dequant_w8_parity(
+        dev: &Device,
+        dtype: DType,
+        in_features: usize,
+        out_features: usize,
+        group_size: usize,
+        label: &str,
+    ) {
+        let (qw, qz, sc, ref_w) =
+            build_w8a16_triplet(dev, dtype, in_features, out_features, group_size);
+        let w_kernel = dequantize_w8(&qw, &qz, &sc).expect("dequantize_w8 must not error");
+        // Reference is [out, in]; kernel emits [in, out].
+        let w_ref = Tensor::from_vec(ref_w, (out_features, in_features), dev).unwrap();
+        let w_ref_t = w_ref.t().unwrap().contiguous().unwrap();
+
+        assert_eq!(
+            w_kernel.dims2().unwrap(),
+            (in_features, out_features),
+            "{label}: shape"
+        );
+        let f = w_kernel
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let r = w_ref_t.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let diff = max_abs_diff_f32(&f, &r);
+        let tol = parity_tol(&r);
+        assert!(diff < tol, "{label}: max_abs_diff = {diff} (tol {tol})");
+    }
+
+    #[test]
+    fn w8a16_gemv_bf16_g128_matches_reference() {
+        let Some(dev) = metal_device_or_skip() else {
+            return;
+        };
+        run_w8a16_gemv_parity(&dev, DType::BF16, 256, 128, 128, "w8/bf16/g128");
+    }
+
+    #[test]
+    fn w8a16_gemv_f16_g64_matches_reference() {
+        let Some(dev) = metal_device_or_skip() else {
+            return;
+        };
+        run_w8a16_gemv_parity(&dev, DType::F16, 256, 128, 64, "w8/f16/g64");
+    }
+
+    #[test]
+    fn dequantize_w8_bf16_matches_reference() {
+        let Some(dev) = metal_device_or_skip() else {
+            return;
+        };
+        run_dequant_w8_parity(&dev, DType::BF16, 256, 128, 128, "w8/bf16/g128");
     }
 
     /// Perf diagnostic (not a correctness gate): times the W4A16 matmul against
@@ -2587,7 +2856,13 @@ mod fused_kernel_parity_tests {
         let x0 = Tensor::zeros((1, n), dtype, &dev).unwrap();
 
         for _ in 0..10 {
-            let _ = w4a16_matmul(&x0, &raw.qweight, &raw.qzeros, &raw.scales).unwrap();
+            let _ = w4a16_matmul(
+                &x0,
+                &raw.qweight,
+                raw.qzeros.as_ref().expect("AWQ qzeros"),
+                &raw.scales,
+            )
+            .unwrap();
             let _ = x0.matmul(&w_bf16).unwrap();
         }
         x0.matmul(&w_bf16).unwrap().to_device(&Device::Cpu).unwrap();
@@ -2598,7 +2873,15 @@ mod fused_kernel_parity_tests {
         let t = Instant::now();
         let mut sink = Vec::with_capacity(iters);
         for _ in 0..iters {
-            sink.push(w4a16_matmul(&x0, &raw.qweight, &raw.qzeros, &raw.scales).unwrap());
+            sink.push(
+                w4a16_matmul(
+                    &x0,
+                    &raw.qweight,
+                    raw.qzeros.as_ref().expect("AWQ qzeros"),
+                    &raw.scales,
+                )
+                .unwrap(),
+            );
         }
         sink.last().unwrap().to_device(&Device::Cpu).unwrap();
         let w4_indep = per_call(t);
@@ -2616,7 +2899,13 @@ mod fused_kernel_parity_tests {
         let t = Instant::now();
         let mut x = x0.clone();
         for _ in 0..iters {
-            x = w4a16_matmul(&x, &raw.qweight, &raw.qzeros, &raw.scales).unwrap();
+            x = w4a16_matmul(
+                &x,
+                &raw.qweight,
+                raw.qzeros.as_ref().expect("AWQ qzeros"),
+                &raw.scales,
+            )
+            .unwrap();
         }
         x.to_device(&Device::Cpu).unwrap();
         let w4_chain = per_call(t);
@@ -2668,6 +2957,7 @@ pub enum GgufFastQuant {
     Q5_1,
     Q8_0,
     Q2K,
+    Q3K,
     Q4K,
     Q5K,
     Q6K,
@@ -2684,6 +2974,7 @@ impl GgufFastQuant {
             Self::Q8_0 => (32, 34),
             // K-quant super-block 256.
             Self::Q2K => (256, 84),
+            Self::Q3K => (256, 110),
             Self::Q4K => (256, 144),
             Self::Q5K => (256, 176),
             Self::Q6K => (256, 210),
@@ -2698,6 +2989,7 @@ impl GgufFastQuant {
             Self::Q5_1 => "gguf_q5_1_gemv_bf16",
             Self::Q8_0 => "gguf_q8_0_gemv_bf16",
             Self::Q2K => "gguf_q2k_gemv_bf16",
+            Self::Q3K => "gguf_q3k_gemv_bf16",
             Self::Q4K => "gguf_q4k_gemv_bf16",
             Self::Q5K => "gguf_q5k_gemv_bf16",
             Self::Q6K => "gguf_q6k_gemv_bf16",
@@ -2712,6 +3004,7 @@ impl GgufFastQuant {
             Self::Q5_1 => "gguf_q5_1_mul_mm_bf16",
             Self::Q8_0 => "gguf_q8_0_mul_mm_bf16",
             Self::Q2K => "gguf_q2k_mul_mm_bf16",
+            Self::Q3K => "gguf_q3k_mul_mm_bf16",
             Self::Q4K => "gguf_q4k_mul_mm_bf16",
             Self::Q5K => "gguf_q5k_mul_mm_bf16",
             Self::Q6K => "gguf_q6k_mul_mm_bf16",
@@ -2726,6 +3019,7 @@ impl GgufFastQuant {
             Self::Q5_1 => "gguf-q5_1-matmul",
             Self::Q8_0 => "gguf-q8_0-matmul",
             Self::Q2K => "gguf-q2k-matmul",
+            Self::Q3K => "gguf-q3k-matmul",
             Self::Q4K => "gguf-q4k-matmul",
             Self::Q5K => "gguf-q5k-matmul",
             Self::Q6K => "gguf-q6k-matmul",
@@ -2740,6 +3034,7 @@ impl GgufFastQuant {
     /// | Q4_0..Q5_1  | 2             | 4              | 8       | 64         |
     /// | Q8_0        | 2             | 4              | 8       | 64         |
     /// | Q2_K        | 2             | 4              | 8       | 64         |
+    /// | Q3_K        | 2             | 2              | 4       | 64         |
     /// | Q4_K        | 1             | 4              | 4       | 32         |
     /// | Q5_K        | 2             | 2              | 4       | 64         |
     /// | Q6_K        | 2             | 1              | 2       | 64         |
@@ -2749,6 +3044,7 @@ impl GgufFastQuant {
             Self::Q4_0 | Self::Q4_1 | Self::Q5_0 | Self::Q5_1 | Self::Q8_0 | Self::Q2K => {
                 (2 * SIMDWIDTH, 2 * 4)
             }
+            Self::Q3K => (2 * SIMDWIDTH, 2 * 2),
             Self::Q4K => (SIMDWIDTH, 4),
             Self::Q5K => (2 * SIMDWIDTH, 2 * 2),
             Self::Q6K => (2 * SIMDWIDTH, 2),
@@ -2954,6 +3250,7 @@ impl CustomOp1 for GgufQuantMulMM {
             GgufFastQuant::Q5_1 => "gguf-q5_1-mul-mm",
             GgufFastQuant::Q8_0 => "gguf-q8_0-mul-mm",
             GgufFastQuant::Q2K => "gguf-q2k-mul-mm",
+            GgufFastQuant::Q3K => "gguf-q3k-mul-mm",
             GgufFastQuant::Q4K => "gguf-q4k-mul-mm",
             GgufFastQuant::Q5K => "gguf-q5k-mul-mm",
             GgufFastQuant::Q6K => "gguf-q6k-mul-mm",

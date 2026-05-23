@@ -30,7 +30,7 @@ pub fn parse(config_path: &str) -> Result<StandardTransformerConfig> {
 
     let arch = v["architectures"][0].as_str().unwrap_or("Unknown");
     maybe_log_torch_dtype(&v);
-    validate_quantization_config(&v["quantization_config"])?;
+    let quant_scheme = validate_quantization_config(&v["quantization_config"])?;
 
     if let Some(reason) = crate::models::arch_defaults::known_unsupported_reason(arch) {
         anyhow::bail!("Architecture '{arch}' is not supported: {reason}");
@@ -272,6 +272,7 @@ pub fn parse(config_path: &str) -> Result<StandardTransformerConfig> {
         per_layer_input_embed_scale,
         per_layer_model_projection_scale,
         per_layer_input_scale,
+        quant_scheme,
     })
 }
 
@@ -319,9 +320,9 @@ fn parse_generation_eos(config_path: &str) -> Vec<u32> {
     parse_eos(&v["eos_token_id"])
 }
 
-fn validate_quantization_config(v: &Value) -> Result<()> {
+fn validate_quantization_config(v: &Value) -> Result<Option<crate::common::weights::QuantScheme>> {
     if v.is_null() {
-        return Ok(());
+        return Ok(None);
     }
     let method = v["quant_method"].as_str().unwrap_or("");
     let bits = v["bits"].as_u64();
@@ -330,9 +331,14 @@ fn validate_quantization_config(v: &Value) -> Result<()> {
 
     match method.to_ascii_lowercase().as_str() {
         "awq" => {
+            // Only 4-bit AWQ has a tested resident kernel today; 8-bit AWQ is a
+            // theoretical future (the bit-parametric template instantiates with
+            // BITS=8 trivially) but no test checkpoint exists locally, so we
+            // continue to gate it.
             if bits != Some(4) {
                 anyhow::bail!(
-                    "AWQ checkpoint requires 4-bit weights, found bits={:?}. Only 4-bit AWQ is supported.",
+                    "AWQ checkpoint requires 4-bit weights, found bits={:?}. \
+                     Only 4-bit AWQ is supported in the resident W4A16 path.",
                     bits
                 );
             }
@@ -349,22 +355,58 @@ fn validate_quantization_config(v: &Value) -> Result<()> {
                 group_size = group_size.unwrap_or(128),
                 "AWQ 4-bit checkpoint detected (W4A16 fused matmul on Metal)"
             );
-            Ok(())
+            Ok(Some(crate::common::weights::QuantScheme::Awq))
         }
         "fp8" => {
             tracing::info!(
                 quant = "fp8",
                 "FP8 checkpoint detected; weights will be dequantized at load time (CPU path on Metal)"
             );
-            Ok(())
+            Ok(None)
         }
-        "gptq" => anyhow::bail!(
-            "GPTQ checkpoints are not yet supported. AWQ is supported; GPTQ requires a separate loader."
-        ),
-        "" => Ok(()),
+        "gptq" => {
+            let bits = bits.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "GPTQ checkpoint missing required 'bits' field in quantization_config"
+                )
+            })?;
+            if bits != 4 && bits != 8 {
+                anyhow::bail!(
+                    "GPTQ checkpoint bits={bits} not supported. Only 4 and 8 bits are recognised."
+                );
+            }
+            let sym = v["sym"].as_bool().unwrap_or(true);
+            let desc_act = v["desc_act"].as_bool().unwrap_or(false);
+            if desc_act {
+                anyhow::bail!(
+                    "GPTQ checkpoint has desc_act=true (act-order). The runtime loader \
+                     currently only supports desc_act=false (sequential g_idx)."
+                );
+            }
+            let checkpoint_format = v["checkpoint_format"].as_str().unwrap_or("gptq");
+            if !checkpoint_format.eq_ignore_ascii_case("gptq") {
+                anyhow::bail!(
+                    "GPTQ checkpoint_format='{checkpoint_format}' not supported \
+                     (only the canonical 'gptq' format is wired)."
+                );
+            }
+            tracing::info!(
+                quant = "gptq",
+                bits = bits,
+                group_size = group_size.unwrap_or(128),
+                sym = sym,
+                desc_act = desc_act,
+                "GPTQ checkpoint detected (dequant-at-load CPU path)"
+            );
+            Ok(Some(crate::common::weights::QuantScheme::Gptq {
+                bits: bits as u32,
+                sym,
+            }))
+        }
+        "" => Ok(None),
         other => anyhow::bail!(
             "Unknown quantization method '{other}' in quantization_config. \
-             Supported: awq (gemm, 4-bit), fp8."
+             Supported: awq (gemm, 4-bit), gptq (4/8-bit, desc_act=false), fp8."
         ),
     }
 }

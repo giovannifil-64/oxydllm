@@ -1,4 +1,4 @@
-use crate::common::awq::{AwqRawTensors, dequantize_awq};
+use crate::common::awq::{AwqRawTensors, PackDim, QuantWeight, dequantize_awq, dequantize_quant};
 use crate::common::weights::apply_scale_inv;
 use candle_core::quantized::{GgmlDType, QMatMul, QTensor};
 use candle_core::{DType, Device, Result, Tensor};
@@ -185,6 +185,7 @@ impl GgufFastPath {
             GgmlDType::Q5_1 => super::metal_ops::GgufFastQuant::Q5_1,
             GgmlDType::Q8_0 => super::metal_ops::GgufFastQuant::Q8_0,
             GgmlDType::Q2K => super::metal_ops::GgufFastQuant::Q2K,
+            GgmlDType::Q3K => super::metal_ops::GgufFastQuant::Q3K,
             GgmlDType::Q4K => super::metal_ops::GgufFastQuant::Q4K,
             GgmlDType::Q5K => super::metal_ops::GgufFastQuant::Q5K,
             GgmlDType::Q6K => super::metal_ops::GgufFastQuant::Q6K,
@@ -398,13 +399,27 @@ pub struct PackedQuantLinear {
 #[cfg(feature = "metal")]
 impl PackedQuantLinear {
     pub fn new(raw: AwqRawTensors, bias: Option<Tensor>, dtype: DType) -> Result<Self> {
+        // PackedQuantLinear is the W4A16 resident path; it currently only
+        // handles AWQ-style 4-bit (out-dim interleaved) tensors. GPTQ goes
+        // through the dequant-at-load path (`AnyLinear::from_gptq`).
+        if !matches!(raw.pack_dim, crate::common::awq::PackDim::Out) || raw.bits != 4 {
+            candle_core::bail!(
+                "PackedQuantLinear: only AWQ 4-bit (PackDim::Out) is supported in the resident path; \
+                 got bits={} pack_dim={:?}",
+                raw.bits,
+                raw.pack_dim,
+            );
+        }
+        let qzeros = raw
+            .qzeros
+            .ok_or_else(|| candle_core::Error::Msg("PackedQuantLinear: qzeros missing".into()))?;
         let (in_features, _packed_out) = raw.qweight.dims2()?;
         let (_groups, out_features) = raw.scales.dims2()?;
         // The kernel reads `scales` in the activation dtype.
         let scales = raw.scales.to_dtype(dtype)?;
         Ok(Self {
             qweight: raw.qweight,
-            qzeros: raw.qzeros,
+            qzeros,
             scales,
             bias,
             in_features,
@@ -489,6 +504,29 @@ impl AnyLinear {
         Ok(Self::Float(Linear::new(weight, bias)?))
     }
 
+    /// Generic packed-quant entrypoint. Routes:
+    /// - AWQ (`pack_dim == Out`) on Metal + bf16/f16 ⇒ resident W4A16 path.
+    /// - AWQ elsewhere ⇒ dequant-at-load to a plain `Linear`.
+    /// - GPTQ (`pack_dim == In`) ⇒ always dequant-at-load (no resident GPU
+    ///   kernel yet — the bit-parametric W4/W8A16 template assumes AWQ
+    ///   packing along out_features).
+    pub fn from_quant(
+        raw: &QuantWeight,
+        bias: Option<Tensor>,
+        device: &Device,
+        dtype: DType,
+    ) -> Result<Self> {
+        match raw.pack_dim {
+            PackDim::Out => Self::from_awq(raw, bias, device, dtype),
+            PackDim::In => {
+                let weight = dequantize_quant(raw, device, dtype).map_err(|e| {
+                    candle_core::Error::Msg(format!("GPTQ dequantization failed: {e:#}"))
+                })?;
+                Ok(Self::Float(Linear::new(weight, bias)?))
+            }
+        }
+    }
+
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         match self {
             Self::Float(l) => l.forward(x),
@@ -571,11 +609,7 @@ mod tests {
         )?;
         let scales_t = Tensor::from_vec(scales.clone(), (groups, out_features), &device)?;
 
-        let raw = AwqRawTensors {
-            qweight,
-            qzeros,
-            scales: scales_t,
-        };
+        let raw = AwqRawTensors::new_awq(qweight, qzeros, scales_t);
         let bias_vec: Vec<f32> = (0..out_features).map(|j| 0.1 * j as f32).collect();
         let bias = Tensor::from_vec(bias_vec.clone(), (out_features,), &device)?;
         let awq_linear = AnyLinear::from_awq(&raw, Some(bias.clone()), &device, DType::F32)?;

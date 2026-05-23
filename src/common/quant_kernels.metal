@@ -207,6 +207,57 @@ kernel void dequantize_w4_bf16(
     awq_dequantize_impl<bfloat, 4>(qweight, qzeros, scales, weight, p, gid);
 }
 
+// ── 8-bit instantiations of the bit-parametric AWQ template ─────────────────
+// Same algorithm as the 4-bit variants above with `BITS=8` (pack_factor=4 and
+// sequential pack_position). Ready for AWQ-8bit checkpoints; not on a critical
+// path today (no local AWQ-8bit model), but covered by the W8A16 parity tests.
+
+kernel void w8a16_gemv_f16(
+    device const half*    x        [[buffer(0)]],
+    device const uint*    qweight  [[buffer(1)]],
+    device const uint*    qzeros   [[buffer(2)]],
+    device const half*    scales   [[buffer(3)]],
+    device atomic_float*  out      [[buffer(4)]],
+    constant W4A16Params& p        [[buffer(5)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    awq_gemv_impl<half, 8>(x, qweight, qzeros, scales, out, p, gid);
+}
+
+kernel void w8a16_gemv_bf16(
+    device const bfloat*  x        [[buffer(0)]],
+    device const uint*    qweight  [[buffer(1)]],
+    device const uint*    qzeros   [[buffer(2)]],
+    device const bfloat*  scales   [[buffer(3)]],
+    device atomic_float*  out      [[buffer(4)]],
+    constant W4A16Params& p        [[buffer(5)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    awq_gemv_impl<bfloat, 8>(x, qweight, qzeros, scales, out, p, gid);
+}
+
+kernel void dequantize_w8_f16(
+    device const uint*    qweight  [[buffer(0)]],
+    device const uint*    qzeros   [[buffer(1)]],
+    device const half*    scales   [[buffer(2)]],
+    device       half*    weight   [[buffer(3)]],
+    constant W4A16Params& p        [[buffer(4)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    awq_dequantize_impl<half, 8>(qweight, qzeros, scales, weight, p, gid);
+}
+
+kernel void dequantize_w8_bf16(
+    device const uint*    qweight  [[buffer(0)]],
+    device const uint*    qzeros   [[buffer(1)]],
+    device const bfloat*  scales   [[buffer(2)]],
+    device       bfloat*  weight   [[buffer(3)]],
+    constant W4A16Params& p        [[buffer(4)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    awq_dequantize_impl<bfloat, 8>(qweight, qzeros, scales, weight, p, gid);
+}
+
 // =============================================================================
 // GGUF quantized GEMV kernels (Q5_0 first; Q4_K and Q2_K to follow).
 //
@@ -1135,6 +1186,166 @@ kernel void gguf_q2k_gemv_bf16(
 }
 
 // =============================================================================
+// Q3_K GEMV bf16 — port of llama.cpp / candle `kernel_mul_mv_q3_K_f32_impl`.
+// Block layout (110 bytes, 256 elements):
+//   u8   hmask[32];                         // 3rd (high) bit per element
+//   u8   qs[64];                            // low 2 bits per element (4 per byte)
+//   u8   scales[12];                        // 16 6-bit packed sub-block scales
+//   half d;                                 // global scale
+// Per-element value: d * (scale - 32) * (((qs >> (2*shift)) & 3) | (hbit << 2) - 4)
+// Geometry: 2 simdgroups × 2 rows per TG (same as Q5_K, threads/TG = 64).
+// =============================================================================
+
+typedef struct {
+    uint8_t  hmask[QK_K / 8];   // 32 bytes
+    uint8_t  qs[QK_K / 4];      // 64 bytes
+    uint8_t  scales[12];        // 12 bytes (16 × 6-bit packed)
+    half     d;                 // 2 bytes
+} block_q3_K;
+
+kernel void gguf_q3k_gemv_bf16(
+    device const bfloat       *x        [[buffer(0)]],
+    device const void         *weight   [[buffer(1)]],
+    device       bfloat       *out      [[buffer(2)]],
+    constant     GgufParams   &p        [[buffer(3)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    uint tiisg  [[thread_index_in_simdgroup]],
+    uint sgitg  [[simdgroup_index_in_threadgroup]])
+{
+    const uint N  = p.out_features;
+    const uint K  = p.in_features;
+    const uint nb = K / QK_K;
+
+    const uint r0 = tgpig.x;
+    const uint first_row = (r0 * GGUF_N_SIMDGROUP + sgitg) * 2;
+    if (first_row >= N) return;
+
+    device const block_q3_K *x_blocks =
+        (device const block_q3_K *)weight + (ulong)first_row * (ulong)nb;
+
+    float yl[32];
+
+    const uint tid = tiisg / 4;            // 0..7
+    const uint ix  = tiisg % 4;            // 0..3 — K-block stride
+    const uint ip  = tid / 4;              // 0 or 1 — which 128-elem half
+    const uint il  = 2u * ((tid % 4u) / 2u);  // 0 or 2 — picks scale/shift pair
+    const uint ir  = tid % 2;              // 0 or 1 — first or second 16-elem chunk
+    const uint n   = 8;
+    const uint l0  = n * ir;
+
+    // Masks for the high bit of each 2-byte hmask read. Indexed by [2*ip + il/2].
+    const ushort4 mm[4] = {{0x0001, 0x0100, 0x0002, 0x0200},
+                           {0x0004, 0x0400, 0x0008, 0x0800},
+                           {0x0010, 0x1000, 0x0020, 0x2000},
+                           {0x0040, 0x4000, 0x0080, 0x8000}};
+    // Masks for the low-2-bit quants inside a 2-byte qs read. Indexed by [il/2].
+    const int4 qm[2] = {{0x0003, 0x0300, 0x000c, 0x0c00},
+                        {0x0030, 0x3000, 0x00c0, 0xc000}};
+
+    const ushort4 hm = mm[2u * ip + il / 2u];
+
+    const uint shift = 2u * il;            // 0 or 4
+    const float v1 = (il == 0u) ? 4.f : 64.f;
+    const float v2 = 4.f * v1;
+
+    const uint16_t s_shift1 = 4u * (uint16_t)ip;
+    const uint16_t s_shift2 = s_shift1 + (uint16_t)il;
+
+    const uint q_offset = 32u * ip + l0;
+    const uint y_offset = 128u * ip + 32u * il + l0;
+
+    // Byte offset between consecutive output rows (= sizeof(block_q3_K) * nb).
+    // Q3_K block size is 110 bytes (even) so uint16_t* reads stay aligned.
+    const uint step_bytes = (uint)sizeof(block_q3_K) * nb;
+
+    device const bfloat *y1 = x + ix * QK_K + y_offset;
+
+    uint32_t scales32, aux32;
+    thread uint16_t   *scales16 = (thread uint16_t   *)&scales32;
+    thread const int8_t *scales = (thread const int8_t *)&scales32;
+
+    float sumf1[2] = {0.f, 0.f};
+    float sumf2[2] = {0.f, 0.f};
+
+    for (uint i = ix; i < nb; i += 4) {
+        for (uint l = 0; l < 8; ++l) {
+            yl[l +  0] = (float)y1[l +  0];
+            yl[l +  8] = (float)y1[l + 16];
+            yl[l + 16] = (float)y1[l + 32];
+            yl[l + 24] = (float)y1[l + 48];
+        }
+
+        device const uint16_t *q = (device const uint16_t *)(x_blocks[i].qs    + q_offset);
+        device const uint16_t *h = (device const uint16_t *)(x_blocks[i].hmask + l0);
+        device const uint16_t *a = (device const uint16_t *)(x_blocks[i].scales);
+        device const half     *dh = &x_blocks[i].d;
+
+        for (uint row = 0; row < 2; ++row) {
+            const float d_all = (float)dh[0];
+
+            // Pack 4 6-bit scales into scales32 (used as 4×i8 below).
+            scales16[0] = a[4];
+            scales16[1] = a[5];
+            aux32 = ((scales32 >> s_shift2) << 4) & 0x30303030u;
+            scales16[0] = a[il + 0u];
+            scales16[1] = a[il + 1u];
+            scales32 = ((scales32 >> s_shift1) & 0x0f0f0f0fu) | aux32;
+
+            float s1 = 0.f, s2 = 0.f, s3 = 0.f, s4 = 0.f, s5 = 0.f, s6 = 0.f;
+            for (uint l = 0; l < n; l += 2) {
+                const int32_t qs = (int32_t)q[l / 2];
+                s1 += yl[l + 0] * (float)(qs & qm[il / 2u][0]);
+                s2 += yl[l + 1] * (float)(qs & qm[il / 2u][1]);
+                s3 += ((h[l / 2] & hm[0]) ? 0.f : yl[l + 0]) +
+                      ((h[l / 2] & hm[1]) ? 0.f : yl[l + 1]);
+                s4 += yl[l + 16] * (float)(qs & qm[il / 2u][2]);
+                s5 += yl[l + 17] * (float)(qs & qm[il / 2u][3]);
+                s6 += ((h[l / 2] & hm[2]) ? 0.f : yl[l + 16]) +
+                      ((h[l / 2] & hm[3]) ? 0.f : yl[l + 17]);
+            }
+            float d1 = d_all * (s1 + 1.f / 256.f * s2 - s3 * v1);
+            float d2 = d_all * (s4 + 1.f / 256.f * s5 - s6 * v2);
+            sumf1[row] += d1 * (float)(scales[0] - 32);
+            sumf2[row] += d2 * (float)(scales[2] - 32);
+
+            s1 = s2 = s3 = s4 = s5 = s6 = 0.f;
+            for (uint l = 0; l < n; l += 2) {
+                const int32_t qs = (int32_t)q[l / 2 + 8];
+                s1 += yl[l + 8] * (float)(qs & qm[il / 2u][0]);
+                s2 += yl[l + 9] * (float)(qs & qm[il / 2u][1]);
+                s3 += ((h[l / 2 + 8] & hm[0]) ? 0.f : yl[l +  8]) +
+                      ((h[l / 2 + 8] & hm[1]) ? 0.f : yl[l +  9]);
+                s4 += yl[l + 24] * (float)(qs & qm[il / 2u][2]);
+                s5 += yl[l + 25] * (float)(qs & qm[il / 2u][3]);
+                s6 += ((h[l / 2 + 8] & hm[2]) ? 0.f : yl[l + 24]) +
+                      ((h[l / 2 + 8] & hm[3]) ? 0.f : yl[l + 25]);
+            }
+            d1 = d_all * (s1 + 1.f / 256.f * s2 - s3 * v1);
+            d2 = d_all * (s4 + 1.f / 256.f * s5 - s6 * v2);
+            sumf1[row] += d1 * (float)(scales[1] - 32);
+            sumf2[row] += d2 * (float)(scales[3] - 32);
+
+            // Advance to next row of the same 2-row pair.
+            q  = (device const uint16_t *)((device const uint8_t *)q  + step_bytes);
+            h  = (device const uint16_t *)((device const uint8_t *)h  + step_bytes);
+            a  = (device const uint16_t *)((device const uint8_t *)a  + step_bytes);
+            dh = (device const half     *)((device const uint8_t *)dh + step_bytes);
+        }
+
+        y1 += 4 * QK_K;
+    }
+
+    for (uint row = 0; row < 2; ++row) {
+        const float sumf = (sumf1[row] + 0.25f * sumf2[row]) / (float)(1u << shift);
+        const float tot = simd_sum(sumf);
+        const uint r = first_row + row;
+        if (tiisg == 0 && r < N) {
+            out[r] = (bfloat)tot;
+        }
+    }
+}
+
+// =============================================================================
 // Fused mul_mm_q*_bf16 — GEMM for M>1 (prefill).
 //
 // `out[M,N] = x[M,K] @ W[K,N].T` where W is GGUF-quantized. The weight is
@@ -1453,6 +1664,63 @@ inline void gguf_q2k_dequant_strip_into(
         const float ml = dmin * (float)((sc >> 4) & 0x0Fu);
 
         w_tile[c][j] = (bfloat)(dl * (float)q - ml);
+    }
+}
+
+// Q3_K 6-bit signed scale for sub-block `sub_idx` (0..15) from the 12-byte
+// packed scales array. Mirrors the unpacking in candle's vec_dot_q3k_q8k
+// (KMASK1=0x03030303, KMASK2=0x0f0f0f0f). Returns the value with the -32
+// offset already applied.
+inline int gguf_q3k_get_scale(uint sub_idx, device const uint8_t *scales) {
+    const uint k          = sub_idx % 4u;
+    const uint group      = sub_idx / 4u;            // 0..3
+    const uint low_byte   = (group < 2u) ? (k + 4u * group) : (k + 4u * (group - 2u));
+    const uint low_shift  = (group < 2u) ? 0u : 4u;
+    const uint high_shift = 2u * group;
+    const uint low  = (uint)(scales[low_byte] >> low_shift) & 0x0Fu;
+    const uint high = (uint)(scales[8u + k]   >> high_shift) & 0x03u;
+    return (int)(low | (high << 4)) - 32;
+}
+
+inline void gguf_q3k_dequant_strip_into(
+    threadgroup bfloat (&w_tile)[GGUF_MM_BN][QK_K],
+    device const block_q3_K *w_blocks_base,
+    uint n_base,
+    uint n_total,
+    uint nb,
+    uint b,
+    uint tg_tid)
+{
+    // Q3_K: 2 halves × 4 shift_idx × 32 elements. For element j:
+    //   block_half = j / 128, shift_idx = (j%128) / 32, elem_in_32 = j % 32
+    //   qs_byte = block_half*32 + elem_in_32, shift = shift_idx*2
+    //   hmask_byte = elem_in_32, hmask_bit = block_half*4 + shift_idx
+    //   q = ((qs >> shift) & 3) - (hbit ? 0 : 4)   ← signed in [-4, 3]
+    //   sub_idx = j / 16 (16 scales per super-block).
+    for (uint kk = tg_tid; kk < GGUF_MM_BN * QK_K; kk += GGUF_MM_TG) {
+        const uint c = kk / QK_K;
+        const uint j = kk % QK_K;
+        const uint n = n_base + c;
+        if (n >= n_total) { continue; }
+        device const block_q3_K *blk = w_blocks_base + (ulong)n * (ulong)nb + (ulong)b;
+        const float d = (float)blk->d;
+
+        const uint block_half = j / 128u;
+        const uint shift_idx  = (j % 128u) / 32u;
+        const uint elem_in_32 = j % 32u;
+
+        const uint qs_byte_idx = block_half * 32u + elem_in_32;
+        const uint shift       = shift_idx * 2u;
+        const uint low_2       = (uint)(blk->qs[qs_byte_idx] >> shift) & 0x03u;
+
+        const uint hbit_pos = block_half * 4u + shift_idx;
+        const uint hbit     = (uint)(blk->hmask[elem_in_32] >> hbit_pos) & 0x01u;
+        const int  q        = (int)low_2 - ((hbit != 0u) ? 0 : 4);
+
+        const uint sub_idx     = j / 16u;
+        const int  scale_signed = gguf_q3k_get_scale(sub_idx, blk->scales);
+
+        w_tile[c][j] = (bfloat)(d * (float)scale_signed * (float)q);
     }
 }
 
@@ -1863,6 +2131,52 @@ kernel void gguf_q2k_mul_mm_bf16(
     float acc = 0.0f;
     for (uint b = 0; b < nb; ++b) {
         gguf_q2k_dequant_strip_into(w_tile, w_base, n_base, N, nb, b, tg_tid);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (m < M && n < N) {
+            device const bfloat *x_chunk = x + (ulong)m * (ulong)K + (ulong)b * (ulong)QK_K;
+            float partial = 0.0f;
+            for (uint j = 0; j < QK_K; ++j) {
+                partial += (float)x_chunk[j] * (float)w_tile[n_off][j];
+            }
+            acc += partial;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (m < M && n < N) {
+        out[(ulong)m * (ulong)N + (ulong)n] = (bfloat)acc;
+    }
+}
+
+kernel void gguf_q3k_mul_mm_bf16(
+    device const bfloat            *x        [[buffer(0)]],
+    device const void              *weight   [[buffer(1)]],
+    device       bfloat            *out      [[buffer(2)]],
+    constant     GgufMatmulParams  &p        [[buffer(3)]],
+    uint3  tg_tid_xy [[thread_position_in_threadgroup]],
+    uint3  tgpig     [[threadgroup_position_in_grid]])
+{
+    threadgroup bfloat w_tile[GGUF_MM_BN][QK_K];
+
+    const uint M  = p.m_total;
+    const uint N  = p.n_total;
+    const uint K  = p.k_total;
+    const uint nb = K / QK_K;
+
+    const uint n_base = tgpig.x * GGUF_MM_BN;
+    const uint m_base = tgpig.y * GGUF_MM_BM;
+    const uint n_off  = tg_tid_xy.x;
+    const uint m_off  = tg_tid_xy.y;
+    const uint n      = n_base + n_off;
+    const uint m      = m_base + m_off;
+    const uint tg_tid = m_off * GGUF_MM_BN + n_off;
+
+    device const block_q3_K *w_base = (device const block_q3_K *)weight;
+
+    float acc = 0.0f;
+    for (uint b = 0; b < nb; ++b) {
+        gguf_q3k_dequant_strip_into(w_tile, w_base, n_base, N, nb, b, tg_tid);
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         if (m < M && n < N) {

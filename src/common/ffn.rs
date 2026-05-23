@@ -1,4 +1,4 @@
-use super::awq::{AwqRawTensors, concat_awq_along_out};
+use super::awq::{AwqRawTensors, PackDim, concat_awq_along_out};
 use super::config::Activation;
 use super::gguf_weights::GgufWeights;
 use super::linear::{AnyLinear, QLinear, gelu_tanh, silu};
@@ -24,7 +24,7 @@ impl FeedForward {
     pub fn load(layer_idx: usize, weights: &ModelWeights, activation: Activation) -> Result<Self> {
         let p = format!("model.layers.{}.mlp", layer_idx);
 
-        if let Some(down_raw) = weights.try_get_awq(&format!("{p}.down_proj")) {
+        if let Some(down_raw) = weights.try_get_quant(&format!("{p}.down_proj")) {
             return Self::load_awq(&p, down_raw, weights, activation, layer_idx);
         }
 
@@ -161,78 +161,83 @@ impl FeedForward {
     ) -> Result<Self> {
         let device = down_raw.scales.device().clone();
         let dtype = down_raw.scales.dtype();
+        let is_awq = down_raw.pack_dim == PackDim::Out;
 
         // down_proj: out_features = hidden, in_features = intermediate.
-        let intermediate_size = down_raw
-            .qweight
-            .dim(0)
-            .map_err(|e| candle_core::Error::Msg(format!("AWQ down_proj rank: {e}")))?;
-        let down_proj = AnyLinear::from_awq(&down_raw, None, &device, dtype)?;
+        let intermediate_size = down_raw.in_features().map_err(|e| {
+            candle_core::Error::Msg(format!("packed-quant down_proj in_features: {e}"))
+        })?;
+        let down_proj = AnyLinear::from_quant(&down_raw, None, &device, dtype)?;
 
         let gate_prefix = format!("{p}.gate_proj");
         let up_prefix = format!("{p}.up_proj");
         let gate_up_prefix = format!("{p}.gate_up_proj");
 
         let gate_up = if let (Some(gate_raw), Some(up_raw)) = (
-            weights.try_get_awq(&gate_prefix),
-            weights.try_get_awq(&up_prefix),
+            weights.try_get_quant(&gate_prefix),
+            weights.try_get_quant(&up_prefix),
         ) {
             let gate_out = gate_raw.scales.dim(1)?;
             let up_out = up_raw.scales.dim(1)?;
             if gate_out != intermediate_size || up_out != intermediate_size {
                 candle_core::bail!(
-                    "AWQ FFN shape mismatch at {p}: gate/up out_features must both be {intermediate_size}, got gate={gate_out} up={up_out}"
+                    "Packed-quant FFN shape mismatch at {p}: gate/up out_features must both be {intermediate_size}, got gate={gate_out} up={up_out}"
                 );
             }
 
-            let gate_up_fused = intermediate_size.is_multiple_of(8);
+            // GPTQ packs along in_features ⇒ out-dim concat (`concat_awq_along_out`)
+            // doesn't apply. Take Separate; the dequant-at-load dominates anyway.
+            let gate_up_fused = is_awq && intermediate_size.is_multiple_of(8);
             if layer_idx == 0 {
                 tracing::info!(
                     intermediate_size,
                     gate_up_fused,
-                    "AWQ FFN loader engaged (separate gate/up tensors)"
+                    quant = if is_awq { "awq" } else { "gptq" },
+                    "Packed-quant FFN loader engaged (separate gate/up tensors)"
                 );
             }
             if gate_up_fused {
                 let fused_raw = concat_awq_along_out(&[gate_raw, up_raw]).map_err(|e| {
                     candle_core::Error::Msg(format!("AWQ gate+up fuse failed: {e:#}"))
                 })?;
-                GateUpProjection::Fused(AnyLinear::from_awq(&fused_raw, None, &device, dtype)?)
+                GateUpProjection::Fused(AnyLinear::from_quant(&fused_raw, None, &device, dtype)?)
             } else {
                 GateUpProjection::Separate {
-                    gate: AnyLinear::from_awq(&gate_raw, None, &device, dtype)?,
-                    up: AnyLinear::from_awq(&up_raw, None, &device, dtype)?,
+                    gate: AnyLinear::from_quant(&gate_raw, None, &device, dtype)?,
+                    up: AnyLinear::from_quant(&up_raw, None, &device, dtype)?,
                 }
             }
-        } else if let Some(gate_up_raw) = weights.try_get_awq(&gate_up_prefix) {
+        } else if let Some(gate_up_raw) = weights.try_get_quant(&gate_up_prefix) {
             let packed_out = gate_up_raw.scales.dim(1)?;
             if packed_out != 2 * intermediate_size {
                 candle_core::bail!(
-                    "AWQ FFN gate_up out_features {packed_out} != 2*{intermediate_size}"
+                    "Packed-quant FFN gate_up out_features {packed_out} != 2*{intermediate_size}"
                 );
             }
             if layer_idx == 0 {
                 tracing::info!(
                     intermediate_size,
-                    "AWQ FFN loader engaged (pre-fused gate_up_proj)"
+                    "Packed-quant FFN loader engaged (pre-fused gate_up_proj)"
                 );
             }
-            GateUpProjection::Fused(AnyLinear::from_awq(&gate_up_raw, None, &device, dtype)?)
-        } else if let Some(up_raw) = weights.try_get_awq(&up_prefix) {
+            GateUpProjection::Fused(AnyLinear::from_quant(&gate_up_raw, None, &device, dtype)?)
+        } else if let Some(up_raw) = weights.try_get_quant(&up_prefix) {
             let up_out = up_raw.scales.dim(1)?;
             if up_out != intermediate_size {
-                candle_core::bail!("AWQ FFN up_proj out_features {up_out} != {intermediate_size}");
+                candle_core::bail!(
+                    "Packed-quant FFN up_proj out_features {up_out} != {intermediate_size}"
+                );
             }
             if layer_idx == 0 {
                 tracing::info!(
                     intermediate_size,
-                    "AWQ FFN loader engaged (ungated up-only path)"
+                    "Packed-quant FFN loader engaged (ungated up-only path)"
                 );
             }
-            GateUpProjection::Simple(AnyLinear::from_awq(&up_raw, None, &device, dtype)?)
+            GateUpProjection::Simple(AnyLinear::from_quant(&up_raw, None, &device, dtype)?)
         } else {
             candle_core::bail!(
-                "Mixed quantization at {p}: down_proj is AWQ but no gate/up tensors are AWQ. \
+                "Mixed quantization at {p}: down_proj is packed but no gate/up tensors are packed. \
                  Expected one of: ({{gate,up}}_proj.qweight) or (gate_up_proj.qweight) or (up_proj.qweight)."
             );
         };

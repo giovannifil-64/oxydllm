@@ -82,10 +82,13 @@ pub struct QuantWeight {
 pub type AwqRawTensors = QuantWeight;
 
 impl QuantWeight {
-    /// AWQ 4-bit constructor: matches autoawq GEMM layout.
-    pub fn new_awq(qweight: Tensor, qzeros: Tensor, scales: Tensor) -> Self {
+    /// AWQ constructor: matches autoawq GEMM layout. `bits` is 4 or 8 —
+    /// determines the packing factor (`32/bits`) and the runtime kernel
+    /// selection in [`crate::common::linear::PackedQuantLinear`].
+    pub fn new_awq(bits: u32, qweight: Tensor, qzeros: Tensor, scales: Tensor) -> Self {
+        debug_assert!(matches!(bits, 4 | 8), "AWQ bits must be 4 or 8, got {bits}");
         Self {
-            bits: 4,
+            bits,
             group_size: 128, // overwritten by callers that compute it from scales
             pack_dim: PackDim::Out,
             pack_order: PackOrder::AwqInterleaved,
@@ -236,6 +239,8 @@ pub fn concat_awq_along_out(parts: &[AwqRawTensors]) -> Result<AwqRawTensors> {
     }
     let in_features = parts[0].in_features()?;
     let group_size = parts[0].group_size()?;
+    let bits = parts[0].bits;
+    let pack_factor = parts[0].pack_factor();
     for (i, p) in parts.iter().enumerate().skip(1) {
         if p.in_features()? != in_features {
             anyhow::bail!(
@@ -249,9 +254,15 @@ pub fn concat_awq_along_out(parts: &[AwqRawTensors]) -> Result<AwqRawTensors> {
                 p.group_size()?
             );
         }
-        if p.out_features()? % AWQ_PACK_FACTOR != 0 {
+        if p.bits != bits {
             anyhow::bail!(
-                "AWQ fuse: part {i} out_features {} not divisible by {AWQ_PACK_FACTOR}",
+                "AWQ fuse: bits mismatch at part {i}: expected {bits}, got {}",
+                p.bits
+            );
+        }
+        if p.out_features()? % pack_factor != 0 {
+            anyhow::bail!(
+                "AWQ fuse: part {i} out_features {} not divisible by pack_factor {pack_factor}",
                 p.out_features()?
             );
         }
@@ -291,7 +302,8 @@ pub fn concat_awq_along_out(parts: &[AwqRawTensors]) -> Result<AwqRawTensors> {
     let qzeros = Tensor::cat(&qzeros_refs, 1).context("AWQ fuse: cat qzeros")?;
     let scales = Tensor::cat(&scales_refs, 1).context("AWQ fuse: cat scales")?;
 
-    Ok(QuantWeight::new_awq(qweight, qzeros, scales))
+    // Bits are preserved from the first part (checked above to match across parts).
+    Ok(QuantWeight::new_awq(parts[0].bits, qweight, qzeros, scales))
 }
 
 /// Dequantize AWQ tensors into a `[out_features, in_features]` weight matrix
@@ -589,138 +601,6 @@ pub fn dequantize_quant(raw: &QuantWeight, device: &Device, out_dtype: DType) ->
     }
 }
 
-// =============================================================================
-// MXFP4 — OCP Microscaling FP4
-//
-// Block size 32: one E8M0 scale byte + 16 bytes of packed E2M1 nibbles
-// (= 17 bytes per 32 elements). Used by GPT-OSS and other "microscaling"
-// checkpoints. Dequant is a tiny LUT (16 FP4 codes → fp32) times the scale
-// (2^(scale_byte - 127)).
-//
-// This module provides the dequant primitive only; full model integration
-// (loader, layer wiring, MoE routing) is gated on a local GPT-OSS test
-// checkpoint, which is not present in `~/.oxydllm/models` at the time of
-// writing. The dequant + parity tests below validate the bit layout against
-// the OCP MX spec so the function is ready to plug in when a checkpoint
-// appears.
-// =============================================================================
-
-/// MXFP4 block size — number of elements that share one scale.
-///
-/// All MXFP4 items below are `#[allow(dead_code)]`: the primitive is shipped
-/// and tested but not yet wired into a loader (blocker: no local GPT-OSS-class
-/// checkpoint + `src/common/moe.rs` is still a stub).
-#[allow(dead_code)]
-pub const MXFP4_BLOCK: usize = 32;
-
-/// Lookup table for unsigned 3-bit FP4 magnitudes (E2M1 without the sign bit).
-/// The full FP4 code is `(sign << 3) | magnitude_3bits`; the final value is
-/// `(-1)^sign × MXFP4_LUT[magnitude]`.
-#[allow(dead_code)]
-const MXFP4_LUT: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
-
-/// Decode a single 4-bit FP4 code (E2M1) into f32.
-#[allow(dead_code)]
-#[inline]
-fn mxfp4_decode(nibble: u8) -> f32 {
-    let sign = (nibble >> 3) & 1;
-    let mag = (nibble & 0b0111) as usize;
-    let v = MXFP4_LUT[mag];
-    if sign == 1 { -v } else { v }
-}
-
-/// Apply an E8M0 scale byte (`2^(s - 127)`) to a base value.
-#[allow(dead_code)]
-#[inline]
-fn mxfp4_apply_scale(value: f32, scale_byte: u8) -> f32 {
-    // E8M0 NaN encoding is 0xFF; treat as 0 to mirror the OCP spec.
-    if scale_byte == 0xFF {
-        return f32::NAN;
-    }
-    let exp = scale_byte as i32 - 127;
-    value * (2.0f32).powi(exp)
-}
-
-/// Dequantise a contiguous MXFP4 buffer into a row-major `[rows, cols]`
-/// f32/bf16/f16 tensor.
-///
-/// Layout (matches GPT-OSS on-disk):
-/// - `blocks`: `[rows, cols / 2]` u8, **two nibbles per byte**, low nibble
-///   first (element `2k` is `byte & 0xF`, element `2k+1` is `byte >> 4`).
-/// - `scales`: `[rows, cols / MXFP4_BLOCK]` u8, E8M0 (one per 32-elem block).
-///
-/// `rows × cols` must be exact; `cols` must be a multiple of `MXFP4_BLOCK`.
-#[allow(dead_code)]
-pub fn dequantize_mxfp4(
-    blocks: &[u8],
-    scales: &[u8],
-    rows: usize,
-    cols: usize,
-    device: &Device,
-    out_dtype: DType,
-) -> Result<Tensor> {
-    if !cols.is_multiple_of(MXFP4_BLOCK) {
-        anyhow::bail!("MXFP4 cols ({cols}) not divisible by block size {MXFP4_BLOCK}");
-    }
-    let blocks_per_row = cols / MXFP4_BLOCK;
-    let nibbles_per_row = cols;
-    let bytes_per_row = nibbles_per_row / 2;
-    if blocks.len() != rows * bytes_per_row {
-        anyhow::bail!(
-            "MXFP4 blocks numel {} != rows*cols/2 ({} * {})",
-            blocks.len(),
-            rows,
-            bytes_per_row
-        );
-    }
-    if scales.len() != rows * blocks_per_row {
-        anyhow::bail!(
-            "MXFP4 scales numel {} != rows*blocks_per_row ({} * {})",
-            scales.len(),
-            rows,
-            blocks_per_row
-        );
-    }
-
-    use rayon::prelude::*;
-    let mut weight_f32 = vec![0f32; rows * cols];
-    weight_f32
-        .par_chunks_mut(cols)
-        .zip(blocks.par_chunks(bytes_per_row))
-        .zip(scales.par_chunks(blocks_per_row))
-        .for_each(|((row_out, row_blocks), row_scales)| {
-            for blk in 0..blocks_per_row {
-                let scale_byte = row_scales[blk];
-                let block_bytes =
-                    &row_blocks[blk * (MXFP4_BLOCK / 2)..(blk + 1) * (MXFP4_BLOCK / 2)];
-                let out_offset = blk * MXFP4_BLOCK;
-                for (k, &b) in block_bytes.iter().enumerate() {
-                    let low = b & 0x0F;
-                    let high = (b >> 4) & 0x0F;
-                    row_out[out_offset + 2 * k] = mxfp4_apply_scale(mxfp4_decode(low), scale_byte);
-                    row_out[out_offset + 2 * k + 1] =
-                        mxfp4_apply_scale(mxfp4_decode(high), scale_byte);
-                }
-            }
-        });
-
-    let weight_cpu = match out_dtype {
-        DType::F32 => Tensor::from_vec(weight_f32, (rows, cols), &Device::Cpu)?,
-        DType::BF16 => {
-            let v: Vec<half::bf16> = weight_f32.into_iter().map(half::bf16::from_f32).collect();
-            Tensor::from_vec(v, (rows, cols), &Device::Cpu)?
-        }
-        DType::F16 => {
-            let v: Vec<half::f16> = weight_f32.into_iter().map(half::f16::from_f32).collect();
-            Tensor::from_vec(v, (rows, cols), &Device::Cpu)?
-        }
-        other => anyhow::bail!("MXFP4 dequantize: unsupported out_dtype {other:?}"),
-    };
-    weight_cpu
-        .to_device(device)
-        .context("MXFP4 dequantized weight → device")
-}
-
 /// Bundled inputs for one AWQ weight-matrix dequantization, shared by the
 /// per-dtype calls to [`fill_awq_weight`].
 struct AwqDequantPlan<'a> {
@@ -881,7 +761,9 @@ pub fn rtn_quantize_awq(weight: &Tensor, group_size: usize) -> Result<AwqRawTens
         .t()?
         .contiguous()?;
 
-    Ok(QuantWeight::new_awq(qweight, qzeros, scales))
+    // RTN produces 4-bit packed weights — the AWQ_PACK_FACTOR=8 path above
+    // assumes nibbles per int32.
+    Ok(QuantWeight::new_awq(4, qweight, qzeros, scales))
 }
 
 #[cfg(test)]
@@ -1094,7 +976,7 @@ mod tests {
         let qzeros = Tensor::from_vec(qzeros_data, (groups, packed_out), &device)?;
         let scales_t = Tensor::from_vec(scales, (groups, out_features), &device)?;
 
-        let raw = QuantWeight::new_awq(qweight, qzeros, scales_t);
+        let raw = QuantWeight::new_awq(4, qweight, qzeros, scales_t);
         let dequant = dequantize_awq(&raw, &device, DType::F32)?;
         assert_eq!(dequant.dims(), [out_features, in_features]);
 
@@ -1120,7 +1002,7 @@ mod tests {
         let qweight = Tensor::from_vec(qweight_data, (in_features, packed_out), device)?;
         let qzeros = Tensor::from_vec(qzeros_data, (groups, packed_out), device)?;
         let scales_t = Tensor::from_vec(scales.to_vec(), (groups, out_features), device)?;
-        Ok(QuantWeight::new_awq(qweight, qzeros, scales_t))
+        Ok(QuantWeight::new_awq(4, qweight, qzeros, scales_t))
     }
 
     #[test]
@@ -1210,7 +1092,7 @@ mod tests {
         let qweight = Tensor::zeros((8, 2), DType::I32, &device)?;
         let qzeros = Tensor::zeros((2, 2), DType::I32, &device)?;
         let scales = Tensor::zeros((2, 8), DType::F32, &device)?;
-        let raw = QuantWeight::new_awq(qweight, qzeros, scales);
+        let raw = QuantWeight::new_awq(4, qweight, qzeros, scales);
         assert!(dequantize_awq(&raw, &device, DType::F32).is_err());
         Ok(())
     }
@@ -1324,116 +1206,6 @@ mod tests {
             assert!(
                 (g - e).abs() < 1e-5,
                 "GPTQ-Int8 dequant: got={g} expected={e}"
-            );
-        }
-        Ok(())
-    }
-
-    /// Encode an f32 to its closest E2M1 nibble (sign + 3-bit magnitude).
-    /// Used only in the MXFP4 parity tests below.
-    fn encode_e2m1(v: f32) -> u8 {
-        let sign = if v.is_sign_negative() { 1u8 } else { 0u8 };
-        let mag = v.abs();
-        let codes: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
-        let mut best = 0usize;
-        let mut best_d = f32::INFINITY;
-        for (i, &c) in codes.iter().enumerate() {
-            let d = (c - mag).abs();
-            if d < best_d {
-                best_d = d;
-                best = i;
-            }
-        }
-        (sign << 3) | (best as u8)
-    }
-
-    #[test]
-    fn mxfp4_decode_table_matches_ocp_spec() {
-        // Spot-check key encoding values per the OCP MX FP4 (E2M1) spec.
-        // Positive magnitudes use the unsigned LUT; sign bit flips them.
-        let cases: &[(u8, f32)] = &[
-            (0b0000, 0.0),
-            (0b0001, 0.5),
-            (0b0010, 1.0),
-            (0b0011, 1.5),
-            (0b0100, 2.0),
-            (0b0101, 3.0),
-            (0b0110, 4.0),
-            (0b0111, 6.0),
-            (0b1000, -0.0), // sign × 0 — kept as -0 but tests use abs comparisons
-            (0b1001, -0.5),
-            (0b1111, -6.0),
-        ];
-        for &(nib, expected) in cases {
-            let v = mxfp4_decode(nib);
-            // -0.0 == 0.0 in == but bit_eq fails; the spec treats both as 0.
-            if expected.abs() == 0.0 {
-                assert_eq!(v.abs(), 0.0, "nib {nib:#06b}: expected ±0, got {v}");
-            } else {
-                assert!(
-                    (v - expected).abs() < 1e-6,
-                    "nib {nib:#06b}: expected {expected}, got {v}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn mxfp4_dequantize_round_trips_perfect_values() -> Result<()> {
-        // Hand-build a small MXFP4 tensor: 2 rows × 64 cols (2 blocks per row).
-        let rows = 2usize;
-        let cols = 64usize;
-        let blocks_per_row = cols / MXFP4_BLOCK;
-        let bytes_per_row = cols / 2;
-
-        // Values chosen to land exactly on the E2M1 grid for both block scales.
-        // Row 0, block 0: scale=2^0=1; values cycle through ±{0,0.5,1,1.5,2,3,4,6}
-        // Row 0, block 1: scale=2^1=2; values are 2× the above
-        // Row 1: scale=2^-1=0.5; values are 0.5× the row-0/block-0 pattern
-        let value_template: [f32; MXFP4_BLOCK] = {
-            let mut t = [0.0f32; MXFP4_BLOCK];
-            let codes = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
-            for (i, slot) in t.iter_mut().enumerate() {
-                let mag = codes[i % 8];
-                *slot = if (i / 8) % 2 == 0 { mag } else { -mag };
-            }
-            t
-        };
-
-        let mut expected = vec![0f32; rows * cols];
-        let mut blocks_bytes = vec![0u8; rows * bytes_per_row];
-        let mut scales = vec![0u8; rows * blocks_per_row];
-
-        for r in 0..rows {
-            for b in 0..blocks_per_row {
-                // Distinct scale per (row, block) to exercise the apply_scale code.
-                let scale_exp: i32 = (b as i32) + if r == 0 { 0 } else { -1 };
-                let scale_byte = (127 + scale_exp) as u8;
-                scales[r * blocks_per_row + b] = scale_byte;
-                let scale_mul = (2.0f32).powi(scale_exp);
-                for k in 0..MXFP4_BLOCK {
-                    let v = value_template[k];
-                    expected[r * cols + b * MXFP4_BLOCK + k] = v * scale_mul;
-                    let nib = encode_e2m1(v);
-                    let byte_idx = r * bytes_per_row + (b * (MXFP4_BLOCK / 2)) + k / 2;
-                    if k % 2 == 0 {
-                        blocks_bytes[byte_idx] = nib;
-                    } else {
-                        blocks_bytes[byte_idx] |= nib << 4;
-                    }
-                }
-            }
-        }
-
-        let device = Device::Cpu;
-        let dq = dequantize_mxfp4(&blocks_bytes, &scales, rows, cols, &device, DType::F32)?;
-        assert_eq!(dq.dims(), [rows, cols]);
-
-        let got: Vec<f32> = dq.flatten_all()?.to_vec1()?;
-        for (i, (g, e)) in got.iter().zip(expected.iter()).enumerate() {
-            assert!(
-                (g - e).abs() < 1e-6,
-                "MXFP4 dequant mismatch at i={i}: got={g} expected={e}"
             );
         }
         Ok(())

@@ -756,15 +756,15 @@ fn load_standard_safetensors(
             }
 
             // Option A (4-bit tied lm_head via RTN) only makes sense when the
-            // model is already AWQ — for GPTQ the tied lm_head is shared with
-            // the embedding tensor (plain bf16/fp16), no need to re-quantize.
+            // model is already AWQ-4bit — `rtn_quantize_awq` produces 4-bit
+            // packed weights, so 8-bit AWQ takes the plain-tied path.
             #[cfg(feature = "metal")]
             if has_packed_quantized_weights
                 && device.is_metal()
                 && matches!(dtype, DType::F16 | DType::BF16)
                 && matches!(
                     weights.quant_scheme(),
-                    Some(crate::common::weights::QuantScheme::Awq)
+                    Some(crate::common::weights::QuantScheme::Awq { bits: 4 })
                 )
             {
                 let raw = crate::common::awq::rtn_quantize_awq(&embed_weight, 128)?;

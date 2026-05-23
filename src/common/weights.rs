@@ -7,12 +7,11 @@ use rustc_hash::FxHashMap;
 /// tensors present (plain fp16/bf16/fp8 model).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum QuantScheme {
-    Awq,
-    /// GPTQ; `sym` ⇒ no `qzeros` (implicit zero = `2^(bits-1)`).
-    Gptq {
-        bits: u32,
-        sym: bool,
-    },
+    /// autoawq GEMM (interleaved out-dim packing). `bits` is 4 or 8.
+    Awq { bits: u32 },
+    /// auto-gptq sequential in-dim packing. `sym=true` collapses dequant to
+    /// `q - 2^(bits-1)` (the on-disk `qzeros` still holds that constant).
+    Gptq { bits: u32, sym: bool },
 }
 
 pub struct ModelWeights {
@@ -306,11 +305,13 @@ impl ModelWeights {
         self.try_get(&format!("{}_scale_inv", weight_name))
     }
 
-    pub fn try_get_awq(&self, prefix: &str) -> Option<AwqRawTensors> {
+    /// `bits` ∈ {4, 8}: the autoawq GEMM packing factor is `32/bits`. The
+    /// internal Metal kernel selection (`w4a16_*` vs `w8a16_*`) keys off this.
+    pub fn try_get_awq(&self, prefix: &str, bits: u32) -> Option<AwqRawTensors> {
         let qweight = self.try_get(&format!("{prefix}.qweight"))?.clone();
         let qzeros = self.try_get(&format!("{prefix}.qzeros"))?.clone();
         let scales = self.try_get(&format!("{prefix}.scales"))?.clone();
-        Some(QuantWeight::new_awq(qweight, qzeros, scales))
+        Some(QuantWeight::new_awq(bits, qweight, qzeros, scales))
     }
 
     /// GPTQ variant: `qweight` is packed along **in_features**, `g_idx` is
@@ -335,7 +336,7 @@ impl ModelWeights {
     /// packed-int tensors *or* the model has no quant scheme.
     pub fn try_get_quant(&self, prefix: &str) -> Option<QuantWeight> {
         match self.quant_scheme {
-            Some(QuantScheme::Awq) => self.try_get_awq(prefix),
+            Some(QuantScheme::Awq { bits }) => self.try_get_awq(prefix, bits),
             Some(QuantScheme::Gptq { bits, sym }) => self.try_get_gptq(prefix, bits, sym),
             None => None,
         }

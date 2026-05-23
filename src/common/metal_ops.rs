@@ -1732,9 +1732,8 @@ pub fn w4a16_matmul(
 }
 
 /// Fused W8A16 matmul: same as [`w4a16_matmul`] but for 8-bit AWQ-style packed
-/// weights (`pack_factor = 4`, sequential pack order). Currently exercised
-/// only by the parity tests; ready for AWQ-8bit checkpoints once one ships.
-#[allow(dead_code)]
+/// weights (`pack_factor = 4`, sequential pack order). Dispatched from
+/// `PackedQuantLinear::forward` whenever `bits == 8`.
 pub fn w8a16_matmul(
     x: &Tensor,
     qweight: &Tensor,
@@ -1774,8 +1773,8 @@ pub fn dequantize_w4(qweight: &Tensor, qzeros: &Tensor, scales: &Tensor) -> Resu
     })
 }
 
-/// 8-bit variant of [`dequantize_w4`]. Same dead-code rationale as [`w8a16_matmul`].
-#[allow(dead_code)]
+/// 8-bit variant of [`dequantize_w4`]. Dispatched from
+/// `PackedQuantLinear::forward` for the M>1 (prefill / batched) path.
 pub fn dequantize_w8(qweight: &Tensor, qzeros: &Tensor, scales: &Tensor) -> Result<Tensor> {
     qweight.apply_op1_no_bwd(&DequantizeW4 {
         qzeros: qzeros.clone(),
@@ -2473,7 +2472,7 @@ mod fused_kernel_parity_tests {
             .unwrap()
             .to_dtype(dtype)
             .unwrap();
-        AwqRawTensors::new_awq(qweight, qzeros, scales)
+        AwqRawTensors::new_awq(4, qweight, qzeros, scales)
     }
 
     /// Tolerance dominated by the kernel's single F16/BF16 output rounding.

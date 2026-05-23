@@ -331,15 +331,19 @@ fn validate_quantization_config(v: &Value) -> Result<Option<crate::common::weigh
 
     match method.to_ascii_lowercase().as_str() {
         "awq" => {
-            // Only 4-bit AWQ has a tested resident kernel today; 8-bit AWQ is a
-            // theoretical future (the bit-parametric template instantiates with
-            // BITS=8 trivially) but no test checkpoint exists locally, so we
-            // continue to gate it.
-            if bits != Some(4) {
+            // Bit-parametric AWQ template supports 4-bit (W4A16, primary path,
+            // covered by Qwen3-4B-AWQ end-to-end) and 8-bit (W8A16, covered by
+            // the metal_ops parity tests). Both instantiate the same kernel
+            // template; the runtime selection happens in
+            // `PackedQuantLinear::forward` based on `QuantWeight::bits`.
+            let bits = bits.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "AWQ checkpoint missing required 'bits' field in quantization_config"
+                )
+            })? as u32;
+            if !matches!(bits, 4 | 8) {
                 anyhow::bail!(
-                    "AWQ checkpoint requires 4-bit weights, found bits={:?}. \
-                     Only 4-bit AWQ is supported in the resident W4A16 path.",
-                    bits
+                    "AWQ checkpoint bits={bits} not supported. Only 4 and 8 bits are recognised."
                 );
             }
             if !version.eq_ignore_ascii_case("gemm") {
@@ -351,11 +355,11 @@ fn validate_quantization_config(v: &Value) -> Result<Option<crate::common::weigh
             tracing::info!(
                 quant = "awq",
                 version = "gemm",
-                bits = 4,
+                bits,
                 group_size = group_size.unwrap_or(128),
-                "AWQ 4-bit checkpoint detected (W4A16 fused matmul on Metal)"
+                "AWQ checkpoint detected (W{bits}A16 fused matmul on Metal)"
             );
-            Ok(Some(crate::common::weights::QuantScheme::Awq))
+            Ok(Some(crate::common::weights::QuantScheme::Awq { bits }))
         }
         "fp8" => {
             tracing::info!(

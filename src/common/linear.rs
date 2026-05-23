@@ -394,18 +394,19 @@ pub struct PackedQuantLinear {
     bias: Option<Tensor>,
     in_features: usize,
     out_features: usize,
+    /// 4 or 8 — selects the W4A16 vs W8A16 kernel instantiation in `forward`.
+    bits: u32,
 }
 
 #[cfg(feature = "metal")]
 impl PackedQuantLinear {
     pub fn new(raw: AwqRawTensors, bias: Option<Tensor>, dtype: DType) -> Result<Self> {
-        // PackedQuantLinear is the W4A16 resident path; it currently only
-        // handles AWQ-style 4-bit (out-dim interleaved) tensors. GPTQ goes
-        // through the dequant-at-load path (`AnyLinear::from_gptq`).
-        if !matches!(raw.pack_dim, crate::common::awq::PackDim::Out) || raw.bits != 4 {
+        // PackedQuantLinear is the W{4,8}A16 resident path. GPTQ (PackDim::In)
+        // goes through the dequant-at-load path via `AnyLinear::from_quant`.
+        if !matches!(raw.pack_dim, crate::common::awq::PackDim::Out) || !matches!(raw.bits, 4 | 8) {
             candle_core::bail!(
-                "PackedQuantLinear: only AWQ 4-bit (PackDim::Out) is supported in the resident path; \
-                 got bits={} pack_dim={:?}",
+                "PackedQuantLinear: only AWQ 4-bit and 8-bit (PackDim::Out) are supported \
+                 in the resident path; got bits={} pack_dim={:?}",
                 raw.bits,
                 raw.pack_dim,
             );
@@ -424,6 +425,7 @@ impl PackedQuantLinear {
             bias,
             in_features,
             out_features,
+            bits: raw.bits,
         })
     }
 
@@ -440,12 +442,21 @@ impl PackedQuantLinear {
         let x_2d = x.reshape((m, in_features))?.contiguous()?;
 
         // M=1 (decode) → fused GEMV kernel; M>1 (prefill / batched) → dequantize
-        // to a transient weight and use the tuned matmul.
+        // to a transient weight and use the tuned matmul. Both paths fork on
+        // `self.bits` to pick the W4A16 or W8A16 instantiation of the
+        // bit-parametric AWQ template.
         let y_2d = if m == 1 {
-            super::metal_ops::w4a16_matmul(&x_2d, &self.qweight, &self.qzeros, &self.scales)?
+            if self.bits == 8 {
+                super::metal_ops::w8a16_matmul(&x_2d, &self.qweight, &self.qzeros, &self.scales)?
+            } else {
+                super::metal_ops::w4a16_matmul(&x_2d, &self.qweight, &self.qzeros, &self.scales)?
+            }
         } else {
-            let weight =
-                super::metal_ops::dequantize_w4(&self.qweight, &self.qzeros, &self.scales)?;
+            let weight = if self.bits == 8 {
+                super::metal_ops::dequantize_w8(&self.qweight, &self.qzeros, &self.scales)?
+            } else {
+                super::metal_ops::dequantize_w4(&self.qweight, &self.qzeros, &self.scales)?
+            };
             x_2d.matmul(&weight)?
         };
 
@@ -609,7 +620,7 @@ mod tests {
         )?;
         let scales_t = Tensor::from_vec(scales.clone(), (groups, out_features), &device)?;
 
-        let raw = AwqRawTensors::new_awq(qweight, qzeros, scales_t);
+        let raw = AwqRawTensors::new_awq(4, qweight, qzeros, scales_t);
         let bias_vec: Vec<f32> = (0..out_features).map(|j| 0.1 * j as f32).collect();
         let bias = Tensor::from_vec(bias_vec.clone(), (out_features,), &device)?;
         let awq_linear = AnyLinear::from_awq(&raw, Some(bias.clone()), &device, DType::F32)?;

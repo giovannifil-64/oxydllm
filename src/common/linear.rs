@@ -182,6 +182,8 @@ impl GgufFastPath {
             GgmlDType::Q5_0 => super::metal_ops::GgufFastQuant::Q5_0,
             GgmlDType::Q8_0 => super::metal_ops::GgufFastQuant::Q8_0,
             GgmlDType::Q4K => super::metal_ops::GgufFastQuant::Q4K,
+            GgmlDType::Q5K => super::metal_ops::GgufFastQuant::Q5K,
+            GgmlDType::Q6K => super::metal_ops::GgufFastQuant::Q6K,
             _ => return Ok(None),
         };
         let shape_dims = qt.shape().dims();

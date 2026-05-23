@@ -2665,18 +2665,19 @@ pub enum GgufFastQuant {
     Q5_0,
     Q8_0,
     Q4K,
+    Q5K,
+    Q6K,
 }
 
 impl GgufFastQuant {
     /// (block_elems, block_bytes) — elements per quant block and bytes per block.
     pub fn block_layout(self) -> (usize, usize) {
         match self {
-            // d:f16 (2) + qh:u32 (4) + qs[16] = 22 bytes / 32 elements
             Self::Q5_0 => (32, 22),
-            // d:f16 (2) + qs[32] = 34 bytes / 32 elements
             Self::Q8_0 => (32, 34),
-            // d:f16 (2) + dmin:f16 (2) + scales[12] + qs[128] = 144 bytes / 256 elements
             Self::Q4K => (256, 144),
+            Self::Q5K => (256, 176),
+            Self::Q6K => (256, 210),
         }
     }
 
@@ -2685,6 +2686,8 @@ impl GgufFastQuant {
             Self::Q5_0 => "gguf_q5_0_gemv_bf16",
             Self::Q8_0 => "gguf_q8_0_gemv_bf16",
             Self::Q4K => "gguf_q4k_gemv_bf16",
+            Self::Q5K => "gguf_q5k_gemv_bf16",
+            Self::Q6K => "gguf_q6k_gemv_bf16",
         }
     }
 
@@ -2693,6 +2696,8 @@ impl GgufFastQuant {
             Self::Q5_0 => "gguf_q5_0_mul_mm_bf16",
             Self::Q8_0 => "gguf_q8_0_mul_mm_bf16",
             Self::Q4K => "gguf_q4k_mul_mm_bf16",
+            Self::Q5K => "gguf_q5k_mul_mm_bf16",
+            Self::Q6K => "gguf_q6k_mul_mm_bf16",
         }
     }
 
@@ -2701,27 +2706,28 @@ impl GgufFastQuant {
             Self::Q5_0 => "gguf-q5_0-matmul",
             Self::Q8_0 => "gguf-q8_0-matmul",
             Self::Q4K => "gguf-q4k-matmul",
+            Self::Q5K => "gguf-q5k-matmul",
+            Self::Q6K => "gguf-q6k-matmul",
         }
     }
 
-    /// Dispatch geometry: `(threads_per_TG, rows_per_TG)`.
+    /// Dispatch geometry: `(threads_per_TG, rows_per_TG)`. Each candle
+    /// template has its own row-per-simdgroup ratio:
     ///
-    /// Q5_0 / Q8_0 follow the `mul_vec_q_n_f32` template: 2 simdgroups × 32
-    /// threads = 64 threads, 2 simdgroups × N_DST=4 rows = 8 rows per TG.
-    ///
-    /// Q4_K follows `kernel_mul_mv_q4_K_f32` which uses ONLY 1 simdgroup
-    /// (`first_row = r0 * N_DST`, ignores `sgitg`): 32 threads × 4 rows per TG.
-    /// Dispatching with 2 simdgroups would race-condition both simdgroups on
-    /// the same output rows.
+    /// | Quant | simdgroups/TG | rows/simdgroup | rows/TG | threads/TG |
+    /// |-------|---------------|----------------|---------|------------|
+    /// | Q5_0  | 2             | 4              | 8       | 64         |
+    /// | Q8_0  | 2             | 4              | 8       | 64         |
+    /// | Q4_K  | 1             | 4              | 4       | 32         |
+    /// | Q5_K  | 2             | 2              | 4       | 64         |
+    /// | Q6_K  | 2             | 1              | 2       | 64         |
     fn dispatch_geometry(self) -> (usize, usize) {
-        const N_DST: usize = 4;
         const SIMDWIDTH: usize = 32;
         match self {
-            Self::Q5_0 | Self::Q8_0 => {
-                let simdgroups = 2;
-                (simdgroups * SIMDWIDTH, simdgroups * N_DST)
-            }
-            Self::Q4K => (SIMDWIDTH, N_DST),
+            Self::Q5_0 | Self::Q8_0 => (2 * SIMDWIDTH, 2 * 4),
+            Self::Q4K => (SIMDWIDTH, 4),
+            Self::Q5K => (2 * SIMDWIDTH, 2 * 2),
+            Self::Q6K => (2 * SIMDWIDTH, 2),
         }
     }
 }
@@ -2921,6 +2927,8 @@ impl CustomOp1 for GgufQuantMulMM {
             GgufFastQuant::Q5_0 => "gguf-q5_0-mul-mm",
             GgufFastQuant::Q8_0 => "gguf-q8_0-mul-mm",
             GgufFastQuant::Q4K => "gguf-q4k-mul-mm",
+            GgufFastQuant::Q5K => "gguf-q5k-mul-mm",
+            GgufFastQuant::Q6K => "gguf-q6k-mul-mm",
         }
     }
 

@@ -534,6 +534,226 @@ kernel void gguf_q4k_gemv_bf16(
 }
 
 // =============================================================================
+// Q5_K GEMV bf16 — port of llama.cpp / candle `kernel_mul_mv_q5_K_f32_impl`.
+// Block layout (176 bytes, 256 elements):
+//   half d;             half dmin;          // global scale + min
+//   u8   scales[12];                        // 6-bit packed sub-block scales/mins
+//   u8   qh[32];                            // 5th bit per element
+//   u8   qs[128];                           // low 4 bits, 2 elements per byte
+// Geometry: 2 simdgroups × 2 rows per TG.
+// =============================================================================
+
+typedef struct {
+    half     d;
+    half     dmin;
+    uint8_t  scales[Q4_K_SCALE_SIZE];  // same 12-byte packing as Q4_K
+    uint8_t  qh[QK_K / 8];             // 32 bytes
+    uint8_t  qs[QK_K / 2];             // 128 bytes
+} block_q5_K;
+
+kernel void gguf_q5k_gemv_bf16(
+    device const bfloat       *x        [[buffer(0)]],
+    device const void         *weight   [[buffer(1)]],
+    device       bfloat       *out      [[buffer(2)]],
+    constant     GgufParams   &p        [[buffer(3)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    uint tiisg  [[thread_index_in_simdgroup]],
+    uint sgitg  [[simdgroup_index_in_threadgroup]])
+{
+    const uint16_t kmask1 = 0x3f3f;
+    const uint16_t kmask2 = 0x0f0f;
+    const uint16_t kmask3 = 0xc0c0;
+
+    const uint N  = p.out_features;
+    const uint K  = p.in_features;
+    const uint nb = K / QK_K;
+
+    const uint r0 = tgpig.x;
+    const uint first_row = (r0 * GGUF_N_SIMDGROUP + sgitg) * 2;
+    if (first_row >= N) return;
+
+    device const block_q5_K *x_blocks =
+        (device const block_q5_K *)weight + (ulong)first_row * (ulong)nb;
+
+    float sumf[2] = {0.f, 0.f};
+
+    const uint tid = tiisg / 4;     // 0..7
+    const uint ix  = tiisg % 4;     // 0..3 — which K-block stride
+    const uint iq  = tid / 4;       // 0 or 1 — which 128-element half
+    const uint ir  = tid % 4;       // 0..3 — which 8-element chunk
+    const uint nn  = 8;
+
+    const uint l0 = nn * ir;
+    const uint q_offset = 32 * iq + l0;
+    const uint y_offset = 64 * iq + l0;
+
+    const uint8_t hm1 = 1u << (2 * iq);
+    const uint8_t hm2 = hm1 << 1;
+    const uint8_t hm3 = hm1 << 4;
+    const uint8_t hm4 = hm2 << 4;
+
+    uint16_t sc16[4];
+    thread const uint8_t *sc8 = (thread const uint8_t *)sc16;
+
+    float yl[16], yh[16];
+    device const bfloat *y1 = x + ix * QK_K + y_offset;
+
+    // Byte offset between consecutive rows of the weight matrix
+    // (= `nb` blocks × sizeof(block_q5_K) bytes). After processing row 0,
+    // advance q1/qh by `step` bytes; dh/a are half*/u16* (2 bytes each)
+    // so they advance by `step/2` *elements* (= step bytes total).
+    const uint step = (uint)sizeof(block_q5_K) * nb;
+
+    for (uint i = ix; i < nb; i += 4) {
+        device const block_q5_K *xb = x_blocks + i;
+        device const uint8_t *q1 = xb->qs + q_offset;
+        device const uint8_t *qh = xb->qh + l0;
+        device const half    *dh = &xb->d;
+        device const uint16_t *a = (device const uint16_t *)xb->scales + iq;
+
+        device const bfloat *y2 = y1 + 128;
+        float4 sumy = {0.f, 0.f, 0.f, 0.f};
+        for (uint l = 0; l < 8; ++l) {
+            yl[l+0] = (float)y1[l+ 0]; sumy[0] += yl[l+0];
+            yl[l+8] = (float)y1[l+32]; sumy[1] += yl[l+8];
+            yh[l+0] = (float)y2[l+ 0]; sumy[2] += yh[l+0];
+            yh[l+8] = (float)y2[l+32]; sumy[3] += yh[l+8];
+        }
+
+        for (uint row = 0; row < 2; ++row) {
+            device const uint8_t *q2 = q1 + 64;
+
+            sc16[0] = a[0] & kmask1;
+            sc16[1] = a[2] & kmask1;
+            sc16[2] = ((a[4] >> 0) & kmask2) | ((a[0] & kmask3) >> 2);
+            sc16[3] = ((a[4] >> 4) & kmask2) | ((a[2] & kmask3) >> 2);
+
+            float4 acc1 = {0.f, 0.f, 0.f, 0.f};
+            float4 acc2 = {0.f, 0.f, 0.f, 0.f};
+            for (uint l = 0; l < nn; ++l) {
+                uint8_t h = qh[l];
+                acc1[0] += yl[l+0] * (q1[l] & 0x0F);
+                acc1[1] += yl[l+8] * (q1[l] & 0xF0);
+                acc1[2] += yh[l+0] * (q2[l] & 0x0F);
+                acc1[3] += yh[l+8] * (q2[l] & 0xF0);
+                acc2[0] += (h & hm1) ? yl[l+0] : 0.f;
+                acc2[1] += (h & hm2) ? yl[l+8] : 0.f;
+                acc2[2] += (h & hm3) ? yh[l+0] : 0.f;
+                acc2[3] += (h & hm4) ? yh[l+8] : 0.f;
+            }
+            const float dall = (float)dh[0];
+            const float dmin = (float)dh[1];
+            sumf[row] += dall * (sc8[0] * (acc1[0]      + 16.f*acc2[0]) +
+                                 sc8[1] * (acc1[1]/16.f + 16.f*acc2[1]) +
+                                 sc8[4] * (acc1[2]      + 16.f*acc2[2]) +
+                                 sc8[5] * (acc1[3]/16.f + 16.f*acc2[3])) -
+                         dmin * (sumy[0]*sc8[2] + sumy[1]*sc8[3] +
+                                 sumy[2]*sc8[6] + sumy[3]*sc8[7]);
+
+            q1 = (device const uint8_t *)((device const uint8_t *)q1 + step);
+            qh = (device const uint8_t *)((device const uint8_t *)qh + step);
+            dh = (device const half *)   ((device const uint8_t *)dh + step);
+            a  = (device const uint16_t *)((device const uint8_t *)a + step);
+        }
+
+        y1 += 4 * QK_K;
+    }
+
+    for (uint row = 0; row < 2; ++row) {
+        const float tot = simd_sum(sumf[row]);
+        const uint r = first_row + row;
+        if (tiisg == 0 && r < N) {
+            out[r] = (bfloat)tot;
+        }
+    }
+}
+
+// =============================================================================
+// Q6_K GEMV bf16 — port of llama.cpp / candle `kernel_mul_mv_q6_K_f32_impl`.
+// Block layout (210 bytes, 256 elements):
+//   u8   ql[128];                           // low 4 bits, 2 elements per byte
+//   u8   qh[64];                            // high 2 bits, 4 elements per byte
+//   i8   scales[16];                        // signed 8-bit, 1 per 16-element sub-block
+//   half d;                                 // global scale
+// Geometry: 2 simdgroups × 1 row per TG.
+// =============================================================================
+
+typedef struct {
+    uint8_t  ql[QK_K / 2];
+    uint8_t  qh[QK_K / 4];
+    int8_t   scales[QK_K / 16];
+    half     d;
+} block_q6_K;
+
+kernel void gguf_q6k_gemv_bf16(
+    device const bfloat       *x        [[buffer(0)]],
+    device const void         *weight   [[buffer(1)]],
+    device       bfloat       *out      [[buffer(2)]],
+    constant     GgufParams   &p        [[buffer(3)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    uint tiisg  [[thread_index_in_simdgroup]],
+    uint sgitg  [[simdgroup_index_in_threadgroup]])
+{
+    const uint8_t kmask1 = 0x03;
+    const uint8_t kmask2 = 0x0C;
+    const uint8_t kmask3 = 0x30;
+    const uint8_t kmask4 = 0xC0;
+
+    const uint N  = p.out_features;
+    const uint K  = p.in_features;
+    const uint nb = K / QK_K;
+
+    const uint r0 = tgpig.x;
+    const uint row = 2 * r0 + sgitg;
+    if (row >= N) return;
+
+    device const block_q6_K *x_blocks =
+        (device const block_q6_K *)weight + (ulong)row * (ulong)nb;
+
+    const uint tid = tiisg / 2;
+    const uint ix  = tiisg % 2;
+    const uint ip  = tid / 8;
+    const uint il  = tid % 8;
+    const uint nn  = 4;
+    const uint l0  = nn * il;
+    const uint is  = 8 * ip + l0 / 16;
+
+    const uint y_offset    = 128 * ip + l0;
+    const uint q_offset_l  = 64  * ip + l0;
+    const uint q_offset_h  = 32  * ip + l0;
+
+    float sumf = 0.f;
+    for (uint i = ix; i < nb; i += 2) {
+        device const block_q6_K *xb = x_blocks + i;
+        device const uint8_t *q1 = xb->ql + q_offset_l;
+        device const uint8_t *q2 = q1 + 32;
+        device const uint8_t *qh = xb->qh + q_offset_h;
+        device const int8_t  *sc = xb->scales + is;
+        device const bfloat  *y  = x + i * QK_K + y_offset;
+        const float dall = (float)xb->d;
+
+        float4 sums = {0.f, 0.f, 0.f, 0.f};
+        for (uint l = 0; l < nn; ++l) {
+            sums[0] += (float)y[l+ 0] *
+                       (float)((int8_t)((q1[l] & 0xF) | ((qh[l] & kmask1) << 4)) - 32);
+            sums[1] += (float)y[l+32] *
+                       (float)((int8_t)((q2[l] & 0xF) | ((qh[l] & kmask2) << 2)) - 32);
+            sums[2] += (float)y[l+64] *
+                       (float)((int8_t)((q1[l]  >> 4) | ((qh[l] & kmask3) << 0)) - 32);
+            sums[3] += (float)y[l+96] *
+                       (float)((int8_t)((q2[l]  >> 4) | ((qh[l] & kmask4) >> 2)) - 32);
+        }
+        sumf += dall * (sums[0]*sc[0] + sums[1]*sc[2] +
+                        sums[2]*sc[4] + sums[3]*sc[6]);
+    }
+
+    const float tot = simd_sum(sumf);
+    if (tiisg == 0 && row < N) {
+        out[row] = (bfloat)tot;
+    }
+}
+
+// =============================================================================
 // Fused mul_mm_q*_bf16 — GEMM for M>1 (prefill).
 //
 // `out[M,N] = x[M,K] @ W[K,N].T` where W is GGUF-quantized. The weight is
@@ -656,6 +876,83 @@ inline void gguf_q4k_dequant_strip_into(
         const uint nibble = (lo == 0) ? (uint)(blk->qs[iq * 32 + elem] & 0x0Fu)
                                        : (uint)(blk->qs[iq * 32 + elem] >> 4);
         w_tile[c][j] = (bfloat)(sc_v * (float)nibble - m_v);
+    }
+}
+
+inline void gguf_q5k_dequant_strip_into(
+    threadgroup bfloat (&w_tile)[GGUF_MM_BN][QK_K],
+    device const block_q5_K *w_blocks_base,
+    uint n_base,
+    uint n_total,
+    uint nb,
+    uint b,
+    uint tg_tid)
+{
+    // Q5_K mirrors Q4_K's sub-block structure (8 half-blocks × 32 elements)
+    // plus a 5th bit per element in `qh` (bit `2*iq + lo` of qh[elem]).
+    for (uint kk = tg_tid; kk < GGUF_MM_BN * QK_K; kk += GGUF_MM_TG) {
+        const uint c = kk / QK_K;
+        const uint j = kk % QK_K;
+        const uint n = n_base + c;
+        if (n >= n_total) { continue; }
+        device const block_q5_K *blk = w_blocks_base + (ulong)n * (ulong)nb + (ulong)b;
+        const float d    = (float)blk->d;
+        const float dmin = (float)blk->dmin;
+        const uint half_idx = j / 32;
+        const uint elem     = j % 32;
+        uint sc_byte, m_byte;
+        gguf_q4k_get_scale_min(half_idx, blk->scales, sc_byte, m_byte);
+        const float sc_v = d    * (float)sc_byte;
+        const float m_v  = dmin * (float)m_byte;
+
+        const uint iq = half_idx / 2;
+        const uint lo = half_idx % 2;
+        const uint ql_byte = blk->qs[iq * 32 + elem];
+        const uint low4    = (lo == 0) ? (ql_byte & 0x0Fu) : (ql_byte >> 4);
+        const uint qh_bit  = (uint)(blk->qh[elem] >> (2u * iq + lo)) & 1u;
+        const uint qv      = low4 | (qh_bit << 4);
+        w_tile[c][j] = (bfloat)(sc_v * (float)qv - m_v);
+    }
+}
+
+inline void gguf_q6k_dequant_strip_into(
+    threadgroup bfloat (&w_tile)[GGUF_MM_BN][QK_K],
+    device const block_q6_K *w_blocks_base,
+    uint n_base,
+    uint n_total,
+    uint nb,
+    uint b,
+    uint tg_tid)
+{
+    // Q6_K: 2 halves × 4 quadrants × 32 elements per super-block. Per element:
+    // 4 bits from `ql` + 2 bits from `qh` → signed 6-bit (offset −32). 16 i8
+    // scales (one per 16-element sub-block). See candle's `BlockQ6K::to_float`.
+    for (uint kk = tg_tid; kk < GGUF_MM_BN * QK_K; kk += GGUF_MM_TG) {
+        const uint c = kk / QK_K;
+        const uint j = kk % QK_K;
+        const uint n = n_base + c;
+        if (n >= n_total) { continue; }
+        device const block_q6_K *blk = w_blocks_base + (ulong)n * (ulong)nb + (ulong)b;
+        const float d = (float)blk->d;
+
+        const uint idx_half = j / 128;
+        const uint pos      = j % 128;
+        const uint quadrant = pos / 32;
+        const uint l        = pos % 32;
+
+        device const uint8_t *ql_base = blk->ql + 64u * idx_half;
+        device const uint8_t *qh_base = blk->qh + 32u * idx_half;
+
+        const uint ql_byte_idx = (quadrant & 1u) ? (l + 32u) : l;
+        const uint shift_ql    = (quadrant < 2u) ? 0u : 4u;
+        const uint shift_qh    = 2u * quadrant;
+        const uint ql_nibble   = (ql_base[ql_byte_idx] >> shift_ql) & 0x0Fu;
+        const uint qh_bits     = (qh_base[l] >> shift_qh) & 0x03u;
+        const int  qv          = (int)(ql_nibble | (qh_bits << 4)) - 32;
+
+        const uint scale_idx = 8u * idx_half + 2u * quadrant + (l / 16u);
+        const float sc_v = d * (float)blk->scales[scale_idx];
+        w_tile[c][j] = (bfloat)(sc_v * (float)qv);
     }
 }
 
@@ -790,6 +1087,98 @@ kernel void gguf_q4k_mul_mm_bf16(
     float acc = 0.0f;
     for (uint b = 0; b < nb; ++b) {
         gguf_q4k_dequant_strip_into(w_tile, w_base, n_base, N, nb, b, tg_tid);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (m < M && n < N) {
+            device const bfloat *x_chunk = x + (ulong)m * (ulong)K + (ulong)b * (ulong)QK_K;
+            float partial = 0.0f;
+            for (uint j = 0; j < QK_K; ++j) {
+                partial += (float)x_chunk[j] * (float)w_tile[n_off][j];
+            }
+            acc += partial;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (m < M && n < N) {
+        out[(ulong)m * (ulong)N + (ulong)n] = (bfloat)acc;
+    }
+}
+
+kernel void gguf_q5k_mul_mm_bf16(
+    device const bfloat            *x        [[buffer(0)]],
+    device const void              *weight   [[buffer(1)]],
+    device       bfloat            *out      [[buffer(2)]],
+    constant     GgufMatmulParams  &p        [[buffer(3)]],
+    uint3  tg_tid_xy [[thread_position_in_threadgroup]],
+    uint3  tgpig     [[threadgroup_position_in_grid]])
+{
+    threadgroup bfloat w_tile[GGUF_MM_BN][QK_K];
+
+    const uint M  = p.m_total;
+    const uint N  = p.n_total;
+    const uint K  = p.k_total;
+    const uint nb = K / QK_K;
+
+    const uint n_base = tgpig.x * GGUF_MM_BN;
+    const uint m_base = tgpig.y * GGUF_MM_BM;
+    const uint n_off  = tg_tid_xy.x;
+    const uint m_off  = tg_tid_xy.y;
+    const uint n      = n_base + n_off;
+    const uint m      = m_base + m_off;
+    const uint tg_tid = m_off * GGUF_MM_BN + n_off;
+
+    device const block_q5_K *w_base = (device const block_q5_K *)weight;
+
+    float acc = 0.0f;
+    for (uint b = 0; b < nb; ++b) {
+        gguf_q5k_dequant_strip_into(w_tile, w_base, n_base, N, nb, b, tg_tid);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (m < M && n < N) {
+            device const bfloat *x_chunk = x + (ulong)m * (ulong)K + (ulong)b * (ulong)QK_K;
+            float partial = 0.0f;
+            for (uint j = 0; j < QK_K; ++j) {
+                partial += (float)x_chunk[j] * (float)w_tile[n_off][j];
+            }
+            acc += partial;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (m < M && n < N) {
+        out[(ulong)m * (ulong)N + (ulong)n] = (bfloat)acc;
+    }
+}
+
+kernel void gguf_q6k_mul_mm_bf16(
+    device const bfloat            *x        [[buffer(0)]],
+    device const void              *weight   [[buffer(1)]],
+    device       bfloat            *out      [[buffer(2)]],
+    constant     GgufMatmulParams  &p        [[buffer(3)]],
+    uint3  tg_tid_xy [[thread_position_in_threadgroup]],
+    uint3  tgpig     [[threadgroup_position_in_grid]])
+{
+    threadgroup bfloat w_tile[GGUF_MM_BN][QK_K];
+
+    const uint M  = p.m_total;
+    const uint N  = p.n_total;
+    const uint K  = p.k_total;
+    const uint nb = K / QK_K;
+
+    const uint n_base = tgpig.x * GGUF_MM_BN;
+    const uint m_base = tgpig.y * GGUF_MM_BM;
+    const uint n_off  = tg_tid_xy.x;
+    const uint m_off  = tg_tid_xy.y;
+    const uint n      = n_base + n_off;
+    const uint m      = m_base + m_off;
+    const uint tg_tid = m_off * GGUF_MM_BN + n_off;
+
+    device const block_q6_K *w_base = (device const block_q6_K *)weight;
+
+    float acc = 0.0f;
+    for (uint b = 0; b < nb; ++b) {
+        gguf_q6k_dequant_strip_into(w_tile, w_base, n_base, N, nb, b, tg_tid);
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         if (m < M && n < N) {

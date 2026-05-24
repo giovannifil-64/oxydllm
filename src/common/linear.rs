@@ -1,6 +1,12 @@
-use crate::common::awq::{AwqRawTensors, PackDim, QuantWeight, dequantize_awq, dequantize_quant};
+#[cfg(feature = "metal")]
+use crate::common::awq::PackDim;
+#[cfg(any(feature = "metal", test))]
+use crate::common::awq::{AwqRawTensors, dequantize_awq};
+use crate::common::awq::{QuantWeight, dequantize_quant};
 use crate::common::weights::apply_scale_inv;
-use candle_core::quantized::{GgmlDType, QMatMul, QTensor};
+#[cfg(feature = "metal")]
+use candle_core::quantized::GgmlDType;
+use candle_core::quantized::{QMatMul, QTensor};
 use candle_core::{DType, Device, Result, Tensor};
 use std::sync::Arc;
 
@@ -297,13 +303,13 @@ impl QLinear {
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let original_dims = x.dims().to_vec();
         let in_features = *original_dims.last().unwrap();
-        let m: usize = original_dims[..original_dims.len() - 1].iter().product();
 
         #[cfg(feature = "metal")]
         if let Some(ref fast) = self.gguf_fast
             && in_features == fast.in_features
             && x.dtype() == DType::BF16
         {
+            let m: usize = original_dims[..original_dims.len() - 1].iter().product();
             let out = if m == 1 {
                 fast.forward_decode(x)?
             } else {
@@ -496,6 +502,7 @@ impl AnyLinear {
         }
     }
 
+    #[cfg(any(feature = "metal", test))]
     pub fn from_awq(
         raw: &AwqRawTensors,
         bias: Option<Tensor>,

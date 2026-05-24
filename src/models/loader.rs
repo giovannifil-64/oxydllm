@@ -666,6 +666,7 @@ fn load_standard_safetensors(
     let weights =
         ModelWeights::load(&weight_path_refs, device, dtype)?.with_quant_scheme(cfg.quant_scheme);
     let weights_size = weights.runtime_size_bytes();
+    #[cfg(feature = "metal")]
     let has_packed_quantized_weights = weights.has_packed_quantized_weights();
 
     let num_layers = cfg.num_hidden_layers;

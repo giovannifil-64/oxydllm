@@ -45,14 +45,12 @@ pub enum ZeroPointMode {
 #[derive(Clone)]
 pub struct QuantWeight {
     pub bits: u32,
-    pub group_size: usize,
     pub pack_dim: PackDim,
     pub pack_order: PackOrder,
     pub zero_point: ZeroPointMode,
     pub qweight: Tensor,
     pub qzeros: Option<Tensor>,
     pub scales: Tensor,
-    pub g_idx: Option<Tensor>,
 }
 
 pub type AwqRawTensors = QuantWeight;
@@ -62,14 +60,12 @@ impl QuantWeight {
         debug_assert!(matches!(bits, 4 | 8), "AWQ bits must be 4 or 8, got {bits}");
         Self {
             bits,
-            group_size: 128,
             pack_dim: PackDim::Out,
             pack_order: PackOrder::AwqInterleaved,
             zero_point: ZeroPointMode::Signed,
             qweight,
             qzeros: Some(qzeros),
             scales,
-            g_idx: None,
         }
     }
 
@@ -79,11 +75,9 @@ impl QuantWeight {
         qweight: Tensor,
         qzeros: Option<Tensor>,
         scales: Tensor,
-        g_idx: Option<Tensor>,
     ) -> Self {
         Self {
             bits,
-            group_size: 128,
             pack_dim: PackDim::In,
             pack_order: PackOrder::Sequential,
             zero_point: if sym {
@@ -94,7 +88,6 @@ impl QuantWeight {
             qweight,
             qzeros,
             scales,
-            g_idx,
         }
     }
 
@@ -128,22 +121,20 @@ impl QuantWeight {
         Ok(in_features / groups)
     }
 
+    #[cfg(any(feature = "metal", test))]
     pub fn runtime_size_bytes(&self) -> usize {
         let mut acc = self.qweight.dtype().size_in_bytes() * self.qweight.elem_count()
             + self.scales.dtype().size_in_bytes() * self.scales.elem_count();
         if let Some(qz) = &self.qzeros {
             acc += qz.dtype().size_in_bytes() * qz.elem_count();
         }
-        if let Some(gi) = &self.g_idx {
-            acc += gi.dtype().size_in_bytes() * gi.elem_count();
-        }
         acc
     }
 
+    #[cfg(any(feature = "metal", test))]
     pub fn to_device(&self, device: &Device) -> Result<Self> {
         Ok(Self {
             bits: self.bits,
-            group_size: self.group_size,
             pack_dim: self.pack_dim,
             pack_order: self.pack_order,
             zero_point: self.zero_point,
@@ -160,11 +151,6 @@ impl QuantWeight {
                 .scales
                 .to_device(device)
                 .context("quant scales → device")?,
-            g_idx: self
-                .g_idx
-                .as_ref()
-                .map(|t| t.to_device(device).context("quant g_idx → device"))
-                .transpose()?,
         })
     }
 }
@@ -572,6 +558,7 @@ fn fill_awq_weight<T: candle_core::WithDType + Send>(
 }
 
 // RTN 4-bit group-wise AWQ quantization (autoawq GEMM-compatible).
+#[cfg(any(feature = "metal", test))]
 pub fn rtn_quantize_awq(weight: &Tensor, group_size: usize) -> Result<AwqRawTensors> {
     use rayon::prelude::*;
 
@@ -1096,7 +1083,7 @@ mod tests {
         let qzeros = Tensor::from_vec(qz_data, (groups, packed_out), &device)?;
         let scales_t = Tensor::from_vec(scales, (groups, out_features), &device)?;
 
-        let raw = QuantWeight::new_gptq(bits, false, qweight, Some(qzeros), scales_t, None);
+        let raw = QuantWeight::new_gptq(bits, false, qweight, Some(qzeros), scales_t);
         let dq = dequantize_gptq(&raw, &device, DType::F32)?;
         assert_eq!(dq.dims(), [out_features, in_features]);
 
@@ -1154,7 +1141,7 @@ mod tests {
         let qzeros = Tensor::from_vec(qz_data, (groups, out_features / pf), &device)?;
         let scales_t = Tensor::from_vec(scales, (groups, out_features), &device)?;
 
-        let raw = QuantWeight::new_gptq(bits, false, qweight, Some(qzeros), scales_t, None);
+        let raw = QuantWeight::new_gptq(bits, false, qweight, Some(qzeros), scales_t);
         let dq = dequantize_gptq(&raw, &device, DType::F32)?;
         let got: Vec<f32> = dq.flatten_all()?.to_vec1()?;
         for (g, e) in got.iter().zip(expected.iter()) {

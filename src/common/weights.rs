@@ -232,6 +232,7 @@ impl ModelWeights {
         self
     }
 
+    #[cfg(feature = "metal")]
     pub fn quant_scheme(&self) -> Option<QuantScheme> {
         self.quant_scheme
     }
@@ -311,10 +312,7 @@ impl ModelWeights {
         let qweight = self.try_get(&format!("{prefix}.qweight"))?.clone();
         let scales = self.try_get(&format!("{prefix}.scales"))?.clone();
         let qzeros = self.try_get(&format!("{prefix}.qzeros")).cloned();
-        let g_idx = self.try_get(&format!("{prefix}.g_idx")).cloned();
-        Some(QuantWeight::new_gptq(
-            bits, sym, qweight, qzeros, scales, g_idx,
-        ))
+        Some(QuantWeight::new_gptq(bits, sym, qweight, qzeros, scales))
     }
 
     pub fn try_get_quant(&self, prefix: &str) -> Option<QuantWeight> {
@@ -325,6 +323,7 @@ impl ModelWeights {
         }
     }
 
+    #[cfg(feature = "metal")]
     pub fn has_packed_quantized_weights(&self) -> bool {
         self.tensors.keys().any(|k| k.ends_with(".qweight"))
     }

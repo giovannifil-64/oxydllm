@@ -3002,14 +3002,7 @@ mod fused_kernel_parity_tests {
             .unwrap()
             .to_dtype(dtype)
             .unwrap();
-        crate::common::awq::QuantWeight::new_gptq(
-            bits,
-            false,
-            qweight,
-            Some(qzeros),
-            scales_t,
-            None,
-        )
+        crate::common::awq::QuantWeight::new_gptq(bits, false, qweight, Some(qzeros), scales_t)
     }
 
     fn run_gptq_gemv_parity(

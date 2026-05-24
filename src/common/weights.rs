@@ -165,17 +165,32 @@ fn apply_weight_scale_inv(tensors: &mut FxHashMap<String, Tensor>) -> Result<()>
             continue;
         }
 
-        // FP8 checkpoints (e.g. Mistral/Ministral variants) store
-        // per-weight inverse scales next to quantized matrices.
-        // scale_inv is always loaded as F32; cast to weight dtype before multiplying.
-        let scale_inv = scale_inv
-            .to_dtype(weight.dtype())
-            .with_context(|| format!("Failed to cast '{}' to {:?}", scale_name, weight.dtype()))?;
-        let scaled = apply_scale_inv(&weight, &scale_inv).with_context(|| {
+        // FP8 checkpoints (e.g. DeepSeek-V3, Qwen3-FP8) store inverse scales
+        // next to quantized matrices. Perform the multiply in F32 — even when
+        // the final dtype is BF16 — because BF16's 7-bit mantissa accumulates
+        // perceptible error across 36+ layers of block-wise rescaling and
+        // produces coherent-but-wrong answers on prompts like "Tokyo is the
+        // capital of …".
+        let weight_dtype = weight.dtype();
+        let weight_f32 = weight.to_dtype(DType::F32).with_context(|| {
+            format!("Failed to promote '{weight_name}' to F32 for scale_inv multiply")
+        })?;
+        // scale_inv is loaded as F32 (forced by `force_f32` in the loader).
+        let scale_inv_f32 = if scale_inv.dtype() == DType::F32 {
+            scale_inv
+        } else {
+            scale_inv.to_dtype(DType::F32).with_context(|| {
+                format!("Failed to cast '{scale_name}' to F32 for scale multiply")
+            })?
+        };
+        let scaled_f32 = apply_scale_inv(&weight_f32, &scale_inv_f32).with_context(|| {
             format!(
                 "Failed to apply '{}' dequantization factor to '{}'",
                 scale_name, weight_name
             )
+        })?;
+        let scaled = scaled_f32.to_dtype(weight_dtype).with_context(|| {
+            format!("Failed to cast scaled '{weight_name}' back to {weight_dtype:?}")
         })?;
         tensors.insert(weight_name, scaled);
     }

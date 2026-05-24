@@ -36,16 +36,19 @@ A rust-based inference engine for Large Language Models.
 
 ## Features
 - OpenAI-compatible chat completions endpoint (`/v1/chat/completions`)
-- **Function calling / tool use (function tools)** — `tools`, `tool_choice` (`auto`, `required`, `none`, forced function, and `allowed_tools`), and `parallel_tool_calls`; assistant tool calls are returned as proper `tool_calls` with `finish_reason: "tool_calls"`, and streaming emits incremental tool-call deltas
-- **Structured output** — `response_format` with `json_object` and `json_schema`; request-time schema validation includes strict-mode requirements plus recursive `$ref` / `$defs`, `anyOf`, enums, nested objects/arrays, and nullable unions
+- Function calling / tool use (function tools) — `tools`, `tool_choice` (`auto`, `required`, `none`, forced function, and `allowed_tools`), and `parallel_tool_calls`; assistant tool calls are returned as proper `tool_calls` with `finish_reason: "tool_calls"`, and streaming emits incremental tool-call deltas
+- Structured output — `response_format` with `json_object` and `json_schema`; request-time schema validation includes strict-mode requirements plus recursive `$ref` / `$defs`, `anyOf`, enums, nested objects/arrays, and nullable unions
 - Metal acceleration on Apple Silicon with fused attention, RMSNorm, RoPE, and Softmax kernels
 - Paged KV cache with prefix caching for reduced redundant computation
 - Batched scheduler, where all active sequences share each GPU forward pass so throughput scales with concurrent users rather than collapsing to serial execution. At startup the scheduler computes `max_num_seqs` automatically as `total_kv_blocks / ceil(context_len / block_size)`, capped to 256; the value is logged and can be overridden with `--max-num-seqs`. Incoming requests are held in a bounded `tokio::sync::mpsc` channel of capacity `--max-queued-requests` (default 200); once full, new arrivals receive HTTP 429 immediately, bounding memory consumption under sustained load.
 - KV cache quantization (Lossless/Balanced/Aggressive) to reduce memory footprint by 2-4x
 - Multi-model server: load several models simultaneously with LRU eviction and configurable memory budgets
 - Thinking/reasoning model support with separated `reasoning_content` field
-- GGUF quantized model support (Q4_K_M, Q5_0, Q8_0, and others), including sharded GGUF loading
-- AWQ 4-bit quantized safetensors support (autoawq GEMM layout) with auto-detection, fused QKV/gate-up projections, and load-time dequantization
+- GGUF quantized model support — bf16 Metal fast path for ten quant types (`Q4_0`, `Q4_1`, `Q5_0`, `Q5_1`, `Q8_0`, `Q2_K`, `Q3_K`, `Q4_K`, `Q5_K`, `Q6_K`); zero-copy mmap loader (Qwen3-4B-Q4_K_M loads in ~2.7 s); fused `mul_mm` for prefill so weights are never held twice. Sharded GGUF loading supported.
+- AWQ 4-bit and 8-bit quantization — fused W4A16 / W8A16 GEMV kernels keep packed weights resident on Metal (Qwen3-4B-AWQ goes from ~7.5 GB to ~2.5 GB resident); QKV and gate+up are fused at load; auto-detected per checkpoint with no flag.
+- GPTQ 4-bit and 8-bit quantization — `desc_act=false` checkpoints route through a dedicated Metal resident kernel family (Qwen3-0.6B-GPTQ-Int8 ~89 tok/s decode); CPU / non-bf16 paths still dequantize at load.
+- FP8 (E4M3) block-wise weight loading — `Qwen3-4B-Instruct-2507-FP8` and similar checkpoints; the load-time `weight × scale_inv` multiply is performed in F32 to preserve precision across deep block-wise rescaling.
+- Mixture-of-Experts — `Qwen3MoeForCausalLM` and `OlmoeForCausalLM` with top-k routing and a hybrid sparse/naive dispatch (decode-friendly + prefill-friendly). Tested on `allenai/OLMoE-1B-7B-0924-Instruct`.
 - Streaming responses via Server-Sent Events
 - Model download directly from HuggingFace with interactive variant selection
 
@@ -54,50 +57,49 @@ oxydLLM is built on top of the Candle tensor library. The model layer implements
 
 KV cache quantization uses TurboQuant with MSE-based quantization during the decode phase, reducing memory overhead without significant quality loss. Metal kernels provide fused operations for attention, normalization, and positional embeddings on Apple Silicon.
 
-> **Note on `--kv-quant`:** the quantization step currently runs on CPU, each KV write transfers the new K/V tensors from GPU to CPU and casts them to F32 before packing. On unified-memory Apple Silicon the transfer is cheap, but on discrete CUDA GPUs the per-step roundtrip can dominate. Enable `--kv-quant` for memory-constrained deployments; leave it `off` when throughput matters and KV memory is not the bottleneck. On-device kernels are on the roadmap.
+> Note on `--kv-quant`: the quantization step currently runs on CPU, each KV write transfers the new K/V tensors from GPU to CPU and casts them to F32 before packing. On unified-memory Apple Silicon the transfer is cheap, but on discrete CUDA GPUs the per-step roundtrip can dominate. Enable `--kv-quant` for memory-constrained deployments; leave it `off` when throughput matters and KV memory is not the bottleneck. On-device kernels are on the roadmap.
 
 ## Tested Models
-Here you can find a list of models that have been tested, divided by architecture. This is ***not*** an exhaustive list of compatible models.
+The following 25 checkpoints are all currently in the local registry and pass the deterministic coherence check in `scripts/stress_baseline.py` on the Apple Silicon reference machine (M5, 24 GB unified memory). Decode `tok/s` is the steady-state median over five 150-token runs after one warm-up.
 
-### LlamaForCausalLM
-- `meta-llama/Llama-3.2-1B-Instruct`
+| Model | Architecture | Format | Decode tok/s |
+|---|---|---|---|
+| `meta-llama/Llama-3.2-1B-Instruct` | LlamaForCausalLM | BF16 safetensors | 33.1 |
+| `Qwen/Qwen2.5-1.5B-Instruct` | Qwen2ForCausalLM | BF16 safetensors | 25.4 |
+| `Qwen/Qwen2.5-3B-Instruct` | Qwen2ForCausalLM | BF16 safetensors | 13.6 |
+| `Qwen/qwen2-1_5b-instruct-q4_0` | Qwen2 (GGUF) | Q4_0 | 67.3 |
+| `Qwen/Qwen2.5-1.5B-Instruct-Q2_K` | Qwen2 (GGUF) | Q2_K | 105.2 |
+| `Qwen/Qwen2.5-1.5B-Instruct-Q3_K_M` | Qwen2 (GGUF) | Q3_K_M | 85.1 |
+| `Qwen/Qwen2.5-1.5B-Instruct-Q4_0` | Qwen2 (GGUF) | Q4_0 | 85.4 |
+| `bartowski/Qwen2.5-1.5B-Instruct-Q4_0` | Qwen2 (GGUF) | Q4_0 | 64.6 |
+| `Qwen/Qwen2.5-1.5B-Instruct-Q4_K_M` | Qwen2 (GGUF) | Q4_K_M | 80.4 |
+| `Qwen/Qwen3-0.6B` | Qwen3ForCausalLM | BF16 safetensors | 52.7 |
+| `Qwen/Qwen3-0.6B-GPTQ-Int8` | Qwen3ForCausalLM | GPTQ Int8 (W8A16 resident) | 86.8 |
+| `Qwen/Qwen3-1.7B-Q8_0` | Qwen3 (GGUF) | Q8_0 | 38.0 |
+| `Qwen/Qwen3-1.7B-GPTQ-Int8` | Qwen3ForCausalLM | GPTQ Int8 (W8A16 resident) | 41.5 |
+| `Qwen/Qwen3-4B-Q4_K_M` | Qwen3 (GGUF) | Q4_K_M | 27.0 |
+| `Qwen/Qwen3-4B-Q5_0` | Qwen3 (GGUF) | Q5_0 | 26.4 |
+| `Qwen/Qwen3-4B-Q5_K_M` | Qwen3 (GGUF) | Q5_K_M | 25.5 |
+| `Qwen/Qwen3-4B-Q6_K` | Qwen3 (GGUF) | Q6_K | 22.8 |
+| `Qwen/Qwen3-4B-AWQ` | Qwen3ForCausalLM | AWQ 4-bit (W4A16 resident) | 38.5 |
+| `Qwen/Qwen3-4B-Instruct-2507-FP8` | Qwen3ForCausalLM | FP8 (E4M3, block-wise) | 10.0 |
+| `google/gemma-2b-it` | GemmaForCausalLM | BF16 safetensors | 16.6 |
+| `google/gemma-2-2b-it` | Gemma2ForCausalLM | BF16 safetensors | 15.5 |
+| `google/gemma-3-1b-it` | Gemma3ForCausalLM | BF16 safetensors | 36.1 |
+| `google/gemma-4-E2B-it` | Gemma4ForConditionalGeneration | BF16 safetensors | 15.4 |
+| `mistralai/Ministral-3-3B-Instruct-25` | Mistral3ForConditionalGeneration | BF16 safetensors | 12.1 |
+| `allenai/OLMoE-1B-7B-0924-Instruct` | OlmoeForCausalLM (MoE) | BF16 safetensors, 64 experts × top-k 8 | 13.6 |
 
-### Mistral3ForConditionalGeneration
-- `mistralai/Ministral-3-3B-Instruct-2512`
-
-### Qwen2ForCausalLM
-- `Qwen/Qwen2.5-1.5B-Instruct` (including Q2_K and Q4_K_M quantized variants)
-- `Qwen/Qwen2.5-3B-Instruct`
-
-### Qwen3ForCausalLM
 > [!NOTE]
-> All Qwen3 models have been tested with and without thinking enabled.
-
-- `Qwen/Qwen3-0.6B` (including the Q8_0 quantized variant)
-- `Qwen/Qwen3-1.7B-Q8_0`
-- `Qwen/Qwen3-4B` (Q4_K_M, Q5_0, and AWQ 4-bit autoawq GEMM variants)
-
-### GemmaForCausalLM
-- `google/gemma-2b-it`
-
-### Gemma2ForCausalLM
-- `google/gemma-2-2b-it`
-
-### Gemma3ForCausalLM
-- `google/gemma-3-270m-it`
-- `google/gemma-3-1b-it`
-
-### Gemma4ForConditionalGeneration (Minor issues)
-- `google/gemma-4-E2B-it` - Known edge cases on some checkpoints/configurations
-
-### Phi3ForCausalLM
-- `microsoft/Phi-3.5-mini-instruct`
+> All Qwen3 models have been tested with and without thinking enabled. Other checkpoints in the same architecture families (e.g. other Llama 3.2, Gemma 3, Qwen2.5 sizes) are likely to work but are not in the regression suite.
 
 ## Unsupported Model Families
 The following model families are not currently supported:
-- Mixture-of-Experts models (Mixtral, Deepseek-V2/V3)
+- Mixtral (`MixtralForCausalLM`) — uses `block_sparse_moe.experts.{e}.{w1,w2,w3}` tensor naming, not yet routed in the loader (the MoE infrastructure itself is in place via `Qwen3MoeForCausalLM` and `OlmoeForCausalLM`).
+- DeepSeek-V2/V3 — Mixture-of-Experts plus Multi-head Latent Attention (MLA); MLA is not implemented yet.
 - Hybrid linear-attention models (Qwen3.5)
-- Multimodal inference (vision+language) is not supported yet; text-only paths from some multimodal checkpoints may work
+- GGUF MoE checkpoints — quant-per-expert tensor layout not yet wired; safetensors MoE works.
+- Multimodal inference (vision+language) is not supported yet; text-only paths from some multimodal checkpoints may work.
 - Encoder-only models (BERT, etc.)
 
 ## Installation
@@ -283,7 +285,7 @@ curl http://localhost:11313/metrics
 | `oxydllm_kv_cache_allocated_bytes` | Gauge | `model` | KV cache memory reserved at load time per model. Not the dynamically occupied portion. |
 | `oxydllm_vram_used_bytes` | Gauge | — | Total inference memory: `model_weights_bytes + kv_cache_allocated_bytes` across all loaded models. |
 
-> **Apple Silicon note**: there is no discrete VRAM on Apple Silicon — all memory metrics measure unified system memory shared between CPU and GPU.
+> Apple Silicon note: there is no discrete VRAM on Apple Silicon — all memory metrics measure unified system memory shared between CPU and GPU.
 
 Example Prometheus queries:
 ```promql
@@ -385,8 +387,8 @@ The HTTP API has **no authentication by default**. Without `--api-key` set, any 
 
 Request-side hardening already enforced by the server (no configuration needed):
 
-- **Per-request wall-clock timeout** (`--request-timeout`, default 300s) bounds the time a single chat-completion request can hold a slot. On expiry the engine sequence is aborted, the client receives `408` (non-streaming) or an error chunk + `[DONE]` (streaming).
-- **Sampling parameter ranges** are validated up-front (`temperature ∈ [0, 2]`, `top_p ∈ [0, 1]`, `frequency_penalty`/`presence_penalty ∈ [-2, 2]`, `top_logprobs ∈ [0, 20]`, `repetition_penalty > 0`, `n ∈ [1, 128]`, `max_tokens ≥ 1`). Out-of-range values return `400 invalid_request_error` rather than silently degrading the sampler.
+- Per-request wall-clock timeout (`--request-timeout`, default 300s) bounds the time a single chat-completion request can hold a slot. On expiry the engine sequence is aborted, the client receives `408` (non-streaming) or an error chunk + `[DONE]` (streaming).
+- Sampling parameter ranges are validated up-front (`temperature ∈ [0, 2]`, `top_p ∈ [0, 1]`, `frequency_penalty`/`presence_penalty ∈ [-2, 2]`, `top_logprobs ∈ [0, 20]`, `repetition_penalty > 0`, `n ∈ [1, 128]`, `max_tokens ≥ 1`). Out-of-range values return `400 invalid_request_error` rather than silently degrading the sampler.
 
 ## Run Options
 Options specific to the `oxydllm run` interactive chat command (not available in the server):
@@ -403,16 +405,18 @@ The following options are shared between `start` and `run`:
 `--models-dir`, `--devices`, `--max-context-len`, `--kv-quant`, `--qjl-quantization`, `--allow-cpu`.
 
 ## Known Limitations and Work in Progress
-- **GGUF compatibility**: Support is broad, but some architecture/quantization combinations may still fail depending on checkpoint format.
-- **Thinking mode is template-dependent**: `enable_thinking` is applied only when the tokenizer chat template supports it.
-- **Byte-level tokenizers**: Streaming decode uses incremental buffering; occasional model-specific Unicode artifacts can still appear.
-- **Tool / schema adherence is model-dependent**: the OpenAI-compatible request fields, response shapes, and streaming semantics are implemented server-side, but local models can still ignore tool instructions or emit invalid JSON / tool arguments.
-- **Only function tools are implemented**: OpenAI custom tools are not supported on `/v1/chat/completions` yet.
-- **Gemma4 edge cases**: Some checkpoints may require architecture-specific tuning.
-- **Metal softcap SDPA policy**: The Metal SDPA path with attention softcap is currently hard-disabled in runtime (no experimental toggle) and falls back to the standard attention path.
-- **Metal SDPA head-dim coverage**: The fused Metal SDPA kernel supports head dimensions `32, 64, 72, 80, 96, 128, 256`. Models with other head dimensions remain functionally correct but fall back to the non-fused attention path with a measurable throughput cost.
-- **CUDA optimization**: Support exists but is not optimized for production use.
-- **AWQ runtime memory footprint**: AWQ checkpoints currently dequantize to fp16/bf16 at load time, so resident weight memory matches an equivalent fp16 model rather than the on-disk 4-bit footprint. Inference throughput matches fp16 thanks to fused QKV/gate-up projections.
+- GGUF compatibility: the bf16 Metal fast path covers ten quant types (`Q4_0/1`, `Q5_0/1`, `Q8_0`, `Q2_K`, `Q3_K`, `Q4_K`, `Q5_K`, `Q6_K`); i-quants (`IQ*`) and ternary (`TQ*`) types fall back to candle's F32 path. MoE GGUFs are not yet wired.
+- Thinking mode is template-dependent: `enable_thinking` is applied only when the tokenizer chat template supports it.
+- Byte-level tokenizers: Streaming decode uses incremental buffering; occasional model-specific Unicode artifacts can still appear.
+- Tool / schema adherence is model-dependent: the OpenAI-compatible request fields, response shapes, and streaming semantics are implemented server-side, but local models can still ignore tool instructions or emit invalid JSON / tool arguments.
+- Only function tools are implemented: OpenAI custom tools are not supported on `/v1/chat/completions` yet.
+- Gemma4 edge cases: Some checkpoints may require architecture-specific tuning.
+- Metal softcap SDPA policy: The Metal SDPA path with attention softcap is currently hard-disabled in runtime (no experimental toggle) and falls back to the standard attention path.
+- Metal SDPA head-dim coverage: The fused Metal SDPA kernel supports head dimensions `32, 64, 72, 80, 96, 128, 256`. Models with other head dimensions remain functionally correct but fall back to the non-fused attention path with a measurable throughput cost.
+- CUDA optimization: Support exists but is not optimized for production use.
+- GPTQ act-order (`desc_act=true`) not supported: load fails fast; only sequential `desc_act=false` checkpoints are accepted. `g_idx` is loaded but ignored on the supported path.
+- FP8 on Apple Silicon doubles resident memory: Metal has no FP8 compute kernels, so all FP8 checkpoints are dequanted to BF16 at load time. A 4B-FP8 model needs ~8 GB resident instead of the ~4 GB on-disk footprint. CUDA / CPU retain the Level-2 resident FP8 path.
+- MoE perf is dispatch-bound: the hybrid sparse/naive path is correct and decode-competitive, but per-expert Metal command-buffer overhead caps prefill throughput. A custom fused MoE kernel would unlock the next ~2-3× speedup on long prompts.
 
 ## CUDA Status
 CUDA is currently a functional compatibility path, not a performance-tuned backend.
@@ -428,7 +432,7 @@ CUDA is currently a functional compatibility path, not a performance-tuned backe
 ### Official CUDA Docker tags
 
 > [!IMPORTANT]
-> Every tag below is **unvalidated**, the images compile and pass CPU tests in CI, but no inference run has been verified on physical NVIDIA hardware. Treat the table as a build matrix, not a compatibility guarantee.
+> Every tag below is unvalidated, the images compile and pass CPU tests in CI, but no inference run has been verified on physical NVIDIA hardware. Treat the table as a build matrix, not a compatibility guarantee.
 
 | Tag | Compute capability | Platform | Target |
 |---|---:|---|---|

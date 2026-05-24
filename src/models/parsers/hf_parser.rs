@@ -4,19 +4,14 @@ use serde_json::Value;
 
 use crate::common::rope::RopeScaling;
 
-/// Parse a HuggingFace `config.json` into a `StandardTransformerConfig`.
-///
-/// Uses `serde_json::Value` instead of per-architecture serde structs so that
-/// adding support for a new architecture only requires adding a match arm here,
-/// with no new struct, no `From` impl, and no change to `loader.rs`.
 pub fn parse(config_path: &str) -> Result<StandardTransformerConfig> {
     let raw = std::fs::read_to_string(config_path)
         .with_context(|| format!("Cannot read {config_path}"))?;
     let v: Value = serde_json::from_str(&raw)
         .with_context(|| format!("Cannot parse JSON from {config_path}"))?;
 
-    // For multimodal models the LLM parameters are nested under "text_config".
-    // text_config should override root fields when both exist.
+    // Multimodal configs nest LLM params under "text_config"; merge them up,
+    // letting text_config win on key collision.
     let v = if let Some(text_cfg) = v.get("text_config").and_then(|tc| tc.as_object()) {
         let mut merged = v.clone();
         let root = merged.as_object_mut().unwrap();
@@ -66,7 +61,7 @@ pub fn parse(config_path: &str) -> Result<StandardTransformerConfig> {
     }
 
     if eos_token_ids.is_empty() {
-        eos_token_ids = vec![2]; // generic <eos>
+        eos_token_ids = vec![2];
     }
 
     let embed_scale = if arch_def.embed_scale_from_hidden {
@@ -98,15 +93,9 @@ pub fn parse(config_path: &str) -> Result<StandardTransformerConfig> {
         attention_scale = Some(1.0);
     }
 
-    // `tie_word_embeddings` controls whether `lm_head` is the transpose of the
-    // embedding matrix or a separate weight. Several official Gemma checkpoints
-    // (gemma-2b-it, gemma-2-2b-it, gemma-3-1b-it, ...) ship a `config.json`
-    // that omits the field entirely, so we default to `true` for the Gemma
-    // family — that's the canonical setting for those weights — and `false`
-    // otherwise. The asymmetric-risk scenario (defaulting tied when the file
-    // also ships an explicit `lm_head.weight`) is caught at load time in
-    // `loader::load_standard_safetensors`, which warns loudly when both are
-    // present.
+    // Several Gemma checkpoints omit `tie_word_embeddings`; default to true
+    // for the Gemma family (canonical setting) and false otherwise. Loader
+    // warns if a file ships both tie=true and an explicit lm_head.weight.
     let tie_word_embeddings = v["tie_word_embeddings"].as_bool().unwrap_or(
         arch == "GemmaForCausalLM"
             || arch == "Gemma2ForCausalLM"
@@ -118,8 +107,7 @@ pub fn parse(config_path: &str) -> Result<StandardTransformerConfig> {
     let rope_scaling = parse_rope_scaling(&v["rope_scaling"]);
     let sliding_window = v["sliding_window"].as_u64().map(|x| x as usize);
 
-    // Mixture-of-Experts: Qwen3-MoE uses `num_experts` + `num_experts_per_tok`;
-    // Mixtral uses `num_local_experts`. OLMoE uses `num_experts`.
+    // Qwen3-MoE/OLMoE use `num_experts`, Mixtral uses `num_local_experts`.
     let moe_num_experts = v["num_experts"]
         .as_u64()
         .or_else(|| v["num_local_experts"].as_u64())
@@ -344,11 +332,6 @@ fn validate_quantization_config(v: &Value) -> Result<Option<crate::common::weigh
 
     match method.to_ascii_lowercase().as_str() {
         "awq" => {
-            // Bit-parametric AWQ template supports 4-bit (W4A16, primary path,
-            // covered by Qwen3-4B-AWQ end-to-end) and 8-bit (W8A16, covered by
-            // the metal_ops parity tests). Both instantiate the same kernel
-            // template; the runtime selection happens in
-            // `PackedQuantLinear::forward` based on `QuantWeight::bits`.
             let bits = bits.ok_or_else(|| {
                 anyhow::anyhow!(
                     "AWQ checkpoint missing required 'bits' field in quantization_config"
@@ -634,11 +617,6 @@ mod tests {
 
     #[test]
     fn missing_tie_word_embeddings_on_gemma_defaults_to_true() {
-        // Official Gemma checkpoints (gemma-2b-it, gemma-2-2b-it, gemma-3-1b-it)
-        // ship a config.json that omits this field; the parser must default to
-        // `true` for the Gemma family to load them. The asymmetric-risk scenario
-        // (default `true` paired with an explicit `lm_head.weight` in the file)
-        // is detected separately in `loader::load_standard_safetensors`.
         let dir = tempdir().unwrap();
         let config_path = dir.path().join("config.json");
 

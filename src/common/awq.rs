@@ -23,33 +23,18 @@ use candle_core::{DType, Device, Tensor};
 pub const AWQ_PACK_ORDER: [usize; 8] = [0, 2, 4, 6, 1, 3, 5, 7];
 pub const AWQ_PACK_FACTOR: usize = 8;
 
-/// Which axis the packed int32 words stride along.
-///
-/// - `Out`: AWQ — `qweight` shape `[in_features, out_features / pack_factor]`.
-/// - `In`: GPTQ — `qweight` shape `[in_features / pack_factor, out_features]`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PackDim {
     Out,
     In,
 }
 
-/// How the `pack_factor` slots inside one packed word map to consecutive
-/// indices along [`PackDim`].
-///
-/// - `AwqInterleaved`: AWQ (4-bit only) uses [`AWQ_PACK_ORDER`].
-/// - `Sequential`: GPTQ (and 8-bit AWQ) — slot `k` maps to offset `k`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PackOrder {
     AwqInterleaved,
     Sequential,
 }
 
-/// Dequant zero-point convention. Reconstruction formula per element:
-///
-/// - `Signed`: `val = (q - zero) * scale` — AWQ.
-/// - `PlusOne`: `val = (q - (zero + 1)) * scale` — GPTQ stores `zero - 1`.
-/// - `Symmetric`: `val = (q - 2^(bits-1)) * scale`, no `qzeros` tensor —
-///   GPTQ with `sym=True`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ZeroPointMode {
     Signed,
@@ -57,8 +42,6 @@ pub enum ZeroPointMode {
     Symmetric,
 }
 
-/// Generic packed-int weight tensor. Carries the format metadata so a single
-/// dequant entrypoint can serve AWQ and GPTQ.
 #[derive(Clone)]
 pub struct QuantWeight {
     pub bits: u32,
@@ -67,29 +50,19 @@ pub struct QuantWeight {
     pub pack_order: PackOrder,
     pub zero_point: ZeroPointMode,
     pub qweight: Tensor,
-    /// `None` only for `ZeroPointMode::Symmetric` (GPTQ sym=True without
-    /// explicit qzeros).
     pub qzeros: Option<Tensor>,
     pub scales: Tensor,
-    /// GPTQ-only: per-input-feature group index permutation. Currently
-    /// unused (only `desc_act=false` GPTQ checkpoints are supported); kept
-    /// as a field so the loader can stash the tensor for future act-order
-    /// support without further plumbing changes.
     pub g_idx: Option<Tensor>,
 }
 
-/// Backwards-compatible alias: most call sites only operate on AWQ tensors.
 pub type AwqRawTensors = QuantWeight;
 
 impl QuantWeight {
-    /// AWQ constructor: matches autoawq GEMM layout. `bits` is 4 or 8 —
-    /// determines the packing factor (`32/bits`) and the runtime kernel
-    /// selection in [`crate::common::linear::PackedQuantLinear`].
     pub fn new_awq(bits: u32, qweight: Tensor, qzeros: Tensor, scales: Tensor) -> Self {
         debug_assert!(matches!(bits, 4 | 8), "AWQ bits must be 4 or 8, got {bits}");
         Self {
             bits,
-            group_size: 128, // overwritten by callers that compute it from scales
+            group_size: 128,
             pack_dim: PackDim::Out,
             pack_order: PackOrder::AwqInterleaved,
             zero_point: ZeroPointMode::Signed,
@@ -100,8 +73,6 @@ impl QuantWeight {
         }
     }
 
-    /// GPTQ constructor: `bits` ∈ {4, 8}, `sym=true` ⇒ no `qzeros` tensor and
-    /// the implicit zero is `2^(bits-1)`.
     pub fn new_gptq(
         bits: u32,
         sym: bool,
@@ -127,7 +98,6 @@ impl QuantWeight {
         }
     }
 
-    /// Slots per packed int32 word: `32 / bits`.
     pub fn pack_factor(&self) -> usize {
         32 / self.bits as usize
     }
@@ -135,13 +105,12 @@ impl QuantWeight {
     pub fn in_features(&self) -> Result<usize> {
         let d0 = self.qweight.dim(0).context("qweight must be 2D")?;
         Ok(match self.pack_dim {
-            PackDim::Out => d0,                     // AWQ: [in_features, ...]
-            PackDim::In => d0 * self.pack_factor(), // GPTQ: [in_features / pack_factor, ...]
+            PackDim::Out => d0,
+            PackDim::In => d0 * self.pack_factor(),
         })
     }
 
     pub fn out_features(&self) -> Result<usize> {
-        // `scales` is `[groups, out_features]` for both AWQ and GPTQ.
         self.scales.dim(1).context("scales must be 2D")
     }
 
@@ -223,16 +192,6 @@ fn read_packed_to_u32(t: &Tensor) -> Result<Vec<u32>> {
     }
 }
 
-/// Concatenate AWQ tensor triplets along the output-features dimension.
-///
-/// All parts must share `in_features` and `group_size`. Each part's
-/// `out_features` must be divisible by 8 (the AWQ pack factor) so that the
-/// packed dim concatenation aligns to nibble boundaries — this holds for any
-/// real model where each projection's output is a multiple of 8.
-///
-/// After fusion the resulting tensor describes a single linear layer whose
-/// output is the concatenation of the inputs, equivalent to running each
-/// `dequantize_awq` separately and then `Tensor::cat(..., dim=0)`.
 pub fn concat_awq_along_out(parts: &[AwqRawTensors]) -> Result<AwqRawTensors> {
     if parts.is_empty() {
         anyhow::bail!("concat_awq_along_out: no parts");
@@ -268,10 +227,7 @@ pub fn concat_awq_along_out(parts: &[AwqRawTensors]) -> Result<AwqRawTensors> {
         }
     }
 
-    // Concatenation must happen on CPU because candle's Metal backend lacks
-    // copy2d for integer dtypes (I32/U32) as of 0.10.2. The fused tensors are
-    // immediately consumed by `dequantize_awq` — which already routes through
-    // CPU — so there is no benefit to keeping them on the GPU here.
+    // Concatenation must happen on CPU: candle Metal lacks copy2d for I32/U32.
     let cpu = Device::Cpu;
     let to_cpu = |t: &Tensor, name: &str| -> Result<Tensor> {
         t.to_device(&cpu)
@@ -302,12 +258,9 @@ pub fn concat_awq_along_out(parts: &[AwqRawTensors]) -> Result<AwqRawTensors> {
     let qzeros = Tensor::cat(&qzeros_refs, 1).context("AWQ fuse: cat qzeros")?;
     let scales = Tensor::cat(&scales_refs, 1).context("AWQ fuse: cat scales")?;
 
-    // Bits are preserved from the first part (checked above to match across parts).
     Ok(QuantWeight::new_awq(parts[0].bits, qweight, qzeros, scales))
 }
 
-/// Dequantize AWQ tensors into a `[out_features, in_features]` weight matrix
-/// in `out_dtype`, ready to drive a standard `Linear`.
 pub fn dequantize_awq(raw: &AwqRawTensors, device: &Device, out_dtype: DType) -> Result<Tensor> {
     let in_features = raw.in_features()?;
     let out_features = raw.out_features()?;
@@ -386,19 +339,11 @@ pub fn dequantize_awq(raw: &AwqRawTensors, device: &Device, out_dtype: DType) ->
         }
     }
 
-    // For a given out_idx, the packed source nibble lives at
-    //   qweight[i][j], bit-offset 4*k   where  j = out_idx / 8
-    // and k is the index into AWQ_PACK_ORDER whose value equals out_idx % 8.
-    // `inv_pack_order` is that inverse map.
     let mut inv_pack_order = [0u32; AWQ_PACK_FACTOR];
     for (k, &offset) in AWQ_PACK_ORDER.iter().enumerate() {
         inv_pack_order[offset] = k as u32;
     }
 
-    // Dequantize directly into the target dtype.  Producing the final dtype
-    // here (rather than an f32 intermediate + a GPU `to_dtype` cast) halves
-    // both the host buffer and the CPU→GPU upload: the upload of the F32
-    // intermediate was the dominant cost of AWQ model loading.
     let plan = AwqDequantPlan {
         in_features,
         out_features,
@@ -433,13 +378,6 @@ pub fn dequantize_awq(raw: &AwqRawTensors, device: &Device, out_dtype: DType) ->
         .context("AWQ dequantized weight → device")
 }
 
-/// Dequantise a GPTQ tensor triplet into a row-major `[out_features, in_features]`
-/// weight in `out_dtype`. Mirrors `dequantize_awq` but for the auto-gptq layout
-/// (`qweight` packed along **in_features**, sequential pack order, `PlusOne`
-/// zero-point convention).
-///
-/// `g_idx` is **ignored** here: only `desc_act=false` checkpoints are
-/// supported, for which `g_idx[i] = i / group_size` and is redundant.
 pub fn dequantize_gptq(raw: &QuantWeight, device: &Device, out_dtype: DType) -> Result<Tensor> {
     if raw.pack_dim != PackDim::In || raw.pack_order != PackOrder::Sequential {
         anyhow::bail!(
@@ -569,7 +507,6 @@ fn fill_gptq_weight<T: candle_core::WithDType + Send>(
     out.par_chunks_mut(plan.in_features)
         .enumerate()
         .for_each(|(out_idx, row)| {
-            // Per-output column constants.
             let o_word = out_idx / plan.pack_factor;
             let o_slot = out_idx % plan.pack_factor;
             let o_shift = (o_slot * plan.bits) as u32;
@@ -584,7 +521,6 @@ fn fill_gptq_weight<T: candle_core::WithDType + Send>(
                 } else {
                     (plan.qzeros[g * plan.packed_out + o_word] >> o_shift) & plan.mask
                 };
-                // GPTQ PlusOne: val = scale * (q - (zero + 1))
                 let val = (q as i32 - (zero as i32 + 1)) as f32
                     * plan.scales[g * plan.out_features + out_idx];
                 *slot = convert(val);
@@ -592,8 +528,6 @@ fn fill_gptq_weight<T: candle_core::WithDType + Send>(
         });
 }
 
-/// Top-level dequant dispatcher: routes to AWQ or GPTQ based on the
-/// [`QuantWeight`]'s `pack_dim` field.
 pub fn dequantize_quant(raw: &QuantWeight, device: &Device, out_dtype: DType) -> Result<Tensor> {
     match raw.pack_dim {
         PackDim::Out => dequantize_awq(raw, device, out_dtype),
@@ -601,8 +535,6 @@ pub fn dequantize_quant(raw: &QuantWeight, device: &Device, out_dtype: DType) ->
     }
 }
 
-/// Bundled inputs for one AWQ weight-matrix dequantization, shared by the
-/// per-dtype calls to [`fill_awq_weight`].
 struct AwqDequantPlan<'a> {
     in_features: usize,
     out_features: usize,
@@ -611,18 +543,11 @@ struct AwqDequantPlan<'a> {
     qweight: &'a [u32],
     zeros: &'a [u8],
     scales: &'a [f32],
-    /// Maps an output column's `% 8` offset back to its nibble index `k`.
     inv_pack_order: [u32; AWQ_PACK_FACTOR],
 }
 
-/// Fill a row-major `[out_features, in_features]` weight buffer from AWQ data.
-///
-/// Parallelized over OUTPUT ROWS (out_idx): each rayon worker fills one
-/// contiguous `in_features`-long row, keeping writes sequential for good
-/// memory bandwidth.  (An earlier version parallelized over input columns,
-/// which scattered writes across a 100-200 MB buffer and bottlenecked the
-/// memory controller.)  The `convert` closure casts each f32 result to the
-/// final element type.
+// Parallelise over output rows: per-row writes stay sequential and don't
+// thrash the memory controller (an earlier per-column variant did, badly).
 fn fill_awq_weight<T: candle_core::WithDType + Send>(
     out: &mut [T],
     plan: &AwqDequantPlan,
@@ -646,13 +571,7 @@ fn fill_awq_weight<T: candle_core::WithDType + Send>(
         });
 }
 
-/// Round-to-nearest 4-bit group-wise quantization of a `[out_features, in_features]`
-/// weight into AWQ-format packed tensors (asymmetric, grouped along `in_features`).
-///
-/// Used to quantize an otherwise-fp16 weight (e.g. a tied `lm_head`) so it can run
-/// through the W4A16 path. The output is bit-compatible with `dequantize_awq` and the
-/// `w4a16` Metal kernels — same packing as autoawq's GEMM format. `out_features` must
-/// be a multiple of 8 and `in_features` a multiple of `group_size`.
+// RTN 4-bit group-wise AWQ quantization (autoawq GEMM-compatible).
 pub fn rtn_quantize_awq(weight: &Tensor, group_size: usize) -> Result<AwqRawTensors> {
     use rayon::prelude::*;
 
@@ -683,8 +602,7 @@ pub fn rtn_quantize_awq(weight: &Tensor, group_size: usize) -> Result<AwqRawTens
         anyhow::bail!("rtn_quantize_awq: weight numel mismatch");
     }
 
-    // Pass 1 — quantize each group (parallel over output rows; rows are independent).
-    // qnib[o][i] = 4-bit value, znib[o][g] = 4-bit zero-point, scl[o][g] = scale.
+    // Pass 1: per-row group quantization. qnib/znib/scl are independent per row.
     let mut qnib = vec![0u8; out_features * in_features];
     let mut znib = vec![0u8; out_features * groups];
     let mut scl = vec![0f32; out_features * groups];
@@ -702,14 +620,12 @@ pub fn rtn_quantize_awq(weight: &Tensor, group_size: usize) -> Result<AwqRawTens
                     xmin = xmin.min(v);
                     xmax = xmax.max(v);
                 }
-                // `(q - zero) * scale` with q, zero in [0, 15] always spans a
-                // range that includes 0. Extend the group range to 0 so groups
-                // that don't straddle 0 quantize correctly rather than clamping
-                // the zero-point (which destroys the reconstruction).
+                // Extend group range to include 0: AWQ's `(q - zero) * scale` with
+                // q, zero ∈ [0, 15] always spans 0, so groups that don't straddle
+                // 0 would otherwise clamp the zero-point and lose reconstruction.
                 let xmin = xmin.min(0.0);
                 let xmax = xmax.max(0.0);
                 if xmax - xmin < 1e-12 {
-                    // Constant group: dequant (q - zero) * scale must yield the constant.
                     s_row[g] = xmin;
                     z_row[g] = 0;
                     for q in &mut q_row[g * group_size..(g + 1) * group_size] {
@@ -729,10 +645,9 @@ pub fn rtn_quantize_awq(weight: &Tensor, group_size: usize) -> Result<AwqRawTens
         });
     drop(w);
 
-    // Pass 2 — pack into AWQ words (parallel over packed-output columns; each owns
-    // distinct words). qweight/qzeros built out-major then transposed to AWQ layout.
-    let mut qw_om = vec![0i32; packed_out * in_features]; // [out/8, in]
-    let mut qz_om = vec![0i32; packed_out * groups]; // [out/8, groups]
+    // Pass 2: pack into AWQ words (out-major buffers, then transposed to AWQ layout).
+    let mut qw_om = vec![0i32; packed_out * in_features];
+    let mut qz_om = vec![0i32; packed_out * groups];
     qw_om
         .par_chunks_mut(in_features)
         .zip(qz_om.par_chunks_mut(groups))
@@ -761,8 +676,6 @@ pub fn rtn_quantize_awq(weight: &Tensor, group_size: usize) -> Result<AwqRawTens
         .t()?
         .contiguous()?;
 
-    // RTN produces 4-bit packed weights — the AWQ_PACK_FACTOR=8 path above
-    // assumes nibbles per int32.
     Ok(QuantWeight::new_awq(4, qweight, qzeros, scales))
 }
 
@@ -798,8 +711,6 @@ mod tests {
             sq += (*w as f64).powi(2);
         }
         let rel = (sq_err / sq).sqrt();
-        // Correct 4-bit group-wise packing → a few % error; a wrong layout would
-        // scramble the weights and blow this far past 5%.
         assert!(
             rel < 0.05,
             "RTN 4-bit relative error {rel} — packing likely wrong"
@@ -807,8 +718,6 @@ mod tests {
         Ok(())
     }
 
-    /// Quality measurement for option A (4-bit lm_head). Run explicitly:
-    ///   cargo test --release --bin oxydllm -- rtn_lm_head_quality --ignored --nocapture
     #[test]
     #[ignore = "A quality measurement — needs the Qwen3-4B-AWQ model on disk"]
     fn rtn_lm_head_quality_measurement() {
@@ -837,7 +746,6 @@ mod tests {
         let raw = rtn_quantize_awq(&w_ref, 128).unwrap();
         let w_q = dequantize_awq(&raw, &device, DType::F32).unwrap();
 
-        // Weight reconstruction error on the real lm_head weight.
         let wv: Vec<f32> = w_ref.flatten_all().unwrap().to_vec1().unwrap();
         let qv: Vec<f32> = w_q.flatten_all().unwrap().to_vec1().unwrap();
         let (mut sq_err, mut sq, mut max_e) = (0f64, 0f64, 0f32);
@@ -852,7 +760,6 @@ mod tests {
             max_e
         );
 
-        // Logit-level: synthetic post-RMSNorm-like activations (per-row RMS = 1).
         let n = 256usize;
         let xd: Vec<f32> = (0..n * in_f)
             .map(|i| {
@@ -1097,8 +1004,6 @@ mod tests {
         Ok(())
     }
 
-    /// Pack `iweight[in/pack_factor, out]` (sequential, GPTQ layout) into a
-    /// flat `Vec<i32>` of length `(in/pack_factor) * out`.
     fn pack_gptq_qweight(
         iweight: &[Vec<u8>],
         in_features: usize,
@@ -1122,7 +1027,6 @@ mod tests {
         out
     }
 
-    /// Pack `izero[groups, out]` (sequential along out) into `[groups, out/pack_factor]`.
     fn pack_gptq_qzeros(
         izero: &[Vec<u8>],
         groups: usize,
@@ -1146,9 +1050,6 @@ mod tests {
         out
     }
 
-    /// Verify [`dequantize_gptq`] reproduces a manual reference dequant for an
-    /// 8-bit asymmetric layout (PlusOne zero point). Covers the `bits=8` path
-    /// used by Qwen3-*-GPTQ-Int8.
     #[test]
     fn dequantize_gptq_int8_matches_reference() -> Result<()> {
         let device = Device::Cpu;
@@ -1156,7 +1057,6 @@ mod tests {
         let groups = in_features / group_size;
         let pf = 32 / bits as usize;
 
-        // Synthetic int8 quants and zero-points in [0, 255].
         let iweight: Vec<Vec<u8>> = (0..in_features)
             .map(|i| {
                 (0..out_features)
@@ -1177,7 +1077,6 @@ mod tests {
             })
             .collect();
 
-        // Reference dequant: val = scale * (q - (zero + 1)).
         let mut expected = vec![0f32; out_features * in_features];
         for i in 0..in_features {
             let g = i / group_size;
@@ -1211,7 +1110,6 @@ mod tests {
         Ok(())
     }
 
-    /// Same for 4-bit asym GPTQ — sanity-checks the bit-parametric pack helpers.
     #[test]
     fn dequantize_gptq_int4_matches_reference() -> Result<()> {
         let device = Device::Cpu;

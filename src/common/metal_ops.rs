@@ -27,8 +27,6 @@ use objc2_metal::{MTLResourceUsage, MTLSize};
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
-// ─── SDPA ────────────────────────────────────────────────────────────────────
-
 struct Sdpa {
     scale: f32,
     softcapping: f32,
@@ -261,8 +259,6 @@ impl CustomOp3 for Sdpa {
     }
 }
 
-// ─── RMSNorm ─────────────────────────────────────────────────────────────────
-
 struct RmsNormOp {
     eps: f32,
 }
@@ -330,8 +326,6 @@ impl CustomOp2 for RmsNormOp {
     }
 }
 
-// ─── Softmax ─────────────────────────────────────────────────────────────────
-
 struct SoftmaxOp;
 
 impl CustomOp1 for SoftmaxOp {
@@ -381,14 +375,6 @@ impl CustomOp1 for SoftmaxOp {
         ))
     }
 }
-
-// ─── RoPE ────────────────────────────────────────────────────────────────────
-//
-// Uses the standard (non-interleaved) layout: [x_first_half | x_second_half].
-// Input  x:   [b, h, seq, d]          (contiguous)
-// Input  cos: [seq, d/2]              (contiguous, pre-gathered for positions)
-// Input  sin: [seq, d/2]              (contiguous, pre-gathered for positions)
-// Output:     [b, h, seq, d]
 
 struct RopeOp;
 
@@ -445,7 +431,6 @@ impl CustomOp3 for RopeOp {
         let output = device.new_buffer(el, src.dtype(), "rope_out")?;
         let encoder = device.command_encoder()?;
 
-        // stride_b = 0: cos/sin are [seq, d/2] shared across all batch/head dims
         candle_metal_kernels::call_rope(
             device.device(),
             &encoder,
@@ -472,28 +457,8 @@ impl CustomOp3 for RopeOp {
     }
 }
 
-// ─── FFN Fused Kernels ────────────────────────────────────────────────────────
-//
-// Two complementary kernels cover every FFN variant:
-//
-//   GatedSiluOp       — takes the combined matmul output [*, 2*N] produced by
-//                       Fused/Packed gate_up projections and computes
-//                       silu(gate)*up in a single pass, avoiding two extra
-//                       encoder creations and an intermediate buffer.
-//   SiluMulOp         — takes two separate contiguous tensors [*, N] (from the
-//                       GGUF Separate path) and computes silu(gate)*up in-place.
-//   GatedGeluTanhOp   — same shape contract as GatedSiluOp but applies the
-//                       tanh approximation of GeLU; used by Gemma family FFNs.
-//   GeluTanhMulOp     — same shape contract as SiluMulOp with GeLU-tanh.
-//
-// All kernels promote F16/BF16 arithmetic to F32 for the activation computation
-// and cast back, matching the precision of the scalar fallback path.
-
 const FFN_METAL_SOURCE: &str = include_str!("ffn_kernels.metal");
 
-// Pipeline cache keyed by (device registry ID, kernel function name).
-// Compilation (first call per device+kernel) takes ~50-100 ms; subsequent
-// calls just clone the cached Arc-wrapped pipeline state.
 static FFN_PIPELINES: OnceLock<Mutex<HashMap<(u64, &'static str), ComputePipeline>>> =
     OnceLock::new();
 
@@ -544,12 +509,6 @@ fn ffn_dispatch(pipeline: &ComputePipeline, encoder: &ComputeCommandEncoder, ele
         },
     );
 }
-
-// ─── GatedSiluOp ─────────────────────────────────────────────────────────────
-//
-// Reads a single contiguous [*, 2*N] tensor where the first N columns are the
-// gate projection output and the second N are the up projection output.
-// Computes silu(gate) * up and writes [*, N].
 
 struct GatedSiluOp {
     intermediate_size: usize,
@@ -613,11 +572,6 @@ impl CustomOp1 for GatedSiluOp {
         ))
     }
 }
-
-// ─── SiluMulOp ───────────────────────────────────────────────────────────────
-//
-// Takes two separate contiguous tensors `gate` and `up` of identical shape and
-// computes silu(gate[i]) * up[i] element-wise.
 
 struct SiluMulOp;
 
@@ -695,11 +649,6 @@ impl CustomOp2 for SiluMulOp {
     }
 }
 
-// ─── GatedGeluTanhOp ─────────────────────────────────────────────────────────
-//
-// Same shape contract as GatedSiluOp: reads a single contiguous [*, 2*N] tensor
-// and writes [*, N] = gelu_tanh(gate) * up.  Used by Gemma family FFNs.
-
 struct GatedGeluTanhOp {
     intermediate_size: usize,
 }
@@ -762,10 +711,6 @@ impl CustomOp1 for GatedGeluTanhOp {
         ))
     }
 }
-
-// ─── GeluTanhMulOp ───────────────────────────────────────────────────────────
-//
-// Same shape contract as SiluMulOp with GeLU-tanh as the gate activation.
 
 struct GeluTanhMulOp;
 
@@ -843,12 +788,6 @@ impl CustomOp2 for GeluTanhMulOp {
     }
 }
 
-// ─── SoftcapOp ───────────────────────────────────────────────────────────────
-//
-// Element-wise out[i] = cap * tanh(x[i] / cap).  Replaces the 3-op fallback
-// (`(x / cap).tanh() * cap`) with a single Metal pass.  Used by Gemma2
-// attention scores (cap=50) and Gemma2/Gemma4 logits (cap=30).
-
 struct SoftcapOp {
     softcap: f32,
 }
@@ -899,16 +838,7 @@ impl CustomOp1 for SoftcapOp {
     }
 }
 
-// ─── Flash Attention prefill kernel ──────────────────────────────────────────
-//
-// Custom Metal FA2-style kernel for the prefill path (num_tokens > 1).
-// Implements tiled QKᵀ → online softmax → PV with causal+prefix masking and
-// GQA support, all in one dispatch.  The decode path (num_tokens == 1)
-// continues to use candle's SDPA vector kernel.
-//
-// Algorithm derived from FlashAttention (Dao et al., BSD-3-Clause).  See the
-// attribution header in `flash_attn.metal`.
-
+// FlashAttention prefill kernel (Dao et al., BSD-3-Clause; see flash_attn.metal).
 const FA_METAL_SOURCE: &str = include_str!("flash_attn.metal");
 
 static FA_PIPELINES: OnceLock<Mutex<HashMap<(u64, &'static str), ComputePipeline>>> =
@@ -945,25 +875,17 @@ fn get_or_compile_fa_pipeline(
     Ok(pipeline)
 }
 
-/// Tile sizes (Br, Bc) chosen to fit threadgroup memory budget on Apple GPUs
-/// (~32 KB conservative).  Computed as:
-///   (Br*D + 2*Br + Br*Bc)*4   (fp32 accumulators)
-///   + (Br + Bc)*D*sizeof(T)   (Q tile + KV tile)
 fn fa_tile_sizes(head_dim: usize) -> (usize, usize) {
     match head_dim {
         64 => (32, 32),
         128 => (16, 32),
         256 => (8, 16),
-        _ => (16, 16), // conservative fallback
+        _ => (16, 16),
     }
 }
 
-/// Returns true if the device supports the hardware Matrix Multiply Accumulate
-/// units present on Apple GPU family 8 and later (M3, M4, …).  On older Apple
-/// silicon (M1/M2 = family 7) simdgroup_matrix is software-emulated and slower
-/// than the scalar 4-way-unrolled kernel, so we explicitly opt-in here.
+// Apple family 8+ (M3/M4) has hardware MMA; family 7 (M1/M2) emulates it.
 fn metal_supports_mma(device: &candle_metal_kernels::metal::Device) -> bool {
-    // Cache the answer per device to avoid the Obj-C dispatch on every kernel call.
     static CACHE: OnceLock<Mutex<HashMap<u64, bool>>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     let key = device.registry_id();
@@ -979,21 +901,7 @@ fn metal_supports_mma(device: &candle_metal_kernels::metal::Device) -> bool {
     supported
 }
 
-/// Layout (in fp32 equivalents — keep in sync with `flash_attn.metal`):
-///   o_acc     : Br * D            fp32
-///   m_row     : Br                fp32
-///   l_row     : Br                fp32
-///   s_scratch : Br * Bc           fp32
-///   p_tile    : Br * Bc           T   (MMA variant only — for converted P)
-///   q_tile    : Br * D            T
-///   kv_tile   : Bc * (D + KV_PAD) T  (K and V share the same area)
-///
-/// KV_PAD = 4 / sizeof(T) adds exactly 1 word per row to break the 32-way
-/// SIMD-group bank conflict on kv_tile reads in the QKᵀ inner loop.
-///
-/// The MMA variant needs `p_tile` for the bfloat/half P operand of the PV
-/// MMA (the scalar kernel re-reads from float s_scratch directly).  Pass
-/// `with_p_tile = true` for the MMA kernel allocation.
+// Threadgroup memory layout must match the kernel side in flash_attn.metal.
 fn fa_threadgroup_bytes(
     br: usize,
     bc: usize,
@@ -1001,7 +909,7 @@ fn fa_threadgroup_bytes(
     dtype_bytes: usize,
     with_p_tile: bool,
 ) -> usize {
-    let kv_pad = 4 / dtype_bytes; // 1 element for f32, 2 elements for f16/bf16
+    let kv_pad = 4 / dtype_bytes;
     let kv_stride = d + kv_pad;
     let fp32_bytes = (br * d + 2 * br + br * bc) * 4;
     let p_tile_bytes = if with_p_tile {
@@ -1013,7 +921,6 @@ fn fa_threadgroup_bytes(
     fp32_bytes + tile_bytes
 }
 
-/// Must match the `FlashAttnParams` struct in `flash_attn.metal`.
 #[repr(C)]
 struct FlashAttnParams {
     t_q: u32,
@@ -1030,7 +937,7 @@ struct FlashAttnParams {
 
 struct FlashAttnPrefill {
     scale: f32,
-    softcap: f32, // 0.0 = disabled
+    softcap: f32,
     prefix_len: usize,
     br: usize,
     bc: usize,
@@ -1137,7 +1044,6 @@ impl CustomOp3 for FlashAttnPrefill {
         let threads_per_group: usize = 128;
 
         let pipeline = get_or_compile_fa_pipeline(device.device(), kernel_name)?;
-        // Cap threads at pipeline's reported maximum (typically 1024 on M-series).
         let max_threads = pipeline.max_total_threads_per_threadgroup();
         let tg_size = threads_per_group.min(max_threads);
 
@@ -1174,12 +1080,6 @@ impl CustomOp3 for FlashAttnPrefill {
     }
 }
 
-// ─── Public API ──────────────────────────────────────────────────────────────
-
-/// Scaled Dot Product Attention via Metal fused kernels.
-///
-/// - Vector path (seq_q ≤ 8): supports `softcapping`
-/// - Full path   (seq_q > 8): requires `softcapping == 1.0`
 pub fn sdpa(
     q: &Tensor,
     k: &Tensor,
@@ -1217,96 +1117,44 @@ pub fn sdpa(
     )
 }
 
-/// Fused RMSNorm via Metal kernel.
-///
-/// Equivalent to `x / rms(x) * weight` in a single GPU pass.
-/// Both `x` and `weight` must be contiguous and have the same dtype.
 pub fn rms_norm_fused(x: &Tensor, weight: &Tensor, eps: f32) -> Result<Tensor> {
     x.apply_op2_no_bwd(weight, &RmsNormOp { eps })
 }
 
-/// Fused softmax over the last dimension via Metal kernel.
-///
-/// Input must be contiguous.
 pub fn softmax_fused(x: &Tensor) -> Result<Tensor> {
     x.apply_op1_no_bwd(&SoftmaxOp)
 }
 
-/// Fused RoPE (standard non-interleaved layout) via Metal kernel.
-///
-/// - `x`:   `[b, h, seq, d]`      — contiguous
-/// - `cos`: `[seq, d/2]`          — pre-gathered for the active positions
-/// - `sin`: `[seq, d/2]`          — pre-gathered for the active positions
 pub fn rope_fused(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
     x.apply_op3_no_bwd(cos, sin, &RopeOp)
 }
 
-/// Check whether SDPA is usable for the given configuration.
-///
-/// Returns `true` when:
-/// - tensor is on a Metal device
-/// - dtype is F16, BF16, or F32
-/// - head_dim is one of 32, 64, 72, 80, 96, 128, 256
 pub fn sdpa_available(tensor: &Tensor, head_dim: usize) -> bool {
     tensor.device().is_metal()
         && matches!(tensor.dtype(), DType::F16 | DType::BF16 | DType::F32)
         && matches!(head_dim, 32 | 64 | 72 | 80 | 96 | 128 | 256)
 }
 
-/// Fused gated-SiLU via Metal kernel.
-///
-/// `x` must be a contiguous tensor of shape `[*, 2*intermediate_size]` where
-/// the first `intermediate_size` columns are the gate projection and the second
-/// are the up projection.  Returns `[*, intermediate_size]` = silu(gate) * up.
 pub fn gated_silu_fused(x: &Tensor, intermediate_size: usize) -> Result<Tensor> {
     x.apply_op1_no_bwd(&GatedSiluOp { intermediate_size })
 }
 
-/// Fused SiLU-Mul via Metal kernel.
-///
-/// Both `gate` and `up` must be contiguous tensors of the same shape.
-/// Returns a tensor of the same shape with values `silu(gate[i]) * up[i]`.
 pub fn silu_mul_fused(gate: &Tensor, up: &Tensor) -> Result<Tensor> {
     gate.apply_op2_no_bwd(up, &SiluMulOp)
 }
 
-/// Fused gated GeLU-tanh via Metal kernel.
-///
-/// Same shape contract as [`gated_silu_fused`] but uses the tanh approximation
-/// of GeLU as the gate activation.  Used by Gemma family FFNs.
 pub fn gated_gelu_tanh_fused(x: &Tensor, intermediate_size: usize) -> Result<Tensor> {
     x.apply_op1_no_bwd(&GatedGeluTanhOp { intermediate_size })
 }
 
-/// Fused GeLU-tanh-Mul via Metal kernel.
-///
-/// Both `gate` and `up` must be contiguous tensors of the same shape.
-/// Returns a tensor of the same shape with values `gelu_tanh(gate[i]) * up[i]`.
 pub fn gelu_tanh_mul_fused(gate: &Tensor, up: &Tensor) -> Result<Tensor> {
     gate.apply_op2_no_bwd(up, &GeluTanhMulOp)
 }
 
-/// Fused softcap via Metal kernel: `out[i] = cap * tanh(x[i] / cap)`.
-///
-/// `x` must be contiguous.  Returns a tensor of the same shape and dtype.
 pub fn softcap_fused(x: &Tensor, softcap: f32) -> Result<Tensor> {
     x.apply_op1_no_bwd(&SoftcapOp { softcap })
 }
 
-/// Flash Attention prefill via Metal custom kernel.
-///
-/// Computes scaled dot-product attention for the prefill path (multi-token Q)
-/// using a tiled FA2-style kernel with online softmax — never materialises the
-/// full QKᵀ matrix in unified memory.
-///
-/// Tensor layout (head counts are taken from the tensor shapes):
-/// - `q`: `[B, H,    T_q,  D]`  contiguous
-/// - `k`: `[B, H_kv, T_kv, D]`  contiguous
-/// - `v`: `[B, H_kv, T_kv, D]`  contiguous
-///
-/// Where `T_kv = prefix_len + T_q` and `H % H_kv == 0` (GQA supported natively).
-/// Causal masking is always applied; `softcap` of `Some(cap)` enables Gemma-style
-/// score capping inline in the kernel.
 pub fn flash_attention_metal_prefill(
     q: &Tensor,
     k: &Tensor,
@@ -1333,21 +1181,9 @@ pub fn flash_attention_metal_prefill(
     )
 }
 
-/// Check whether the custom Metal Flash Attention prefill kernel can handle
-/// the given configuration.
-///
-/// Returns `true` for head dims 64, 128, 256 (the configurations with vetted
-/// threadgroup memory budgets).  Other head dims fall back to the standard
-/// attention path.
 pub fn flash_attention_metal_available(head_dim: usize) -> bool {
     matches!(head_dim, 64 | 128 | 256)
 }
-
-// ─── W4A16 quantized matmul ──────────────────────────────────────────────────
-//
-// Fused dequantize + matmul for AWQ 4-bit weight-only checkpoints. The packed
-// weight triplet (qweight/qzeros u32, scales T) stays resident; the unpack is
-// done inline in the kernel. See `quant_kernels.metal` for the AWQ layout.
 
 const QUANT_METAL_SOURCE: &str = include_str!("quant_kernels.metal");
 
@@ -1383,7 +1219,6 @@ fn get_or_compile_quant_pipeline(
     Ok(pipeline)
 }
 
-/// Must match `W4A16Params` in `quant_kernels.metal`.
 #[repr(C)]
 struct W4A16Params {
     in_features: u32,
@@ -1395,7 +1230,6 @@ struct W4A16Params {
     chunk: u32,
 }
 
-/// Geometry of an AWQ weight triplet, validated once per dispatch.
 struct AwqShape {
     in_features: usize,
     out_features: usize,
@@ -1430,7 +1264,6 @@ impl AwqShape {
         })
     }
 
-    /// `group_shift`/`k_splits`/`chunk` are gemv-only; pass 0 for the dequant kernel.
     fn params(&self, group_shift: usize, k_splits: usize, chunk: usize) -> W4A16Params {
         W4A16Params {
             in_features: self.in_features as u32,
@@ -1444,11 +1277,6 @@ impl AwqShape {
     }
 }
 
-/// Fused W{4,8}A16 GEMV. An `InplaceOp1` that atomically accumulates the
-/// split-K partials into a pre-zeroed `[1, out]` F32 buffer; `x` and the
-/// packed triplet are carried as fields (the trait passes only the in-place
-/// tensor). `bits` selects between the 4-bit and 8-bit kernel instantiations
-/// of the bit-parametric AWQ template.
 struct W4A16Matmul {
     x: Tensor,
     qweight: Tensor,
@@ -1541,11 +1369,6 @@ impl InplaceOp1 for W4A16Matmul {
             ),
         };
 
-        // Split the in_features reduction so enough simdgroups are resident to
-        // hide HBM latency. Chunks are contiguous, so each thread stays inside a
-        // quant group and the scale/zero reload is amortised. The split-K
-        // partials are accumulated straight into `out` with atomic adds — no
-        // partial buffer, no separate reduction pass.
         const TARGET_THREADS: usize = 32768;
         let k_splits = (TARGET_THREADS / shape.packed_out.max(1))
             .clamp(1, 256)
@@ -1611,9 +1434,6 @@ impl InplaceOp1 for W4A16Matmul {
     }
 }
 
-/// Dequantize an AWQ triplet to a plain `[in, out]` weight. `CustomOp1` over
-/// `qweight`; `qzeros`/`scales` carried as fields. Used for the prefill path
-/// where a tuned GEMM on the dequantized weight beats a custom kernel.
 struct DequantizeW4 {
     qzeros: Tensor,
     scales: Tensor,
@@ -1718,10 +1538,6 @@ impl CustomOp1 for DequantizeW4 {
     }
 }
 
-/// Fused W4A16 matmul: `x [M, in] @ dequant(AWQ)ᵀ → [M, out]`.
-///
-/// `x` must be 2-D, contiguous, F16/BF16 on a Metal device; the AWQ triplet
-/// must be Metal-resident with `scales` in the same dtype as `x`.
 pub fn w4a16_matmul(
     x: &Tensor,
     qweight: &Tensor,
@@ -1731,9 +1547,6 @@ pub fn w4a16_matmul(
     wna16_matmul_inner(x, qweight, qzeros, scales, 4)
 }
 
-/// Fused W8A16 matmul: same as [`w4a16_matmul`] but for 8-bit AWQ-style packed
-/// weights (`pack_factor = 4`, sequential pack order). Dispatched from
-/// `PackedQuantLinear::forward` whenever `bits == 8`.
 pub fn w8a16_matmul(
     x: &Tensor,
     qweight: &Tensor,
@@ -1750,8 +1563,6 @@ fn wna16_matmul_inner(
     scales: &Tensor,
     bits: u32,
 ) -> Result<Tensor> {
-    // Zero-initialised F32 accumulator; the kernel atomic-adds the split-K
-    // partials straight into it (no partial buffer, no reduction pass).
     let out_features = scales.dim(1)?;
     let out = Tensor::zeros((1, out_features), DType::F32, x.device())?;
     out.inplace_op1(&W4A16Matmul {
@@ -1764,7 +1575,6 @@ fn wna16_matmul_inner(
     out.to_dtype(x.dtype())
 }
 
-/// Dequantize an AWQ-4bit triplet to a plain `[in, out]` weight in the scales' dtype.
 pub fn dequantize_w4(qweight: &Tensor, qzeros: &Tensor, scales: &Tensor) -> Result<Tensor> {
     qweight.apply_op1_no_bwd(&DequantizeW4 {
         qzeros: qzeros.clone(),
@@ -1773,8 +1583,6 @@ pub fn dequantize_w4(qweight: &Tensor, qzeros: &Tensor, scales: &Tensor) -> Resu
     })
 }
 
-/// 8-bit variant of [`dequantize_w4`]. Dispatched from
-/// `PackedQuantLinear::forward` for the M>1 (prefill / batched) path.
 pub fn dequantize_w8(qweight: &Tensor, qzeros: &Tensor, scales: &Tensor) -> Result<Tensor> {
     qweight.apply_op1_no_bwd(&DequantizeW4 {
         qzeros: qzeros.clone(),
@@ -1783,9 +1591,6 @@ pub fn dequantize_w8(qweight: &Tensor, qzeros: &Tensor, scales: &Tensor) -> Resu
     })
 }
 
-// ── GPTQ resident path (auto-gptq layout) ───────────────────────────────────
-
-/// Must match `GptqParams` in `quant_kernels.metal`.
 #[repr(C)]
 struct GptqParams {
     in_features: u32,
@@ -1796,9 +1601,6 @@ struct GptqParams {
     chunk: u32,
 }
 
-/// Validated GPTQ shape. Unlike [`AwqShape`] there's no `packed_out` because
-/// qweight is packed along *in_features*; the only derived value we cache is
-/// `packed_in = in_features / pack_factor`.
 struct GptqShape {
     in_features: usize,
     out_features: usize,
@@ -1840,8 +1642,6 @@ impl GptqShape {
     }
 }
 
-/// Fused GPTQ-W{4,8}A16 GEMV. Mirror of [`W4A16Matmul`] but for the
-/// auto-gptq pack layout (`qweight[i_word, o]`, PlusOne zero point).
 struct GptqMatmul {
     x: Tensor,
     qweight: Tensor,
@@ -1935,15 +1735,12 @@ impl InplaceOp1 for GptqMatmul {
             ),
         };
 
-        // Split-K sizing: aim for ~32k threads = `out_features × k_splits`.
-        // `chunk` must be a multiple of `pack_factor` so each thread iterates
-        // whole qweight words (no per-element boundary check inside the loop).
+        // `chunk` must be a multiple of pack_factor (kernel iterates whole words).
         const TARGET_THREADS: usize = 32768;
         let k_splits = (TARGET_THREADS / shape.out_features.max(1))
             .clamp(1, 256)
             .min(shape.in_features.max(1));
         let raw_chunk = shape.in_features.div_ceil(k_splits);
-        // Round chunk up to next pack_factor boundary.
         let chunk = raw_chunk.div_ceil(pack_factor) * pack_factor;
         let k_splits = shape.in_features.div_ceil(chunk);
         let group_shift = shape.group_size.trailing_zeros() as usize;
@@ -2118,9 +1915,6 @@ impl CustomOp1 for DequantizeGptqPacked {
     }
 }
 
-/// Fused GPTQ-W{4,8}A16 matmul: `x [1, in] @ dequant(GPTQ)ᵀ → [1, out]`. The
-/// caller picks `bits` based on the quantization config; group size must be a
-/// power of two.
 pub fn gptq_matmul(
     x: &Tensor,
     qweight: &Tensor,
@@ -2140,8 +1934,6 @@ pub fn gptq_matmul(
     out.to_dtype(x.dtype())
 }
 
-/// Dequantize a GPTQ packed weight to a plain `[in, out]` tensor in the scales'
-/// dtype on Metal. Used by `PackedQuantLinear` for the prefill (M>1) path.
 pub fn dequantize_gptq_packed(
     qweight: &Tensor,
     qzeros: &Tensor,
@@ -2157,14 +1949,6 @@ pub fn dequantize_gptq_packed(
 
 #[cfg(test)]
 mod fused_kernel_parity_tests {
-    //! Numerical parity between fused Metal kernels and the scalar reference
-    //! path on a real Metal device.  Each test silently skips on machines
-    //! without a Metal device available (e.g. CI Linux runners), so the
-    //! suite stays useful both locally on macOS and in cross-platform CI.
-    //!
-    //! Tolerance is loose because F16/BF16 differ between fused (F32-promote
-    //! intermediate) and scalar (F16/BF16-native) paths.
-
     use super::*;
     use crate::common::awq::{AWQ_PACK_ORDER, AwqRawTensors, dequantize_awq};
     use candle_core::{D, Device};
@@ -2441,13 +2225,6 @@ mod fused_kernel_parity_tests {
         let diff = max_abs_diff_f32(&f, &s);
         assert!(diff < 0.5, "max_abs_diff (bf16) = {diff}");
     }
-
-    // ── Flash Attention prefill parity tests ─────────────────────────────────
-    //
-    // Compare the custom Metal FA kernel against a naive `matmul + softmax +
-    // matmul` reference computed on the same Metal device.  Both paths use
-    // F32 internal accumulation so the numerical agreement should be tight
-    // (<1e-3 for F32, ~1e-2 for BF16).
 
     fn naive_attention_reference(
         q: &Tensor, // [B, H, T_q, D]
@@ -2783,9 +2560,6 @@ mod fused_kernel_parity_tests {
         );
     }
 
-    // ── W4A16 quantized matmul parity ────────────────────────────────────────
-
-    /// Pack a `[rows][out]` 4-bit-nibble matrix into AWQ `[rows, out/8]` words.
     fn pack_awq(matrix: &[Vec<u8>], rows: usize, out_features: usize) -> Vec<i32> {
         let packed_out = out_features / 8;
         let mut words = vec![0u32; rows * packed_out];
@@ -2801,7 +2575,6 @@ mod fused_kernel_parity_tests {
         words.into_iter().map(|w| w as i32).collect()
     }
 
-    /// Deterministic synthetic AWQ triplet on `dev`, `scales` cast to `dtype`.
     fn build_awq_triplet(
         dev: &Device,
         dtype: DType,
@@ -2847,7 +2620,6 @@ mod fused_kernel_parity_tests {
         AwqRawTensors::new_awq(4, qweight, qzeros, scales)
     }
 
-    /// Tolerance dominated by the kernel's single F16/BF16 output rounding.
     fn parity_tol(reference: &[f32]) -> f32 {
         let max_abs = reference.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
         0.06 * max_abs + 1e-2
@@ -2861,7 +2633,6 @@ mod fused_kernel_parity_tests {
         group_size: usize,
         label: &str,
     ) {
-        // The fused GEMV kernel is the M=1 (decode) path.
         let raw = build_awq_triplet(dev, dtype, in_features, out_features, group_size);
         let x_data: Vec<f32> = (0..in_features)
             .map(|i| ((i % 13) as f32 - 6.0) * 0.03)
@@ -2879,8 +2650,7 @@ mod fused_kernel_parity_tests {
         )
         .expect("w4a16 kernel must not error");
 
-        // Golden: dequantize + matmul in F32 (x keeps its F16/BF16 precision).
-        let w_ref = dequantize_awq(&raw, dev, DType::F32).unwrap(); // [out, in]
+        let w_ref = dequantize_awq(&raw, dev, DType::F32).unwrap();
         let x_f32 = x.to_dtype(DType::F32).unwrap();
         let y_ref = x_f32
             .matmul(&w_ref.t().unwrap().contiguous().unwrap())
@@ -3010,14 +2780,6 @@ mod fused_kernel_parity_tests {
         );
     }
 
-    // ── W8A16 parity ─────────────────────────────────────────────────────────
-    // The 4-bit AWQ layout doubles to 8-bit via `pack_factor = 4` (sequential
-    // pack order, no AWQ_PACK_ORDER interleave because the template makes
-    // `pack_position<8>` return identity). No real AWQ-8bit checkpoint ships
-    // today, so the parity tests below drive the kernels with synthetic data.
-
-    /// Pack `[rows][out]` of 8-bit values (0..255) into `[rows, out/4]` u32
-    /// words, sequential order (matches `pack_position<8>` = identity).
     fn pack_awq_8bit(matrix: &[Vec<u8>], rows: usize, out_features: usize) -> Vec<i32> {
         let packed_out = out_features / 4;
         let mut words = vec![0u32; rows * packed_out];
@@ -3033,8 +2795,6 @@ mod fused_kernel_parity_tests {
         words.into_iter().map(|w| w as i32).collect()
     }
 
-    /// Build a synthetic 8-bit triplet + the manually-computed reference
-    /// `[out, in]` F32 weight matrix for parity.
     fn build_w8a16_triplet(
         dev: &Device,
         dtype: DType,
@@ -3061,8 +2821,6 @@ mod fused_kernel_parity_tests {
             .flat_map(|g| (0..out_features).map(move |j| 0.001 + 0.0007 * ((g + j) % 17) as f32))
             .collect();
 
-        // Reference weight [out, in] = scale * (q - zero) (Signed convention,
-        // mirroring AWQ).
         let mut ref_w = vec![0f32; out_features * in_features];
         for i in 0..in_features {
             let g = i / group_size;
@@ -3112,7 +2870,6 @@ mod fused_kernel_parity_tests {
 
         let y_kernel = w8a16_matmul(&x, &qw, &qz, &sc).expect("w8a16 kernel must not error");
 
-        // Reference: x_f32 @ ref_w.T
         let w_ref = Tensor::from_vec(ref_w.clone(), (out_features, in_features), dev).unwrap();
         let x_f32 = x.to_dtype(DType::F32).unwrap();
         let y_ref = x_f32
@@ -3152,7 +2909,6 @@ mod fused_kernel_parity_tests {
         let (qw, qz, sc, ref_w) =
             build_w8a16_triplet(dev, dtype, in_features, out_features, group_size);
         let w_kernel = dequantize_w8(&qw, &qz, &sc).expect("dequantize_w8 must not error");
-        // Reference is [out, in]; kernel emits [in, out].
         let w_ref = Tensor::from_vec(ref_w, (out_features, in_features), dev).unwrap();
         let w_ref_t = w_ref.t().unwrap().contiguous().unwrap();
 
@@ -3198,13 +2954,6 @@ mod fused_kernel_parity_tests {
         run_dequant_w8_parity(&dev, DType::BF16, 256, 128, 128, "w8/bf16/g128");
     }
 
-    // ── GPTQ resident kernel parity ──────────────────────────────────────────
-    // Drives `gptq_matmul` and `dequantize_gptq_packed` against the CPU
-    // reference `dequantize_gptq` (asymmetric PlusOne, sequential pack).
-
-    /// Build a synthetic GPTQ triplet (4 or 8 bits, asym/PlusOne) on `dev`
-    /// matching the auto-gptq layout: qweight `[in/pf, out]`, qzeros
-    /// `[groups, out/pf]`, scales `[groups, out]`.
     fn build_gptq_triplet(
         dev: &Device,
         dtype: DType,
@@ -3217,7 +2966,6 @@ mod fused_kernel_parity_tests {
         let groups = in_features / group_size;
         let mask = (1u32 << bits) - 1;
 
-        // Pack qweight along IN: word at [iw, o] holds rows iw*pf..iw*pf+pf for column o.
         let packed_in = in_features / pf;
         let mut qw = vec![0i32; packed_in * out_features];
         for iw in 0..packed_in {
@@ -3231,7 +2979,6 @@ mod fused_kernel_parity_tests {
                 qw[iw * out_features + o] = w as i32;
             }
         }
-        // Pack qzeros along OUT: word at [g, ow] holds zero-1 for cols ow*pf..ow*pf+pf.
         let packed_out = out_features / pf;
         let mut qz = vec![0i32; groups * packed_out];
         for g in 0..groups {
@@ -3292,7 +3039,6 @@ mod fused_kernel_parity_tests {
         )
         .expect("gptq kernel must not error");
 
-        // Golden: CPU dequant → matmul. Reference path returns [out, in].
         let w_ref = crate::common::awq::dequantize_gptq(&raw, dev, DType::F32).unwrap();
         let x_f32 = x.to_dtype(DType::F32).unwrap();
         let y_ref = x_f32
@@ -3391,11 +3137,6 @@ mod fused_kernel_parity_tests {
         run_gptq_dequant_parity(&dev, DType::BF16, 8, 256, 128, 128, "gptq8/bf16/g128");
     }
 
-    /// Perf diagnostic (not a correctness gate): times the W4A16 matmul against
-    /// the bf16 `matmul` it replaces, both as independent calls (the GPU can
-    /// overlap them) and as a dependent chain (mirrors the decode loop, where
-    /// each op feeds the next and the GPU cannot overlap). Run explicitly:
-    ///   cargo test --release --bin oxydllm -- w4a16_decode_perf --ignored --nocapture
     #[test]
     #[ignore = "perf diagnostic"]
     fn w4a16_decode_perf_diagnostic() {
@@ -3410,7 +3151,6 @@ mod fused_kernel_parity_tests {
         let iters = 144; // ~quantized matmuls per Qwen3-4B decode token
 
         let raw = build_awq_triplet(&dev, dtype, n, n, group_size);
-        // bf16 [n, n] weight = exactly what the old dequant-at-load path used.
         let w_bf16 = dequantize_awq(&raw, &dev, dtype)
             .unwrap()
             .t()
@@ -3433,7 +3173,6 @@ mod fused_kernel_parity_tests {
 
         let per_call = |t: Instant| t.elapsed().as_secs_f64() * 1e6 / iters as f64;
 
-        // Independent calls — the GPU may overlap successive dispatches.
         let t = Instant::now();
         let mut sink = Vec::with_capacity(iters);
         for _ in 0..iters {
@@ -3459,7 +3198,6 @@ mod fused_kernel_parity_tests {
         let bf16_indep = per_call(t);
         drop(sink);
 
-        // Dependent chain — each call feeds the next, as in the decode loop.
         let t = Instant::now();
         let mut x = x0.clone();
         for _ in 0..iters {
@@ -3488,31 +3226,12 @@ mod fused_kernel_parity_tests {
     }
 }
 
-// ─── GGUF quantized matmul (Q5_0 first; Q4_K and Q2_K to follow) ────────────
-//
-// Bf16-aware GEMV kernels for GGUF-quantized weights. The packed block stream
-// (e.g. 22 bytes per 32 elements for Q5_0) is carried as a `Tensor` of `U8`
-// scalars Metal-resident — see `GgufFastPath` in `linear.rs` for the loader
-// side. Algorithm is a port of `mul_vec_q_n_f32` from llama.cpp / candle
-// (MIT) adapted to bf16 I/O (no host-side casts; bf16 read + bf16 write).
-// Geometry: N_SIMDGROUP=2 simdgroups × N_DST=4 rows → 8 rows per threadgroup;
-// each simdgroup loops over the row's K blocks with simd_sum at the end and
-// one writer per row (no atomics, no split-K).
-//
-// Forward is M=1 only; the caller (QLinear) falls back to candle `QMatMul`
-// for M>1 prefill.
-
 #[repr(C)]
 struct GgufParams {
     in_features: u32,
     out_features: u32,
 }
 
-// Per-quant geometry lives in `GgufFastQuant::dispatch_geometry`.
-
-/// Supported GGUF dtype variants for the bf16 fast path. Each variant carries
-/// its (block_elems, block_bytes, kernel_name, dequant_kernel_name) tuple via
-/// the helpers below.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum GgufFastQuant {
     Q4_0,
@@ -3528,7 +3247,6 @@ pub enum GgufFastQuant {
 }
 
 impl GgufFastQuant {
-    /// (block_elems, block_bytes) — elements per quant block and bytes per block.
     pub fn block_layout(self) -> (usize, usize) {
         match self {
             Self::Q4_0 => (32, 18),
@@ -3536,7 +3254,6 @@ impl GgufFastQuant {
             Self::Q5_0 => (32, 22),
             Self::Q5_1 => (32, 24),
             Self::Q8_0 => (32, 34),
-            // K-quant super-block 256.
             Self::Q2K => (256, 84),
             Self::Q3K => (256, 110),
             Self::Q4K => (256, 144),
@@ -3590,18 +3307,7 @@ impl GgufFastQuant {
         }
     }
 
-    /// Dispatch geometry: `(threads_per_TG, rows_per_TG)`. Each candle
-    /// template has its own row-per-simdgroup ratio:
-    ///
-    /// | Quant       | simdgroups/TG | rows/simdgroup | rows/TG | threads/TG |
-    /// |-------------|---------------|----------------|---------|------------|
-    /// | Q4_0..Q5_1  | 2             | 4              | 8       | 64         |
-    /// | Q8_0        | 2             | 4              | 8       | 64         |
-    /// | Q2_K        | 2             | 4              | 8       | 64         |
-    /// | Q3_K        | 2             | 2              | 4       | 64         |
-    /// | Q4_K        | 1             | 4              | 4       | 32         |
-    /// | Q5_K        | 2             | 2              | 4       | 64         |
-    /// | Q6_K        | 2             | 1              | 2       | 64         |
+    // (threads_per_TG, rows_per_TG) per quant — must match the kernel's geometry.
     fn dispatch_geometry(self) -> (usize, usize) {
         const SIMDWIDTH: usize = 32;
         match self {
@@ -3735,9 +3441,6 @@ impl InplaceOp1 for GgufQuantMatmul {
         encoder.use_resource(w_buf, MTLResourceUsage::Read);
         encoder.use_resource(out.buffer(), MTLResourceUsage::Write);
 
-        // Geometry depends on the quant's template: Q5_0/Q8_0 use 2 simdgroups
-        // (`mul_vec_q_n` pattern), Q4_K uses 1 simdgroup (its `kernel_mul_mv_q4_K`
-        // hard-codes `first_row = r0 * N_DST`, ignoring `sgitg`).
         let (tg_threads, rows_per_tg) = self.quant.dispatch_geometry();
         encoder.dispatch_thread_groups(
             MTLSize {
@@ -3756,9 +3459,6 @@ impl InplaceOp1 for GgufQuantMatmul {
     }
 }
 
-/// GGUF quantized GEMV (M=1 decode path). `out = x @ W.T`, where `W` is laid
-/// out as a packed byte stream in `weight_bytes`. Dispatches the right Metal
-/// kernel based on `quant`. `x` must be BF16 `[1, K]`. Returns BF16 `[1, N]`.
 pub fn gguf_quant_matmul(
     x: &Tensor,
     weight_bytes: &Tensor,
@@ -3777,16 +3477,6 @@ pub fn gguf_quant_matmul(
     })?;
     Ok(out)
 }
-
-// ─── GGUF quantized GEMM (M>1 prefill path) ─────────────────────────────────
-//
-// Fused dequantize + matmul: the packed block stream is read straight from
-// HBM, dequantized inline in threadgroup memory per K-strip, and the result
-// is accumulated into the output tile without ever materialising a full bf16
-// weight tensor. See `quant_kernels.metal` for the kernel body.
-//
-// Geometry must match the kernel side: GGUF_MM_BM rows × GGUF_MM_BN cols per
-// TG.  Each thread of the TG owns one output element.
 
 const GGUF_MM_BM: usize = 16;
 const GGUF_MM_BN: usize = 16;
@@ -3922,9 +3612,6 @@ impl CustomOp1 for GgufQuantMulMM {
     }
 }
 
-/// Fused GGUF GEMM for `out = x @ W.T`, M>1. `weight_bytes` carries the GGUF
-/// packed block stream; the kernel dequantizes inline (no intermediate bf16
-/// weight tensor). `x` is BF16 `[M, K]`; output is BF16 `[M, N]`.
 pub fn gguf_quant_mul_mm(
     x: &Tensor,
     weight_bytes: &Tensor,

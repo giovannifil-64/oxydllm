@@ -1,17 +1,3 @@
-// ─────────────────────────────────────────────────────────────────────────────
-// estimate.rs — Memory and accuracy estimator for local and remote models
-// ─────────────────────────────────────────────────────────────────────────────
-//
-// Usage:
-//   oxydllm estimate <model-name>                    # local model in models_dir
-//   oxydllm estimate <user/repo>                     # remote HF repo (no download)
-//   oxydllm estimate <model> --context-len 8192      # custom context length
-//   oxydllm estimate <model> --num-sequences 4       # concurrent sequences
-//
-// For local GGUF models, only the file header is parsed — the full quantized
-// weight data is NOT loaded into memory, making this command instant.
-// ─────────────────────────────────────────────────────────────────────────────
-
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -632,21 +618,17 @@ fn best_recommendation(files: &[(String, u64)]) -> Option<&str> {
     })
 }
 
-/// Returns the approximate expansion factor from GGUF on-disk size to F32 loaded size.
-///
-/// GGUF on CPU: every tensor is dequantized to F32 at load time.
-/// The factor depends on the quantization — Q4_K_M needs ~7× while Q8_0 needs ~4×.
-/// Only the file header is parsed (metadata + tensor info, not weight data).
+/// Approximate expansion factor from GGUF on-disk size to F32 loaded size.
+/// On CPU every tensor is dequantized to F32 at load — Q4_K_M ≈ 7×, Q8_0 ≈ 4×.
 pub fn gguf_cpu_expansion(gguf_path: &Path) -> f64 {
     let mut file = match std::fs::File::open(gguf_path) {
         Ok(f) => f,
-        Err(_) => return 7.0, // conservative Q4 default
+        Err(_) => return 7.0,
     };
     let content = match gguf_file::Content::read(&mut file) {
         Ok(c) => c,
         Err(_) => return 7.0,
     };
-    // Inspect the dtype of the first available weight tensor.
     let dtype_debug = content
         .tensor_infos
         .get("blk.0.ffn_down.weight")
@@ -661,7 +643,7 @@ pub fn gguf_cpu_expansion(gguf_path: &Path) -> f64 {
         Some("Q4_0") | Some("Q4_1") | Some("Q4K") => 7.5,
         Some("Q3K") => 10.0,
         Some("Q2K") => 13.0,
-        _ => 7.0, // unknown / future formats: assume Q4-equivalent
+        _ => 7.0,
     }
 }
 

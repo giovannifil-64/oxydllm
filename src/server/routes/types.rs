@@ -28,10 +28,6 @@ pub struct ResponseFormat {
     pub json_schema: Option<JsonSchemaSpec>,
 }
 
-// ---------------------------------------------------------------------------
-// Tool / function-calling types
-// ---------------------------------------------------------------------------
-
 #[derive(Deserialize, Serialize, Clone, Debug)]
 pub struct FunctionDefinition {
     pub name: String,
@@ -64,10 +60,6 @@ pub struct ToolCall {
     pub function: ToolCallFunction,
 }
 
-// ---------------------------------------------------------------------------
-// Chat message (used for both incoming requests and template rendering)
-// ---------------------------------------------------------------------------
-
 #[derive(Deserialize, Serialize, Clone, Debug)]
 pub struct ChatMessage {
     pub role: String,
@@ -77,11 +69,9 @@ pub struct ChatMessage {
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
-    // For assistant messages that contain tool calls (incoming multi-turn)
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCall>>,
-    // For role="tool" messages
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
@@ -89,10 +79,6 @@ pub struct ChatMessage {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
 }
-
-// ---------------------------------------------------------------------------
-// Request
-// ---------------------------------------------------------------------------
 
 #[derive(Deserialize)]
 pub struct ChatCompletionRequest {
@@ -128,7 +114,6 @@ pub struct ChatCompletionRequest {
     pub top_logprobs: Option<usize>,
     #[serde(default)]
     pub logit_bias: Option<serde_json::Value>,
-    // Extensions (non-OpenAI)
     #[serde(default)]
     pub top_k: Option<usize>,
     #[serde(default)]
@@ -158,18 +143,14 @@ pub enum StopParam {
     Multiple(Vec<String>),
 }
 
-/// Pre-decoded logprob entry for a single generated token.
 pub struct EngineLogprobEntry {
     pub token_str: String,
     pub logprob: f32,
     pub bytes: Vec<u8>,
-    /// Top-k alternatives: (token_str, logprob, bytes).
     pub top_logprobs: Vec<(String, f32, Vec<u8>)>,
 }
 
 pub struct IncomingRequest {
-    /// UUID generated at HTTP handler entry, shared across all completions for
-    /// the same API call. Used to correlate all log lines for one request.
     pub request_id: String,
     pub prompt_tokens: Vec<u32>,
     pub sampling_params: SamplingParams,

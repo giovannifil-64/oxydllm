@@ -44,7 +44,6 @@ impl TokenDecodeCache {
     }
 }
 
-/// Build an `EngineLogprobEntry` by decoding token IDs to strings.
 fn build_logprob_entry(
     tokenizer: &Tokenizer,
     decode_cache: &mut TokenDecodeCache,
@@ -75,8 +74,6 @@ type PendingRawLogprob = (u32, f32, RawTopLogprobs);
 
 struct SeqTracker {
     tx: tokio_mpsc::UnboundedSender<EngineEvent>,
-    /// UUID from the originating HTTP request. Shared across all N completions
-    /// of the same API call. Use this to correlate log lines end-to-end.
     request_id: String,
     model_id: String,
     enqueued_at: std::time::Instant,
@@ -173,9 +170,8 @@ fn clamp_to_char_boundary(s: &str, idx: usize) -> usize {
     i
 }
 
-/// Pure suffix-emission logic given the canonical full decode and the bytes
-/// already emitted.  Trailing `U+FFFD` is held back so multi-byte UTF-8
-/// split across tokens is buffered until the continuation token arrives.
+// Trailing `U+FFFD` is held back so multi-byte UTF-8 split across tokens is
+// buffered until the continuation token arrives.
 fn emit_suffix(full: &str, decoded_len: &mut usize) -> Option<String> {
     let start = clamp_to_char_boundary(full, *decoded_len);
     let new_text = &full[start..];
@@ -265,9 +261,6 @@ fn prefix_decode_incremental(
 mod streaming_decode_tests {
     use super::*;
 
-    /// Drive `emit_suffix` with the canonical decode at each step (`steps[i]`
-    /// = what `tokenizer.decode(all_ids[..=i])` would return) and return the
-    /// concatenation of every emitted chunk.
     fn run_stream(steps: &[&str]) -> String {
         let mut decoded_len = 0;
         let mut out = String::new();
@@ -292,12 +285,8 @@ mod streaming_decode_tests {
 
     #[test]
     fn space_only_token_followed_by_g_prefixed_token_does_not_double_space() {
-        // Regression: the old fast-path heuristic ("piece starts with Ġ ⇒
-        // prepend space") emitted an extra space when a Ġ-only space token
-        // was followed by a Ġ-prefixed token, producing "...assistente
-        // virtuale" → "...assistente  virtuale" with drift that could later
-        // swallow a character (the original "  irtuale" report).  Canonical
-        // suffix-emission must reproduce the canonical text exactly.
+        // Regression: Ġ-only space token followed by a Ġ-prefixed token must
+        // not emit a double space.
         let steps = [
             "Sono un assistente",
             "Sono un assistente ",
@@ -308,9 +297,6 @@ mod streaming_decode_tests {
 
     #[test]
     fn no_character_loss_across_partial_utf8_token_boundary() {
-        // Token N decodes to a partial multi-byte UTF-8 (FFFD trailing); the
-        // next token completes the codepoint.  The emitter must hold the
-        // partial char back and emit the complete sequence on the next step.
         let steps = ["caf\u{FFFD}", "café", "café 🎉"];
         assert_eq!(run_stream(&steps), "café 🎉");
     }
@@ -331,8 +317,6 @@ mod streaming_decode_tests {
 
     #[test]
     fn clamps_decoded_len_past_end_of_full() {
-        // Defensive: if some upstream bug bumps decoded_len past full.len(),
-        // the clamp should bound it and emit nothing rather than panic.
         let mut decoded_len = 100;
         let out = emit_suffix("short", &mut decoded_len);
         assert!(out.is_none());
@@ -341,11 +325,9 @@ mod streaming_decode_tests {
 
     #[test]
     fn clamps_decoded_len_to_char_boundary_inside_multibyte() {
-        // decoded_len starts in the middle of a 2-byte UTF-8 char (é = 2 bytes).
-        // Clamp must back off to the previous char boundary.
-        let mut decoded_len = 4; // "café" = 5 bytes; offset 4 is inside é
+        // decoded_len starts inside é (2-byte UTF-8); must back off to boundary.
+        let mut decoded_len = 4;
         let out = emit_suffix("café!", &mut decoded_len);
-        // Should clamp to 3 (start of é) and emit "é!"
         assert_eq!(out.as_deref(), Some("é!"));
         assert_eq!(decoded_len, 6);
     }
@@ -433,7 +415,6 @@ pub fn engine_loop(
                             }
                             tracker.token_count += 1;
 
-                            // Handle thinking tokens.
                             if tracker.in_thinking {
                                 let raw = tokenizer
                                     .decode_with_special(&[tok.token])
@@ -468,7 +449,6 @@ pub fn engine_loop(
                                     disconnected = true;
                                 }
                             } else {
-                                // Buffer logprob raw data (if logprobs were requested).
                                 if let Some(logprob) = tok.logprob {
                                     tracker.pending_raw_lps.push((
                                         tok.token,
@@ -527,7 +507,6 @@ pub fn engine_loop(
 
                     for completed in &step.completed {
                         if let Some(mut tracker) = trackers.remove(&completed.id) {
-                            // Flush any remaining buffered text.
                             let remaining_text = if !tracker.output_ids.is_empty() {
                                 let full =
                                     tokenizer.decode(&tracker.output_ids).unwrap_or_default();
@@ -547,7 +526,6 @@ pub fn engine_loop(
                                 String::new()
                             };
 
-                            // Drain any buffered logprob entries (tokens whose text was still in the buffer).
                             let drained = std::mem::take(&mut tracker.pending_raw_lps);
                             let mut remaining_lp_entries: Vec<EngineLogprobEntry> =
                                 Vec::with_capacity(drained.len());
@@ -568,7 +546,6 @@ pub fn engine_loop(
                                 });
                             }
 
-                            // Flush remaining thinking text.
                             if !tracker.thinking_ids.is_empty() {
                                 let full =
                                     tokenizer.decode(&tracker.thinking_ids).unwrap_or_default();
@@ -621,7 +598,6 @@ pub fn engine_loop(
                         }
                     }
 
-                    // Update prefix cache counters from this step's prefill results.
                     if step.prefix_cache_hits + step.prefix_cache_misses > 0 {
                         let model_label = trackers
                             .values()
@@ -668,7 +644,6 @@ pub fn engine_loop(
                     }
                 }
             }
-            // Update queue depth after each step (reflects post-step state).
             metrics::QUEUE_DEPTH.set(engine.queue_depth() as f64);
             std::thread::yield_now();
         }

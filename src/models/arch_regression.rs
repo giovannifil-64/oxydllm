@@ -77,7 +77,6 @@ mod tests {
         }
     }
 
-    //  Weight factory
     fn rand_t(dims: &[usize], dev: &Device) -> Tensor {
         Tensor::randn(0f32, 0.02, dims, dev).unwrap()
     }
@@ -101,7 +100,6 @@ mod tests {
         for i in 0..LAYERS {
             let p = format!("model.layers.{i}");
 
-            // Attention projections
             t.insert(
                 format!("{p}.self_attn.q_proj.weight"),
                 rand_t(&[q_dim, h], dev),
@@ -119,7 +117,6 @@ mod tests {
                 rand_t(&[h, q_dim], dev),
             );
 
-            // QK norm (Qwen3, Gemma3, Gemma4)
             if spec.qk_norm {
                 t.insert(
                     format!("{p}.self_attn.q_norm.weight"),
@@ -131,14 +128,12 @@ mod tests {
                 );
             }
 
-            // Layer norms
             t.insert(format!("{p}.input_layernorm.weight"), ones_t(h, dev));
             t.insert(
                 format!("{p}.post_attention_layernorm.weight"),
                 ones_t(h, dev),
             );
 
-            // Extra FFN norms (Gemma2, Gemma3, Gemma4)
             if spec.has_ffn_norms {
                 t.insert(
                     format!("{p}.pre_feedforward_layernorm.weight"),
@@ -150,7 +145,6 @@ mod tests {
                 );
             }
 
-            // FFN (gate+up fused layout — standard for all supported archs)
             t.insert(
                 format!("{p}.mlp.gate_proj.weight"),
                 rand_t(&[INTER, h], dev),
@@ -165,7 +159,6 @@ mod tests {
         t
     }
 
-    // Model builder
     fn build_model(spec: ArchSpec) -> Result<StandardTransformer> {
         let dev = Device::Cpu;
         let tensors = build_weights(&spec, &dev);
@@ -251,8 +244,6 @@ mod tests {
         })
     }
 
-    //  Forward pass helpers
-
     fn run_prefill(
         model: &StandardTransformer,
         caches: &mut Vec<PagedKvCache>,
@@ -298,8 +289,6 @@ mod tests {
         }
     }
 
-    //  Assertions
-
     fn assert_logits_ok(logits: &Tensor, seq_len: usize, arch_name: &str) {
         let dims = logits.dims();
         assert_eq!(
@@ -327,12 +316,10 @@ mod tests {
             build_model(spec).unwrap_or_else(|e| panic!("[{name}] model build failed: {e}"));
         let mut caches = make_caches(&model);
 
-        // Prefill: 8 tokens
         let prefill_logits = run_prefill(&model, &mut caches, 8)
             .unwrap_or_else(|e| panic!("[{name}] prefill failed: {e}"));
         assert_logits_ok(&prefill_logits, 8, name);
 
-        // Decode: 3 steps
         for step in 0..3 {
             let decode_logits = run_decode(&model, &mut caches, 8 + step)
                 .unwrap_or_else(|e| panic!("[{name}] decode step {step} failed: {e}"));
@@ -341,13 +328,6 @@ mod tests {
 
         clear_caches(&mut caches);
     }
-
-    //
-    // Architecture tests
-    //
-    // Each test exercises a unique combination of feature flags.
-    // The comment lists which code paths are specifically activated.
-    //
 
     #[test]
     fn arch_llama() {
@@ -359,8 +339,6 @@ mod tests {
         });
     }
 
-    /// MistralForCausalLM — SiLU + sliding window attention.
-    /// Exercises: truncate_kv_window in decode, causal_mask_prefixed in prefill.
     #[test]
     fn arch_mistral() {
         run_arch_test(ArchSpec {
@@ -371,7 +349,6 @@ mod tests {
         });
     }
 
-    /// Qwen2ForCausalLM — SiLU, high rope theta, otherwise standard.
     #[test]
     fn arch_qwen2() {
         run_arch_test(ArchSpec {
@@ -382,8 +359,6 @@ mod tests {
         });
     }
 
-    /// Qwen3ForCausalLM — SiLU + QK norm.
-    /// Exercises: q_norm/k_norm paths in Attention.
     #[test]
     fn arch_qwen3() {
         run_arch_test(ArchSpec {
@@ -395,8 +370,6 @@ mod tests {
         });
     }
 
-    /// GemmaForCausalLM — GeLU + Gemma norm (+1 offset) + embed_scale + tied weights.
-    /// Exercises: NormType::Gemma (weight+1), gelu_tanh activation, embed_scale multiply.
     #[test]
     fn arch_gemma() {
         run_arch_test(ArchSpec {
@@ -409,9 +382,6 @@ mod tests {
         });
     }
 
-    /// Gemma2ForCausalLM — GeLU + Gemma norm + FFN norms + attn softcap + logit softcap
-    /// + sliding window (alternating via Gemma norm type).
-    /// Exercises: pre/post_feedforward norms, softcap in attention scores, logit capping, compute_sliding_window Gemma odd-layer disable.
     #[test]
     fn arch_gemma2() {
         run_arch_test(ArchSpec {
@@ -428,8 +398,6 @@ mod tests {
         });
     }
 
-    /// Gemma3ForCausalLM — GeLU + Gemma norm + QK norm + FFN norms + embed_scale.
-    /// Exercises: combined qk_norm + ffn_norms (both active simultaneously).
     #[test]
     fn arch_gemma3() {
         run_arch_test(ArchSpec {
@@ -444,9 +412,6 @@ mod tests {
         });
     }
 
-    /// Gemma4ForConditionalGeneration — GeLU + Standard norm + QK norm + V norm
-    /// + FFN norms + logit softcap + attention_scale override.
-    /// Exercises: v_norm (rms_norm_no_weight), attention_scale override, Standard+qk_norm combo.
     #[test]
     fn arch_gemma4() {
         run_arch_test(ArchSpec {
@@ -464,7 +429,6 @@ mod tests {
         });
     }
 
-    /// Phi3ForCausalLM — SiLU, standard norm (similar to Llama baseline).
     #[test]
     fn arch_phi3() {
         run_arch_test(ArchSpec {
@@ -474,12 +438,6 @@ mod tests {
         });
     }
 
-    //
-    // Edge case / combination tests
-    //
-
-    /// Verify that sliding window + softcap together don't interfere.
-    /// This is the Gemma2 path but with more aggressive window to force truncation.
     #[test]
     fn edge_sliding_window_plus_softcap() {
         run_arch_test(ArchSpec {
@@ -487,14 +445,13 @@ mod tests {
             activation: Activation::GeLUTanh,
             norm_type: NormType::Gemma,
             attn_softcap: Some(50.0),
-            sliding_window: Some(4), // Very small → forces truncation even with 8-token prefill
+            sliding_window: Some(4),
             tie_weights: true,
             embed_scale: Some((HIDDEN as f64).sqrt()),
             ..Default::default()
         });
     }
 
-    /// All features enabled simultaneously — catches interaction bugs.
     #[test]
     fn edge_all_features() {
         run_arch_test(ArchSpec {
@@ -514,8 +471,6 @@ mod tests {
         });
     }
 
-    /// Minimal features — catches "default path" regressions that might be
-    /// masked by feature-specific tests always having something enabled.
     #[test]
     fn edge_minimal() {
         run_arch_test(ArchSpec {
@@ -523,21 +478,6 @@ mod tests {
             ..Default::default()
         });
     }
-
-    // ── KV cache quantization regression ─────────────────────────────────────
-    //
-    // Build two identical models from the same weights: one with no KV
-    // quantization, one with 4-bit (Lossless) quantization.  After a shared
-    // prefill, run one decode step on each and verify:
-    //   1. Both produce finite, non-zero logits.
-    //   2. The softmax L1 distance between the two outputs is < 0.5.
-    //      (4-bit quantization on HEAD_DIM=8 vectors introduces bounded error;
-    //       the threshold is generous to avoid flakiness with random weights
-    //       while still catching catastrophic numerical failures.)
-    //
-    // This test exercises the full TurboQuant write→read round-trip through
-    // BlockAllocator::append / flush_pending / gather, catching bugs that
-    // pure unit-level quantize/dequantize tests cannot reach.
 
     fn softmax(v: &[f32]) -> Vec<f32> {
         let max = v.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
@@ -573,7 +513,6 @@ mod tests {
         };
         let dev = Device::Cpu;
 
-        // Build weights once; clone (cheap Arc increments) for the second model.
         let tensors = build_weights(&spec, &dev);
         let tensors2: rustc_hash::FxHashMap<String, Tensor> = tensors
             .iter()
@@ -590,12 +529,10 @@ mod tests {
         let mut caches_off = make_caches(&model_off);
         let mut caches_quant = make_caches(&model_quant);
 
-        // Prefill with identical token sequence on both models.
         run_prefill(&model_off, &mut caches_off, 8).expect("kv_quant: prefill failed (off)");
         run_prefill(&model_quant, &mut caches_quant, 8)
             .expect("kv_quant: prefill failed (lossless)");
 
-        // Single decode step — this reads the (possibly quantized) KV cache.
         let off_logits =
             run_decode(&model_off, &mut caches_off, 8).expect("kv_quant: decode failed (off)");
         let quant_logits = run_decode(&model_quant, &mut caches_quant, 8)
@@ -689,10 +626,9 @@ mod tests {
         );
     }
 
-    /// P-6 chunking parity: a single packed forward over `[seq_a; seq_b]` must
-    /// produce the same logits as two sequential forward calls (one per seq)
-    /// concatenated along the seq dim.  This is the property the engine
-    /// relies on when it splits prefill into two `forward_batch` calls.
+    /// Single packed forward over `[seq_a; seq_b]` must match two sequential
+    /// per-seq forwards concatenated along the seq dim — the engine relies on
+    /// this when splitting prefill into multiple `forward_batch` calls.
     #[test]
     fn chunked_forward_matches_single_packed_forward() {
         let model = build_model(ArchSpec {
@@ -709,7 +645,6 @@ mod tests {
         let pos_a: Vec<u32> = (0..len_a as u32).collect();
         let pos_b: Vec<u32> = (0..len_b as u32).collect();
 
-        // Single packed forward: caches for seq A and seq B side by side.
         let mut caches_a_pkd = make_caches(&model);
         let mut caches_b_pkd = make_caches(&model);
         let combined_tokens: Vec<u32> = tokens_a.iter().chain(tokens_b.iter()).copied().collect();
@@ -723,7 +658,6 @@ mod tests {
             .unwrap();
         crate::common::block::flush_caches(&mut slices_pkd).unwrap();
 
-        // Two-chunk forward: seq A alone, then seq B alone, then concat logits.
         let mut caches_a_chk = make_caches(&model);
         let mut caches_b_chk = make_caches(&model);
         let input_a = Tensor::from_vec(tokens_a.clone(), (1, len_a), &dev).unwrap();
@@ -742,13 +676,10 @@ mod tests {
 
         let logits_chk = Tensor::cat(&[&logits_a, &logits_b], 1).unwrap();
 
-        // Both flushes happen after both chunks complete in the real engine.
         let mut all_chk: Vec<&mut [PagedKvCache]> =
             vec![caches_a_chk.as_mut_slice(), caches_b_chk.as_mut_slice()];
         crate::common::block::flush_caches(&mut all_chk).unwrap();
 
-        // Compare logits.  CPU compute is deterministic; tolerance accounts
-        // only for any reordering of equivalent ops.
         let p = logits_pkd.flatten_all().unwrap().to_vec1::<f32>().unwrap();
         let c = logits_chk.flatten_all().unwrap().to_vec1::<f32>().unwrap();
         assert_eq!(p.len(), c.len(), "chunked vs packed shape mismatch");

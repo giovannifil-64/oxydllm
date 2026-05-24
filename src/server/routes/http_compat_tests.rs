@@ -87,10 +87,7 @@ fn spawn_scripted_engine(replies: Vec<ScriptedReply>) -> tokio_mpsc::Sender<Inco
     request_tx
 }
 
-/// Engine that accepts requests but never sends any events on `response_tx`.
-/// Used to verify that wall-clock per-request timeouts fire on stuck sequences.
-/// The receiver task holds onto each `IncomingRequest` so that `response_tx`
-/// is not dropped (which would prematurely close the channel).
+// Holds onto each IncomingRequest so response_tx isn't dropped (would close the channel early).
 fn spawn_stuck_engine() -> tokio_mpsc::Sender<IncomingRequest> {
     let (request_tx, mut request_rx) = tokio_mpsc::channel::<IncomingRequest>(64);
     tokio::spawn(async move {
@@ -141,7 +138,6 @@ fn build_test_app(replies: Vec<ScriptedReply>) -> anyhow::Result<(Router, TempDi
     Ok((build_router(state), tmp))
 }
 
-/// Build a test app with an `OXYDLLM_API_KEY`-style bearer-only configuration.
 fn build_test_app_with_api_key(
     replies: Vec<ScriptedReply>,
     api_key: &str,
@@ -184,9 +180,6 @@ fn build_test_app_with_api_key(
     Ok((build_router(state), tmp))
 }
 
-/// Build a test app with a per-request wall-clock timeout. The scripted engine
-/// must be the slow variant so the timeout actually fires before the engine
-/// finishes producing tokens.
 fn build_test_app_with_timeout(
     request_tx: tokio_mpsc::Sender<IncomingRequest>,
     timeout: Duration,
@@ -325,10 +318,6 @@ async fn get_request(app: &Router, uri: &str) -> axum::response::Response {
         .expect("request failed")
 }
 
-// ---------------------------------------------------------------------------
-// GET endpoint tests
-// ---------------------------------------------------------------------------
-
 #[tokio::test]
 async fn metrics_endpoint_returns_prometheus_text() {
     let (app, _tmp) = build_test_app(vec![]).expect("test app");
@@ -353,10 +342,7 @@ async fn metrics_endpoint_returns_prometheus_text() {
     )
     .expect("utf-8");
 
-    // Simple Gauges (non-vec) always appear in Prometheus output even with value 0.
-    // Labeled Vecs (HistogramVec, CounterVec, GaugeVec) only appear after at least
-    // one label combination has been observed or set. We check the gauges that the
-    // handler explicitly sets for the test model.
+    // Labeled Vecs only appear after at least one observation; check unconditional gauges.
     for metric in &[
         "oxydllm_queue_depth",
         "oxydllm_vram_used_bytes",
@@ -384,9 +370,6 @@ async fn metrics_endpoint_shows_test_model_label() {
     )
     .expect("utf-8");
 
-    // The handler calls list_running() and sets oxydllm_model_weights_bytes and
-    // oxydllm_kv_cache_allocated_bytes for every loaded model. The test model is
-    // in SlotState::Ready, so its label must appear in the output.
     assert!(
         body.contains("test-model"),
         "expected test-model label in /metrics output"
@@ -460,10 +443,6 @@ async fn get_model_not_found_returns_404() {
             .contains("nonexistent")
     );
 }
-
-// ---------------------------------------------------------------------------
-// Input validation error tests
-// ---------------------------------------------------------------------------
 
 #[tokio::test]
 async fn empty_messages_returns_400() {
@@ -554,10 +533,6 @@ async fn invalid_json_body_returns_422() {
         response.status()
     );
 }
-
-// ---------------------------------------------------------------------------
-// Happy-path chat completion tests
-// ---------------------------------------------------------------------------
 
 #[tokio::test]
 async fn non_streaming_chat_returns_full_response() {
@@ -654,10 +629,6 @@ async fn streaming_chat_emits_content_chunks_and_done() {
     assert_eq!(finish_reason.as_deref(), Some("stop"));
     assert!(done_seen, "expected [DONE] marker");
 }
-
-// ---------------------------------------------------------------------------
-// Tool call tests
-// ---------------------------------------------------------------------------
 
 #[tokio::test]
 async fn forced_function_choice_wraps_direct_json_into_tool_call() {
@@ -847,10 +818,6 @@ async fn streaming_tool_calls_emit_incremental_sse_deltas() {
     assert!(done_seen, "expected [DONE] marker");
 }
 
-// ---------------------------------------------------------------------------
-// B1 — S3: HTTP API authentication
-// ---------------------------------------------------------------------------
-
 #[tokio::test]
 async fn auth_disabled_when_no_api_key_configured() {
     let (app, _tmp) = build_test_app(vec![ScriptedReply {
@@ -940,8 +907,7 @@ async fn auth_request_with_x_api_key_header_succeeds() {
 async fn auth_health_endpoint_remains_unauthenticated() {
     let (app, _tmp) = build_test_app_with_api_key(vec![], "secret-key").expect("test app");
 
-    // /health must be reachable without any credentials so liveness probes
-    // (k8s, systemd, docker healthcheck) keep working.
+    // /health must stay reachable without credentials for liveness probes.
     let resp = get_request(&app, "/health").await;
     assert_eq!(resp.status(), StatusCode::OK);
 }
@@ -965,10 +931,6 @@ async fn auth_v1_models_endpoint_requires_api_key() {
     let unauth = get_request(&app, "/v1/models").await;
     assert_eq!(unauth.status(), StatusCode::UNAUTHORIZED);
 }
-
-// ---------------------------------------------------------------------------
-// B1 — S4: sampling parameter range validation
-// ---------------------------------------------------------------------------
 
 async fn assert_invalid_request(app: &Router, body: Value, field_hint: &str) {
     let resp = post_chat(app, body).await;
@@ -1096,7 +1058,7 @@ async fn validation_top_logprobs_above_twenty_rejected() {
 #[tokio::test]
 async fn validation_repetition_penalty_zero_rejected() {
     let (app, _tmp) = build_test_app(vec![]).expect("test app");
-    // repetition_penalty=0 would produce division-by-zero NaN logits — must be rejected.
+    // 0 would produce division-by-zero NaN logits.
     assert_invalid_request(
         &app,
         json!({
@@ -1141,8 +1103,7 @@ async fn validation_n_above_max_rejected() {
 
 #[tokio::test]
 async fn validation_valid_params_still_accepted() {
-    // Negative regression check: every parameter at the edge of its valid
-    // range must still produce a 200, otherwise the validator over-rejected.
+    // Edge-of-range values must still produce 200 (over-rejection regression).
     let (app, _tmp) = build_test_app(vec![ScriptedReply {
         content: "ok".to_string(),
         finish_reason: "stop".to_string(),
@@ -1169,10 +1130,6 @@ async fn validation_valid_params_still_accepted() {
     assert_eq!(resp.status(), StatusCode::OK);
 }
 
-// ---------------------------------------------------------------------------
-// B1 — S5: per-request timeout
-// ---------------------------------------------------------------------------
-
 #[tokio::test]
 async fn timeout_non_streaming_returns_408_when_engine_stuck() {
     let request_tx = spawn_stuck_engine();
@@ -1192,8 +1149,6 @@ async fn timeout_non_streaming_returns_408_when_engine_stuck() {
         serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.expect("body"))
             .expect("json");
     assert_eq!(body["error"]["type"], "request_timeout");
-    // Sanity: the handler returned promptly after the deadline, not after the
-    // upstream channel happened to close. 5s upper bound is generous.
     assert!(
         elapsed < Duration::from_secs(5),
         "handler should return within a few seconds of the deadline; took {elapsed:?}"
@@ -1215,7 +1170,7 @@ async fn timeout_streaming_emits_error_chunk_and_done() {
         }),
     )
     .await;
-    // Streaming responses always 200 — the error surfaces in the body.
+    // Streaming always 200; error surfaces in body.
     assert_eq!(resp.status(), StatusCode::OK);
 
     let body = String::from_utf8(
@@ -1251,8 +1206,6 @@ async fn timeout_streaming_emits_error_chunk_and_done() {
 
 #[tokio::test]
 async fn timeout_does_not_fire_when_engine_responds_promptly() {
-    // Sanity: a request that completes well before the deadline must not be
-    // incorrectly marked as timed out.
     let request_tx = spawn_scripted_engine(vec![ScriptedReply {
         content: "fast".to_string(),
         finish_reason: "stop".to_string(),
@@ -1272,14 +1225,9 @@ async fn timeout_does_not_fire_when_engine_responds_promptly() {
     assert_eq!(body["choices"][0]["message"]["content"], "fast");
 }
 
-// ---------------------------------------------------------------------------
-// B1 — S6: tools-streaming error path emits [DONE] sentinel
-// ---------------------------------------------------------------------------
-
 #[tokio::test]
 async fn tools_streaming_error_emits_done_sentinel() {
-    // Spawn an engine that emits an Error event for the tools request, which
-    // is the path that previously omitted [DONE].
+    // Tools error path previously omitted [DONE].
     let (request_tx, mut request_rx) = tokio_mpsc::channel::<IncomingRequest>(64);
     tokio::spawn(async move {
         while let Some(req) = request_rx.recv().await {
@@ -1356,15 +1304,9 @@ async fn tools_streaming_error_emits_done_sentinel() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// B1 — S7: strict-mode JSON schema must catch non-parseable JSON
-// ---------------------------------------------------------------------------
-
 #[tokio::test]
 async fn strict_schema_non_parseable_json_returns_content_filter() {
-    // Model output is plain prose — not JSON at all. Under strict mode this
-    // must trip the schema-fail path and produce finish_reason="content_filter"
-    // with null content, not slip through as a normal "stop".
+    // Strict mode: non-JSON output must produce finish_reason="content_filter" + null content.
     let (app, _tmp) = build_test_app(vec![ScriptedReply {
         content: "this is not JSON".to_string(),
         finish_reason: "stop".to_string(),
@@ -1406,7 +1348,7 @@ async fn strict_schema_non_parseable_json_returns_content_filter() {
 
 #[tokio::test]
 async fn strict_schema_parseable_but_invalid_returns_content_filter() {
-    // Output is valid JSON but doesn't satisfy the schema (missing "name").
+    // Valid JSON missing required "name".
     let (app, _tmp) = build_test_app(vec![ScriptedReply {
         content: r#"{"age": 30}"#.to_string(),
         finish_reason: "stop".to_string(),
@@ -1442,9 +1384,7 @@ async fn strict_schema_parseable_but_invalid_returns_content_filter() {
 
 #[tokio::test]
 async fn non_strict_schema_non_parseable_passes_through() {
-    // Non-strict mode (`strict: false`): the model output is passed through
-    // verbatim even if it doesn't satisfy the schema. This preserves the
-    // pre-S7 behavior for the non-strict path.
+    // Non-strict mode passes raw model output through even when schema doesn't match.
     let (app, _tmp) = build_test_app(vec![ScriptedReply {
         content: "this is not JSON".to_string(),
         finish_reason: "stop".to_string(),

@@ -21,10 +21,6 @@ use crate::models::manager::GetResult;
 use crate::sampling::SamplingParams;
 use crate::tokenizer::Tokenizer;
 
-// ---------------------------------------------------------------------------
-// Logprob response structs
-// ---------------------------------------------------------------------------
-
 #[derive(Serialize, Clone)]
 struct TopLogprobItem {
     token: String,
@@ -46,12 +42,7 @@ struct Logprobs {
     refusal: Option<String>,
 }
 
-// ---------------------------------------------------------------------------
-// Completion response structs
-// ---------------------------------------------------------------------------
-
-/// Response message for chat completions — separate from the request ChatMessage
-/// so that `content` can be serialized as explicit `null` when tool_calls are present.
+// Separate from ChatMessage so `content` serializes as explicit `null` when tool_calls present.
 #[derive(Serialize)]
 struct ResponseMessage {
     role: String,
@@ -166,10 +157,6 @@ enum SchemaStrictness {
     Strict,
 }
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
 fn unix_timestamp() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -197,7 +184,6 @@ fn make_chat_id() -> String {
     format!("chatcmpl-{:x}{:x}-{}", t.as_secs(), t.subsec_nanos(), seq)
 }
 
-/// Strip markdown code fences (```json ... ```) that models often wrap JSON in.
 fn strip_json_fences(s: &str) -> &str {
     let s = s.trim();
     let inner = s
@@ -208,10 +194,6 @@ fn strip_json_fences(s: &str) -> &str {
         .map(|t| t.trim_end_matches('\n').trim());
     inner.unwrap_or(s)
 }
-
-// ---------------------------------------------------------------------------
-// Tool calling helpers
-// ---------------------------------------------------------------------------
 
 fn make_tool_call_id() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -571,7 +553,6 @@ fn validate_against_schema_inner(
     true
 }
 
-/// Build the system instruction that describes available tools and expected output format.
 fn tools_system_instruction(tools: &[ToolDefinition], config: &ToolConfig) -> String {
     let tools_json = serde_json::to_string_pretty(tools).unwrap_or_default();
     let choice_instruction = match &config.choice_mode {
@@ -639,9 +620,6 @@ fn tool_exists(tools: &[ToolDefinition], name: &str) -> bool {
     tools.iter().any(|tool| tool.function.name == name)
 }
 
-/// Try to parse a model output string as a tool call response.
-/// Returns `Some(Vec<ToolCall>)` if the output is a valid tool call JSON,
-/// `None` otherwise.
 fn try_parse_tool_calls(raw: &str, config: &ToolConfig) -> Option<Vec<ToolCall>> {
     let stripped = strip_json_fences(raw.trim());
     let value: serde_json::Value = serde_json::from_str(stripped).ok()?;
@@ -884,7 +862,6 @@ fn build_tool_config(
     Ok(config)
 }
 
-/// Build the JSON mode system instruction from a `ResponseFormat`.
 fn json_system_instruction(rf: &ResponseFormat) -> String {
     match rf.format_type.as_str() {
         "json_schema" => {
@@ -927,18 +904,12 @@ fn json_system_instruction(rf: &ResponseFormat) -> String {
             }
         }
         _ => {
-            // json_object or anything else that signals JSON mode
             "You must respond with valid JSON only. Do not include any explanation, markdown, or text outside of the JSON object.".to_string()
         }
     }
 }
 
-/// Validate sampling parameter ranges from a chat completion request.
-///
-/// Mirrors the ranges accepted by OpenAI's Chat Completions API. Out-of-range
-/// values are rejected with a descriptive message so they surface as
-/// `invalid_request_error` to the caller rather than silently degrading the
-/// sampler.
+// Mirrors OpenAI Chat Completions ranges; out-of-range becomes invalid_request_error.
 fn validate_sampling_params(body: &ChatCompletionRequest) -> Result<(), String> {
     fn check_range_inclusive(
         value: Option<f32>,
@@ -1091,7 +1062,6 @@ pub fn apply_chat_template(
     }
 }
 
-/// Convert engine logprob entries into the serializable `Logprobs` response struct.
 fn build_logprobs_content(entries: &[EngineLogprobEntry], req_top_n: usize) -> Logprobs {
     Logprobs {
         content: entries
@@ -1116,11 +1086,6 @@ fn build_logprobs_content(entries: &[EngineLogprobEntry], req_top_n: usize) -> L
     }
 }
 
-// ---------------------------------------------------------------------------
-// chat/completions — helpers
-// ---------------------------------------------------------------------------
-
-/// Accumulated result for a single completion (used for n>1).
 struct CompletionData {
     content: String,
     reasoning_content: String,
@@ -1130,12 +1095,8 @@ struct CompletionData {
     logprob_entries: Vec<EngineLogprobEntry>,
 }
 
-/// Run a streaming response body with an optional wall-clock timeout.
-///
-/// When `timeout` expires, the inner future is cancelled (dropping its
-/// `sse_tx` and `rx` handles, which cause the engine to abort the sequence)
-/// and an `error` chunk plus a `[DONE]` sentinel are emitted on the clone of
-/// `sse_tx` retained by this helper.
+// On timeout: cancel inner (drops sse_tx/rx, engine aborts the sequence) and
+// emit error chunk + [DONE] on the retained sse_tx clone.
 async fn run_streaming_with_timeout<F>(
     inner: F,
     sse_tx_watchdog: tokio_mpsc::UnboundedSender<Result<Event, std::convert::Infallible>>,
@@ -1168,12 +1129,8 @@ async fn run_streaming_with_timeout<F>(
     }
 }
 
-/// Drain one completion channel into a `CompletionData`.
-///
-/// When `timeout` is `Some`, the wall-clock deadline applies to the entire
-/// drain. On expiry we return a `408 Request Timeout` error and drop the
-/// receiver, which causes the engine loop to abort the underlying sequence
-/// at its next iteration (it watches `tracker.tx.is_closed()`).
+// On timeout expiry: returns 408 and drops the receiver, which triggers the
+// engine loop to abort the sequence via tracker.tx.is_closed().
 async fn collect_one_completion(
     rx: tokio_mpsc::UnboundedReceiver<EngineEvent>,
     timeout: Option<Duration>,
@@ -1236,10 +1193,6 @@ async fn collect_one_completion_inner(
     Ok(data)
 }
 
-// ---------------------------------------------------------------------------
-// chat/completions — main handler
-// ---------------------------------------------------------------------------
-
 pub(super) async fn chat_completions(
     State(state): State<Arc<AppState>>,
     Json(body): Json<ChatCompletionRequest>,
@@ -1285,7 +1238,6 @@ pub(super) async fn chat_completions(
         ));
     }
 
-    // Validate logit_bias shape early.
     if let Some(ref lb) = body.logit_bias
         && !lb.is_null()
         && !lb.is_object()
@@ -1364,15 +1316,12 @@ pub(super) async fn chat_completions(
     let enable_thinking =
         body.enable_thinking.unwrap_or(false) && handle.tokenizer.has_thinking_support();
 
-    // Build the message list, optionally injecting system instructions for
-    // JSON mode and/or tool calling.
     let json_mode = body
         .response_format
         .as_ref()
         .map(|rf| rf.format_type == "json_object" || rf.format_type == "json_schema")
         .unwrap_or(false);
 
-    // Build tools as a serde_json::Value for the template (native tool support).
     let tools_value: Option<serde_json::Value> = (!tool_config.tools.is_empty())
         .then(|| serde_json::to_value(&tool_config.tools).ok())
         .flatten();
@@ -1384,7 +1333,6 @@ pub(super) async fn chat_completions(
         if needs_json_instr || needs_tool_instr {
             let mut msgs = body.messages.clone();
 
-            // Collect extra instructions to append to the system message.
             let mut extra_parts: Vec<String> = Vec::new();
             if needs_tool_instr {
                 extra_parts.push(tools_system_instruction(&tool_config.tools, &tool_config));
@@ -1459,7 +1407,7 @@ pub(super) async fn chat_completions(
         "prompt preparation timings"
     );
 
-    // Parse stop strings into token IDs (single-token stops only).
+    // Single-token stops only.
     let extra_stop_token_ids: Vec<u32> = match &body.stop {
         Some(StopParam::Single(s)) => {
             let ids = handle.tokenizer.encode(s).unwrap_or_default();
@@ -1475,7 +1423,6 @@ pub(super) async fn chat_completions(
         None => Vec::new(),
     };
 
-    // Parse logit_bias.
     let logit_bias: Option<Vec<(u32, f32)>> = match &body.logit_bias {
         Some(serde_json::Value::Object(map)) if !map.is_empty() => {
             let pairs: Vec<(u32, f32)> = map
@@ -1491,14 +1438,10 @@ pub(super) async fn chat_completions(
         _ => None,
     };
 
-    // Compute top_logprobs_k for sampling.
     let wants_logprobs = body.logprobs.unwrap_or(false);
     let req_top_n = body.top_logprobs.unwrap_or(0);
-    let top_logprobs_k: usize = if wants_logprobs {
-        req_top_n.max(1) // at least 1 so we always get the chosen token's logprob
-    } else {
-        0
-    };
+    // min 1 so the chosen token's logprob is always returned.
+    let top_logprobs_k: usize = if wants_logprobs { req_top_n.max(1) } else { 0 };
 
     let base_sampling_params = SamplingParams {
         temperature: body.temperature.unwrap_or(0.7),
@@ -1521,12 +1464,11 @@ pub(super) async fn chat_completions(
         .unwrap_or(remaining)
         .min(remaining);
 
-    // Spawn N requests (one per completion).
     let mut completion_rxs: Vec<tokio_mpsc::UnboundedReceiver<EngineEvent>> = Vec::with_capacity(n);
 
     for i in 0..n {
         let (response_tx, response_rx) = tokio_mpsc::unbounded_channel();
-        // Give each completion a distinct seed offset so n>1 produces different outputs.
+        // Distinct seed per completion so n>1 produces different outputs.
         let seed = base_sampling_params.seed.map(|s| s.wrapping_add(i as u64));
         let sampling_params = SamplingParams {
             seed,
@@ -1572,11 +1514,6 @@ pub(super) async fn chat_completions(
         .unwrap_or(false);
 
     if stream {
-        // For n=1: use the existing direct-channel approach (avoids merge overhead).
-        // For n>1: merge all N receivers into a single (index, event) channel.
-        // When tools are present with n=1: buffer the full response so we can detect
-        // tool calls before emitting SSE chunks.
-
         let (sse_tx, sse_rx) =
             tokio_mpsc::unbounded_channel::<Result<Event, std::convert::Infallible>>();
 
@@ -1853,7 +1790,6 @@ pub(super) async fn chat_completions(
             tokio::spawn(async move {
                 let watchdog_tx = sse_tx.clone();
                 let inner = async move {
-                    // Role chunk.
                     let role_chunk = ChatCompletionChunk {
                         id: chat_id.clone(),
                         object: "chat.completion.chunk".to_string(),
@@ -2035,7 +1971,6 @@ pub(super) async fn chat_completions(
                 run_streaming_with_timeout(inner, watchdog_tx, req_timeout).await;
             });
         } else {
-            // n > 1: merge all receivers into a tagged channel.
             let (merged_tx, merged_rx) = tokio_mpsc::unbounded_channel::<(usize, EngineEvent)>();
             for (i, rx) in completion_rxs.into_iter().enumerate() {
                 let tx = merged_tx.clone();
@@ -2056,7 +1991,6 @@ pub(super) async fn chat_completions(
             tokio::spawn(async move {
                 let watchdog_tx = sse_tx.clone();
                 let inner = async move {
-                    // Send role chunk for each completion.
                     for i in 0..n {
                         let role_chunk = ChatCompletionChunk {
                             id: chat_id.clone(),
@@ -2252,7 +2186,6 @@ pub(super) async fn chat_completions(
         let sse_stream = UnboundedReceiverStream::new(sse_rx);
         Ok(Sse::new(sse_stream).into_response())
     } else {
-        // Non-streaming: collect all N completions concurrently.
         let req_timeout = state.request_timeout;
         let mut handles = Vec::with_capacity(n);
         for rx in completion_rxs {
@@ -2287,7 +2220,7 @@ pub(super) async fn chat_completions(
                 None
             };
 
-            // Try tool call detection first (takes priority over JSON mode).
+            // Tool call detection takes priority over JSON mode.
             let (response_msg, finish_reason) = if has_tools {
                 let raw = strip_json_fences(data.content.trim());
                 if let Some(tool_calls) = try_parse_tool_calls(raw, &tool_config) {
@@ -2301,7 +2234,6 @@ pub(super) async fn chat_completions(
                         "tool_calls".to_string(),
                     )
                 } else {
-                    // Model chose not to call a tool — return normal content.
                     (
                         ResponseMessage {
                             role: "assistant".to_string(),

@@ -284,8 +284,8 @@ fn select_gguf_paths(
 }
 
 pub fn resolve_model_path(models_dir: &Path, model_id: &str) -> Option<PathBuf> {
-    // Fast path: works for both flat ("ModelName") and nested ("user/ModelName").
-    // PathBuf::join resolves the '/' in the id as a subdirectory on all platforms.
+    // PathBuf::join resolves '/' as a subdir, handling both flat
+    // ("ModelName") and nested ("user/ModelName") forms on all platforms.
     let direct = models_dir.join(model_id);
     if direct.is_dir() {
         let ok = direct.join("config.json").exists() || find_gguf_file(&direct).is_some();
@@ -363,7 +363,6 @@ pub fn resolve_model_path(models_dir: &Path, model_id: &str) -> Option<PathBuf> 
         .filter(|e| e.path().is_dir())
         .collect();
 
-    // GGUF stem exact match
     for entry in &entries {
         let path = entry.path();
         if let Some(gguf_paths) = find_gguf_files(&path) {
@@ -381,7 +380,7 @@ pub fn resolve_model_path(models_dir: &Path, model_id: &str) -> Option<PathBuf> 
         }
     }
 
-    // Case-insensitive prefix match on directory names (e.g. "Ministral-3B" → "Ministral-3B-Instruct-2512")
+    // Case-insensitive prefix match: e.g. "Ministral-3B" → "Ministral-3B-Instruct-2512".
     let mut prefix_match: Option<PathBuf> = None;
     for entry in &entries {
         let path = entry.path();
@@ -393,7 +392,6 @@ pub fn resolve_model_path(models_dir: &Path, model_id: &str) -> Option<PathBuf> 
         if dir_name.starts_with(&needle) || needle.starts_with(&dir_name) {
             let valid = path.join("config.json").exists() || find_gguf_file(&path).is_some();
             if valid {
-                // Prefer the shorter name to avoid ambiguous over-matches
                 let better = prefix_match
                     .as_ref()
                     .map(|p| {
@@ -441,9 +439,8 @@ fn resolve_weight_paths(model_dir: &str) -> anyhow::Result<Vec<String>> {
         );
         Ok(files)
     } else {
-        // No index file: try the standard single-file names in order.
-        // Some repos (e.g. Mistral-7B-Instruct-v0.3) ship a `consolidated.safetensors`
-        // as an alternative to the sharded layout.
+        // Some repos (e.g. Mistral-7B-Instruct-v0.3) ship consolidated.safetensors
+        // instead of the sharded layout.
         for name in &["model.safetensors", "consolidated.safetensors"] {
             let path = format!("{}/{}", model_dir, name);
             if std::path::Path::new(&path).exists() {
@@ -741,11 +738,8 @@ fn load_standard_safetensors(
         };
 
         let (lm_head, lm_head_extra_bytes): (AnyLinear, usize) = if cfg.tie_word_embeddings {
-            // Catch the asymmetric-risk scenario the hf_parser default cannot
-            // see: config (or default) says tie, but the file actually ships
-            // its own lm_head — the file's head will be silently ignored. This
-            // is the only known path to "loads cleanly, outputs garbage" for
-            // tied/untied resolution.
+            // Catch "loads cleanly, outputs garbage": config says tie but the
+            // file ships its own lm_head, which would be silently ignored.
             if weights.try_get(lm_head_weight_name).is_some() {
                 tracing::warn!(
                     model_dir,
@@ -755,9 +749,8 @@ fn load_standard_safetensors(
                 );
             }
 
-            // Option A (4-bit tied lm_head via RTN) only makes sense when the
-            // model is already AWQ-4bit — `rtn_quantize_awq` produces 4-bit
-            // packed weights, so 8-bit AWQ takes the plain-tied path.
+            // 4-bit tied lm_head (via RTN) only applies to AWQ-4bit; 8-bit AWQ
+            // takes the plain-tied path.
             #[cfg(feature = "metal")]
             if has_packed_quantized_weights
                 && device.is_metal()
@@ -1028,9 +1021,8 @@ fn compute_kv_blocks(
 ) -> anyhow::Result<(usize, usize)> {
     let total_slots = p.max_num_sequences * p.max_context_len;
     let desired_blocks = total_slots.div_ceil(DEFAULT_BLOCK_SIZE);
-    let min_blocks: usize = 256; // ~4 096 token minimum context
+    let min_blocks: usize = 256;
 
-    // Bytes for one block summed across all layers (K + V).
     let per_block_bytes = match p.kv_quant {
         KvQuantMode::Off => p
             .layer_kv_specs

@@ -1,12 +1,11 @@
 use std::f32::consts::PI;
 
-/// KV cache quantization mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KvQuantMode {
     Off,
-    Lossless,   // 4-bit MSE, quality-neutral
-    Balanced,   // 3-bit MSE, near-identical quality
-    Aggressive, // 2-bit MSE, maximum compression
+    Lossless,
+    Balanced,
+    Aggressive,
 }
 
 impl KvQuantMode {
@@ -92,7 +91,7 @@ fn generate_qjl_signs(head_dim: usize) -> Vec<f32> {
     generate_signs_with_seed(head_dim, 0x9E3779B97F4A7C15_u64)
 }
 
-/// In-place Walsh-Hadamard transform (unnormalized). Requires power-of-2 length.
+/// Unnormalized, requires power-of-2 length.
 fn wht_inplace(x: &mut [f32]) {
     let d = x.len();
     debug_assert!(d.is_power_of_two(), "WHT requires power-of-2, got {d}");
@@ -110,11 +109,8 @@ fn wht_inplace(x: &mut [f32]) {
     }
 }
 
-/// TurboQuant quantizer for a given (bit_width, head_dim) pair.
-///
-/// Values use Stage-1 MSE quantization at `bit_width`.
-/// Keys use Stage-2 style quantization: MSE at `bit_width - 1` + 1-bit QJL residual sign,
-/// plus an extra residual norm scalar.
+/// Values: Stage-1 MSE at `bit_width`. Keys: Stage-2 MSE at `bit_width - 1`
+/// + 1-bit QJL residual sign + residual norm scalar.
 pub struct KvQuantizer {
     bit_width: u8,
     key_mse_bit_width: u8,
@@ -190,7 +186,6 @@ impl KvQuantizer {
         self.qjl_quantization
     }
 
-    /// Packed bytes per key head (MSE indices + 1-bit residual signs).
     pub fn key_packed_bytes(&self) -> usize {
         if self.qjl_quantization {
             self.packed_bytes_for_bits(self.key_mse_bit_width) + self.packed_bytes_for_bits(1)
@@ -199,12 +194,10 @@ impl KvQuantizer {
         }
     }
 
-    /// Packed bytes per value head (MSE indices only).
     pub fn value_packed_bytes(&self) -> usize {
         self.packed_bytes_for_bits(self.bit_width)
     }
 
-    /// Quantize a value vector using Stage-1 MSE at full configured bit width.
     pub fn quantize(&self, x: &[f32]) -> (Vec<u8>, f32) {
         self.quantize_mse(
             x,
@@ -214,7 +207,6 @@ impl KvQuantizer {
         )
     }
 
-    /// Dequantize a value vector from Stage-1 MSE representation.
     pub fn dequantize(&self, packed: &[u8], norm: f32) -> Vec<f32> {
         self.dequantize_mse(
             packed,
@@ -225,8 +217,6 @@ impl KvQuantizer {
         )
     }
 
-    /// Quantize a key vector with Stage-2 style residual signaling.
-    ///
     /// Returns `(packed_key, mse_norm, residual_norm)` where packed_key is
     /// `[mse_indices | qjl_sign_bits]`.
     pub fn quantize_key(&self, x: &[f32]) -> (Vec<u8>, f32, f32) {
@@ -272,7 +262,7 @@ impl KvQuantizer {
             return (packed, mse_norm, 0.0);
         }
 
-        // Stage-2 residual signs: sign(S r), approximated via randomized Hadamard.
+        // sign(S r), S approximated via randomized Hadamard.
         for (r, &sign) in residual.iter_mut().zip(self.qjl_signs.iter()) {
             *r *= sign;
         }
@@ -290,7 +280,6 @@ impl KvQuantizer {
         (packed, mse_norm, residual_norm)
     }
 
-    /// Dequantize a key vector from Stage-2 representation.
     pub fn dequantize_key(&self, packed: &[u8], mse_norm: f32, residual_norm: f32) -> Vec<f32> {
         if !self.qjl_quantization {
             return self.dequantize(packed, mse_norm);
@@ -322,7 +311,7 @@ impl KvQuantizer {
             *q = if idx == 0 { -1.0 } else { 1.0 };
         }
 
-        // x_qjl = gamma * sqrt(pi/2) / d * S^T sign(Sr), with S approximated by HD.
+        // x_qjl = gamma * sqrt(pi/2) / d * S^T sign(Sr).
         if self.use_hadamard {
             wht_inplace(&mut qjl);
         }
@@ -361,7 +350,7 @@ impl KvQuantizer {
             y.push(v * inv_norm);
         }
 
-        // Forward rotation: y = (1/sqrt(d)) * H * D * x_hat
+        // y = (1/sqrt(d)) * H * D * x_hat
         for (yv, &sign) in y.iter_mut().zip(self.mse_signs.iter()) {
             *yv *= sign;
         }
@@ -561,12 +550,10 @@ impl KvQuantizer {
     }
 }
 
-/// Value-side bytes per head (`packed_indices + f32 norm`).
 pub fn quantized_value_bytes_per_head(head_dim: usize, bit_width: u8) -> usize {
     (head_dim * bit_width as usize).div_ceil(8) + 4
 }
 
-/// Key-side bytes per head, configurable between Stage-1 and Stage-2.
 pub fn quantized_key_bytes_per_head_with_qjl(
     head_dim: usize,
     bit_width: u8,
@@ -653,7 +640,7 @@ mod tests {
 
     #[test]
     fn quantize_dequantize_4bit_d96_non_power_of_two() {
-        // Phi-family models can use head_dim=96; ensure KV quantization does not panic.
+        // Phi-family models use head_dim=96 (not power-of-2).
         let q = KvQuantizer::new_with_qjl(4, 96, false);
         let x: Vec<f32> = (0..96)
             .map(|i| (i as f32 * 0.27 + 0.4).sin() * 1.9)
@@ -794,18 +781,15 @@ mod tests {
 
     #[test]
     fn bytes_per_head_matches() {
-        // Value path: packed indices + 1 norm.
         assert_eq!(quantized_value_bytes_per_head(128, 4), 68);
         assert_eq!(quantized_value_bytes_per_head(128, 3), 52);
         assert_eq!(quantized_value_bytes_per_head(128, 2), 36);
         assert_eq!(quantized_value_bytes_per_head(64, 4), 36);
 
-        // Stage-2 key path: (b-1)-bit indices + 1-bit signs + 2 norms.
         assert_eq!(quantized_key_bytes_per_head_with_qjl(128, 4, true), 72);
         assert_eq!(quantized_key_bytes_per_head_with_qjl(128, 3, true), 56);
         assert_eq!(quantized_key_bytes_per_head_with_qjl(128, 2, true), 40);
 
-        // Combined K+V budget per head for d=128.
         assert_eq!(
             quantized_key_bytes_per_head_with_qjl(128, 4, true)
                 + quantized_value_bytes_per_head(128, 4),
@@ -822,7 +806,6 @@ mod tests {
             76
         );
 
-        // Stage-1 key path when QJL is disabled: b-bit indices + 1 norm.
         assert_eq!(quantized_key_bytes_per_head_with_qjl(128, 4, false), 68);
         assert_eq!(quantized_key_bytes_per_head_with_qjl(128, 3, false), 52);
         assert_eq!(quantized_key_bytes_per_head_with_qjl(128, 2, false), 36);

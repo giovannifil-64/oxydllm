@@ -3,14 +3,9 @@ use anyhow::{Context, Result};
 use candle_core::{DType, Device, Tensor, safetensors::MmapedSafetensors};
 use rustc_hash::FxHashMap;
 
-/// Quantization scheme of a model's packed tensors. `None` ⇒ no `.qweight`
-/// tensors present (plain fp16/bf16/fp8 model).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum QuantScheme {
-    /// autoawq GEMM (interleaved out-dim packing). `bits` is 4 or 8.
     Awq { bits: u32 },
-    /// auto-gptq sequential in-dim packing. `sym=true` collapses dequant to
-    /// `q - 2^(bits-1)` (the on-disk `qzeros` still holds that constant).
     Gptq { bits: u32, sym: bool },
 }
 
@@ -45,13 +40,11 @@ fn load_tensor_with_dtype(
     }
 
     if t.dtype() == DType::F8E4M3 {
-        // Metal has no F8E4M3 compute kernels (not even type conversion), so the on-the-fly
-        // dequant path used by Fp8Linear is unavailable. Always dequantize at load time on
-        // CPU and move the result to the device.
+        // Metal has no F8E4M3 compute kernels, so Fp8Linear's on-the-fly dequant
+        // is unavailable there; dequantize at load on CPU and move to device.
         let use_cpu_path = matches!(device, Device::Metal(_));
 
         if preserve_fp8_weight && !use_cpu_path {
-            // Level-2 FP8 path: keep FP8 weights resident and dequantize on-the-fly in linear layers.
             return Ok(t);
         }
 
@@ -108,13 +101,8 @@ fn load_tensor_with_dtype(
     }
 }
 
-/// Multiply an FP8 weight (already cast to a float dtype) by its inverse-scale tensor.
-///
-/// FP8 checkpoints store `weight_scale_inv` at one of three granularities:
-///   * per-tensor / per-channel — the scale broadcasts directly onto the weight;
-///   * block-wise (`weight_block_size`, DeepSeek- / Qwen3-FP8 style) — the scale is a
-///     `[out/block, in/block]` grid with one entry per weight tile, which `broadcast_mul`
-///     cannot expand. The grid is repeated up to the weight shape, then multiplied.
+/// Per-tensor / per-channel scales broadcast directly; block-wise scales
+/// (DeepSeek- / Qwen3-FP8 style) are tiled up to the weight shape first.
 pub(crate) fn apply_scale_inv(weight: &Tensor, scale_inv: &Tensor) -> candle_core::Result<Tensor> {
     if let Ok(scaled) = weight.broadcast_mul(scale_inv) {
         return Ok(scaled);
@@ -161,21 +149,15 @@ fn apply_weight_scale_inv(tensors: &mut FxHashMap<String, Tensor>) -> Result<()>
         };
 
         if weight.dtype() == DType::F8E4M3 {
-            // Level-2 FP8 path keeps quantized weights + scales for runtime dequantization.
             continue;
         }
 
-        // FP8 checkpoints (e.g. DeepSeek-V3, Qwen3-FP8) store inverse scales
-        // next to quantized matrices. Perform the multiply in F32 — even when
-        // the final dtype is BF16 — because BF16's 7-bit mantissa accumulates
-        // perceptible error across 36+ layers of block-wise rescaling and
-        // produces coherent-but-wrong answers on prompts like "Tokyo is the
-        // capital of …".
+        // Multiply in F32: BF16's 7-bit mantissa accumulates perceptible error
+        // across 36+ layers of block-wise rescaling (gibberish vs coherent).
         let weight_dtype = weight.dtype();
         let weight_f32 = weight.to_dtype(DType::F32).with_context(|| {
             format!("Failed to promote '{weight_name}' to F32 for scale_inv multiply")
         })?;
-        // scale_inv is loaded as F32 (forced by `force_f32` in the loader).
         let scale_inv_f32 = if scale_inv.dtype() == DType::F32 {
             scale_inv
         } else {
@@ -200,8 +182,8 @@ fn apply_weight_scale_inv(tensors: &mut FxHashMap<String, Tensor>) -> Result<()>
 
 impl ModelWeights {
     pub fn load(paths: &[&str], device: &Device, dtype: DType) -> Result<Self> {
-        // Safety: the server owns models_dir exclusively; no external process will
-        // truncate or replace these files while the mmap is live.
+        // SAFETY: the server owns models_dir exclusively; no external process
+        // will truncate or replace these files while the mmap is live.
         let mmap = unsafe {
             MmapedSafetensors::multi(paths).context("Failed to memory-map weight files")?
         };
@@ -259,9 +241,7 @@ impl ModelWeights {
             return Some(t);
         }
 
-        // Multimodal checkpoints may nest the text model under wrappers
-        // like `model.language_model.model.*` while this runtime expects
-        // `model.*` names.
+        // Multimodal checkpoints nest the text model under `model.language_model.*`.
         if let Some(rest) = name.strip_prefix("model.") {
             for alias in [
                 format!("model.language_model.{rest}"),
@@ -320,8 +300,6 @@ impl ModelWeights {
         self.try_get(&format!("{}_scale_inv", weight_name))
     }
 
-    /// `bits` ∈ {4, 8}: the autoawq GEMM packing factor is `32/bits`. The
-    /// internal Metal kernel selection (`w4a16_*` vs `w8a16_*`) keys off this.
     pub fn try_get_awq(&self, prefix: &str, bits: u32) -> Option<AwqRawTensors> {
         let qweight = self.try_get(&format!("{prefix}.qweight"))?.clone();
         let qzeros = self.try_get(&format!("{prefix}.qzeros"))?.clone();
@@ -329,16 +307,9 @@ impl ModelWeights {
         Some(QuantWeight::new_awq(bits, qweight, qzeros, scales))
     }
 
-    /// GPTQ variant: `qweight` is packed along **in_features**, `g_idx` is
-    /// optional (act-order). With `sym=true` `qzeros` is still on-disk in
-    /// auto-gptq but holds the same value at every slot — we still load it
-    /// for the dequant path's convenience, treating it as `PlusOne` semantics
-    /// (sym=true checkpoints set zero = `2^(bits-1) - 1` so the formula
-    /// `q - (zero + 1)` collapses to `q - 2^(bits-1)`).
     pub fn try_get_gptq(&self, prefix: &str, bits: u32, sym: bool) -> Option<QuantWeight> {
         let qweight = self.try_get(&format!("{prefix}.qweight"))?.clone();
         let scales = self.try_get(&format!("{prefix}.scales"))?.clone();
-        // qzeros may be absent for some sym checkpoints; load if present.
         let qzeros = self.try_get(&format!("{prefix}.qzeros")).cloned();
         let g_idx = self.try_get(&format!("{prefix}.g_idx")).cloned();
         Some(QuantWeight::new_gptq(
@@ -346,9 +317,6 @@ impl ModelWeights {
         ))
     }
 
-    /// Dispatcher: picks AWQ or GPTQ based on the model-level scheme set via
-    /// [`Self::with_quant_scheme`]. Returns `None` when the prefix has no
-    /// packed-int tensors *or* the model has no quant scheme.
     pub fn try_get_quant(&self, prefix: &str) -> Option<QuantWeight> {
         match self.quant_scheme {
             Some(QuantScheme::Awq { bits }) => self.try_get_awq(prefix, bits),
@@ -371,8 +339,6 @@ impl ModelWeights {
 
 #[cfg(test)]
 impl ModelWeights {
-    /// Build ModelWeights from a pre-built tensor map (test-only).
-    /// Allows regression tests to construct synthetic models without safetensors files.
     pub fn from_tensors(tensors: FxHashMap<String, Tensor>) -> Self {
         Self {
             tensors,
@@ -464,8 +430,6 @@ mod tests {
 
         let weights = ModelWeights::from_tensors(tensors);
 
-        // W4A16 keeps AWQ tensors packed: qweight 4·4 + qzeros 4·4 + scales 32·2
-        // + bias 32·2 + layernorm 8·2.
         assert_eq!(weights.runtime_size_bytes(), 16 + 16 + 64 + 64 + 16);
         Ok(())
     }

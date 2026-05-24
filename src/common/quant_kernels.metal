@@ -22,49 +22,29 @@
 #include <metal_atomic>
 using namespace metal;
 
-// Must stay in sync with `W4A16Params` in metal_ops.rs.
 struct W4A16Params {
     uint in_features;
     uint out_features;
-    uint packed_out;    // out_features / pack_factor
-    uint group_size;    // dequant kernel only
-    uint group_shift;   // log2(group_size) — gemv kernel only
-    uint k_splits;      // in_features partitions — gemv kernel only
-    uint chunk;         // ceil(in_features / k_splits) — gemv kernel only
+    uint packed_out;
+    uint group_size;
+    uint group_shift;
+    uint k_splits;
+    uint chunk;
 };
 
 constant uint AWQ_PACK_ORDER[8] = {0u, 2u, 4u, 6u, 1u, 3u, 5u, 7u};
 
-// Extract slot k (BITS bits at offset BITS*k) from a 32-bit packed word.
 template<uint BITS>
 inline uint unpack(uint word, uint k) {
     return (word >> (BITS * k)) & ((1u << BITS) - 1u);
 }
 
-// Map slot index k → its output-column offset within a packed word. AWQ's
-// 4-bit kernel uses an interleave; 8-bit is sequential. The compiler folds
-// this away per template instantiation.
 template<uint BITS>
 inline uint pack_position(uint k) {
     return (BITS == 4u) ? AWQ_PACK_ORDER[k] : k;
 }
 
-// ── Fused WxA16 GEMV (M=1), split-K: out += x @ dequant(W)ᵀ ──────────────────
-//
-// Grid: (packed_out, k_splits). A naive one-thread-per-output GEMV launches
-// only `packed_out` threads (~hundreds) and leaves the GPU idle with HBM load
-// latency fully exposed. Here the reduction is split `k_splits` ways,
-// multiplying the thread count so enough simdgroups are resident to hide
-// latency.
-//
-// Each thread owns one packed-out column `j` and a CONTIGUOUS in_features
-// chunk `[ks*chunk, (ks+1)*chunk)`. Contiguous (not strided) is essential: a
-// thread stays inside a quant group for `group_size` steps, so the per-group
-// scale/zero reload is amortised. Reads stay coalesced — consecutive threads
-// (consecutive j) read consecutive qweight words. The `k_splits` partial sums
-// are combined straight into `out` with relaxed atomic adds: this avoids
-// materialising a `[k_splits, out]` partial buffer and a separate (strided,
-// slow) reduction. `out` must be zero-initialised by the host.
+// Split-K AWQ GEMV: `out` must be host-zeroed (atomic_fetch_add accumulates).
 template<typename T, uint BITS>
 inline void awq_gemv_impl(
     device const T*       x,
@@ -97,7 +77,6 @@ inline void awq_gemv_impl(
         acc[k] = 0.0f;
     }
 
-    // Zero-point and scale depend only on the group → cached, refreshed on change.
     float zero_slot[PACK_FACTOR];
     float scale_v[PACK_FACTOR];
     uint last_g = 0xFFFFFFFFu;
@@ -127,11 +106,6 @@ inline void awq_gemv_impl(
     }
 }
 
-// ── Dequantize only: weight[in, out] = dequant(packed) ───────────────────────
-//
-// Grid: (in_features, packed_out). Produces a plain row-major [in, out] weight
-// ready for a standard matmul — used for the prefill / batched (M>1) path, where
-// a tuned GEMM beats a custom kernel.
 template<typename T, uint BITS>
 inline void awq_dequantize_impl(
     device const uint*    qweight,
@@ -207,11 +181,6 @@ kernel void dequantize_w4_bf16(
     awq_dequantize_impl<bfloat, 4>(qweight, qzeros, scales, weight, p, gid);
 }
 
-// ── 8-bit instantiations of the bit-parametric AWQ template ─────────────────
-// Same algorithm as the 4-bit variants above with `BITS=8` (pack_factor=4 and
-// sequential pack_position). Ready for AWQ-8bit checkpoints; not on a critical
-// path today (no local AWQ-8bit model), but covered by the W8A16 parity tests.
-
 kernel void w8a16_gemv_f16(
     device const half*    x        [[buffer(0)]],
     device const uint*    qweight  [[buffer(1)]],
@@ -258,43 +227,25 @@ kernel void dequantize_w8_bf16(
     awq_dequantize_impl<bfloat, 8>(qweight, qzeros, scales, weight, p, gid);
 }
 
-// =============================================================================
-// GPTQ (auto-gptq) resident kernels — bit-parametric W{4,8}A16
-//
-// Layout differs from AWQ along TWO axes:
-//   1. qweight is packed along *in_features* — `qweight[i_word, o]` (u32) holds
-//      `PACK_FACTOR` consecutive input rows for one output column.
-//   2. Zero-point convention is `(q - (z + 1))` (auto-gptq stores `zero - 1`).
-//   3. qzeros pack order is sequential along *out_features* — slot `k` of
-//      `qzeros[g, o_word]` corresponds to output column `o_word * pf + k`.
-//
-// Grid: `(out_features, k_splits)` — one thread per output column. Compared
-// to AWQ which uses `(packed_out, k_splits)`, GPTQ launches `PACK_FACTOR×`
-// more threads per output row, which helps hide HBM latency when out_features
-// is small (decode time). The trade-off is fewer FMAs per thread (1 vs
-// PACK_FACTOR), so AWQ amortises scale/zero loads better when out_features is
-// large.
-//
-// Chunks are aligned to PACK_FACTOR (host responsibility); inside the kernel
-// we walk `i_word` and unpack PACK_FACTOR rows per word.
-// =============================================================================
+// GPTQ (auto-gptq): qweight packed along IN, zero stored as (z-1), grid is
+// (out_features, k_splits). Caller pre-aligns `chunk` to PACK_FACTOR.
 
 struct GptqParams {
     uint in_features;
     uint out_features;
-    uint group_size;    // dequant kernel only
-    uint group_shift;   // log2(group_size) — gemv only
-    uint k_splits;      // gemv only
-    uint chunk;         // ceil(in_features / k_splits), pf-aligned — gemv only
+    uint group_size;
+    uint group_shift;
+    uint k_splits;
+    uint chunk;
 };
 
 template<typename T, uint BITS>
 inline void gptq_gemv_impl(
     device const T*       x,
-    device const uint*    qweight,    // [in_features/PACK_FACTOR, out_features]
-    device const uint*    qzeros,     // [groups, out_features/PACK_FACTOR]
-    device const T*       scales,     // [groups, out_features]
-    device atomic_float*  out,        // [out_features], F32 accumulator
+    device const uint*    qweight,
+    device const uint*    qzeros,
+    device const T*       scales,
+    device atomic_float*  out,
     constant GptqParams&  p,
     uint2 gid)
 {
@@ -315,13 +266,9 @@ inline void gptq_gemv_impl(
     if (i_start >= i_end) {
         return;
     }
-    // Caller ensures `chunk` is a multiple of PACK_FACTOR, so the slice falls
-    // on word boundaries and we can iterate `i_word` without per-element checks.
     uint w_start = i_start / PACK_FACTOR;
     uint w_end = (i_end + PACK_FACTOR - 1u) / PACK_FACTOR;
 
-    // Per-output qzeros slot is the same across all input rows (qzeros is
-    // strided along OUT, not IN). Compute once.
     uint o_word = o / PACK_FACTOR;
     uint o_slot = o % PACK_FACTOR;
     uint o_shift = BITS * o_slot;
@@ -329,12 +276,10 @@ inline void gptq_gemv_impl(
 
     float acc = 0.0f;
     float scale_v = 0.0f;
-    float zp1 = 0.0f;       // = z + 1, applied as q - zp1
+    float zp1 = 0.0f;
     uint last_g = 0xFFFFFFFFu;
 
     for (uint iw = w_start; iw < w_end; ++iw) {
-        // All PACK_FACTOR rows of this word share a group when group_size is a
-        // multiple of PACK_FACTOR (true for all real GPTQ checkpoints).
         uint i_base = iw * PACK_FACTOR;
         uint g = i_base >> p.group_shift;
         if (g != last_g) {
@@ -346,8 +291,6 @@ inline void gptq_gemv_impl(
         }
 
         uint ww = qweight[iw * p.out_features + o];
-        // Manually unroll the inner loop. The compiler also unrolls but being
-        // explicit makes the access pattern obvious.
         for (uint k = 0; k < PACK_FACTOR; ++k) {
             uint q = (ww >> (BITS * k)) & MASK;
             uint i = i_base + k;
@@ -360,10 +303,10 @@ inline void gptq_gemv_impl(
 
 template<typename T, uint BITS>
 inline void gptq_dequantize_impl(
-    device const uint*    qweight,    // [in_features/PACK_FACTOR, out_features]
-    device const uint*    qzeros,     // [groups, out_features/PACK_FACTOR]
-    device const T*       scales,     // [groups, out_features]
-    device       T*       weight,     // [in_features, out_features]
+    device const uint*    qweight,
+    device const uint*    qzeros,
+    device const T*       scales,
+    device       T*       weight,
     constant GptqParams&  p,
     uint2 gid)
 {
@@ -489,26 +432,8 @@ kernel void dequantize_gptq8_bf16(
     gptq_dequantize_impl<bfloat, 8>(qweight, qzeros, scales, weight, p, gid);
 }
 
-// =============================================================================
-// GGUF quantized GEMV kernels (Q5_0 first; Q4_K and Q2_K to follow).
-//
-// Bf16-aware port of llama.cpp's `mul_vec_q_n_f32` template (MIT) via
-// candle-metal-kernels (MIT). The candle path runs in F32 only — the host
-// wrapper has to cast bf16 activations to f32 and the f32 output back to bf16
-// per call. Here we read bf16 activations directly, do the reduction in
-// register float, and write bf16 directly to dst — eliminating both cast
-// kernels.
-//
-// Algorithm (per simdgroup of N_SIMDWIDTH=32 threads):
-//   • Each simdgroup owns N_DST=4 consecutive output rows.
-//   • Each threadgroup contains N_SIMDGROUP=2 simdgroups → 8 rows/TG.
-//   • Within a simdgroup, threads `tiisg` (0..31) cooperate over a row's
-//     `nb = K/32` blocks: thread `tiisg` handles block `tiisg/2`, half `il`
-//     (0 or 8), striding by `N_SIMDWIDTH/2 = 16` blocks per pass.
-//   • Per-thread partials accumulate into `sumf[N_DST]`, then `simd_sum`
-//     reduces across the simdgroup; thread 0 writes one bf16 per row.
-//   • No atomics, no split-K — one writer per output row.
-// =============================================================================
+// GGUF GEMV kernels: bf16-aware ports of llama.cpp `mul_vec_q_n_f32` (MIT).
+// One simdgroup writes N_DST consecutive rows; no atomics.
 
 #define QK5_0 32
 #define GGUF_N_SIMDWIDTH 32
@@ -516,20 +441,16 @@ kernel void dequantize_gptq8_bf16(
 #define GGUF_N_SIMDGROUP 2
 
 struct GgufParams {
-    uint in_features;   // K — must be a multiple of block_elems
-    uint out_features;  // N
+    uint in_features;
+    uint out_features;
 };
 
 typedef struct {
-    half     d;             // delta (offset 0,  2 bytes)
-    uint8_t  qh[4];         // 5-th bit per element (offset 2, 4 bytes)
-    uint8_t  qs[QK5_0/2];   // low 4 bits, 2 elements per byte (offset 6, 16 bytes)
+    half     d;
+    uint8_t  qh[4];
+    uint8_t  qs[QK5_0/2];
 } block_q5_0;
 
-// Inner product of one Q5_0 block-half with 16 pre-scaled activations.
-// `yl[]` were pre-scaled in the caller so that the qs[] bits can be ANDed at
-// their native positions without further shifting (1, 1/16, 1/256, 1/4096).
-// `sumy` is the sum of the 16 raw activations, used for the -16 offset.
 inline float gguf_q5_0_dot_y(device const block_q5_0 *qb,
                               float sumy,
                               thread float *yl,
@@ -549,22 +470,10 @@ inline float gguf_q5_0_dot_y(device const block_q5_0 *qb,
     return d * (sumy * -16.f + acc[0] + acc[1]);
 }
 
-// Q5_0 GEMV bf16: M=1 decode path. Weight is laid out as a contiguous block
-// stream `[N * (K/32) * 22]` bytes (the GGUF on-disk format); we cast to
-// `block_q5_0*` for typed access.
-//
-// Tried during F2 verticale (2026-05-22), all rolled back:
-//   • `gguf_q5_0_gemv_bf16_cached` — threadgroup memory caching of the K
-//     activations. Cooperative-load + barrier overhead supersedes the
-//     savings (Apple L2 already does the work). Net: −5%.
-//   • bfloat4-vectorised activation reads in the inner loop. Net: within
-//     noise (the GPU coalesces scalar bf16 reads already).
-// The verbatim port of the candle template wins, +6% over the F32 path
-// (entirely the elimination of the bf16↔f32 host-side casts).
 kernel void gguf_q5_0_gemv_bf16(
-    device const bfloat       *x        [[buffer(0)]],   // [K]
-    device const void         *weight   [[buffer(1)]],   // [N * K/32 * 22] raw bytes
-    device       bfloat       *out      [[buffer(2)]],   // [N]
+    device const bfloat       *x        [[buffer(0)]],
+    device const void         *weight   [[buffer(1)]],
+    device       bfloat       *out      [[buffer(2)]],
     constant     GgufParams   &p        [[buffer(3)]],
     uint3 tgpig [[threadgroup_position_in_grid]],
     uint tiisg  [[thread_index_in_simdgroup]],
@@ -584,8 +493,8 @@ kernel void gguf_q5_0_gemv_bf16(
     float yl[16];
     float sumf[GGUF_N_DST] = {0.f};
 
-    const uint ix = (tiisg / 2);          // which block (0..15)
-    const uint il = (tiisg % 2) * 8;      // 0 or 8 — which half of the block
+    const uint ix = (tiisg / 2);
+    const uint il = (tiisg % 2) * 8;
 
     device const bfloat *yb = x + ix * QK5_0 + il;
 
@@ -619,19 +528,9 @@ kernel void gguf_q5_0_gemv_bf16(
     }
 }
 
-// =============================================================================
-// Q4_0 GEMV bf16 — port of `mul_vec_q_n_f32_impl<block_q4_0>` of candle/ggml.
-// Block layout (18 bytes, 32 elements):
-//   half  d;          // global scale (offset 0)
-//   u8    qs[16];     // low+high 4-bit nibbles per byte (offset 2)
-// Dequantized value: val[j]    = ((qs[j] & 0x0F) - 8) * d
-//                    val[j+16] = ((qs[j] >> 4)   - 8) * d
-// Geometry: identical to Q5_0 (N_SIMDGROUP=2 × N_DST=4 = 8 rows/TG).
-// =============================================================================
-
 typedef struct {
     half     d;
-    uint8_t  qs[QK5_0 / 2];  // QK5_0=32 — same block size as Q4_0/Q4_1/Q5_1
+    uint8_t  qs[QK5_0 / 2];
 } block_q4_0;
 
 inline float gguf_q4_0_dot_y(device const block_q4_0 *qb,
@@ -708,16 +607,6 @@ kernel void gguf_q4_0_gemv_bf16(
         }
     }
 }
-
-// =============================================================================
-// Q4_1 GEMV bf16 — port of `mul_vec_q_n_f32_impl<block_q4_1>`.
-// Block layout (20 bytes, 32 elements):
-//   half  d;          // scale
-//   half  m;          // offset
-//   u8    qs[16];     // low+high 4-bit nibbles
-// Dequantized value: val[j] = q * d + m  (no -8 offset, m is the affine bias).
-// Geometry: same as Q4_0.
-// =============================================================================
 
 typedef struct {
     half     d;
@@ -800,17 +689,6 @@ kernel void gguf_q4_1_gemv_bf16(
         }
     }
 }
-
-// =============================================================================
-// Q5_1 GEMV bf16 — port of `mul_vec_q_n_f32_impl<block_q5_1>`.
-// Block layout (24 bytes, 32 elements):
-//   half  d;          // scale
-//   half  m;          // offset
-//   u8    qh[4];      // 5th bit per element
-//   u8    qs[16];     // low 4 bits per element
-// Dequantized value: val = (q4 | (qh_bit << 4)) * d + m
-// Geometry: same as Q4_0/Q4_1.
-// =============================================================================
 
 typedef struct {
     half     d;
@@ -896,17 +774,8 @@ kernel void gguf_q5_1_gemv_bf16(
     }
 }
 
-// =============================================================================
-// Q8_0 GEMV bf16 — port of llama.cpp / candle `kernel_mul_mv_q8_0_f32_impl`.
-// Block layout (34 bytes, 32 elements):
-//   half  d;       // global scale
-//   int8  qs[32];  // signed quants (no offset, no bit packing — simplest)
-// Dequantized value: q * d.
-// Geometry: same as Q5_0 (N_SIMDGROUP=2 × N_DST=4 = 8 rows/TG).
-// =============================================================================
-
 #define QK8_0 32
-#define NB_Q8_0 8        // 8 quants per thread per pass
+#define NB_Q8_0 8
 
 typedef struct {
     half    d;
@@ -914,9 +783,9 @@ typedef struct {
 } block_q8_0;
 
 kernel void gguf_q8_0_gemv_bf16(
-    device const bfloat       *x        [[buffer(0)]],   // [K]
-    device const void         *weight   [[buffer(1)]],   // [N * K/32 * 34] raw bytes
-    device       bfloat       *out      [[buffer(2)]],   // [N]
+    device const bfloat       *x        [[buffer(0)]],
+    device const void         *weight   [[buffer(1)]],
+    device       bfloat       *out      [[buffer(2)]],
     constant     GgufParams   &p        [[buffer(3)]],
     uint3 tgpig [[threadgroup_position_in_grid]],
     uint tiisg  [[thread_index_in_simdgroup]],
@@ -936,13 +805,11 @@ kernel void gguf_q8_0_gemv_bf16(
     float yl[NB_Q8_0];
     float sumf[GGUF_N_DST] = {0.f};
 
-    const uint ix = tiisg / 4;         // which block-index stride (0..7)
-    const uint il = tiisg % 4;         // 0..3 — which 8-element chunk
+    const uint ix = tiisg / 4;
+    const uint il = tiisg % 4;
 
     device const bfloat *yb = x + ix * QK8_0 + NB_Q8_0 * il;
 
-    // Each thread handles NB_Q8_0=8 quants from a block; 4 threads cover the
-    // full QK8_0=32-element block. ib steps by GGUF_N_SIMDWIDTH/4 = 8.
     for (uint ib = ix; ib < nb; ib += GGUF_N_SIMDWIDTH/4) {
         for (uint i = 0; i < NB_Q8_0; ++i) {
             yl[i] = (float)yb[i];
@@ -970,21 +837,7 @@ kernel void gguf_q8_0_gemv_bf16(
     }
 }
 
-// =============================================================================
-// Q4_K GEMV bf16 — port of llama.cpp / candle `kernel_mul_mv_q4_K_f32_impl`.
-// Block layout (144 bytes, 256 elements):
-//   half  d;            // global scale
-//   half  dmin;         // global min
-//   u8    scales[12];   // 8 sub-block scales + 8 sub-block mins, 6-bit packed
-//   u8    qs[128];      // 256 4-bit quants
-// Sub-block decoding: kmask1/kmask2/kmask3 are the bit-tricks from llama.cpp
-// (split the 6-bit sc/min nibbles across bytes [0,2,4] / [1,3,5]).
-//
-// Geometry: 1 simdgroup × N_DST=4 rows per TG (the working set per thread —
-// 16 yl + 16 yh + 8 acc + 4 sc16 — keeps register pressure high enough that
-// adding a second simdgroup per TG would spill; this matches candle's
-// hard-coded `N_DST` use without `N_SIMDGROUP`).
-// =============================================================================
+// Q4_K geometry: 1 simdgroup × N_DST=4 rows per TG (register pressure forbids 2).
 
 #define QK_K 256
 #define Q4_K_SCALE_SIZE 12
@@ -997,9 +850,9 @@ typedef struct {
 } block_q4_K;
 
 kernel void gguf_q4k_gemv_bf16(
-    device const bfloat       *x        [[buffer(0)]],   // [K]
-    device const void         *weight   [[buffer(1)]],   // [N * K/256 * 144] raw bytes
-    device       bfloat       *out      [[buffer(2)]],   // [N]
+    device const bfloat       *x        [[buffer(0)]],
+    device const void         *weight   [[buffer(1)]],
+    device       bfloat       *out      [[buffer(2)]],
     constant     GgufParams   &p        [[buffer(3)]],
     uint3 tgpig [[threadgroup_position_in_grid]],
     uint tiisg  [[thread_index_in_simdgroup]],
@@ -1009,10 +862,10 @@ kernel void gguf_q4k_gemv_bf16(
     const uint16_t kmask2 = 0x0f0f;
     const uint16_t kmask3 = 0xc0c0;
 
-    const uint ix = tiisg / 8;          // 0..3 — which super-block of the 4-stride
-    const uint it = tiisg % 8;          // 0..7
-    const uint iq = it / 4;             // 0 or 1 — which 128-element half
-    const uint ir = it % 4;             // 0..3 — which 8-element chunk
+    const uint ix = tiisg / 8;
+    const uint it = tiisg % 8;
+    const uint iq = it / 4;
+    const uint ir = it % 4;
 
     const uint N  = p.out_features;
     const uint K  = p.in_features;
@@ -1092,22 +945,13 @@ kernel void gguf_q4k_gemv_bf16(
     }
 }
 
-// =============================================================================
-// Q5_K GEMV bf16 — port of llama.cpp / candle `kernel_mul_mv_q5_K_f32_impl`.
-// Block layout (176 bytes, 256 elements):
-//   half d;             half dmin;          // global scale + min
-//   u8   scales[12];                        // 6-bit packed sub-block scales/mins
-//   u8   qh[32];                            // 5th bit per element
-//   u8   qs[128];                           // low 4 bits, 2 elements per byte
-// Geometry: 2 simdgroups × 2 rows per TG.
-// =============================================================================
-
+// Q5_K geometry: 2 simdgroups × 2 rows per TG.
 typedef struct {
     half     d;
     half     dmin;
-    uint8_t  scales[Q4_K_SCALE_SIZE];  // same 12-byte packing as Q4_K
-    uint8_t  qh[QK_K / 8];             // 32 bytes
-    uint8_t  qs[QK_K / 2];             // 128 bytes
+    uint8_t  scales[Q4_K_SCALE_SIZE];
+    uint8_t  qh[QK_K / 8];
+    uint8_t  qs[QK_K / 2];
 } block_q5_K;
 
 kernel void gguf_q5k_gemv_bf16(
@@ -1136,10 +980,10 @@ kernel void gguf_q5k_gemv_bf16(
 
     float sumf[2] = {0.f, 0.f};
 
-    const uint tid = tiisg / 4;     // 0..7
-    const uint ix  = tiisg % 4;     // 0..3 — which K-block stride
-    const uint iq  = tid / 4;       // 0 or 1 — which 128-element half
-    const uint ir  = tid % 4;       // 0..3 — which 8-element chunk
+    const uint tid = tiisg / 4;
+    const uint ix  = tiisg % 4;
+    const uint iq  = tid / 4;
+    const uint ir  = tid % 4;
     const uint nn  = 8;
 
     const uint l0 = nn * ir;
@@ -1157,10 +1001,6 @@ kernel void gguf_q5k_gemv_bf16(
     float yl[16], yh[16];
     device const bfloat *y1 = x + ix * QK_K + y_offset;
 
-    // Byte offset between consecutive rows of the weight matrix
-    // (= `nb` blocks × sizeof(block_q5_K) bytes). After processing row 0,
-    // advance q1/qh by `step` bytes; dh/a are half*/u16* (2 bytes each)
-    // so they advance by `step/2` *elements* (= step bytes total).
     const uint step = (uint)sizeof(block_q5_K) * nb;
 
     for (uint i = ix; i < nb; i += 4) {
@@ -1227,16 +1067,7 @@ kernel void gguf_q5k_gemv_bf16(
     }
 }
 
-// =============================================================================
-// Q6_K GEMV bf16 — port of llama.cpp / candle `kernel_mul_mv_q6_K_f32_impl`.
-// Block layout (210 bytes, 256 elements):
-//   u8   ql[128];                           // low 4 bits, 2 elements per byte
-//   u8   qh[64];                            // high 2 bits, 4 elements per byte
-//   i8   scales[16];                        // signed 8-bit, 1 per 16-element sub-block
-//   half d;                                 // global scale
-// Geometry: 2 simdgroups × 1 row per TG.
-// =============================================================================
-
+// Q6_K geometry: 2 simdgroups × 1 row per TG.
 typedef struct {
     uint8_t  ql[QK_K / 2];
     uint8_t  qh[QK_K / 4];
@@ -1312,17 +1143,7 @@ kernel void gguf_q6k_gemv_bf16(
     }
 }
 
-// =============================================================================
-// Q2_K GEMV bf16 — port of llama.cpp / candle `kernel_mul_mv_q2_K_f32_impl`.
-// Block layout (84 bytes, 256 elements):
-//   u8   scales[16];   // 4-bit nibbles: low = sub-block scale, high = sub-block min
-//   u8   qs[64];       // 2-bit quants packed 4-per-byte
-//   half d;            // global scale
-//   half dmin;         // global min
-// Geometry: 2 simdgroups × 4 rows per TG (template uses
-// `first_row = (r0 * N_SIMDGROUP + sgitg) * N_DST`).
-// =============================================================================
-
+// Q2_K geometry: 2 simdgroups × 4 rows per TG.
 typedef struct {
     uint8_t  scales[QK_K / 16];
     uint8_t  qs[QK_K / 4];
@@ -1353,14 +1174,14 @@ kernel void gguf_q2k_gemv_bf16(
     float yl[32];
     float sumf[GGUF_N_DST] = {0.f};
 
-    const uint ix = tiisg / 8;     // 0..3
-    const uint it = tiisg % 8;     // 0..7
-    const uint iq = it / 4;        // 0 or 1
-    const uint ir = it % 4;        // 0..3
-    const uint is = (8 * ir) / 16; // 0 or 1
+    const uint ix = tiisg / 8;
+    const uint it = tiisg % 8;
+    const uint iq = it / 4;
+    const uint ir = it % 4;
+    const uint is = (8 * ir) / 16;
 
     device const bfloat *y4 = x + ix * QK_K + 128 * iq + 8 * ir;
-    const uint step = (uint)sizeof(block_q2_K) * nb;  // bytes between consecutive output rows
+    const uint step = (uint)sizeof(block_q2_K) * nb;
 
     for (uint ib = ix; ib < nb; ib += 4) {
         float4 sumy = {0.f, 0.f, 0.f, 0.f};
@@ -1416,22 +1237,12 @@ kernel void gguf_q2k_gemv_bf16(
     }
 }
 
-// =============================================================================
-// Q3_K GEMV bf16 — port of llama.cpp / candle `kernel_mul_mv_q3_K_f32_impl`.
-// Block layout (110 bytes, 256 elements):
-//   u8   hmask[32];                         // 3rd (high) bit per element
-//   u8   qs[64];                            // low 2 bits per element (4 per byte)
-//   u8   scales[12];                        // 16 6-bit packed sub-block scales
-//   half d;                                 // global scale
-// Per-element value: d * (scale - 32) * (((qs >> (2*shift)) & 3) | (hbit << 2) - 4)
-// Geometry: 2 simdgroups × 2 rows per TG (same as Q5_K, threads/TG = 64).
-// =============================================================================
-
+// Q3_K geometry: 2 simdgroups × 2 rows per TG.
 typedef struct {
-    uint8_t  hmask[QK_K / 8];   // 32 bytes
-    uint8_t  qs[QK_K / 4];      // 64 bytes
-    uint8_t  scales[12];        // 12 bytes (16 × 6-bit packed)
-    half     d;                 // 2 bytes
+    uint8_t  hmask[QK_K / 8];
+    uint8_t  qs[QK_K / 4];
+    uint8_t  scales[12];
+    half     d;
 } block_q3_K;
 
 kernel void gguf_q3k_gemv_bf16(
@@ -1456,26 +1267,24 @@ kernel void gguf_q3k_gemv_bf16(
 
     float yl[32];
 
-    const uint tid = tiisg / 4;            // 0..7
-    const uint ix  = tiisg % 4;            // 0..3 — K-block stride
-    const uint ip  = tid / 4;              // 0 or 1 — which 128-elem half
-    const uint il  = 2u * ((tid % 4u) / 2u);  // 0 or 2 — picks scale/shift pair
-    const uint ir  = tid % 2;              // 0 or 1 — first or second 16-elem chunk
+    const uint tid = tiisg / 4;
+    const uint ix  = tiisg % 4;
+    const uint ip  = tid / 4;
+    const uint il  = 2u * ((tid % 4u) / 2u);
+    const uint ir  = tid % 2;
     const uint n   = 8;
     const uint l0  = n * ir;
 
-    // Masks for the high bit of each 2-byte hmask read. Indexed by [2*ip + il/2].
     const ushort4 mm[4] = {{0x0001, 0x0100, 0x0002, 0x0200},
                            {0x0004, 0x0400, 0x0008, 0x0800},
                            {0x0010, 0x1000, 0x0020, 0x2000},
                            {0x0040, 0x4000, 0x0080, 0x8000}};
-    // Masks for the low-2-bit quants inside a 2-byte qs read. Indexed by [il/2].
     const int4 qm[2] = {{0x0003, 0x0300, 0x000c, 0x0c00},
                         {0x0030, 0x3000, 0x00c0, 0xc000}};
 
     const ushort4 hm = mm[2u * ip + il / 2u];
 
-    const uint shift = 2u * il;            // 0 or 4
+    const uint shift = 2u * il;
     const float v1 = (il == 0u) ? 4.f : 64.f;
     const float v2 = 4.f * v1;
 
@@ -1485,8 +1294,6 @@ kernel void gguf_q3k_gemv_bf16(
     const uint q_offset = 32u * ip + l0;
     const uint y_offset = 128u * ip + 32u * il + l0;
 
-    // Byte offset between consecutive output rows (= sizeof(block_q3_K) * nb).
-    // Q3_K block size is 110 bytes (even) so uint16_t* reads stay aligned.
     const uint step_bytes = (uint)sizeof(block_q3_K) * nb;
 
     device const bfloat *y1 = x + ix * QK_K + y_offset;
@@ -1514,7 +1321,6 @@ kernel void gguf_q3k_gemv_bf16(
         for (uint row = 0; row < 2; ++row) {
             const float d_all = (float)dh[0];
 
-            // Pack 4 6-bit scales into scales32 (used as 4×i8 below).
             scales16[0] = a[4];
             scales16[1] = a[5];
             aux32 = ((scales32 >> s_shift2) << 4) & 0x30303030u;
@@ -1556,7 +1362,6 @@ kernel void gguf_q3k_gemv_bf16(
             sumf1[row] += d1 * (float)(scales[1] - 32);
             sumf2[row] += d2 * (float)(scales[3] - 32);
 
-            // Advance to next row of the same 2-row pair.
             q  = (device const uint16_t *)((device const uint8_t *)q  + step_bytes);
             h  = (device const uint16_t *)((device const uint8_t *)h  + step_bytes);
             a  = (device const uint16_t *)((device const uint8_t *)a  + step_bytes);
@@ -1576,36 +1381,18 @@ kernel void gguf_q3k_gemv_bf16(
     }
 }
 
-// =============================================================================
-// Fused mul_mm_q*_bf16 — GEMM for M>1 (prefill).
-//
-// `out[M,N] = x[M,K] @ W[K,N].T` where W is GGUF-quantized. The weight is
-// dequantized **inline** in the inner loop — no intermediate bf16 weight
-// tensor is ever materialised (which is what made the dequant+matmul rollback
-// regress: a single `gate_up_proj` would allocate ~192 MB per call).
-//
-// Algorithm: each threadgroup owns a `BM × BN` tile of the output. The K
-// dimension is walked one quant block at a time; the BN weight blocks for the
-// current K-strip are cooperatively dequantized into threadgroup memory once
-// per K-tick (a 32-element row each), and every thread of the TG accumulates
-// its row's dot-product against that shared row using the cached `x` tile.
-// =============================================================================
+// Fused mul_mm_q*_bf16: BM×BN tile of out, cooperative inline dequant per K-block.
 
 struct GgufMatmulParams {
-    uint m_total;        // batch / sequence length
-    uint n_total;        // output features
-    uint k_total;        // input features
+    uint m_total;
+    uint n_total;
+    uint k_total;
 };
 
-constant uint GGUF_MM_BM = 16;   // rows of output per TG
-constant uint GGUF_MM_BN = 16;   // cols of output per TG
-constant uint GGUF_MM_TG = GGUF_MM_BM * GGUF_MM_BN;  // 256 threads per TG
+constant uint GGUF_MM_BM = 16;
+constant uint GGUF_MM_BN = 16;
+constant uint GGUF_MM_TG = GGUF_MM_BM * GGUF_MM_BN;
 
-// Cooperative dequantize of `BN` weight blocks (one block = QK5_0=32 elements)
-// for the BN output columns of the current tile, written into `w_tile`.
-// `n_base` is the global column index of the tile's first column; `b` is the
-// current K-block index. Each TG-thread dequantizes BN*QK5_0/GGUF_MM_TG = 2
-// elements.
 inline void gguf_q5_0_dequant_strip_into(
     threadgroup bfloat (&w_tile)[GGUF_MM_BN][QK5_0],
     device const block_q5_0 *w_blocks_base,
@@ -1662,7 +1449,6 @@ inline void gguf_q4_0_dequant_strip_into(
     uint b,
     uint tg_tid)
 {
-    // Q4_0: 32 elements per block, low/high nibbles per byte, signed offset -8.
     for (uint kk = tg_tid; kk < GGUF_MM_BN * QK5_0; kk += GGUF_MM_TG) {
         const uint c = kk / QK5_0;
         const uint j = kk % QK5_0;
@@ -1670,7 +1456,7 @@ inline void gguf_q4_0_dequant_strip_into(
         if (n >= n_total) { continue; }
         device const block_q4_0 *blk = w_blocks_base + (ulong)n * (ulong)nb + (ulong)b;
         const float d  = (float)blk->d;
-        const uint hi  = j / (QK5_0 / 2);     // 0 = low nibble, 1 = high nibble
+        const uint hi  = j / (QK5_0 / 2);
         const uint jj  = j % (QK5_0 / 2);
         const uint q_packed = (hi == 0) ? (blk->qs[jj] & 0x0Fu) : (blk->qs[jj] >> 4);
         const int  q = (int)q_packed - 8;
@@ -1687,7 +1473,6 @@ inline void gguf_q4_1_dequant_strip_into(
     uint b,
     uint tg_tid)
 {
-    // Q4_1: q * d + m (affine, no -8 offset).
     for (uint kk = tg_tid; kk < GGUF_MM_BN * QK5_0; kk += GGUF_MM_TG) {
         const uint c = kk / QK5_0;
         const uint j = kk % QK5_0;
@@ -1712,7 +1497,6 @@ inline void gguf_q5_1_dequant_strip_into(
     uint b,
     uint tg_tid)
 {
-    // Q5_1: 5-bit (low 4 from qs, 5th from qh), affine offset m.
     for (uint kk = tg_tid; kk < GGUF_MM_BN * QK5_0; kk += GGUF_MM_TG) {
         const uint c = kk / QK5_0;
         const uint j = kk % QK5_0;
@@ -1731,8 +1515,7 @@ inline void gguf_q5_1_dequant_strip_into(
     }
 }
 
-// Get scale/min byte for Q4_K sub-block `j` (0..7) from the 12-byte packed
-// scales array. Matches `get_scale_min_k4` from candle (MIT) / ggml.
+// Q4_K sub-block (0..7) scale+min from the 12-byte packed scales (get_scale_min_k4).
 inline void gguf_q4k_get_scale_min(uint j,
                                     device const uint8_t *q,
                                     thread uint &d_out,
@@ -1764,9 +1547,8 @@ inline void gguf_q4k_dequant_strip_into(
         device const block_q4_K *blk = w_blocks_base + (ulong)n * (ulong)nb + (ulong)b;
         const float d    = (float)blk->d;
         const float dmin = (float)blk->dmin;
-        // j in [0, 256): which 32-element half (8 halves), which element.
-        const uint half_idx = j / 32;          // 0..7
-        const uint elem     = j % 32;          // 0..31
+        const uint half_idx = j / 32;
+        const uint elem     = j % 32;
         uint sc_byte, m_byte;
         gguf_q4k_get_scale_min(half_idx, blk->scales, sc_byte, m_byte);
         const float sc_v = d    * (float)sc_byte;
@@ -1789,8 +1571,6 @@ inline void gguf_q5k_dequant_strip_into(
     uint b,
     uint tg_tid)
 {
-    // Q5_K mirrors Q4_K's sub-block structure (8 half-blocks × 32 elements)
-    // plus a 5th bit per element in `qh` (bit `2*iq + lo` of qh[elem]).
     for (uint kk = tg_tid; kk < GGUF_MM_BN * QK_K; kk += GGUF_MM_TG) {
         const uint c = kk / QK_K;
         const uint j = kk % QK_K;
@@ -1825,9 +1605,6 @@ inline void gguf_q6k_dequant_strip_into(
     uint b,
     uint tg_tid)
 {
-    // Q6_K: 2 halves × 4 quadrants × 32 elements per super-block. Per element:
-    // 4 bits from `ql` + 2 bits from `qh` → signed 6-bit (offset −32). 16 i8
-    // scales (one per 16-element sub-block). See candle's `BlockQ6K::to_float`.
     for (uint kk = tg_tid; kk < GGUF_MM_BN * QK_K; kk += GGUF_MM_TG) {
         const uint c = kk / QK_K;
         const uint j = kk % QK_K;
@@ -1866,9 +1643,6 @@ inline void gguf_q2k_dequant_strip_into(
     uint b,
     uint tg_tid)
 {
-    // Q2_K: 2 halves × 4 quadrants × 32 elements. Each quadrant uses shift
-    // {0,2,4,6} into the 16-byte qs sub-slice; scales are 4-bit nibble pairs
-    // (low = dl, high = ml). 16 scales per super-block (8 per half).
     for (uint kk = tg_tid; kk < GGUF_MM_BN * QK_K; kk += GGUF_MM_TG) {
         const uint c = kk / QK_K;
         const uint j = kk % QK_K;
@@ -1878,11 +1652,11 @@ inline void gguf_q2k_dequant_strip_into(
         const float d    = (float)blk->d;
         const float dmin = (float)blk->dmin;
 
-        const uint idx_half = j / 128;             // 0 or 1
+        const uint idx_half = j / 128;
         const uint pos      = j % 128;
-        const uint sub      = pos / 32;            // 0..3 → shift = sub*2
+        const uint sub      = pos / 32;
         const uint pos_in_sub = pos % 32;
-        const uint second_half = pos_in_sub / 16;  // 0 or 1 — which 16-byte half of qs
+        const uint second_half = pos_in_sub / 16;
         const uint elem     = pos_in_sub % 16;
         const uint shift    = sub * 2u;
 
@@ -1898,13 +1672,10 @@ inline void gguf_q2k_dequant_strip_into(
     }
 }
 
-// Q3_K 6-bit signed scale for sub-block `sub_idx` (0..15) from the 12-byte
-// packed scales array. Mirrors the unpacking in candle's vec_dot_q3k_q8k
-// (KMASK1=0x03030303, KMASK2=0x0f0f0f0f). Returns the value with the -32
-// offset already applied.
+// Q3_K signed 6-bit scale for sub-block 0..15 (offset −32 applied).
 inline int gguf_q3k_get_scale(uint sub_idx, device const uint8_t *scales) {
     const uint k          = sub_idx % 4u;
-    const uint group      = sub_idx / 4u;            // 0..3
+    const uint group      = sub_idx / 4u;
     const uint low_byte   = (group < 2u) ? (k + 4u * group) : (k + 4u * (group - 2u));
     const uint low_shift  = (group < 2u) ? 0u : 4u;
     const uint high_shift = 2u * group;
@@ -1922,12 +1693,6 @@ inline void gguf_q3k_dequant_strip_into(
     uint b,
     uint tg_tid)
 {
-    // Q3_K: 2 halves × 4 shift_idx × 32 elements. For element j:
-    //   block_half = j / 128, shift_idx = (j%128) / 32, elem_in_32 = j % 32
-    //   qs_byte = block_half*32 + elem_in_32, shift = shift_idx*2
-    //   hmask_byte = elem_in_32, hmask_bit = block_half*4 + shift_idx
-    //   q = ((qs >> shift) & 3) - (hbit ? 0 : 4)   ← signed in [-4, 3]
-    //   sub_idx = j / 16 (16 scales per super-block).
     for (uint kk = tg_tid; kk < GGUF_MM_BN * QK_K; kk += GGUF_MM_TG) {
         const uint c = kk / QK_K;
         const uint j = kk % QK_K;
@@ -1955,21 +1720,12 @@ inline void gguf_q3k_dequant_strip_into(
     }
 }
 
-// Common GEMM kernel body: each thread accumulates one output element
-// `out[m, n]`. The weight is provided as a TG-shared `w_tile[BN][BLOCK]`
-// dequantized strip; the x activation is fetched directly from HBM (cached
-// per-row by L2 across the BN threads sharing the same row).
-//
-// `dequant_fn` is the per-quant lambda that fills `w_tile` for a given K-block.
-// We instantiate one kernel per quant type because Metal lacks first-class
-// function templates over `inline` lambdas — see the kernel bodies below.
-//
-// Layout: dispatch grid is (ceil(N/BN), ceil(M/BM), 1); TG is (BN, BM, 1).
+// Per-quant mul_mm kernels: grid (ceil(N/BN), ceil(M/BM)), TG (BN, BM).
 
 kernel void gguf_q5_0_mul_mm_bf16(
-    device const bfloat            *x        [[buffer(0)]],  // [M, K]
-    device const void              *weight   [[buffer(1)]],  // packed block stream
-    device       bfloat            *out      [[buffer(2)]],  // [M, N]
+    device const bfloat            *x        [[buffer(0)]],
+    device const void              *weight   [[buffer(1)]],
+    device       bfloat            *out      [[buffer(2)]],
     constant     GgufMatmulParams  &p        [[buffer(3)]],
     uint3  tg_tid_xy [[thread_position_in_threadgroup]],
     uint3  tgpig     [[threadgroup_position_in_grid]])

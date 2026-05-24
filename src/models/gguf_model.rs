@@ -29,9 +29,6 @@ use crate::common::{
 };
 use crate::models::traits::BatchModel;
 
-/// Single generic transformer model used by all standard architectures
-/// (Llama, Qwen3, GGUF, and any future architecture that fits the standard
-/// pre-norm TransformerBlock pattern).
 pub struct StandardTransformer {
     pub(crate) embed_tokens: Embedding,
     pub(crate) blocks: Vec<TransformerBlock>,
@@ -189,7 +186,7 @@ impl StandardTransformer {
             }
         };
 
-        // Read query_pre_attn_scalar from GGUF if present (e.g. Gemma2 27B uses 224, not head_dim)
+        // Gemma2 27B uses query_pre_attn_scalar=224, not head_dim.
         let attention_scale = {
             let scalar = gguf
                 .metadata_f32_or(&format!("{prefix}.attention.query_pre_attn_scalar"), 0.0)
@@ -245,8 +242,7 @@ impl StandardTransformer {
                     v_norm: has_v_norm,
                     has_ffn_norms,
                     sliding_window: arch_def.resolve_sliding_window_for_layer(sliding_window, i),
-                    // GGUF runtime is dense-only today (MoE GGUF support is
-                    // future work — see `block.rs::load_gguf`).
+                    // GGUF runtime is dense-only; MoE GGUF support is future work.
                     moe: None,
                 };
                 TransformerBlock::load_gguf(&block_cfg, i, gguf, device, dtype, intermediate_size)

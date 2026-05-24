@@ -62,7 +62,7 @@ pub fn detect_system_kv_budget(memory_budget_bytes: Option<usize>, is_cpu: bool)
     };
     // Leave ~40-45% for model weights + OS + activations; KV gets the rest.
     let kv_fraction: f64 = if is_cpu { 0.65 } else { 0.55 };
-    let headroom: usize = 512 * 1024 * 1024; // 512 MB
+    let headroom: usize = 512 * 1024 * 1024;
     ((base as f64 * kv_fraction) as usize).saturating_sub(headroom)
 }
 
@@ -153,36 +153,20 @@ enum KvPool {
     },
 }
 
-/// One reusable `(k, v)` pair retired from a `PagedKvCache` and held in the pool
-/// for the next sequence. The `cap` field is the buffer's dim-2 length.
 struct ContigBuffer {
     k: Tensor,
     v: Tensor,
     cap: usize,
 }
 
-/// Per-allocator pool of retired contig buffers. `PagedKvCache::append` scales the
-/// contig buffer to sequence length; once a sequence ends (or outgrows its buffer
-/// and reallocates), the old buffer would otherwise be dropped and the next
-/// sequence would pay `Tensor::zeros` again. Returning it here lets the next
-/// sequence take it for free.
-///
-/// Invariants:
-/// - `buffers` is kept sorted ascending by `cap`, so `take(needed)` can find the
-///   smallest fit via a single forward scan and `put` finds its insertion point
-///   via `partition_point` in O(log n).
-/// - Length is capped at `max_buffers`; on overflow the smallest buffer is
-///   evicted, since large buffers are the expensive ones to rebuild.
+/// Invariant: `buffers` is sorted ascending by `cap` (smallest-fit via forward scan,
+/// insertion via `partition_point`). On overflow the smallest is evicted because
+/// large buffers cost more to rebuild.
 struct ContigBufferPool {
     buffers: Vec<ContigBuffer>,
     max_buffers: usize,
 }
 
-/// Per-allocator (= per-layer) ceiling on retained contig buffers. With L layers
-/// and S peak-concurrent sequences, the steady-state memory held by all pools at
-/// idle is roughly `L * MAX_POOL_BUFFERS * (sequence_len * 2 * n_kv * hd *
-/// dtype_bytes)`. 4 buffers per layer is enough to absorb typical churn while
-/// keeping the idle footprint modest on Apple Silicon unified memory.
 const MAX_POOL_BUFFERS: usize = 4;
 
 impl ContigBufferPool {
@@ -193,14 +177,11 @@ impl ContigBufferPool {
         }
     }
 
-    /// Smallest buffer with `cap >= needed`, removed from the pool. `None` if no
-    /// suitable buffer exists; caller should allocate fresh.
     fn take(&mut self, needed: usize) -> Option<ContigBuffer> {
         let idx = self.buffers.iter().position(|b| b.cap >= needed)?;
         Some(self.buffers.remove(idx))
     }
 
-    /// Return a buffer to the pool, evicting the smallest if over the cap.
     fn put(&mut self, buf: ContigBuffer) {
         if self.max_buffers == 0 {
             return;
@@ -350,7 +331,6 @@ impl BlockAllocator {
         &self.device
     }
 
-    /// Returns a clone of the quantizer Arc if the pool is quantized.
     pub fn get_quantizer(&self) -> Option<Arc<KvQuantizer>> {
         match &self.pool {
             KvPool::Quantized { quantizer, .. } => Some(Arc::clone(quantizer)),
@@ -358,15 +338,10 @@ impl BlockAllocator {
         }
     }
 
-    /// Take a contig buffer from the per-allocator pool. Returns `(k, v, cap)`
-    /// if a buffer with `cap >= needed` was available, else `None`.
-    /// Caller is responsible for allocating fresh on `None`.
     pub fn take_contig_buffer(&mut self, needed: usize) -> Option<(Tensor, Tensor, usize)> {
         self.contig_pool.take(needed).map(|b| (b.k, b.v, b.cap))
     }
 
-    /// Return a contig buffer to the pool for reuse by future sequences.
-    /// Drops the buffer if the pool is full and `cap` is the smallest entry.
     pub fn release_contig_buffer(&mut self, k: Tensor, v: Tensor, cap: usize) {
         self.contig_pool.put(ContigBuffer { k, v, cap });
     }
@@ -381,10 +356,7 @@ impl BlockAllocator {
         self.contig_pool.capacities()
     }
 
-    /// Copy pre-quantized CPU-staged data into the block pool.
-    /// All slices are indexed as flat `[n_tokens * n_kv_heads * bph]` (packed)
-    /// or `[n_tokens * n_kv_heads]` (norms).
-    /// Holds the lock for microseconds (pure memcpy — no quantization).
+    /// Pure-memcpy write of pre-quantized staged data; quantization happens at the caller.
     pub fn write_staged(
         &mut self,
         block_id: usize,
@@ -452,7 +424,6 @@ impl BlockAllocator {
         }
     }
 
-    /// Write KV data for a chunk of tokens into the block pool.
     /// data_k, data_v shape: [n_tokens, n_kv_heads, head_dim]
     pub fn write(
         &mut self,
@@ -521,7 +492,6 @@ impl BlockAllocator {
         Ok(())
     }
 
-    /// Gather KV data for given slot indices.
     /// Returns (K, V) with shape [1, n_kv_heads, num_tokens, head_dim].
     pub fn gather(&self, slot_indices: &Tensor) -> Result<(Tensor, Tensor)> {
         match &self.pool {
@@ -618,7 +588,7 @@ fn contig_buf_capacity(total_needed: usize) -> usize {
     cap.max(64)
 }
 
-/// Deferred block pool write (avoids GPU -> CPU sync during forward pass).
+/// Deferred block-pool write — avoids GPU→CPU sync during the forward pass.
 struct PendingWrite {
     block_id: usize,
     offset: usize,
@@ -626,7 +596,6 @@ struct PendingWrite {
     v_chunk: Tensor,
 }
 
-/// Metadata for one staged block-pool write emitted during flush.
 struct BgFlushItem {
     block_id: usize,
     offset: usize,
@@ -635,12 +604,10 @@ struct BgFlushItem {
 
 pub struct PagedKvCache {
     allocator: SharedBlockAllocator,
-    /// Cached quantizer reference — avoids locking the allocator in the hot path.
+    // Cached at construction so the hot path never relocks the allocator.
     quantizer: Option<Arc<KvQuantizer>>,
     table: BlockTable,
     block_size: usize,
-    /// Cached allocator dims/dtype/device — read once at construction so the
-    /// contig fresh-alloc path never has to relock the allocator.
     n_kv: usize,
     head_dim: usize,
     dtype: DType,
@@ -676,10 +643,7 @@ impl PagedKvCache {
         }
     }
 
-    /// Pull a contig `(k, v)` buffer with `cap >= needed` — first from the
-    /// per-allocator pool, otherwise freshly allocated at `contig_buf_capacity(needed)`.
-    /// The allocator lock is released before the `Tensor::zeros` call so that the
-    /// (potentially slow) GPU allocation doesn't serialize with other layers.
+    /// Lock is released before `Tensor::zeros` so GPU alloc doesn't serialize with other layers.
     fn acquire_contig(&self, needed: usize) -> Result<(Tensor, Tensor, usize)> {
         if let Some(t) = self.allocator.lock().unwrap().take_contig_buffer(needed) {
             debug_assert!(t.2 >= needed);
@@ -707,10 +671,8 @@ impl PagedKvCache {
         let v_flat = new_v.squeeze(0)?.transpose(0, 1)?;
         let block_size = self.block_size;
 
-        // Option 3: Skip block-pool writes for single-token decode steps.
-        // The contiguous buffer is always present during decode and serves all
-        // attention.  Pool writes are only needed for prefix-cache reuse, and
-        // the prefix cache only uses full blocks filled during prefill.
+        // Decode-only: pool writes are only needed for prefix-cache reuse, which
+        // only uses full blocks filled during prefill.
         let skip_pool_write = self.contig_len > 0 && new_seq == 1;
 
         let prev_tokens = self.table.num_tokens;
@@ -758,9 +720,8 @@ impl PagedKvCache {
 
         let total_needed = prev_tokens + new_seq;
 
-        // Buffers retired here go back to the per-allocator pool below — the
-        // region past `contig_len` is never observed by callers (every read
-        // narrows to `contig_len`) so reusing dirty memory is safe.
+        // Region past `contig_len` is never observed (all reads narrow to it), so
+        // reusing dirty pooled memory is safe.
         match (self.contig_k.take(), self.contig_v.take()) {
             (Some(k_buf), Some(v_buf)) => {
                 let cap = k_buf.dim(2)?;
@@ -826,22 +787,13 @@ impl PagedKvCache {
         }
     }
 
-    /// Flush deferred quantized writes to the block pool.
-    ///
-    /// Two optimizations are applied here:
-    /// - decode steps never populate `pending_writes`, so this is a no-op for
-    ///   every decode token (see `append`).
-    /// - all pending K chunks and all pending V chunks are concatenated into one
-    ///   tensor each before the GPU→CPU transfer, reducing many small syncs to 2.
-    ///
-    /// The final quantize+pool-write is synchronous to guarantee that newly
-    /// registered prefix-cache blocks always point to fully materialized data.
+    /// Synchronous on completion: prefix-cache blocks must point to fully
+    /// materialized data before reuse.
     pub fn flush_pending(&mut self) -> Result<()> {
         if self.pending_writes.is_empty() {
             return Ok(());
         }
 
-        // Non-quantized path: write directly (full-precision pool).
         if self.quantizer.is_none() {
             let mut alloc = self.allocator.lock().unwrap();
             for pw in self.pending_writes.drain(..) {
@@ -850,7 +802,7 @@ impl PagedKvCache {
             return Ok(());
         }
 
-        // ── Option 1: single batched GPU→CPU transfer ─────────────────────────
+        // Batch all pending K/V chunks into one GPU→CPU transfer each.
         let pending_writes = std::mem::take(&mut self.pending_writes);
 
         let token_counts: Vec<usize> = pending_writes
@@ -1113,7 +1065,7 @@ mod tests {
         let prefix_v =
             Tensor::from_vec((100..116).map(|x| x as f32).collect(), (1, 2, 2, 4), &dev).unwrap();
         let _ = source.append(&prefix_k, &prefix_v).unwrap();
-        source.flush_pending().unwrap(); // pool writes are deferred; flush before reuse
+        source.flush_pending().unwrap();
         let prefix_block_id = source.block_id_at(0).unwrap();
 
         let mut cache = PagedKvCache::new(Arc::clone(&alloc));
@@ -1188,24 +1140,19 @@ mod tests {
         let alloc = make_allocator(8, 2);
         let dev = Device::Cpu;
 
-        // Pool starts empty.
         assert_eq!(alloc.lock().unwrap().contig_pool_len(), 0);
 
-        // First sequence: pool is empty so this triggers a fresh allocation.
         let mut cache_a = PagedKvCache::new(Arc::clone(&alloc));
         let k = Tensor::zeros((1, 2, 4, 4), DType::F32, &dev).unwrap();
         let v = Tensor::zeros((1, 2, 4, 4), DType::F32, &dev).unwrap();
         cache_a.append(&k, &v).unwrap();
-        // While the cache holds the buffer, the pool is still empty.
         assert_eq!(alloc.lock().unwrap().contig_pool_len(), 0);
 
-        // Clearing the cache retires the buffer into the pool.
         cache_a.clear();
         assert_eq!(alloc.lock().unwrap().contig_pool_len(), 1);
         let pooled_cap = alloc.lock().unwrap().contig_pool_capacities()[0];
         assert!(pooled_cap >= 4);
 
-        // A second sequence reuses the pooled buffer — no fresh allocation.
         let mut cache_b = PagedKvCache::new(Arc::clone(&alloc));
         let k = Tensor::zeros((1, 2, 3, 4), DType::F32, &dev).unwrap();
         let v = Tensor::zeros((1, 2, 3, 4), DType::F32, &dev).unwrap();
@@ -1220,7 +1167,6 @@ mod tests {
     #[test]
     fn contig_pool_evicts_smallest_on_overflow() {
         let alloc = make_allocator(64, 2);
-        // Force a tiny capacity to exercise eviction without going through `append`.
         {
             let mut a = alloc.lock().unwrap();
             for cap in [10usize, 50, 30, 100, 70] {
@@ -1229,7 +1175,7 @@ mod tests {
                 a.release_contig_buffer(k, v, cap);
             }
         }
-        // MAX_POOL_BUFFERS = 4 so smallest (10) is evicted; remaining are sorted asc.
+        // MAX_POOL_BUFFERS = 4: smallest (10) evicted, remainder sorted ascending.
         let caps = alloc.lock().unwrap().contig_pool_capacities();
         assert_eq!(caps, vec![30, 50, 70, 100]);
     }
@@ -1246,42 +1192,33 @@ mod tests {
             }
         }
         let mut a = alloc.lock().unwrap();
-        // Needs 50 → smallest fit is 64.
         let (_, _, cap) = a.take_contig_buffer(50).expect("expected hit");
         assert_eq!(cap, 64);
-        // Needs 200 → smallest fit is 256.
         let (_, _, cap) = a.take_contig_buffer(200).expect("expected hit");
         assert_eq!(cap, 256);
-        // Remaining: just 32; need 100 → miss.
         assert!(a.take_contig_buffer(100).is_none());
-        // 32 still there for a tiny request.
         let (_, _, cap) = a.take_contig_buffer(16).expect("expected hit");
         assert_eq!(cap, 32);
     }
 
     #[test]
     fn contig_buffer_growth_retires_old_to_pool() {
-        // 256 blocks × 4 slots = 1024 tokens of headroom — comfortably above the
-        // 64-token minimum capacity baked into `contig_buf_capacity`.
         let alloc = Arc::new(Mutex::new(
             BlockAllocator::new(256, 4, 2, 4, DType::F32, &Device::Cpu, None).unwrap(),
         ));
         let dev = Device::Cpu;
         let mut cache = PagedKvCache::new(Arc::clone(&alloc));
 
-        // Initial prefill. With `total_needed = 32`, cap is clamped to the 64-token floor.
         let k = Tensor::zeros((1, 2, 32, 4), DType::F32, &dev).unwrap();
         let v = Tensor::zeros((1, 2, 32, 4), DType::F32, &dev).unwrap();
         cache.append(&k, &v).unwrap();
         let first_cap = contig_buf_capacity(32);
         assert_eq!(alloc.lock().unwrap().contig_pool_len(), 0);
 
-        // Second append crosses the cap (32 + 50 = 82 > 64) so the buffer grows.
         let big_k = Tensor::zeros((1, 2, 50, 4), DType::F32, &dev).unwrap();
         let big_v = Tensor::zeros((1, 2, 50, 4), DType::F32, &dev).unwrap();
         cache.append(&big_k, &big_v).unwrap();
 
-        // The old (smaller) buffer should have been retired to the pool.
         let caps = alloc.lock().unwrap().contig_pool_capacities();
         assert_eq!(caps.len(), 1, "growth path must retire the old buffer");
         assert_eq!(caps[0], first_cap);

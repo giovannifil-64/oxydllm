@@ -10,15 +10,6 @@ use prometheus::{
 
 use super::AppState;
 
-// ---------------------------------------------------------------------------
-// Metric definitions
-// ---------------------------------------------------------------------------
-
-/// Time-to-first-token histogram in milliseconds, labeled by model.
-///
-/// Measures elapsed time from the moment a request is enqueued in the engine
-/// to the moment the first generated token is available. Includes prefill
-/// latency and any queuing delay.
 pub static TTFT_HISTOGRAM: LazyLock<HistogramVec> = LazyLock::new(|| {
     register_histogram_vec!(
         "oxydllm_ttft_milliseconds",
@@ -30,10 +21,6 @@ pub static TTFT_HISTOGRAM: LazyLock<HistogramVec> = LazyLock::new(|| {
     .expect("failed to register oxydllm_ttft_milliseconds")
 });
 
-/// Decode throughput histogram in tokens/s, labeled by model.
-///
-/// Measured from the first generated token to request completion.
-/// Excludes prefill time — use ttft_ms if you need end-to-end latency.
 pub static TPS_HISTOGRAM: LazyLock<HistogramVec> = LazyLock::new(|| {
     register_histogram_vec!(
         "oxydllm_tokens_per_second",
@@ -45,7 +32,6 @@ pub static TPS_HISTOGRAM: LazyLock<HistogramVec> = LazyLock::new(|| {
     .expect("failed to register oxydllm_tokens_per_second")
 });
 
-/// Total completed requests, labeled by model and status ("ok" / "error").
 pub static REQUESTS_TOTAL: LazyLock<CounterVec> = LazyLock::new(|| {
     register_counter_vec!(
         "oxydllm_requests_total",
@@ -55,10 +41,6 @@ pub static REQUESTS_TOTAL: LazyLock<CounterVec> = LazyLock::new(|| {
     .expect("failed to register oxydllm_requests_total")
 });
 
-/// Instantaneous queue depth (sequences waiting + running in the engine).
-///
-/// Updated on every engine step. A sustained depth > 1 means the engine
-/// is batching requests; depth approaching max_num_seqs means saturation.
 pub static QUEUE_DEPTH: LazyLock<Gauge> = LazyLock::new(|| {
     register_gauge!(
         "oxydllm_queue_depth",
@@ -68,11 +50,6 @@ pub static QUEUE_DEPTH: LazyLock<Gauge> = LazyLock::new(|| {
     .expect("failed to register oxydllm_queue_depth")
 });
 
-/// Prefix KV cache lookup results, labeled by model and result ("hit" / "miss").
-///
-/// Compute the hit ratio in Prometheus with:
-///   rate(oxydllm_prefix_cache_requests_total{result="hit"}[5m])
-///   / rate(oxydllm_prefix_cache_requests_total[5m])
 pub static PREFIX_CACHE_REQUESTS: LazyLock<CounterVec> = LazyLock::new(|| {
     register_counter_vec!(
         "oxydllm_prefix_cache_requests_total",
@@ -83,12 +60,6 @@ pub static PREFIX_CACHE_REQUESTS: LazyLock<CounterVec> = LazyLock::new(|| {
     .expect("failed to register oxydllm_prefix_cache_requests_total")
 });
 
-/// Model weight memory in bytes, labeled by model.
-///
-/// Set once at model load time; reflects actual in-memory footprint after
-/// dtype conversion (F32 on CPU, BF16 on GPU/Metal). Cleared when the model
-/// is evicted. On Apple Silicon there is no discrete GPU VRAM — this is
-/// unified system memory shared between CPU and GPU.
 pub static MODEL_WEIGHTS_BYTES: LazyLock<GaugeVec> = LazyLock::new(|| {
     register_gauge_vec!(
         "oxydllm_model_weights_bytes",
@@ -100,12 +71,6 @@ pub static MODEL_WEIGHTS_BYTES: LazyLock<GaugeVec> = LazyLock::new(|| {
     .expect("failed to register oxydllm_model_weights_bytes")
 });
 
-/// KV cache memory reserved per loaded model, labeled by model.
-///
-/// This is the total KV cache budget allocated at model load time, not the
-/// portion currently occupied by active sequences. Freed when the model is
-/// evicted. On Apple Silicon there is no discrete GPU VRAM — this is
-/// unified system memory.
 pub static KV_CACHE_ALLOCATED_BYTES: LazyLock<GaugeVec> = LazyLock::new(|| {
     register_gauge_vec!(
         "oxydllm_kv_cache_allocated_bytes",
@@ -118,12 +83,6 @@ pub static KV_CACHE_ALLOCATED_BYTES: LazyLock<GaugeVec> = LazyLock::new(|| {
     .expect("failed to register oxydllm_kv_cache_allocated_bytes")
 });
 
-/// Total inference memory: model weights + KV cache across all loaded models.
-///
-/// Computed as the sum of oxydllm_model_weights_bytes and
-/// oxydllm_kv_cache_allocated_bytes across all currently loaded models.
-/// On Apple Silicon there is no discrete GPU VRAM — this is unified system
-/// memory. For per-model breakdown, query the labelled gauges above.
 pub static VRAM_USED_BYTES: LazyLock<Gauge> = LazyLock::new(|| {
     register_gauge!(
         "oxydllm_vram_used_bytes",
@@ -134,10 +93,6 @@ pub static VRAM_USED_BYTES: LazyLock<Gauge> = LazyLock::new(|| {
     )
     .expect("failed to register oxydllm_vram_used_bytes")
 });
-
-// ---------------------------------------------------------------------------
-// Handler
-// ---------------------------------------------------------------------------
 
 pub(super) async fn serve_metrics(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     // Touch all statics so they appear in output even before any request comes in.
@@ -150,9 +105,6 @@ pub(super) async fn serve_metrics(State(state): State<Arc<AppState>>) -> impl In
     let _ = &*KV_CACHE_ALLOCATED_BYTES;
     let _ = &*VRAM_USED_BYTES;
 
-    // Update memory gauges just-in-time from the current manager state.
-    // model_weights_bytes and kv_cache_allocated_bytes are stored in SlotState::Ready
-    // and are already accurate without additional engine-side tracking.
     let running = state.manager.lock().await.list_running();
     let mut total_bytes: u64 = 0;
     for info in &running {

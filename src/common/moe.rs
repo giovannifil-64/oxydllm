@@ -73,9 +73,6 @@ pub struct MoeFeedForward {
     experts: Vec<MoeExpert>,
     top_k: usize,
     activation: Activation,
-    /// Renormalise top-k probabilities so they sum to 1 per token. True for
-    /// Qwen3-MoE and OLMoE; some checkpoints (older Mixtral) use the raw
-    /// pre-normalisation values.
     norm_topk: bool,
 }
 
@@ -93,8 +90,6 @@ impl MoeFeedForward {
         }
         let p = format!("model.layers.{layer_idx}.mlp");
 
-        // Router (gating network). The HF Qwen3-MoE / OLMoE convention is
-        // `mlp.gate.weight`; some checkpoints use `mlp.router.weight`.
         let router_w = weights
             .try_get(&format!("{p}.gate.weight"))
             .or_else(|| weights.try_get(&format!("{p}.router.weight")))
@@ -128,40 +123,16 @@ impl MoeFeedForward {
         })
     }
 
-    /// `x: [..., hidden] → [..., hidden]`. Routing happens over the flattened
-    /// leading dimensions, then the shape is restored.
-    ///
-    /// ## Dispatch strategy
-    ///
-    /// Two equivalent implementations, picked per call based on `n_tokens`:
-    ///
-    /// 1. **Naive** (small batches): run each non-empty expert FFN on the full
-    ///    `x_flat`, multiply by its sparse weight column, sum. `top_k`
-    ///    experts → `top_k` FFN forward calls on tiny inputs.
-    /// 2. **Sparse** (large batches): for each expert, gather the subset of
-    ///    tokens that selected it, FFN on just those rows, `index_add` back.
-    ///    Per-expert compute drops from `n_tokens` to
-    ///    `~n_tokens × top_k / num_experts`. For OLMoE-1B-7B (64 × top_k=8)
-    ///    this is up to ~8× compute saving on long prefill.
-    ///
-    /// Sparse adds per-expert `index_select` + `index_add` overhead (extra
-    /// command-buffer dispatches on Metal); for `n_tokens ≤ top_k` the naive
-    /// path is empirically faster because the FFN compute is already minimal
-    /// and the overhead dominates. `n_tokens > top_k` flips the trade-off.
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let original_shape = x.dims().to_vec();
         let hidden = *original_shape.last().unwrap();
         let n_tokens: usize = original_shape[..original_shape.len() - 1].iter().product();
         let x_flat = x.reshape((n_tokens, hidden))?.contiguous()?;
 
-        // Router scores. Router weight is plain bf16/f16 — output matches `x`.
         let logits = self.router.forward(&x_flat)?;
-        // Softmax in F32 for numerical stability across many experts.
         let logits_f32 = logits.to_dtype(DType::F32)?;
         let probs = softmax_last_dim(&logits_f32)?;
 
-        // Top-k via descending arg_sort + narrow + gather. Candle 0.10.2 has
-        // no built-in `topk` but exposes the primitives.
         let sorted_idx = probs.arg_sort_last_dim(false)?;
         let top_idx = sorted_idx.narrow(D::Minus1, 0, self.top_k)?.contiguous()?;
         let top_vals = probs.gather(&top_idx, D::Minus1)?;
@@ -173,6 +144,8 @@ impl MoeFeedForward {
             top_vals
         };
 
+        // Per-expert `index_select` / `index_add` overhead beats the FFN saving
+        // when `n_tokens ≤ top_k` (decode); cross over to the sparse path above.
         let out = if n_tokens > self.top_k {
             self.dispatch_sparse(&x_flat, &top_idx, &top_vals, n_tokens, hidden)?
         } else {
@@ -181,9 +154,6 @@ impl MoeFeedForward {
         out.reshape(original_shape)
     }
 
-    /// Decode-friendly path. Used when `n_tokens ≤ top_k` (e.g. M=1) where
-    /// the sparse path's per-expert command-buffer overhead exceeds the FFN
-    /// compute saving.
     fn dispatch_naive(
         &self,
         x_flat: &Tensor,
@@ -194,13 +164,10 @@ impl MoeFeedForward {
     ) -> Result<Tensor> {
         let num_experts = self.experts.len();
         let device = x_flat.device();
-        // Dense `[n_tokens, num_experts]` gate: zero everywhere except the
-        // top-k positions per row (scatter_add from a zero base).
         let gate_f32 = Tensor::zeros((n_tokens, num_experts), DType::F32, device)?;
         let gate_f32 = gate_f32.scatter_add(top_idx, top_vals, D::Minus1)?;
         let gate = gate_f32.to_dtype(x_flat.dtype())?;
 
-        // Per-expert routing mass — skip experts no token selected.
         let per_expert_mass: Vec<f32> = gate_f32.sum(0)?.flatten_all()?.to_vec1::<f32>()?;
 
         let mut acc: Option<Tensor> = None;
@@ -208,7 +175,7 @@ impl MoeFeedForward {
             if per_expert_mass[e] == 0.0 {
                 continue;
             }
-            let weight_e = gate.narrow(D::Minus1, e, 1)?; // [n_tokens, 1]
+            let weight_e = gate.narrow(D::Minus1, e, 1)?;
             let expert_out = expert.forward(x_flat, self.activation)?;
             let weighted = expert_out.broadcast_mul(&weight_e)?;
             acc = Some(match acc {
@@ -218,16 +185,10 @@ impl MoeFeedForward {
         }
         Ok(match acc {
             Some(a) => a,
-            // Defensive: top_k ≥ 1 is checked at load, so every token routes
-            // to ≥1 expert and this arm is unreachable in practice.
             None => Tensor::zeros((n_tokens, hidden), x_flat.dtype(), device)?,
         })
     }
 
-    /// Prefill-friendly path. Gather tokens per expert (CPU-side index work),
-    /// run FFN on the subset, `index_add` back. Wins when the per-expert
-    /// compute saving (`1 - top_k/k_active`) outweighs the per-expert
-    /// command-buffer overhead.
     fn dispatch_sparse(
         &self,
         x_flat: &Tensor,
@@ -239,9 +200,6 @@ impl MoeFeedForward {
         let num_experts = self.experts.len();
         let device = x_flat.device();
 
-        // Pull the routing tables to the CPU once so the per-expert grouping
-        // is a tight integer loop. Both tensors are small (n_tokens × top_k
-        // ≤ a few KB even at 4k-token prefill).
         let top_idx_cpu: Vec<u32> = top_idx.flatten_all()?.to_vec1::<u32>()?;
         let top_vals_cpu: Vec<f32> = top_vals.flatten_all()?.to_vec1::<f32>()?;
 
@@ -284,10 +242,6 @@ mod tests {
     use crate::common::linear::{AnyLinear, Linear};
     use candle_core::Device;
 
-    /// Build a minimal `MoeFeedForward` in-memory (no `ModelWeights` round-trip).
-    /// Used to exercise routing + scatter without touching the loader. Weights
-    /// are deterministic (linear ramp) so tests don't depend on the candle CPU
-    /// RNG (which doesn't support `set_seed`).
     fn build_synth_moe(
         device: &Device,
         hidden: usize,
@@ -296,21 +250,16 @@ mod tests {
         top_k: usize,
         salt: u64,
     ) -> Result<MoeFeedForward> {
-        // Mirror the load-time guard so the test exercises the same invariant.
         if top_k == 0 || top_k > num_experts {
             candle_core::bail!("MoE top_k={top_k} must be in (0, {num_experts}] (num_experts)");
         }
         let mk = |rows: usize, cols: usize, offset: u64| -> Result<Tensor> {
-            // Deterministic small-magnitude values; `offset+salt` give distinct
-            // patterns per tensor so experts aren't bit-identical.
             let total = rows * cols;
             let data: Vec<f32> = (0..total)
                 .map(|i| {
                     let raw = (i as u64)
                         .wrapping_mul(2654435761)
                         .wrapping_add(offset + salt);
-                    // Map to [-0.05, 0.05] via 16 LSBs / max → small std avoids
-                    // SiLU saturation in tests.
                     ((raw & 0xFFFF) as f32 / 65535.0 - 0.5) * 0.1
                 })
                 .collect();
@@ -340,34 +289,24 @@ mod tests {
 
     #[test]
     fn moe_single_expert_topk1_matches_single_ffn() -> Result<()> {
-        // With num_experts=1 and top_k=1, MoE must reduce exactly to the lone
-        // expert's FFN output (routing weight = softmax([x]) = 1.0, no scatter).
         let device = Device::Cpu;
         let moe = build_synth_moe(&device, 16, 32, 1, 1, 0xc0ffee)?;
 
-        // Deterministic input (no RNG dependency).
         let input_data: Vec<f32> = (0..2 * 4 * 16).map(|i| (i as f32 * 0.013).sin()).collect();
         let x = Tensor::from_vec(input_data, (2, 4, 16), &device)?;
         let y = moe.forward(&x)?;
 
-        // Reference: expert directly applied
         let x_flat = x.reshape((8, 16))?.contiguous()?;
         let ref_out = moe.experts[0].forward(&x_flat, Activation::SiLU)?;
         let ref_y = ref_out.reshape((2, 4, 16))?;
 
         let diff = (y - ref_y)?.abs()?.max_all()?.to_scalar::<f32>()?;
-        assert!(
-            diff < 1e-5,
-            "single-expert MoE differs from direct FFN: max_abs_diff = {diff}"
-        );
+        assert!(diff < 1e-5, "max_abs_diff = {diff}");
         Ok(())
     }
 
     #[test]
     fn moe_topk_routing_uses_only_topk_experts() -> Result<()> {
-        // Stress correctness on a multi-expert / multi-top-k config:
-        // verify the output is a convex combination of `top_k` expert outputs
-        // (all routing weights non-negative, sum to 1 per token).
         let device = Device::Cpu;
         let (hidden, intermediate, num_experts, top_k) = (8, 16, 4, 2);
         let moe = build_synth_moe(&device, hidden, intermediate, num_experts, top_k, 0xdead)?;
@@ -378,25 +317,19 @@ mod tests {
         let x = Tensor::from_vec(input_data, (1, 3, hidden), &device)?;
         let y = moe.forward(&x)?;
         let y_norm = y.flatten_all()?.to_vec1::<f32>()?;
-        // Sanity: output is finite (no NaN/inf from the scatter or division).
         assert!(y_norm.iter().all(|v| v.is_finite()));
 
-        // Sanity: with all experts contributing through normalised weights,
-        // `‖y‖` should be in roughly the same scale as a single expert output.
         let x_flat = x.reshape((3, hidden))?.contiguous()?;
         let ref0 = moe.experts[0].forward(&x_flat, Activation::SiLU)?;
         let ref_norm = ref0.flatten_all()?.to_vec1::<f32>()?;
         let y_mag: f32 = y_norm.iter().map(|v| v.abs()).sum::<f32>() / y_norm.len() as f32;
         let r_mag: f32 = ref_norm.iter().map(|v| v.abs()).sum::<f32>() / ref_norm.len() as f32;
-        // Within an order of magnitude.
         assert!(y_mag < 10.0 * r_mag && r_mag < 10.0 * y_mag);
         Ok(())
     }
 
     #[test]
     fn moe_rejects_invalid_topk() -> Result<()> {
-        // top_k > num_experts must error at load — guarantees the loader fails
-        // loud rather than silently swallowing a misconfigured checkpoint.
         let device = Device::Cpu;
         let moe = build_synth_moe(&device, 4, 8, 2, 3, 1);
         assert!(moe.is_err());

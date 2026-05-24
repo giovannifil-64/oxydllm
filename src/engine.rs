@@ -21,9 +21,7 @@ pub struct NewToken {
 pub struct StepOutput {
     pub new_tokens: Vec<NewToken>,
     pub completed: Vec<CompletedSequence>,
-    /// Number of prefill sequences that had a prefix cache hit this step.
     pub prefix_cache_hits: usize,
-    /// Number of prefill sequences that had no prefix cache match this step.
     pub prefix_cache_misses: usize,
 }
 
@@ -149,14 +147,6 @@ fn pick_prefill_chunk_split(uncached_lens: &[usize], total_prefill_tokens: usize
     }
     None
 }
-
-// ──────────────────────────────────────────────────────────────────────────────
-// `step()` helpers — pure refactor, no behavior change.
-//
-// Each helper owns one phase of a step: prefix-cache resolution, batch
-// assembly, the forward pass, and per-sequence sampling. `step()` itself stays
-// a short orchestrator that's easy to follow top-to-bottom.
-// ──────────────────────────────────────────────────────────────────────────────
 
 struct PrefillInfo {
     seq_id: SequenceId,
@@ -762,8 +752,6 @@ mod tests {
         }
     }
 
-    // Like FakeModel, but writes zero KV tensors to the cache on each forward pass,
-    // allowing block_id_at() to return valid IDs for prefix cache registration.
     struct KvFakeModel {
         device: Device,
         vocab_size: usize,
@@ -1046,19 +1034,17 @@ mod tests {
     #[test]
     fn step_mixes_prefill_and_decode_in_same_step() {
         let allocators = make_allocators(1, 8);
-        let forced_token = 5; // not a stop token
+        let forced_token = 5;
         let (model, forward_calls) = FakeModel::new(vec![1], forced_token, allocators);
         let mut engine =
             Engine::new_with_stop_controls(Box::new(model), test_scheduler_config(), &[], &[]);
 
-        // Step 1: pure prefill for seq A
         let id_a = engine.add_request(vec![10, 11], SamplingParams::default(), 8);
         let out = engine.step().unwrap();
         assert_eq!(forward_calls.load(Ordering::Relaxed), 1);
         assert_eq!(out.new_tokens.len(), 1);
         assert_eq!(out.new_tokens[0].seq_id, id_a);
 
-        // Step 2: seq A is in decode, seq B starts prefill → mixed batch
         let id_b = engine.add_request(vec![20, 21], SamplingParams::default(), 8);
         let out = engine.step().unwrap();
         assert_eq!(
@@ -1075,7 +1061,7 @@ mod tests {
     #[test]
     fn step_finishes_with_length_when_max_tokens_reached() {
         let allocators = make_allocators(1, 8);
-        let forced_token = 5; // not a stop token
+        let forced_token = 5;
         let (model, _) = FakeModel::new(vec![], forced_token, allocators);
         let mut engine =
             Engine::new_with_stop_controls(Box::new(model), test_scheduler_config(), &[], &[]);
@@ -1115,9 +1101,6 @@ mod tests {
     #[test]
     fn engine_prefix_cache_hits_on_repeated_prompt() {
         // 64-token shared prefix = exactly 4 full blocks (DEFAULT_BLOCK_SIZE=16).
-        // Request 0 runs alone: cold miss, registers blocks in PrefixCache.
-        // Requests 1-7 are added together: each has 1 uncached token after the
-        // shared prefix, so all 7 find the 4 cached blocks and count as hits.
         let allocators = make_allocators(1, 256);
         let model = KvFakeModel::new(vec![31], 1, allocators);
         let mut engine = Engine::new_with_stop_controls(
@@ -1132,7 +1115,6 @@ mod tests {
 
         let shared_prefix: Vec<u32> = vec![42u32; 64];
 
-        // First request — cold miss, populates the prefix cache.
         let first_prompt: Vec<u32> = shared_prefix.iter().copied().chain([0u32]).collect();
         engine.add_request(first_prompt, SamplingParams::default(), 5);
         while engine.has_pending_work() {

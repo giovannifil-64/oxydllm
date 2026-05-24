@@ -27,12 +27,8 @@ fn log_sdpa_fallback_once(head_dim: usize, dtype: candle_core::DType) {
     });
 }
 
-/// Minimum KV length for the custom Metal Flash Attention prefill kernel.
-///
-/// Below this the standard fallback (candle matmul → softmax → matmul) is used:
-/// for short prefills the materialised QKᵀ still fits in cache, so the FA
-/// kernel's IO-aware tiling provides no benefit and loses to MPS GEMM.  FA only
-/// pulls ahead once the score matrix exceeds L1/L2 cache.
+/// Below this the materialised QKᵀ fits in cache and the fallback (matmul →
+/// softmax → matmul) beats FA's IO-aware tiling.
 #[cfg(feature = "metal")]
 const METAL_FA_MIN_KV: usize = 1024;
 
@@ -51,15 +47,9 @@ enum QkvProjection {
     },
 }
 
-/// Where the `q_norm` / `k_norm` weights live on the head axis.
-/// - `PerHead`: weight shape `[head_dim]`, applied to `[B, H, T, head_dim]`
-///   (Qwen3 / Gemma3 convention; variance over `head_dim`).
-/// - `Flat`: weight shape `[hidden]` or `[n_kv_heads * head_dim]`, applied to
-///   `[B, T, q_dim]` / `[B, T, kv_dim]` **before reshape into heads** (OLMoE
-///   convention; variance over the full per-head-bundle).
-///
-/// Auto-detected from the loaded weight's element count at construction time
-/// so checkpoints don't need an explicit config flag.
+/// Auto-detected from weight element count. `PerHead` ([head_dim], applied to
+/// [B,H,T,head_dim]) is Qwen3/Gemma3; `Flat` ([hidden] or [n_kv*head_dim],
+/// applied to [B,T,*_dim] **before reshape**) is OLMoE.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum QkNormLayout {
     PerHead,
@@ -85,8 +75,6 @@ pub struct Attention {
     out_buf: std::cell::RefCell<Option<Tensor>>,
 }
 
-/// Pick `PerHead` vs `Flat` from the weight tensor's element count.
-/// Returns `None` if the shape matches neither — caller should bail.
 fn detect_qk_norm_layout(
     weight_numel: usize,
     head_dim: usize,
@@ -336,9 +324,7 @@ impl Attention {
             (Some(_), Some(_), Some(_)) | (None, None, None)
         );
         let dims_fusable = q_dim.is_multiple_of(8) && kv_dim.is_multiple_of(8);
-        // GPTQ packs along in_features, so the out-dim concat used by
-        // `concat_awq_along_out` doesn't apply. Take the Separate path; the
-        // dequant-at-load cost dominates, fusion only saves matmul launches.
+        // GPTQ packs along in_features → out-dim concat doesn't apply, use Separate.
         let is_awq = q_raw.pack_dim == PackDim::Out;
         let qkv_fused = bias_fusable && dims_fusable && is_awq;
         let group_size = q_raw
@@ -509,9 +495,7 @@ impl Attention {
 
         let actual_window = compute_sliding_window(cfg);
 
-        // GGUF quants only ship Qwen3-style per-head qk_norm today; assume that
-        // layout. If a GGUF MoE / OLMoE-style port appears we'd need shape
-        // detection here too.
+        // GGUF quants only ship Qwen3-style per-head qk_norm today.
         Ok(Self {
             qkv,
             o_proj: AnyLinear::Quantized(o_proj),
@@ -576,9 +560,6 @@ impl Attention {
         mask: Option<&Tensor>,
         segments: &mut [SegmentInfo],
     ) -> Result<Tensor> {
-        // Pre-empt the "cross-device tensor" failure mode that will become
-        // possible once tensor-parallel inference is added. Debug-only — has
-        // no runtime cost in release builds.
         if let Some((_, position_ids)) = rope {
             debug_assert_eq!(
                 x.device().location(),
@@ -599,9 +580,7 @@ impl Attention {
 
         let (q_raw, k_raw, v_raw) = self.qkv_split(x)?;
 
-        // OLMoE-style `Flat` qk_norm operates on the per-head-bundle
-        // ([B, T, q_dim] / [B, T, kv_dim]) **before** reshape into heads,
-        // and its variance covers the full bundle (not head_dim). Apply here.
+        // Flat qk_norm must run before reshape (variance over full bundle).
         let (q_raw, k_raw) = match self.qk_norm_layout {
             QkNormLayout::Flat => {
                 let q = match &self.q_norm {
@@ -627,8 +606,7 @@ impl Attention {
             .reshape((b, total_seq, self.n_kv_heads, hd))?
             .transpose(1, 2)?;
 
-        // Per-head qk_norm (Qwen3 / Gemma3): apply AFTER reshape so variance
-        // is taken over `head_dim` only.
+        // Per-head qk_norm runs after reshape (variance over head_dim only).
         let (q, k) = match self.qk_norm_layout {
             QkNormLayout::PerHead => {
                 let q = match &self.q_norm {
@@ -697,16 +675,9 @@ impl Attention {
         };
         let mut q_offset = 0usize;
 
-        // ── Per-segment routing: Metal FA prefill, Metal SDPA decode, or fallback ────
-        // Priority order:
-        //   1. Metal Flash Attention (custom kernel) — prefill path (num_tokens > 1)
-        //      Replaces the fallback for multi-token attention when supported.
-        //   2. Metal SDPA — decode path (num_tokens == 1) via candle-metal-kernels.
-        //   3. Standard fallback — anything else (CPU, F64, external mask, etc.).
-        //
-        // Metal SDPA "full" mode (q_seq > 1) corrupts outputs on sequences past ~16
-        // tokens (NaN propagation), so it stays disabled for prefill regardless of
-        // FA availability.  Decode keeps using SDPA vector path which works correctly.
+        // Routing priority: Metal FA (prefill) → Metal SDPA vector (decode) → fallback.
+        // SDPA "full" mode (q_seq > 1) corrupts outputs past ~16 tokens, so it
+        // stays disabled for prefill regardless of FA availability.
         #[cfg(feature = "metal")]
         let sdpa_base_ok = super::metal_ops::sdpa_available(&q, self.head_dim);
         #[cfg(feature = "metal")]
@@ -729,14 +700,8 @@ impl Attention {
                 seg.num_tokens,
             )?;
 
-            // ── Metal FA prefill eligibility (per segment) ──────────────────
-            // - Multi-token Q (prefill)
-            // - No external mask (the kernel applies causal+prefix mask itself)
-            // - No sliding-window applied to current segment (kernel assumes
-            //   standard causal pattern; sliding-window prefill is rare).
-            // - prefix_len + T_q == T_kv (sanity)
-            // - kv_len >= METAL_FA_MIN_KV  (short prefills lose to MPS GEMM in
-            //   the fallback path; FA only pays off past the cache threshold).
+            // FA kernel assumes standard causal + no external mask; sliding-window
+            // prefill is rare so falls back. METAL_FA_MIN_KV gates on cache size.
             #[cfg(feature = "metal")]
             let use_metal_fa = metal_fa_base_ok
                 && seg.num_tokens > 1
@@ -795,7 +760,7 @@ impl Attention {
             } else if use_seg_sdpa {
                 #[cfg(feature = "metal")]
                 {
-                    // SDPA handles GQA natively — no repeat_kv needed.
+                    // SDPA handles GQA natively.
                     let q_c_owned;
                     let q_c = if q_seg.is_contiguous() {
                         &q_seg
@@ -830,7 +795,6 @@ impl Attention {
                     out_buf.slice_set(&seg_out.contiguous()?, 2, q_offset)?;
                 }
             } else {
-                // ── Fallback: standard attention ─────────────────────
                 let k_seg = self.repeat_kv(k_seg)?;
                 let v_seg = self.repeat_kv(v_seg)?;
 
@@ -906,7 +870,7 @@ impl Attention {
         let device = candle_core::Device::Cpu;
         let q_dim = n_heads * head_dim;
         let kv_dim = n_kv_heads * head_dim;
-        let hidden = q_dim; // input hidden size equals q_dim in these tests
+        let hidden = q_dim;
         let qkv_w = Tensor::zeros(
             (q_dim + 2 * kv_dim, hidden),
             candle_core::DType::F32,
@@ -1021,8 +985,8 @@ mod tests {
 
     #[test]
     fn repeat_kv_gqa_expands_kv_heads_to_q_heads() -> Result<()> {
-        let attn = Attention::new_for_test(4, 2, 8, None)?; // 4 q-heads, 2 kv-heads
-        let k_data: Vec<f32> = (0..48).map(|v| v as f32).collect(); // (1,2,3,8)
+        let attn = Attention::new_for_test(4, 2, 8, None)?;
+        let k_data: Vec<f32> = (0..48).map(|v| v as f32).collect();
         let k = Tensor::from_vec(k_data, (1, 2, 3, 8), &Device::Cpu)?;
 
         let k_rep = attn.repeat_kv(k)?;
@@ -1049,7 +1013,7 @@ mod tests {
         let n_heads = 4;
         let n_kv_heads = 2;
         let head_dim = 8;
-        let hidden = n_heads * head_dim; // 32
+        let hidden = n_heads * head_dim;
         let seq_len = 3;
 
         let attn = Attention::new_for_test(n_heads, n_kv_heads, head_dim, None)?;

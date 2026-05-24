@@ -163,10 +163,6 @@ fn round_1(v: f64) -> f64 {
     (v * 10.0).round() / 10.0
 }
 
-/// Returns the best available size estimate for `model_id` before it is loaded.
-/// Priority:
-///   1. Registry entry — real in-memory footprint from a previous load (accurate).
-///   2. Disk safetensors size — corrected by dtype: ×2 on CPU (F32), ×1 on GPU (BF16).
 pub fn estimate_model_size(model_dir: &Path) -> usize {
     std::fs::read_dir(model_dir)
         .into_iter()
@@ -211,7 +207,6 @@ impl ModelManager {
             max_queued_requests,
         } = config;
         let mut registry = load_registry(&models_dir);
-        // Remove registry entries whose model directory no longer exists.
         let valid_ids: std::collections::HashSet<String> = loader::discover_models(&models_dir)
             .into_iter()
             .map(|m| m.id)
@@ -305,19 +300,9 @@ impl ModelManager {
             .collect()
     }
 
-    /// Atomic `(discovered, registry)` snapshot.
-    ///
-    /// Replaces the previous pattern in `handlers.rs` of "lock manager, clone
-    /// registry, drop lock, then `discover_models(...)`" which had two issues:
-    ///   1. **L5** — every `GET /v1/models{,/:id}` re-scanned the filesystem.
-    ///   2. **L6** — between the lock release and the filesystem scan, a
-    ///      registry mutation (model load/unload) could produce an inconsistent
-    ///      response (e.g. a discovered model with `size_bytes: 0`).
-    ///
-    /// Both reads happen under the same manager lock acquisition, and the
-    /// discovery itself is cached for `DISCOVERY_CACHE_TTL` to absorb bursts.
-    /// Manual `oxydllm rm` or operator drops of new model directories are
-    /// reflected within the TTL.
+    /// Atomic `(discovered, registry)` snapshot — both reads happen under the
+    /// same manager lock acquisition, with discovery cached for
+    /// `DISCOVERY_CACHE_TTL` to avoid re-scanning the filesystem on each call.
     pub fn discovered_with_registry(
         &mut self,
     ) -> (
@@ -350,22 +335,16 @@ impl ModelManager {
         self.discovery_cache = None;
     }
 
-    /// Returns the best pre-load size estimate for eviction decisions.
-    /// Uses real measured registry data when available; falls back to a
-    /// corrected disk estimate otherwise.
-    /// The estimate includes both weights and KV cache.
+    /// Best pre-load size estimate (weights + KV) for eviction decisions.
+    /// Uses registry data when available; otherwise estimates from disk with
+    /// dtype correction (CPU=F32 doubles BF16, AWQ keeps packed 4-bit).
     fn projected_size_bytes(&self, model_id: &str, model_path: &Path) -> usize {
-        // Case 1: previously loaded — use the real in-memory footprint (weights + kv).
         if let Some(entry) = self.registry.get(model_id)
             && entry.size_bytes > 0
         {
             return entry.size_bytes + entry.kv_cache_bytes;
         }
 
-        // Case 2: first-ever load — estimate from disk.
-        // On GPU we load BF16 (≈ same size as on-disk BF16 safetensors).
-        // On CPU we load F32 (2× larger than BF16 on-disk files).
-        // AWQ models keep packed 4-bit weights resident (W4A16): no load-time expansion.
         let disk_bytes = estimate_model_size(model_path);
         let is_cpu = self.cuda_devices.is_empty();
 
@@ -382,15 +361,12 @@ impl ModelManager {
             })
             .unwrap_or(disk_bytes);
 
-        // On CPU, safetensors are loaded as F32 (2× BF16 on-disk size).
-        // GGUF models are dequantized to F32 at load time: Q4_K_M needs ~7×, Q8_0 ~4×, etc.
-        // Read the GGUF header (metadata only, no weight data) to get an accurate factor.
         let (corrected, cpu_expansion) = if is_cpu {
             if let Some(gguf_path) = crate::models::loader::find_gguf_file(model_path) {
                 let factor = crate::models::estimate::gguf_cpu_expansion(&gguf_path);
                 ((gpu_bytes as f64 * factor) as usize, factor)
             } else {
-                (gpu_bytes * 2, 2.0) // safetensors BF16 → F32
+                (gpu_bytes * 2, 2.0)
             }
         } else {
             (gpu_bytes, 1.0)
@@ -689,29 +665,14 @@ struct SpawnLoadParams {
     max_queued_requests: usize,
 }
 
-/// Runs dummy forward passes to force the device (Metal/CUDA) to JIT-compile
-/// GPU kernels for **all** SDPA paths before the model is marked as Ready.
-///
-/// Without this, the very first real request pays the compilation cost,
-/// causing multi-second TTFT spikes.  More importantly on Metal, a Candle
-/// `candle_metal_kernels` bug makes the first `call_sdpa_full` (prefill,
-/// q_seq > 8) emit NaN logits if it follows a `call_sdpa_vector` call
-/// (q_seq <= 8) without an intervening `call_sdpa_full`. We work around
-/// this by running three warmup phases, terminating with a multi-token
-/// prefill so the last kernel exercised matches the regime real prefill
-/// requests use.
-///
-/// Phases:
-///   1. Prefill n=8   -> SDPA vector (compile path used by 1-8 token prompts)
-///   2. Decode  n=1   -> SDPA vector (compile decode-step path)
-///   3. Prefill n=16  -> SDPA full   (compile path used by 9+ token prompts;
-///      leaves Metal state in the full regime that virtually every real chat hits)
+/// JIT-compile all SDPA kernels before marking the model Ready, otherwise the
+/// first real request pays multi-second compilation latency. Phase 3 (full
+/// prefill) MUST be last: a Metal candle bug emits NaN logits on the first
+/// `call_sdpa_full` after a `call_sdpa_vector` call without an intervening full.
 fn warm_up_model(model: &dyn BatchModel) {
     let device = model.device();
     let allocators = model.allocators();
 
-    // Acquire the per-device GPU lock so warmup doesn't contend with any
-    // model already running inference on the same device.
     let lock = crate::gpu_lock::gpu_lock_for(device);
     let _gpu = lock.acquire();
 
@@ -720,7 +681,6 @@ fn warm_up_model(model: &dyn BatchModel) {
         .map(|a| PagedKvCache::new(std::sync::Arc::clone(a)))
         .collect();
 
-    // ── Phase 1: SDPA vector prefill (q_seq=8) ──────────────────────────
     {
         let dummy_tokens: Vec<u32> = (1..=8).collect();
         let positions: Vec<u32> = (0..8).collect();
@@ -747,7 +707,6 @@ fn warm_up_model(model: &dyn BatchModel) {
         }
     }
 
-    // ── Phase 2: SDPA vector decode (q_seq=1) ───────────────────────────
     {
         let input = match Tensor::from_vec(vec![1u32], (1, 1), device) {
             Ok(t) => t,
@@ -770,15 +729,10 @@ fn warm_up_model(model: &dyn BatchModel) {
         }
     }
 
-    // Release the warmup blocks so Phase 3 starts from a clean per-sequence
-    // state (matches what the engine does at request boundaries).
     for cache in &mut caches {
         cache.clear();
     }
 
-    // ── Phase 3: SDPA full prefill (q_seq>8) ────────────────────────────
-    // Must be the LAST forward — fixes Metal-SDPA NaN bug where a fresh
-    // call_sdpa_full following call_sdpa_vector produces NaN logits.
     const FULL_WARMUP_TOKENS: usize = 16;
     {
         let dummy_tokens: Vec<u32> = (1..=FULL_WARMUP_TOKENS as u32).collect();
@@ -815,7 +769,6 @@ fn warm_up_model(model: &dyn BatchModel) {
         cache.clear();
     }
 
-    // Flush any in-flight GPU commands so the first real request sees clean state.
     #[cfg(feature = "metal")]
     if let candle_core::Device::Metal(dev) = device {
         dev.wait_until_completed().ok();
@@ -896,7 +849,6 @@ fn spawn_load(params: SpawnLoadParams) {
             .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
             .and_then(|v| v["architectures"][0].as_str().map(|s| s.to_string()))
             .unwrap_or_else(|| {
-                // Try GGUF metadata for architecture
                 if loader::is_gguf_model(&model_dir) {
                     "GGUF".to_string()
                 } else {
@@ -904,9 +856,6 @@ fn spawn_load(params: SpawnLoadParams) {
                 }
             });
 
-        // weights_size_bytes is the real in-memory footprint (post dtype-conversion).
-        // On GPU: BF16 = 2 bytes/param → roughly half the on-disk F32 safetensors size.
-        // On CPU: F32 = 4 bytes/param → matches or slightly exceeds on-disk size.
         let total_bytes = weights_size_bytes + kv_cache_bytes;
         tracing::info!(
             model_id = %model_id_thread,
@@ -1313,7 +1262,6 @@ mod tests {
         let h = build_dummy_handle();
         mgr.insert_ready_with_size_for_tests("big-model", h, 80, 0);
 
-        // total=80, budget=100: 80 + 50 > 100 → eviction required
         let evicted = mgr.evict_lru_for_bytes(50);
         assert_eq!(evicted, 1);
         assert_eq!(

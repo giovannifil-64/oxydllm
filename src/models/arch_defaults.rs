@@ -82,12 +82,12 @@ pub fn llama_defaults() -> ArchDefaults {
 
 pub fn known_unsupported_reason(arch: &str) -> Option<&'static str> {
     match arch {
-        // Mixture-of-Experts models — MoE routing not yet implemented.
-        "Qwen3MoeForCausalLM"
-        | "MixtralForCausalLM"
-        | "DeepseekV2ForCausalLM"
-        | "DeepseekV3ForCausalLM" => {
-            Some("Mixture-of-Experts (MoE) architectures are not yet supported")
+        // Mixtral + DeepSeek-V2/V3 use a different MoE tensor naming
+        // (`block_sparse_moe.experts.*` and shared-expert paths) and the
+        // DeepSeek variants add latent attention. Qwen3-MoE and OLMoE are now
+        // supported via the `mlp.experts.{e}.{gate,up,down}_proj` convention.
+        "MixtralForCausalLM" | "DeepseekV2ForCausalLM" | "DeepseekV3ForCausalLM" => {
+            Some("This MoE variant (Mixtral / DeepSeek) uses a tensor naming we don't load yet")
         }
         "Qwen3_5ForConditionalGeneration" => {
             Some("Hybrid linear+full attention models are not yet supported")
@@ -120,6 +120,24 @@ pub fn arch_defaults(arch: &str) -> Option<ArchDefaults> {
         "qwen3" | "Qwen3ForCausalLM" => Some(ArchDefaults {
             qk_norm: true,
             default_rope_theta: 1_000_000.0,
+            extra_eos_ids: &[],
+            ..llama_defaults()
+        }),
+        // Qwen3-MoE — same attention defaults as Qwen3, MoE FFN handled by
+        // `BlockConfig.moe` (parsed from `num_experts` / `num_experts_per_tok`).
+        "qwen3_moe" | "Qwen3MoeForCausalLM" => Some(ArchDefaults {
+            qk_norm: true,
+            default_rope_theta: 1_000_000.0,
+            extra_eos_ids: &[],
+            ..llama_defaults()
+        }),
+        // OLMoE (1B-7B/7B-A1B family) — Llama-style attention with per-head
+        // q_norm/k_norm (qk_norm=true), MoE FFN, rope_theta=10k. `clip_qkv`
+        // (sometimes set in OLMoE configs) is currently ignored; on the
+        // 0924-Instruct checkpoint it's `null` so this is a no-op.
+        "olmoe" | "OlmoeForCausalLM" => Some(ArchDefaults {
+            qk_norm: true,
+            default_rope_theta: 10_000.0,
             extra_eos_ids: &[],
             ..llama_defaults()
         }),

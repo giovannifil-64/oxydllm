@@ -4,6 +4,7 @@ use super::{
     ffn::FeedForward,
     gguf_weights::GgufWeights,
     linear::{AnyLinear, Embedding},
+    moe::MoeFeedForward,
     norm::RMSNorm,
     paged::PagedKvCache,
     rope::RotaryEmbedding,
@@ -13,11 +14,28 @@ use candle_core::DType;
 use candle_core::Result;
 use candle_core::Tensor;
 
+/// Dense or MoE FFN sub-layer. Both variants share the same `forward(x) → x`
+/// signature so the block can dispatch uniformly. `Moe` is only constructed
+/// when [`BlockConfig::moe`] is `Some`.
+enum FeedForwardLayer {
+    Dense(FeedForward),
+    Moe(MoeFeedForward),
+}
+
+impl FeedForwardLayer {
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        match self {
+            Self::Dense(f) => f.forward(x),
+            Self::Moe(f) => f.forward(x),
+        }
+    }
+}
+
 pub struct TransformerBlock {
     input_norm: RMSNorm,
     attention: Attention,
     ffn_norm: RMSNorm,
-    ffn: FeedForward,
+    ffn: FeedForwardLayer,
     pre_ffn_norm: Option<RMSNorm>,
     post_ffn_norm: Option<RMSNorm>,
     per_layer_input_gate: Option<AnyLinear>,
@@ -61,7 +79,17 @@ impl TransformerBlock {
             cfg.norm_type,
         )?;
         let attention = Attention::load(cfg, layer_idx, weights)?;
-        let ffn = FeedForward::load(layer_idx, weights, cfg.activation)?;
+        let ffn = match cfg.moe {
+            Some(moe_cfg) => FeedForwardLayer::Moe(MoeFeedForward::load(
+                layer_idx,
+                weights,
+                cfg.activation,
+                moe_cfg.num_experts,
+                moe_cfg.num_experts_per_tok,
+                moe_cfg.norm_topk_prob,
+            )?),
+            None => FeedForwardLayer::Dense(FeedForward::load(layer_idx, weights, cfg.activation)?),
+        };
 
         let mut pre_ffn_norm = None;
         let mut post_ffn_norm = None;
@@ -170,14 +198,21 @@ impl TransformerBlock {
             RMSNorm::from_qtensor(&ffn_norm_qt, device, dtype, cfg.rms_norm_eps, cfg.norm_type)?;
 
         let attention = Attention::load_gguf(cfg, layer_idx, gguf, device, dtype)?;
-        let ffn = FeedForward::load_gguf(
+        // GGUF runtime: dense FFN only — MoE GGUF support is future work
+        // (different tensor naming and per-expert quantization layout).
+        if cfg.moe.is_some() {
+            candle_core::bail!(
+                "GGUF MoE models are not yet supported (layer {layer_idx} has cfg.moe = Some)"
+            );
+        }
+        let ffn = FeedForwardLayer::Dense(FeedForward::load_gguf(
             layer_idx,
             gguf,
             intermediate_size,
             device,
             dtype,
             cfg.activation,
-        )?;
+        )?);
 
         Ok(Self {
             input_norm,

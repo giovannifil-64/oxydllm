@@ -25,6 +25,21 @@ pub struct BlockConfig {
     pub v_norm: bool,
     pub has_ffn_norms: bool,
     pub sliding_window: Option<usize>,
+
+    /// Mixture-of-Experts: when `Some`, the FFN at this block is built via
+    /// [`crate::common::moe::MoeFeedForward`] instead of the dense
+    /// [`crate::common::ffn::FeedForward`]. `num_experts_per_tok` is the
+    /// top-k routing width.
+    pub moe: Option<MoeConfig>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MoeConfig {
+    pub num_experts: usize,
+    pub num_experts_per_tok: usize,
+    /// Renormalise top-k router probabilities so they sum to 1 per token.
+    /// True for Qwen3-MoE / Mixtral; false for OLMoE.
+    pub norm_topk_prob: bool,
 }
 
 /// Architecture-independent config for standard pre-norm transformer models
@@ -69,10 +84,30 @@ pub struct StandardTransformerConfig {
     /// `None` ⇒ plain float / FP8 weights. AWQ / GPTQ checkpoints set this so
     /// the weight loader can dispatch the right `try_get_quant`.
     pub quant_scheme: Option<crate::common::weights::QuantScheme>,
+
+    /// Mixture-of-Experts: number of experts in the MoE FFN, or `None` for a
+    /// dense FFN. Populated from `num_experts` / `num_local_experts` in
+    /// `config.json`. See [`MoeConfig`].
+    pub moe_num_experts: Option<usize>,
+    /// Top-k routing width (e.g. 2 for Mixtral, 8 for OLMoE/Qwen3-MoE).
+    /// Required when `moe_num_experts.is_some()`.
+    pub moe_num_experts_per_tok: Option<usize>,
+    /// Renormalise top-k router probabilities. `None` ⇒ default `true`
+    /// (Qwen3-MoE / Mixtral). OLMoE-1B-7B sets this to `false` in its
+    /// `config.json`.
+    pub moe_norm_topk_prob: Option<bool>,
 }
 
 impl StandardTransformerConfig {
     pub fn block_config(&self) -> BlockConfig {
+        let moe = match (self.moe_num_experts, self.moe_num_experts_per_tok) {
+            (Some(n), Some(k)) => Some(MoeConfig {
+                num_experts: n,
+                num_experts_per_tok: k,
+                norm_topk_prob: self.moe_norm_topk_prob.unwrap_or(true),
+            }),
+            _ => None,
+        };
         BlockConfig {
             n_heads: self.num_attention_heads,
             n_kv_heads: self.num_key_value_heads,
@@ -86,6 +121,7 @@ impl StandardTransformerConfig {
             v_norm: self.v_norm,
             has_ffn_norms: self.has_ffn_norms,
             sliding_window: self.sliding_window,
+            moe,
         }
     }
 }

@@ -51,11 +51,27 @@ enum QkvProjection {
     },
 }
 
+/// Where the `q_norm` / `k_norm` weights live on the head axis.
+/// - `PerHead`: weight shape `[head_dim]`, applied to `[B, H, T, head_dim]`
+///   (Qwen3 / Gemma3 convention; variance over `head_dim`).
+/// - `Flat`: weight shape `[hidden]` or `[n_kv_heads * head_dim]`, applied to
+///   `[B, T, q_dim]` / `[B, T, kv_dim]` **before reshape into heads** (OLMoE
+///   convention; variance over the full per-head-bundle).
+///
+/// Auto-detected from the loaded weight's element count at construction time
+/// so checkpoints don't need an explicit config flag.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum QkNormLayout {
+    PerHead,
+    Flat,
+}
+
 pub struct Attention {
     qkv: QkvProjection,
     o_proj: AnyLinear,
     q_norm: Option<RMSNorm>,
     k_norm: Option<RMSNorm>,
+    qk_norm_layout: QkNormLayout,
     n_heads: usize,
     n_kv_heads: usize,
     head_dim: usize,
@@ -67,6 +83,22 @@ pub struct Attention {
     v_norm: bool,
     rms_norm_eps: f64,
     out_buf: std::cell::RefCell<Option<Tensor>>,
+}
+
+/// Pick `PerHead` vs `Flat` from the weight tensor's element count.
+/// Returns `None` if the shape matches neither — caller should bail.
+fn detect_qk_norm_layout(
+    weight_numel: usize,
+    head_dim: usize,
+    n_heads: usize,
+) -> Option<QkNormLayout> {
+    if weight_numel == head_dim {
+        Some(QkNormLayout::PerHead)
+    } else if weight_numel == n_heads * head_dim {
+        Some(QkNormLayout::Flat)
+    } else {
+        None
+    }
 }
 
 fn truncate_kv_window(
@@ -195,23 +227,32 @@ impl Attention {
         }
         let o_proj = AnyLinear::from_weight_with_scale_inv(o_weight, o_scale_inv, None)?;
 
-        let q_norm = if cfg.qk_norm {
-            Some(RMSNorm::new(
-                weights.get(&format!("{}.q_norm.weight", p))?.clone(),
-                cfg.rms_norm_eps,
-                cfg.norm_type,
-            )?)
+        let (q_norm, k_norm, qk_norm_layout) = if cfg.qk_norm {
+            let q_w = weights.get(&format!("{}.q_norm.weight", p))?.clone();
+            let k_w = weights.get(&format!("{}.k_norm.weight", p))?.clone();
+            let q_layout = detect_qk_norm_layout(q_w.elem_count(), cfg.head_dim, cfg.n_heads);
+            let k_layout = detect_qk_norm_layout(k_w.elem_count(), cfg.head_dim, cfg.n_kv_heads);
+            let layout = match (q_layout, k_layout) {
+                (Some(a), Some(b)) if a == b => a,
+                (Some(_), Some(_)) => candle_core::bail!(
+                    "qk_norm layout mismatch between q_norm and k_norm at layer {layer_idx}",
+                ),
+                _ => candle_core::bail!(
+                    "q/k_norm weight shape at layer {layer_idx}: q={} k={} matches neither per-head ({}) nor flat ({}, {})",
+                    q_w.elem_count(),
+                    k_w.elem_count(),
+                    cfg.head_dim,
+                    cfg.n_heads * cfg.head_dim,
+                    cfg.n_kv_heads * cfg.head_dim,
+                ),
+            };
+            (
+                Some(RMSNorm::new(q_w, cfg.rms_norm_eps, cfg.norm_type)?),
+                Some(RMSNorm::new(k_w, cfg.rms_norm_eps, cfg.norm_type)?),
+                layout,
+            )
         } else {
-            None
-        };
-        let k_norm = if cfg.qk_norm {
-            Some(RMSNorm::new(
-                weights.get(&format!("{}.k_norm.weight", p))?.clone(),
-                cfg.rms_norm_eps,
-                cfg.norm_type,
-            )?)
-        } else {
-            None
+            (None, None, QkNormLayout::PerHead)
         };
 
         let actual_window = compute_sliding_window(cfg);
@@ -221,6 +262,7 @@ impl Attention {
             o_proj,
             q_norm,
             k_norm,
+            qk_norm_layout,
             n_heads: cfg.n_heads,
             n_kv_heads: cfg.n_kv_heads,
             head_dim: hd,
@@ -331,23 +373,24 @@ impl Attention {
         };
         let o_proj = AnyLinear::from_quant(&o_raw, o_bias, &device, dtype)?;
 
-        let q_norm = if cfg.qk_norm {
-            Some(RMSNorm::new(
-                weights.get(&format!("{p}.q_norm.weight"))?.clone(),
-                cfg.rms_norm_eps,
-                cfg.norm_type,
-            )?)
+        let (q_norm, k_norm, qk_norm_layout) = if cfg.qk_norm {
+            let q_w = weights.get(&format!("{p}.q_norm.weight"))?.clone();
+            let k_w = weights.get(&format!("{p}.k_norm.weight"))?.clone();
+            let q_layout = detect_qk_norm_layout(q_w.elem_count(), cfg.head_dim, cfg.n_heads);
+            let k_layout = detect_qk_norm_layout(k_w.elem_count(), cfg.head_dim, cfg.n_kv_heads);
+            let layout = match (q_layout, k_layout) {
+                (Some(a), Some(b)) if a == b => a,
+                _ => candle_core::bail!(
+                    "AWQ q/k_norm layout mismatch or unsupported at layer {layer_idx}"
+                ),
+            };
+            (
+                Some(RMSNorm::new(q_w, cfg.rms_norm_eps, cfg.norm_type)?),
+                Some(RMSNorm::new(k_w, cfg.rms_norm_eps, cfg.norm_type)?),
+                layout,
+            )
         } else {
-            None
-        };
-        let k_norm = if cfg.qk_norm {
-            Some(RMSNorm::new(
-                weights.get(&format!("{p}.k_norm.weight"))?.clone(),
-                cfg.rms_norm_eps,
-                cfg.norm_type,
-            )?)
-        } else {
-            None
+            (None, None, QkNormLayout::PerHead)
         };
 
         let actual_window = compute_sliding_window(cfg);
@@ -357,6 +400,7 @@ impl Attention {
             o_proj,
             q_norm,
             k_norm,
+            qk_norm_layout,
             n_heads: cfg.n_heads,
             n_kv_heads: cfg.n_kv_heads,
             head_dim: hd,
@@ -465,11 +509,15 @@ impl Attention {
 
         let actual_window = compute_sliding_window(cfg);
 
+        // GGUF quants only ship Qwen3-style per-head qk_norm today; assume that
+        // layout. If a GGUF MoE / OLMoE-style port appears we'd need shape
+        // detection here too.
         Ok(Self {
             qkv,
             o_proj: AnyLinear::Quantized(o_proj),
             q_norm,
             k_norm,
+            qk_norm_layout: QkNormLayout::PerHead,
             n_heads: cfg.n_heads,
             n_kv_heads: cfg.n_kv_heads,
             head_dim: hd,
@@ -550,6 +598,25 @@ impl Attention {
         let hd = self.head_dim;
 
         let (q_raw, k_raw, v_raw) = self.qkv_split(x)?;
+
+        // OLMoE-style `Flat` qk_norm operates on the per-head-bundle
+        // ([B, T, q_dim] / [B, T, kv_dim]) **before** reshape into heads,
+        // and its variance covers the full bundle (not head_dim). Apply here.
+        let (q_raw, k_raw) = match self.qk_norm_layout {
+            QkNormLayout::Flat => {
+                let q = match &self.q_norm {
+                    Some(norm) => norm.forward(&q_raw)?,
+                    None => q_raw,
+                };
+                let k = match &self.k_norm {
+                    Some(norm) => norm.forward(&k_raw)?,
+                    None => k_raw,
+                };
+                (q, k)
+            }
+            QkNormLayout::PerHead => (q_raw, k_raw),
+        };
+
         let q = q_raw
             .reshape((b, total_seq, self.n_heads, hd))?
             .transpose(1, 2)?;
@@ -560,13 +627,21 @@ impl Attention {
             .reshape((b, total_seq, self.n_kv_heads, hd))?
             .transpose(1, 2)?;
 
-        let q = match &self.q_norm {
-            Some(norm) => norm.forward(&q)?,
-            None => q,
-        };
-        let k = match &self.k_norm {
-            Some(norm) => norm.forward(&k)?,
-            None => k,
+        // Per-head qk_norm (Qwen3 / Gemma3): apply AFTER reshape so variance
+        // is taken over `head_dim` only.
+        let (q, k) = match self.qk_norm_layout {
+            QkNormLayout::PerHead => {
+                let q = match &self.q_norm {
+                    Some(norm) => norm.forward(&q)?,
+                    None => q,
+                };
+                let k = match &self.k_norm {
+                    Some(norm) => norm.forward(&k)?,
+                    None => k,
+                };
+                (q, k)
+            }
+            QkNormLayout::Flat => (q, k),
         };
         let v = if self.v_norm {
             rms_norm_no_weight(&v, self.rms_norm_eps)?
@@ -843,6 +918,7 @@ impl Attention {
             o_proj: AnyLinear::from_weight_with_scale_inv(o_w, None, None)?,
             q_norm: None,
             k_norm: None,
+            qk_norm_layout: QkNormLayout::PerHead,
             n_heads,
             n_kv_heads,
             head_dim,
@@ -878,6 +954,7 @@ mod tests {
             v_norm: false,
             has_ffn_norms: false,
             sliding_window,
+            moe: None,
         }
     }
 

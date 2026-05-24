@@ -194,6 +194,7 @@ mod tests {
             v_norm: spec.v_norm,
             has_ffn_norms: spec.has_ffn_norms,
             sliding_window: spec.sliding_window,
+            moe: None,
         };
 
         let blocks = (0..LAYERS)

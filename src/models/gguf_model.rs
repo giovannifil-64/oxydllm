@@ -245,6 +245,9 @@ impl StandardTransformer {
                     v_norm: has_v_norm,
                     has_ffn_norms,
                     sliding_window: arch_def.resolve_sliding_window_for_layer(sliding_window, i),
+                    // GGUF runtime is dense-only today (MoE GGUF support is
+                    // future work — see `block.rs::load_gguf`).
+                    moe: None,
                 };
                 TransformerBlock::load_gguf(&block_cfg, i, gguf, device, dtype, intermediate_size)
             })

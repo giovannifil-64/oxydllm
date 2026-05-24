@@ -118,6 +118,16 @@ pub fn parse(config_path: &str) -> Result<StandardTransformerConfig> {
     let rope_scaling = parse_rope_scaling(&v["rope_scaling"]);
     let sliding_window = v["sliding_window"].as_u64().map(|x| x as usize);
 
+    // Mixture-of-Experts: Qwen3-MoE uses `num_experts` + `num_experts_per_tok`;
+    // Mixtral uses `num_local_experts`. OLMoE uses `num_experts`.
+    let moe_num_experts = v["num_experts"]
+        .as_u64()
+        .or_else(|| v["num_local_experts"].as_u64())
+        .map(|x| x as usize)
+        .filter(|&n| n > 1);
+    let moe_num_experts_per_tok = v["num_experts_per_tok"].as_u64().map(|x| x as usize);
+    let moe_norm_topk_prob = v["norm_topk_prob"].as_bool();
+
     let layer_types =
         parse_string_array(&v["layer_types"]).filter(|x| x.len() == num_hidden_layers);
     let global_head_dim = v["global_head_dim"]
@@ -273,6 +283,9 @@ pub fn parse(config_path: &str) -> Result<StandardTransformerConfig> {
         per_layer_model_projection_scale,
         per_layer_input_scale,
         quant_scheme,
+        moe_num_experts,
+        moe_num_experts_per_tok,
+        moe_norm_topk_prob,
     })
 }
 

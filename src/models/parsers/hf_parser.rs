@@ -104,7 +104,13 @@ pub fn parse(config_path: &str) -> Result<StandardTransformerConfig> {
             || arch == "Gemma4ForConditionalGeneration",
     );
 
-    let rope_scaling = parse_rope_scaling(&v["rope_scaling"]);
+    let mut rope_scaling = parse_rope_scaling(&v["rope_scaling"]);
+    if matches!(rope_scaling, RopeScaling::None)
+        && let Some(rp) = v.get("rope_parameters")
+        && (rp.get("rope_type").is_some() || rp.get("type").is_some())
+    {
+        rope_scaling = parse_rope_scaling(rp);
+    }
     let sliding_window = v["sliding_window"].as_u64().map(|x| x as usize);
 
     // Qwen3-MoE/OLMoE use `num_experts`, Mixtral uses `num_local_experts`.
@@ -566,6 +572,42 @@ mod tests {
             "factor": 2.0
         });
         assert!(matches!(parse_rope_scaling(&v), RopeScaling::None));
+    }
+
+    #[test]
+    fn mistral_v3_rope_parameters_yarn_picked_up() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("config.json");
+        let config = json!({
+            "architectures": ["Mistral3ForConditionalGeneration"],
+            "text_config": {
+                "hidden_size": 3072,
+                "num_hidden_layers": 24,
+                "num_attention_heads": 24,
+                "num_key_value_heads": 8,
+                "vocab_size": 131072,
+                "max_position_embeddings": 262144,
+                "rope_parameters": {
+                    "rope_type": "yarn",
+                    "factor": 16.0,
+                    "rope_theta": 1000000.0,
+                    "original_max_position_embeddings": 16384,
+                    "beta_fast": 32.0,
+                    "beta_slow": 1.0
+                }
+            }
+        });
+        fs::write(&config_path, config.to_string()).unwrap();
+        let cfg = parse(&config_path).unwrap();
+        assert!(matches!(
+            cfg.rope_scaling,
+            RopeScaling::Yarn { factor, original_max_pos, beta_fast, beta_slow }
+                if factor == 16.0
+                && original_max_pos == 16384
+                && beta_fast == 32.0
+                && beta_slow == 1.0
+        ));
+        assert_eq!(cfg.rope_theta, 1_000_000.0);
     }
 
     #[test]

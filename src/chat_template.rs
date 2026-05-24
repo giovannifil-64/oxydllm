@@ -168,6 +168,62 @@ pub fn format_turn_chat(
     prompt
 }
 
+pub fn format_mistral_inst_chat(
+    messages: &[ChatMessage],
+    bos_token: Option<&str>,
+    eos_token: Option<&str>,
+    has_system_prompt_token: bool,
+) -> String {
+    let mut prompt = String::new();
+    if let Some(bos) = bos_token {
+        prompt.push_str(bos);
+    }
+
+    let mut pending_system: Option<String> = None;
+    for message in messages {
+        let content = message.content.as_deref().unwrap_or("").trim();
+        match message.role.as_str() {
+            "system" | "developer" => {
+                if has_system_prompt_token {
+                    prompt.push_str("[SYSTEM_PROMPT]");
+                    prompt.push_str(content);
+                    prompt.push_str("[/SYSTEM_PROMPT]");
+                } else {
+                    pending_system = Some(content.to_string());
+                }
+            }
+            "assistant" => {
+                if let Some(tc) = &message.tool_calls {
+                    prompt.push_str("[TOOL_CALLS]");
+                    if let Ok(s) = serde_json::to_string(tc) {
+                        prompt.push_str(&s);
+                    }
+                } else {
+                    prompt.push_str(content);
+                }
+                if let Some(eos) = eos_token {
+                    prompt.push_str(eos);
+                }
+            }
+            "tool" => {
+                prompt.push_str("[TOOL_RESULTS]");
+                prompt.push_str(content);
+                prompt.push_str("[/TOOL_RESULTS]");
+            }
+            _ => {
+                prompt.push_str("[INST]");
+                if let Some(sys) = pending_system.take() {
+                    prompt.push_str(&sys);
+                    prompt.push_str("\n\n");
+                }
+                prompt.push_str(content);
+                prompt.push_str("[/INST]");
+            }
+        }
+    }
+    prompt
+}
+
 fn preprocess_template(template: &str) -> String {
     let mut t = template.to_string();
     t = t.replace("[::-1]", "|reverse");

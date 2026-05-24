@@ -1025,6 +1025,17 @@ pub fn apply_chat_template(
             ));
         }
 
+        if tokenizer.special_token_id("[INST]").is_some()
+            && tokenizer.special_token_id("[/INST]").is_some()
+        {
+            return Ok(chat_template::format_mistral_inst_chat(
+                messages,
+                tokenizer.bos_token(),
+                tokenizer.eos_token(),
+                tokenizer.special_token_id("[SYSTEM_PROMPT]").is_some(),
+            ));
+        }
+
         return Ok(chat_template::format_plain_chat(messages));
     };
 

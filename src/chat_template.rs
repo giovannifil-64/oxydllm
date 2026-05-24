@@ -185,7 +185,7 @@ pub fn format_mistral_inst_chat(
         match message.role.as_str() {
             "system" | "developer" => {
                 if has_system_prompt_token {
-                    prompt.push_str("[SYSTEM_PROMPT]");
+                    prompt.push_str("[SYSTEM_PROMPT] ");
                     prompt.push_str(content);
                     prompt.push_str("[/SYSTEM_PROMPT]");
                 } else {
@@ -194,11 +194,12 @@ pub fn format_mistral_inst_chat(
             }
             "assistant" => {
                 if let Some(tc) = &message.tool_calls {
-                    prompt.push_str("[TOOL_CALLS]");
+                    prompt.push_str("[TOOL_CALLS] ");
                     if let Ok(s) = serde_json::to_string(tc) {
                         prompt.push_str(&s);
                     }
                 } else {
+                    prompt.push(' ');
                     prompt.push_str(content);
                 }
                 if let Some(eos) = eos_token {
@@ -206,12 +207,12 @@ pub fn format_mistral_inst_chat(
                 }
             }
             "tool" => {
-                prompt.push_str("[TOOL_RESULTS]");
+                prompt.push_str("[TOOL_RESULTS] ");
                 prompt.push_str(content);
                 prompt.push_str("[/TOOL_RESULTS]");
             }
             _ => {
-                prompt.push_str("[INST]");
+                prompt.push_str("[INST] ");
                 if let Some(sys) = pending_system.take() {
                     prompt.push_str(&sys);
                     prompt.push_str("\n\n");

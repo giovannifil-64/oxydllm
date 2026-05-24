@@ -96,33 +96,34 @@ impl RotaryEmbedding {
                 beta_fast,
                 beta_slow,
             } => {
-                let dim = head_dim;
-                let base = rope_theta;
+                if max_seq_len > original_max_pos {
+                    let dim = head_dim;
+                    let base = rope_theta;
 
-                let find_correction_dim = |num_rotations: f64| -> f64 {
-                    (dim as f64
-                        * (original_max_pos as f64 / (num_rotations * 2.0 * std::f64::consts::PI))
-                            .ln())
-                        / (2.0 * base.ln())
-                };
-                let low = (find_correction_dim(beta_fast).floor().max(0.0)) as usize;
-                let high = (find_correction_dim(beta_slow)
-                    .ceil()
-                    .min((dim / 2 - 1) as f64)) as usize;
-
-                for (i, inv) in inv_freq.iter_mut().enumerate().take(dim / 2) {
-                    let freq_extra = *inv;
-                    let freq_inter = *inv / factor as f32;
-
-                    let ramp = if high <= low {
-                        if i < low { 0.0f32 } else { 1.0 }
-                    } else {
-                        ((i as f32 - low as f32) / (high as f32 - low as f32)).clamp(0.0, 1.0)
+                    let find_correction_dim = |num_rotations: f64| -> f64 {
+                        (dim as f64
+                            * (original_max_pos as f64
+                                / (num_rotations * 2.0 * std::f64::consts::PI))
+                                .ln())
+                            / (2.0 * base.ln())
                     };
+                    let low = (find_correction_dim(beta_fast).floor().max(0.0)) as usize;
+                    let high = (find_correction_dim(beta_slow)
+                        .ceil()
+                        .min((dim / 2 - 1) as f64)) as usize;
 
-                    // ramp=0 → keep original freq (high-freq dims, small index)
-                    // ramp=1 → scale by factor  (low-freq dims, large index)
-                    *inv = freq_inter * ramp + freq_extra * (1.0 - ramp);
+                    for (i, inv) in inv_freq.iter_mut().enumerate().take(dim / 2) {
+                        let freq_extra = *inv;
+                        let freq_inter = *inv / factor as f32;
+
+                        let ramp = if high <= low {
+                            if i < low { 0.0f32 } else { 1.0 }
+                        } else {
+                            ((i as f32 - low as f32) / (high as f32 - low as f32)).clamp(0.0, 1.0)
+                        };
+
+                        *inv = freq_inter * ramp + freq_extra * (1.0 - ramp);
+                    }
                 }
             }
             RopeScaling::LongRope {
@@ -411,6 +412,47 @@ mod tests {
             .zip(base_cos.iter().flatten())
             .any(|(a, b)| (a - b).abs() > 1e-5);
         assert!(differs, "Yarn with factor=4 must differ from the baseline");
+    }
+
+    #[test]
+    fn yarn_skipped_when_seq_within_trained_range() {
+        let device = Device::Cpu;
+        let rope_yarn = RotaryEmbedding::new_with_scaling(
+            8,
+            16,
+            10_000.0,
+            RopeScaling::Yarn {
+                factor: 4.0,
+                original_max_pos: 32,
+                beta_fast: 32.0,
+                beta_slow: 1.0,
+            },
+            DType::F32,
+            &device,
+        )
+        .unwrap();
+        let rope_none = RotaryEmbedding::new_with_scaling(
+            8,
+            16,
+            10_000.0,
+            RopeScaling::None,
+            DType::F32,
+            &device,
+        )
+        .unwrap();
+
+        let y = rope_yarn.cos.to_vec2::<f32>().unwrap();
+        let n = rope_none.cos.to_vec2::<f32>().unwrap();
+        let max_diff = y
+            .iter()
+            .flatten()
+            .zip(n.iter().flatten())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_diff < 1e-6,
+            "YARN must be a no-op when max_seq_len ≤ original_max_pos (got max_diff {max_diff})"
+        );
     }
 
     #[test]

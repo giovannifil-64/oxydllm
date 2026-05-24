@@ -598,7 +598,7 @@ mod tests {
             }
         });
         fs::write(&config_path, config.to_string()).unwrap();
-        let cfg = parse(&config_path).unwrap();
+        let cfg = parse(config_path.to_str().unwrap()).unwrap();
         assert!(matches!(
             cfg.rope_scaling,
             RopeScaling::Yarn { factor, original_max_pos, beta_fast, beta_slow }

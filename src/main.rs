@@ -142,21 +142,21 @@ fn print_usage() {
 Usage: oxydllm <command> [options]
 
 Commands:
-  pull     <user/model>      Download a model from HuggingFace
-  rm       <model-name>      Remove a model and its files from disk
-  update   [--nightly|--pre]      Update oxydllm to the latest version
-  uninstall [--purge]             Remove oxydllm from the system
-  list                       List all locally available models
-  start                      Start the HTTP inference server
-  run      <model-name>      Interactive chat in terminal
-  estimate <model>           Estimate memory footprint and accuracy
+  pull      <user/model>       Download a model from HuggingFace
+  rm        <model-name>       Remove a model and its files from disk
+  update    [--nightly|--pre]  Update oxydllm to the latest version
+  uninstall [--purge]          Remove oxydllm from the system
+  list                         List all locally available models
+  start                        Start the HTTP inference server
+  run       <model-name>       Interactive chat in terminal
+  estimate <model>             Estimate memory footprint and accuracy
 
 Download options (pull):
-  --models-dir <DIR>         Destination directory (default: ~/.oxydllm/models/)
-  --name <NAME>              Folder name override (default: model name)
-  --token <TOKEN>            HuggingFace token for gated models
-  --variant <FORMAT>         GGUF variant to download (e.g. Q4_K_M); skips interactive prompt
-  --force                    Overwrite if model already exists
+  --models-dir <DIR>           Destination directory (default: ~/.oxydllm/models/)
+  --name <NAME>                Folder name override (default: model name)
+  --token <TOKEN>              HuggingFace token for gated models
+  --variant <FORMAT>           GGUF variant to download (e.g. Q4_K_M); skips interactive prompt
+  --force                      Overwrite if model already exists
 
 Server options (start):
   CLI flags take priority over environment variables.

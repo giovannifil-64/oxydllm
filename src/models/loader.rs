@@ -568,7 +568,7 @@ fn check_cuda_compute_capability(device: &Device, ordinal: usize) {
                 );
             } else {
                 if let Some(compiled_cap) =
-                    option_env!("OXYDLLM_COMPILED_CAP").and_then(|s| s.parse::<usize>().ok())
+                    option_env!("OXYDLLM_COMPILED_CAP").and_then(|s| s.parse::<i32>().ok())
                 {
                     if compiled_cap < cap {
                         tracing::warn!(

@@ -559,6 +559,87 @@ impl AnyLinear {
 mod tests {
     use super::*;
 
+    // Isolated, deterministic repro for the candle-metal-kernels 0.10.2
+    // command-buffer-pool data race (root cause of intermittent gibberish on
+    // Metal, e.g. Qwen3-4B-Instruct-2507-FP8). Each thread runs the SAME
+    // deterministic chain (candle matmul + this repo's custom `rms_norm_fused`),
+    // so every result MUST equal the single-thread value — any divergence/NaN is
+    // the race. No model / no FP8 weights involved.
+    //
+    //   RUN_POOL_REPRO=1 POOL_REPRO_THREADS=8 \
+    //     CANDLE_METAL_COMMAND_POOL_SIZE=5 cargo test --release \
+    //     metal_pool_ordering_race_repro --features metal -- --nocapture
+    //
+    // Proven (M5, 8 procs each):
+    //   - 1 thread, any pool size        -> always identical (safe)
+    //   - 8 threads, POOL_SIZE=5 (default) -> all_equal=false, garbage + NaN
+    //   - 8 threads, POOL_SIZE=1          -> all_equal=true, 64/64 identical
+    // i.e. candle's pool is NOT thread-safe for concurrent encoding despite its
+    // own "shared across threads safely" claim; POOL_SIZE=1 serializes and fixes
+    // it (forced in `main()`). The server is multi-threaded so it hits this.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn metal_pool_ordering_race_repro() -> Result<()> {
+        if std::env::var("RUN_POOL_REPRO").is_err() {
+            return Ok(());
+        }
+        let dev = Device::new_metal(0)?;
+        // One deterministic chain alternating candle matmul and this repo's custom
+        // Metal rms_norm. Same input/ops every time => identical result, so any
+        // divergence is the race.
+        let chain = |dev: &Device| -> Result<f32> {
+            let mk = |rows: usize, cols: usize, seed: usize| -> Result<Tensor> {
+                let v: Vec<f32> = (0..rows * cols)
+                    .map(|i| (((i + seed) % 7) as f32 - 3.0) * 0.02)
+                    .collect();
+                Ok(Tensor::from_vec(v, (rows, cols), dev)?.to_dtype(DType::BF16)?)
+            };
+            let (h_dim, id) = (2560usize, 9728usize);
+            let wq = mk(h_dim, h_dim, 1)?;
+            let wg = mk(id, h_dim, 3)?;
+            let wd = mk(h_dim, id, 5)?;
+            let nw: Vec<f32> = (0..h_dim).map(|i| 0.5 + ((i % 5) as f32) * 0.1).collect();
+            let norm_w = Tensor::from_vec(nw, h_dim, dev)?.to_dtype(DType::BF16)?;
+            let mut h = mk(8, h_dim, 9)?;
+            for _ in 0..60 {
+                let a = h.matmul(&wq.t()?)?.contiguous()?;
+                let a = crate::common::metal_ops::rms_norm_fused(&a, &norm_w, 1e-6)?;
+                let g = a.matmul(&wg.t()?)?;
+                let d = g.matmul(&wd.t()?)?.contiguous()?;
+                h = crate::common::metal_ops::rms_norm_fused(
+                    &(h + d)?.contiguous()?,
+                    &norm_w,
+                    1e-6,
+                )?;
+            }
+            h.to_dtype(DType::F32)?.abs()?.sum_all()?.to_scalar::<f32>()
+        };
+
+        let n_threads: usize = std::env::var("POOL_REPRO_THREADS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1);
+
+        if n_threads <= 1 {
+            eprintln!("POOL_REPRO single sumabs={}", chain(&dev)?);
+            return Ok(());
+        }
+
+        // Many threads share ONE Metal device (mirrors the server: multiple
+        // threads hitting candle's command-buffer pool concurrently).
+        let handles: Vec<_> = (0..n_threads)
+            .map(|_| {
+                let d = dev.clone();
+                std::thread::spawn(move || chain(&d).unwrap_or(f32::NAN))
+            })
+            .collect();
+        let results: Vec<f32> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let first = results[0];
+        let all_equal = results.iter().all(|&r| r == first);
+        eprintln!("POOL_REPRO threads={n_threads} all_equal={all_equal} results={results:?}");
+        Ok(())
+    }
+
     #[test]
     fn any_linear_from_awq_matches_reference_linear() -> Result<()> {
         use crate::common::awq::{AWQ_PACK_FACTOR, AWQ_PACK_ORDER, AwqRawTensors};

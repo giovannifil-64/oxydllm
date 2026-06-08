@@ -1295,6 +1295,23 @@ fn run_interactive(args: &RunArgs) -> anyhow::Result<()> {
 }
 
 fn main() -> anyhow::Result<()> {
+    // candle-metal-kernels 0.10.2 distributes operations across a pool of 5
+    // command buffers (CANDLE_METAL_COMMAND_POOL_SIZE) and commits them when each
+    // fills, with no cross-command-buffer hazard tracking. Data-dependent ops can
+    // therefore land on different buffers committed out of dependency order — a
+    // reader runs before its writer → nondeterministic gibberish (seen on
+    // Qwen3-4B-Instruct-2507-FP8: coherent on some loads, garbage on others).
+    // We already serialize all GPU work per device via `gpu_lock`, so a single
+    // command buffer yields no throughput loss here while restoring correct
+    // ordering. Set before any device/thread is created; honor an explicit user
+    // override.
+    #[cfg(feature = "metal")]
+    if std::env::var_os("CANDLE_METAL_COMMAND_POOL_SIZE").is_none() {
+        // SAFETY: called at the very start of `main`, before any threads are
+        // spawned or any Metal device is constructed.
+        unsafe { std::env::set_var("CANDLE_METAL_COMMAND_POOL_SIZE", "1") };
+    }
+
     init_tracing();
 
     let args: Vec<String> = std::env::args().collect();

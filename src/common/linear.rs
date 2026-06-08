@@ -559,24 +559,12 @@ impl AnyLinear {
 mod tests {
     use super::*;
 
-    // Isolated, deterministic repro for the candle-metal-kernels 0.10.2
-    // command-buffer-pool data race (root cause of intermittent gibberish on
-    // Metal, e.g. Qwen3-4B-Instruct-2507-FP8). Each thread runs the SAME
-    // deterministic chain (candle matmul + this repo's custom `rms_norm_fused`),
-    // so every result MUST equal the single-thread value — any divergence/NaN is
-    // the race. No model / no FP8 weights involved.
-    //
-    //   RUN_POOL_REPRO=1 POOL_REPRO_THREADS=8 \
-    //     CANDLE_METAL_COMMAND_POOL_SIZE=5 cargo test --release \
+    // Repro for the candle-metal-kernels 0.10.2 command-buffer-pool data race
+    // (root cause of intermittent Metal gibberish). Each thread runs the same
+    // deterministic chain, so any divergence/NaN is the race. Proven on M5:
+    // 8 threads + POOL_SIZE=5 -> corruption; POOL_SIZE=1 -> 64/64 identical.
+    //   RUN_POOL_REPRO=1 POOL_REPRO_THREADS=8 cargo test --release \
     //     metal_pool_ordering_race_repro --features metal -- --nocapture
-    //
-    // Proven (M5, 8 procs each):
-    //   - 1 thread, any pool size        -> always identical (safe)
-    //   - 8 threads, POOL_SIZE=5 (default) -> all_equal=false, garbage + NaN
-    //   - 8 threads, POOL_SIZE=1          -> all_equal=true, 64/64 identical
-    // i.e. candle's pool is NOT thread-safe for concurrent encoding despite its
-    // own "shared across threads safely" claim; POOL_SIZE=1 serializes and fixes
-    // it (forced in `main()`). The server is multi-threaded so it hits this.
     #[cfg(feature = "metal")]
     #[test]
     fn metal_pool_ordering_race_repro() -> Result<()> {
@@ -592,7 +580,7 @@ mod tests {
                 let v: Vec<f32> = (0..rows * cols)
                     .map(|i| (((i + seed) % 7) as f32 - 3.0) * 0.02)
                     .collect();
-                Ok(Tensor::from_vec(v, (rows, cols), dev)?.to_dtype(DType::BF16)?)
+                Tensor::from_vec(v, (rows, cols), dev)?.to_dtype(DType::BF16)
             };
             let (h_dim, id) = (2560usize, 9728usize);
             let wq = mk(h_dim, h_dim, 1)?;

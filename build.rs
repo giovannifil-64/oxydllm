@@ -1,11 +1,12 @@
 fn main() {
-    println!("cargo::rustc-check-cfg=cfg(dist_build)");
     println!("cargo:rerun-if-env-changed=OXYDLLM_DIST_BUILD");
     println!("cargo:rerun-if-env-changed=OXYDLLM_BUILD_TS_OVERRIDE");
     println!("cargo:rerun-if-env-changed=CUDA_COMPUTE_CAP");
 
+    // install.sh sets OXYDLLM_DIST_BUILD; re-export it as a compile env (read via
+    // option_env! in main.rs) rather than a cfg, so there's no custom-cfg lint.
     if std::env::var("OXYDLLM_DIST_BUILD").is_ok() {
-        println!("cargo:rustc-cfg=dist_build");
+        println!("cargo:rustc-env=OXYDLLM_DIST_BUILD=1");
     }
 
     let ts = if let Ok(v) = std::env::var("OXYDLLM_BUILD_TS_OVERRIDE") {

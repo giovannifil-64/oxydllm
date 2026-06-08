@@ -53,11 +53,8 @@ pub fn sample(
         && params.logit_bias.is_none();
 
     if params.temperature == 0.0 && params.top_logprobs_k == 0 && no_mods {
-        // Greedy decode: only the argmax token id needs to leave the GPU.
         let token = logits.argmax(D::Minus1)?.to_scalar::<u32>()?;
-        // NaN guard: reduce in the native dtype (NaN propagates through the sum)
-        // and cast only the 1-element result to F32 — avoids materializing the
-        // whole vocab row in F32 every token just to check for instability.
+        // NaN guard reduced in native dtype (no full-vocab F32 cast per token).
         let sum: f32 = logits
             .sum_all()?
             .to_dtype(candle_core::DType::F32)?

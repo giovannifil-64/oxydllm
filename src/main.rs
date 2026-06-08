@@ -437,8 +437,11 @@ fn run_rm(args: &RmArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+// `update`/`uninstall` are only meaningful for binaries installed via install.sh,
+// which sets OXYDLLM_DIST_BUILD at build time (surfaced by build.rs as a compile
+// env). option_env! avoids a custom cfg, so no lint to allow.
 fn check_dist_build(cmd: &str) {
-    if cfg!(not(dist_build)) {
+    if option_env!("OXYDLLM_DIST_BUILD").is_none() {
         eprintln!("'{cmd}' is only available for binaries installed via install.sh.");
         eprintln!("To rebuild from source: cargo build --release");
         std::process::exit(1);
@@ -542,7 +545,13 @@ fn run_update_nightly() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("Failed to parse release timestamp: {e}"))?
         .timestamp() as u64;
 
-    let build_ts: u64 = env!("OXYDLLM_BUILD_TS").parse().unwrap_or(0);
+    // option_env!, not env!: build.rs sets this, but the Docker dummy-build layer
+    // doesn't always reapply the build-script env to the final compile. Optional
+    // metadata (0 when absent), so don't make it a hard compile-time requirement.
+    let build_ts: u64 = option_env!("OXYDLLM_BUILD_TS")
+        .unwrap_or("0")
+        .parse()
+        .unwrap_or(0);
 
     if release_ts <= build_ts {
         println!("Already up-to-date (nightly).");
@@ -1295,20 +1304,12 @@ fn run_interactive(args: &RunArgs) -> anyhow::Result<()> {
 }
 
 fn main() -> anyhow::Result<()> {
-    // candle-metal-kernels 0.10.2 distributes operations across a pool of 5
-    // command buffers (CANDLE_METAL_COMMAND_POOL_SIZE) and commits them when each
-    // fills, with no cross-command-buffer hazard tracking. Data-dependent ops can
-    // therefore land on different buffers committed out of dependency order — a
-    // reader runs before its writer → nondeterministic gibberish (seen on
-    // Qwen3-4B-Instruct-2507-FP8: coherent on some loads, garbage on others).
-    // We already serialize all GPU work per device via `gpu_lock`, so a single
-    // command buffer yields no throughput loss here while restoring correct
-    // ordering. Set before any device/thread is created; honor an explicit user
-    // override.
+    // candle-metal-kernels 0.10.2's command-buffer pool is not thread-safe under
+    // concurrent encoding (corrupts output on Metal); a single buffer serializes
+    // it. gpu_lock already serializes GPU work, so this costs no throughput.
     #[cfg(feature = "metal")]
     if std::env::var_os("CANDLE_METAL_COMMAND_POOL_SIZE").is_none() {
-        // SAFETY: called at the very start of `main`, before any threads are
-        // spawned or any Metal device is constructed.
+        // SAFETY: first statement in main(), before any thread/device exists.
         unsafe { std::env::set_var("CANDLE_METAL_COMMAND_POOL_SIZE", "1") };
     }
 

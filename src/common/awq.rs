@@ -121,7 +121,7 @@ impl QuantWeight {
         Ok(in_features / groups)
     }
 
-    #[cfg(any(feature = "metal", test))]
+    #[cfg(feature = "metal")]
     pub fn runtime_size_bytes(&self) -> usize {
         let mut acc = self.qweight.dtype().size_in_bytes() * self.qweight.elem_count()
             + self.scales.dtype().size_in_bytes() * self.scales.elem_count();
@@ -131,7 +131,7 @@ impl QuantWeight {
         acc
     }
 
-    #[cfg(any(feature = "metal", test))]
+    #[cfg(feature = "metal")]
     pub fn to_device(&self, device: &Device) -> Result<Self> {
         Ok(Self {
             bits: self.bits,

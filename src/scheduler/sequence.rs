@@ -25,6 +25,9 @@ pub struct SequenceState {
     pub status: SequenceStatus,
     pub phase: SequencePhase,
     pub caches: Vec<PagedKvCache>,
+    /// Per-layer KV caches for the speculative draft model; empty when no draft
+    /// is configured.
+    pub draft_caches: Vec<PagedKvCache>,
     pub num_processed_tokens: usize,
     pub max_tokens: usize,
     pub finish_reason: Option<String>,
@@ -39,6 +42,17 @@ impl SequenceState {
     pub fn append_token(&mut self, token: u32) {
         self.all_tokens.push(token);
         *self.token_counts.entry(token).or_insert(0) += 1;
+    }
+
+    /// Free all KV blocks (target + draft). `PagedKvCache` has no `Drop`, so this
+    /// must be called on preempt/retire/abort or blocks leak.
+    pub fn clear_caches(&mut self) {
+        for c in &mut self.caches {
+            c.clear();
+        }
+        for c in &mut self.draft_caches {
+            c.clear();
+        }
     }
 
     pub fn apply_token(&mut self, _next_token: u32, is_stop: bool) -> bool {

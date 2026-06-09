@@ -108,8 +108,13 @@ impl Drop for CacheRestoreGuard<'_> {
     }
 }
 
+/// Number of tokens the draft model proposes per speculative step.
+const SPEC_DRAFT_K: usize = 4;
+
 pub struct Engine {
     model: Box<dyn BatchModel>,
+    /// Speculative-decoding draft model; `None` disables speculation.
+    draft_model: Option<Box<dyn BatchModel>>,
     scheduler: Scheduler,
     device: Device,
     stop_token_ids: HashSet<u32>,
@@ -458,6 +463,112 @@ fn sample_decode_outputs(
     Ok(())
 }
 
+/// Run one forward on a single sequence's caches and return the greedy argmax
+/// token id at each input position. Greedy speculative decoding only needs
+/// argmaxes, so no full logits leave the GPU.
+fn greedy_forward(
+    model: &dyn BatchModel,
+    device: &Device,
+    caches: &mut [PagedKvCache],
+    tokens: &[u32],
+    positions: &[u32],
+) -> Result<Vec<u32>> {
+    let t = tokens.len();
+    let input = Tensor::from_vec(tokens.to_vec(), (1, t), device)?;
+    let pos = Tensor::from_vec(positions.to_vec(), (t,), device)?;
+    let mut slices: Vec<&mut [PagedKvCache]> = vec![caches];
+    let logits = model.forward_batch(&input, &pos, &mut slices, &[t])?;
+    let argmax = logits.squeeze(0)?.argmax(candle_core::D::Minus1)?;
+    argmax.to_vec1::<u32>()
+}
+
+/// Greedy speculative decode for the given decode sequences (one at a time).
+/// The draft proposes `SPEC_DRAFT_K` tokens; the target verifies all of them in
+/// one forward and we accept the longest prefix matching the target's argmax,
+/// plus the target's own token at the first divergence (correction) or after the
+/// last accepted token (bonus). Output is identical to plain greedy decoding.
+fn run_speculative_decode(
+    model: &dyn BatchModel,
+    draft: &dyn BatchModel,
+    device: &Device,
+    scheduler: &mut Scheduler,
+    decode_ids: &[SequenceId],
+    stop: &StopRules,
+    new_tokens: &mut Vec<NewToken>,
+) -> Result<()> {
+    for &seq_id in decode_ids {
+        let seq = scheduler.get_running_mut(seq_id).unwrap();
+        let l = seq.all_tokens.len();
+        // Invariant: the target cache holds `l - 1` tokens (all but the last,
+        // which is fed this step). Lazily bring the draft cache up to the same
+        // confirmed length (covers the first step's prompt and the m==K gap).
+        let target_have = l - 1;
+        let draft_have = seq.draft_caches.first().map_or(0, |c| c.num_tokens());
+        if draft_have < target_have {
+            let gap: Vec<u32> = seq.all_tokens[draft_have..target_have].to_vec();
+            let pos: Vec<u32> = (draft_have as u32..target_have as u32).collect();
+            greedy_forward(draft, device, &mut seq.draft_caches, &gap, &pos)?;
+        }
+
+        // Draft K tokens autoregressively.
+        let last = seq.all_tokens[l - 1];
+        let mut drafts: Vec<u32> = Vec::with_capacity(SPEC_DRAFT_K);
+        let mut cur = last;
+        let mut pos = (l - 1) as u32;
+        for _ in 0..SPEC_DRAFT_K {
+            let out = greedy_forward(draft, device, &mut seq.draft_caches, &[cur], &[pos])?;
+            cur = out[0];
+            drafts.push(cur);
+            pos += 1;
+        }
+
+        // Target verifies [last, d_1..d_K] in one forward -> K+1 argmaxes:
+        // target_am[i] is the target's token after verify[i] (predicts verify[i+1]).
+        let mut verify: Vec<u32> = Vec::with_capacity(SPEC_DRAFT_K + 1);
+        verify.push(last);
+        verify.extend_from_slice(&drafts);
+        let vpos: Vec<u32> = ((l - 1) as u32..(l + SPEC_DRAFT_K) as u32).collect();
+        let target_am = greedy_forward(model, device, &mut seq.caches, &verify, &vpos)?;
+
+        // Accept the longest prefix where the draft matches the target's argmax.
+        let mut m = 0usize;
+        while m < SPEC_DRAFT_K && target_am[m] == drafts[m] {
+            m += 1;
+        }
+        let mut accepted: Vec<u32> = drafts[..m].to_vec();
+        accepted.push(target_am[m]); // correction (m<K) or bonus (m==K)
+
+        for tok in accepted {
+            seq.append_token(tok);
+            seq.num_processed_tokens = seq.all_tokens.len() - 1;
+            let is_stop = stop.matches(tok, &seq.extra_stop_token_ids, &seq.all_tokens);
+            if seq.apply_token(tok, is_stop) {
+                new_tokens.push(NewToken {
+                    seq_id: seq.id,
+                    token: tok,
+                    logprob: None,
+                    top_logprobs: Vec::new(),
+                });
+            } else {
+                break; // stop or length cap: drop remaining speculative tokens
+            }
+        }
+
+        // Roll both caches back to the new confirmed length minus the last token.
+        // Speculative verify writes (decode tokens) never belong in the pool.
+        let keep = seq.all_tokens.len() - 1;
+        for c in &mut seq.caches {
+            c.discard_pending();
+            c.truncate_to(keep)?;
+        }
+        for c in &mut seq.draft_caches {
+            c.discard_pending();
+            c.truncate_to(keep)?;
+        }
+    }
+    Ok(())
+}
+
 impl Engine {
     pub fn new_with_stop_controls(
         model: Box<dyn BatchModel>,
@@ -490,6 +601,7 @@ impl Engine {
         let prefix_cache = PrefixCache::new(512);
         Self {
             model,
+            draft_model: None,
             scheduler,
             device,
             stop_token_ids,
@@ -498,6 +610,16 @@ impl Engine {
             prefix_cache,
             block_size,
         }
+    }
+
+    /// Enable greedy speculative decoding with `draft` as the proposer. The draft
+    /// must share the target's tokenizer/vocab and run on the same device.
+    pub fn with_draft_model(mut self, draft: Box<dyn BatchModel>) -> Self {
+        let draft_allocators: Vec<SharedBlockAllocator> =
+            draft.allocators().iter().map(Arc::clone).collect();
+        self.scheduler.set_draft_allocators(draft_allocators);
+        self.draft_model = Some(draft);
+        self
     }
 
     pub fn device(&self) -> &Device {
@@ -532,6 +654,7 @@ impl Engine {
     pub fn step(&mut self) -> Result<StepOutput> {
         let Engine {
             model,
+            draft_model,
             scheduler,
             device,
             stop_token_ids,
@@ -539,9 +662,9 @@ impl Engine {
             allocators,
             prefix_cache,
             block_size,
-            ..
         } = self;
         let block_size = *block_size;
+        let draft = draft_model.as_deref();
 
         let output = scheduler.schedule(Some(prefix_cache));
 
@@ -554,10 +677,28 @@ impl Engine {
             }
         }
 
-        let prefill_infos = plan_prefill_inputs(scheduler, prefix_cache, &prefill_ids, block_size);
-        let batch = build_batch_input(scheduler, &prefill_infos, &decode_ids);
+        // Only plain-greedy sequences can use the (exact) greedy spec cycle; the
+        // rest decode normally so their temperature/top-p/penalties are honored.
+        // Without a draft, everything decodes normally.
+        let (spec_ids, normal_decode_ids): (Vec<SequenceId>, Vec<SequenceId>) = if draft.is_some() {
+            decode_ids.iter().copied().partition(|&id| {
+                scheduler
+                    .get_running(id)
+                    .is_some_and(|s| s.sampling_params.is_plain_greedy())
+            })
+        } else {
+            (Vec::new(), decode_ids.clone())
+        };
 
-        if batch.all_token_ids.is_empty() {
+        // Spec-cycle sequences run their own forwards and stay out of the batched
+        // target forward; normal decode rides along with prefill.
+        let decode_for_batch: &[SequenceId] = &normal_decode_ids;
+        let has_spec_work = !spec_ids.is_empty();
+
+        let prefill_infos = plan_prefill_inputs(scheduler, prefix_cache, &prefill_ids, block_size);
+        let batch = build_batch_input(scheduler, &prefill_infos, decode_for_batch);
+
+        if batch.all_token_ids.is_empty() && !has_spec_work {
             let completed = scheduler.retire_finished();
             return Ok(StepOutput {
                 new_tokens: Vec::new(),
@@ -567,46 +708,63 @@ impl Engine {
             });
         }
 
-        let prefill_uncached_lens: Vec<usize> =
-            prefill_infos.iter().map(|i| i.uncached_len).collect();
-        let total_prefill_tokens = batch.total_prefill_tokens;
-
-        let batch_logits = run_forward_pass(
-            model.as_ref(),
-            device,
-            scheduler,
-            &prefill_ids,
-            &decode_ids,
-            &prefill_uncached_lens,
-            batch,
-        )?;
-
         let stop = StopRules {
             token_ids: stop_token_ids,
             sequences: stop_token_sequences,
         };
-        let mut prefix = PrefixRegistry {
-            cache: prefix_cache,
-            allocators,
-            block_size,
-        };
         let mut new_tokens = Vec::new();
-        sample_prefill_outputs(
-            scheduler,
-            &mut prefix,
-            &prefill_infos,
-            &batch_logits,
-            &stop,
-            &mut new_tokens,
-        )?;
-        sample_decode_outputs(
-            scheduler,
-            &decode_ids,
-            &batch_logits,
-            total_prefill_tokens,
-            &stop,
-            &mut new_tokens,
-        )?;
+
+        // Batched forward: prefill always; decode too only when there's no draft.
+        if !batch.all_token_ids.is_empty() {
+            let prefill_uncached_lens: Vec<usize> =
+                prefill_infos.iter().map(|i| i.uncached_len).collect();
+            let total_prefill_tokens = batch.total_prefill_tokens;
+            let batch_logits = run_forward_pass(
+                model.as_ref(),
+                device,
+                scheduler,
+                &prefill_ids,
+                decode_for_batch,
+                &prefill_uncached_lens,
+                batch,
+            )?;
+            let mut prefix = PrefixRegistry {
+                cache: prefix_cache,
+                allocators,
+                block_size,
+            };
+            sample_prefill_outputs(
+                scheduler,
+                &mut prefix,
+                &prefill_infos,
+                &batch_logits,
+                &stop,
+                &mut new_tokens,
+            )?;
+            sample_decode_outputs(
+                scheduler,
+                &normal_decode_ids,
+                &batch_logits,
+                total_prefill_tokens,
+                &stop,
+                &mut new_tokens,
+            )?;
+        }
+
+        // Greedy decode sequences go through the speculative cycle.
+        if let Some(draft) = draft
+            && !spec_ids.is_empty()
+        {
+            run_speculative_decode(
+                model.as_ref(),
+                draft,
+                device,
+                scheduler,
+                &spec_ids,
+                &stop,
+                &mut new_tokens,
+            )?;
+        }
 
         let completed = scheduler.retire_finished();
         let prefix_cache_hits = prefill_infos

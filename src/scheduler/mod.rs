@@ -33,6 +33,9 @@ pub struct Scheduler {
     running: Vec<SequenceState>,
     running_index: HashMap<SequenceId, usize>,
     allocators: Vec<SharedBlockAllocator>,
+    /// Draft-model allocators for speculative decoding; empty when no draft.
+    draft_allocators: Vec<SharedBlockAllocator>,
+    draft_num_layers: usize,
     next_id: SequenceId,
     num_layers: usize,
     block_size: usize,
@@ -55,10 +58,19 @@ impl Scheduler {
             running: Vec::new(),
             running_index: HashMap::new(),
             allocators,
+            draft_allocators: Vec::new(),
+            draft_num_layers: 0,
             next_id: 0,
             num_layers,
             block_size,
         }
+    }
+
+    /// Enable speculative decoding by registering the draft model's per-layer
+    /// allocators; subsequently-added sequences get matching `draft_caches`.
+    pub fn set_draft_allocators(&mut self, allocators: Vec<SharedBlockAllocator>) {
+        self.draft_num_layers = allocators.len();
+        self.draft_allocators = allocators;
     }
 
     fn push_to_running(&mut self, seq: SequenceState) {
@@ -105,6 +117,10 @@ impl Scheduler {
             .map(|i| PagedKvCache::new(Arc::clone(&self.allocators[i])))
             .collect();
 
+        let draft_caches = (0..self.draft_num_layers)
+            .map(|i| PagedKvCache::new(Arc::clone(&self.draft_allocators[i])))
+            .collect();
+
         let seq = SequenceState {
             id,
             num_generated: 0,
@@ -114,6 +130,7 @@ impl Scheduler {
             status: SequenceStatus::Waiting,
             phase: SequencePhase::Prefill,
             caches,
+            draft_caches,
             num_processed_tokens: 0,
             max_tokens,
             finish_reason: None,
@@ -183,9 +200,7 @@ impl Scheduler {
                     seq_id = seq.id,
                     "sequence preempted due to memory pressure; KV cache cleared and re-queued"
                 );
-                for cache in &mut seq.caches {
-                    cache.clear();
-                }
+                seq.clear_caches();
                 seq.num_processed_tokens = 0;
                 seq.phase = SequencePhase::Prefill;
                 seq.status = SequenceStatus::Waiting;
@@ -250,9 +265,7 @@ impl Scheduler {
         for seq_id in finished {
             let idx = *self.running_index.get(&seq_id).unwrap();
             let mut seq = self.remove_from_running(idx);
-            for cache in &mut seq.caches {
-                cache.clear();
-            }
+            seq.clear_caches();
             completed.push(CompletedSequence {
                 id: seq.id,
                 finish_reason: seq.finish_reason.clone(),
@@ -264,9 +277,7 @@ impl Scheduler {
     pub fn abort_all_running(&mut self) -> Vec<SequenceId> {
         let ids: Vec<SequenceId> = self.running.iter().map(|s| s.id).collect();
         for mut seq in self.running.drain(..) {
-            for cache in &mut seq.caches {
-                cache.clear();
-            }
+            seq.clear_caches();
         }
         self.running_index.clear();
         ids
@@ -275,18 +286,14 @@ impl Scheduler {
     pub fn abort_sequence(&mut self, seq_id: SequenceId) -> bool {
         if let Some(&idx) = self.running_index.get(&seq_id) {
             let mut seq = self.remove_from_running(idx);
-            for cache in &mut seq.caches {
-                cache.clear();
-            }
+            seq.clear_caches();
             return true;
         }
 
         if let Some(wait_idx) = self.waiting.iter().position(|s| s.id == seq_id)
             && let Some(mut seq) = self.waiting.remove(wait_idx)
         {
-            for cache in &mut seq.caches {
-                cache.clear();
-            }
+            seq.clear_caches();
             return true;
         }
 
@@ -297,9 +304,7 @@ impl Scheduler {
         let mut ids = self.abort_all_running();
         for mut seq in self.waiting.drain(..) {
             ids.push(seq.id);
-            for cache in &mut seq.caches {
-                cache.clear();
-            }
+            seq.clear_caches();
         }
         ids
     }

@@ -85,6 +85,7 @@ pub struct ModelManager {
     require_gpu: bool,
     max_num_seqs: Option<usize>,
     max_queued_requests: usize,
+    draft_model: Option<String>,
     discovery_cache: Option<DiscoveryCache>,
 }
 
@@ -190,6 +191,7 @@ pub struct ModelManagerConfig {
     pub require_gpu: bool,
     pub max_num_seqs: Option<usize>,
     pub max_queued_requests: usize,
+    pub draft_model: Option<String>,
 }
 
 impl ModelManager {
@@ -205,6 +207,7 @@ impl ModelManager {
             require_gpu,
             max_num_seqs,
             max_queued_requests,
+            draft_model,
         } = config;
         let mut registry = load_registry(&models_dir);
         let valid_ids: std::collections::HashSet<String> = loader::discover_models(&models_dir)
@@ -251,6 +254,7 @@ impl ModelManager {
             require_gpu,
             max_num_seqs,
             max_queued_requests,
+            draft_model,
             discovery_cache: None,
         }
     }
@@ -496,6 +500,10 @@ impl ModelManager {
             SlotState::Loading { waiters: vec![tx] },
         );
 
+        let draft_model = self.draft_model.as_ref().and_then(|name| {
+            loader::resolve_model_path(&self.models_dir, name).map(|p| (p, name.clone()))
+        });
+
         spawn_load(SpawnLoadParams {
             model_id: model_id.to_string(),
             model_path,
@@ -509,6 +517,7 @@ impl ModelManager {
             require_gpu: self.require_gpu,
             max_num_seqs: self.max_num_seqs,
             max_queued_requests: self.max_queued_requests,
+            draft_model,
         });
 
         GetResult::Wait(rx)
@@ -663,6 +672,8 @@ struct SpawnLoadParams {
     require_gpu: bool,
     max_num_seqs: Option<usize>,
     max_queued_requests: usize,
+    /// Optional draft model as (resolved_path, id) for speculative decoding.
+    draft_model: Option<(PathBuf, String)>,
 }
 
 /// JIT-compile all SDPA kernels before marking the model Ready, otherwise the
@@ -789,6 +800,7 @@ fn spawn_load(params: SpawnLoadParams) {
         require_gpu,
         max_num_seqs,
         max_queued_requests,
+        draft_model,
     } = params;
 
     let (result_tx, result_rx) = oneshot::channel::<Result<LoadResult, String>>();
@@ -819,6 +831,15 @@ fn spawn_load(params: SpawnLoadParams) {
 
         tracing::info!(model_id = %model_id_thread, "loading model");
         let load_max_num_sequences: usize = max_num_seqs.unwrap_or(8);
+
+        // A configured draft shares the GlobalKvBudget; acquire() is first-come, so
+        // reserve half for the draft or the target takes 100% and the draft load
+        // fails (spec silently off). Draft per-block KV cost <= target's, so its
+        // half always holds >= the target's sequence capacity (no runtime starve).
+        let draft_kv_reservation = draft_model
+            .is_some()
+            .then(|| kv_budget.acquire(kv_budget.available_bytes() / 2));
+
         let (batch_model, weights_size_bytes) = match loader::load_batch_model(
             &model_dir,
             &model_id_thread,
@@ -833,6 +854,9 @@ fn spawn_load(params: SpawnLoadParams) {
         ) {
             Ok(m) => m,
             Err(e) => {
+                if let Some(reserved) = draft_kv_reservation {
+                    kv_budget.release(reserved);
+                }
                 let _ = result_tx.send(Err(format!("Failed to load model: {e}")));
                 return;
             }
@@ -939,12 +963,57 @@ fn spawn_load(params: SpawnLoadParams) {
         };
         let extra_stop_ids = tokenizer.stop_token_ids();
         let extra_stop_sequences = tokenizer.stop_token_sequences();
-        let engine = Engine::new_with_stop_controls(
+
+        // Release the reservation so the draft can acquire its half of the budget.
+        if let Some(reserved) = draft_kv_reservation {
+            kv_budget.release(reserved);
+        }
+
+        // Load the speculative draft model on the same device (shares the KV
+        // budget). Disable speculation for this model if it fails to load or its
+        // vocab doesn't match the target.
+        let draft = draft_model.as_ref().and_then(|(draft_path, draft_id)| {
+            let draft_dir = draft_path.to_string_lossy().to_string();
+            match loader::load_batch_model(
+                &draft_dir,
+                draft_id,
+                &device,
+                loader::LoadBatchOptions {
+                    max_context_len,
+                    max_num_sequences: load_max_num_sequences,
+                    kv_budget: &kv_budget,
+                    kv_quant,
+                    qjl_quantization,
+                },
+            ) {
+                Ok((d, _)) if d.vocab_size() == vocab_size => {
+                    tracing::info!(model_id = %model_id_thread, draft = %draft_id, "speculative draft model loaded");
+                    Some(d)
+                }
+                Ok((d, _)) => {
+                    tracing::warn!(
+                        model_id = %model_id_thread, draft = %draft_id,
+                        draft_vocab = d.vocab_size(), target_vocab = vocab_size,
+                        "draft vocab mismatch; speculative decoding disabled for this model"
+                    );
+                    None
+                }
+                Err(e) => {
+                    tracing::warn!(model_id = %model_id_thread, draft = %draft_id, error = %e, "failed to load draft model; speculative decoding disabled");
+                    None
+                }
+            }
+        });
+
+        let mut engine = Engine::new_with_stop_controls(
             batch_model,
             config,
             &extra_stop_ids,
             &extra_stop_sequences,
         );
+        if let Some(d) = draft {
+            engine = engine.with_draft_model(d);
+        }
         engine_loop(engine, tokenizer, request_rx, shutdown);
     });
 
@@ -1104,6 +1173,7 @@ mod tests {
             require_gpu: false,
             max_num_seqs: None,
             max_queued_requests: 200,
+            draft_model: None,
         })
     }
 

@@ -35,6 +35,20 @@ impl Default for SamplingParams {
     }
 }
 
+impl SamplingParams {
+    /// True when sampling reduces to a plain argmax — no temperature, logprobs,
+    /// penalties, or logit bias. This is the only case greedy speculative
+    /// decoding can serve exactly; everything else must use the normal sampler.
+    pub fn is_plain_greedy(&self) -> bool {
+        self.temperature == 0.0
+            && self.top_logprobs_k == 0
+            && self.repetition_penalty == 1.0
+            && self.frequency_penalty == 0.0
+            && self.presence_penalty == 0.0
+            && self.logit_bias.is_none()
+    }
+}
+
 pub struct SampleOutput {
     pub token: u32,
     pub logprob: Option<f32>,
@@ -47,12 +61,7 @@ pub fn sample(
     prev_tokens: &[u32],
     token_counts: Option<&std::collections::HashMap<u32, u32>>,
 ) -> Result<SampleOutput> {
-    let no_mods = params.repetition_penalty == 1.0
-        && params.frequency_penalty == 0.0
-        && params.presence_penalty == 0.0
-        && params.logit_bias.is_none();
-
-    if params.temperature == 0.0 && params.top_logprobs_k == 0 && no_mods {
+    if params.is_plain_greedy() {
         let token = logits.argmax(D::Minus1)?.to_scalar::<u32>()?;
         // NaN guard reduced in native dtype (no full-vocab F32 cast per token).
         let sum: f32 = logits

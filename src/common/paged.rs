@@ -957,8 +957,44 @@ impl PagedKvCache {
         }
     }
 
+    /// Drop buffered pool writes without materializing them. Speculative verify
+    /// forwards (M>1) queue pool writes for what are really decode tokens; those
+    /// never belong in the block pool (the normal M=1 decode path skips them too),
+    /// so discard them before rollback to avoid writing to soon-freed blocks.
+    pub fn discard_pending(&mut self) {
+        self.pending_writes.clear();
+    }
+
+    /// Roll the cache back to `n` tokens, freeing blocks that now hold only
+    /// dropped tokens. Used to discard rejected speculative tokens. Pending
+    /// writes are flushed first so kept blocks stay materialized; dropped tokens
+    /// either land in freed blocks (overwritten on realloc) or in the tail of the
+    /// last kept block (overwritten by confirmed tokens before it ever fills).
+    pub fn truncate_to(&mut self, n: usize) -> Result<()> {
+        if n >= self.table.num_tokens {
+            return Ok(());
+        }
+        self.flush_pending()?;
+        let blocks_needed = n.div_ceil(self.block_size);
+        if blocks_needed < self.table.block_ids.len() {
+            let mut alloc = self.allocator.lock().unwrap();
+            for &bid in &self.table.block_ids[blocks_needed..] {
+                alloc.free(bid);
+            }
+            drop(alloc);
+            self.table.block_ids.truncate(blocks_needed);
+        }
+        self.set_num_tokens(n);
+        Ok(())
+    }
+
     pub fn block_id_at(&self, idx: usize) -> Option<usize> {
         self.table.block_ids.get(idx).copied()
+    }
+
+    /// Number of tokens currently cached (the sequence length this cache holds).
+    pub fn num_tokens(&self) -> usize {
+        self.table.num_tokens
     }
 }
 
@@ -996,6 +1032,52 @@ mod tests {
         alloc.lock().unwrap().free(b2);
         alloc.lock().unwrap().free(b3);
         assert_eq!(alloc.lock().unwrap().num_free(), 4);
+    }
+
+    #[test]
+    fn truncate_to_frees_blocks_and_preserves_prefix() {
+        let alloc = make_allocator(8, 2); // block_size = 2
+        let mut cache = PagedKvCache::new(Arc::clone(&alloc));
+        let dev = Device::Cpu;
+
+        // 6 tokens => 3 blocks.
+        let k = Tensor::randn(0f32, 1., (1, 2, 6, 4), &dev).unwrap();
+        let v = Tensor::randn(0f32, 1., (1, 2, 6, 4), &dev).unwrap();
+        let (k_full, _) = cache.append(&k, &v).unwrap();
+        assert_eq!(cache.table.num_tokens, 6);
+        let free_before = alloc.lock().unwrap().num_free();
+
+        // Roll back to 3 tokens => needs 2 blocks => frees exactly 1.
+        cache.truncate_to(3).unwrap();
+        assert_eq!(cache.table.num_tokens, 3);
+        assert_eq!(alloc.lock().unwrap().num_free(), free_before + 1);
+
+        let (k_trunc, _) = cache.current().unwrap();
+        assert_eq!(k_trunc.dim(2).unwrap(), 3);
+        let orig3 = k_full.narrow(2, 0, 3).unwrap();
+        let diff = (&k_trunc - &orig3)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .sum_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert!(
+            diff < 1e-6,
+            "kept K must match original prefix: diff={diff}"
+        );
+
+        // Re-append after truncation continues correctly.
+        let k2 = Tensor::randn(0f32, 1., (1, 2, 2, 4), &dev).unwrap();
+        let v2 = Tensor::randn(0f32, 1., (1, 2, 2, 4), &dev).unwrap();
+        let (k5, _) = cache.append(&k2, &v2).unwrap();
+        assert_eq!(k5.dim(2).unwrap(), 5);
+        assert_eq!(cache.table.num_tokens, 5);
+
+        // truncate_to a no-op when n >= current length.
+        cache.truncate_to(99).unwrap();
+        assert_eq!(cache.table.num_tokens, 5);
     }
 
     #[test]

@@ -167,6 +167,9 @@ pub struct StartServerArgs {
     pub api_key: Option<String>,
     /// Wall-clock per-request timeout. `None` disables the timeout.
     pub request_timeout: Option<Duration>,
+    /// Optional speculative-decoding draft model id, applied to every loaded
+    /// model whose vocab matches.
+    pub draft_model: Option<String>,
 }
 
 pub fn start_server(args: StartServerArgs) -> anyhow::Result<()> {
@@ -185,6 +188,7 @@ pub fn start_server(args: StartServerArgs) -> anyhow::Result<()> {
         max_queued_requests,
         api_key,
         request_timeout,
+        draft_model,
     } = args;
 
     if !models_dir.exists() {
@@ -213,6 +217,7 @@ pub fn start_server(args: StartServerArgs) -> anyhow::Result<()> {
             require_gpu,
             max_num_seqs,
             max_queued_requests,
+            draft_model,
         },
     )));
 

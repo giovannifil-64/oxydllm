@@ -48,6 +48,7 @@ struct StartArgs {
     max_queued_requests: usize,
     api_key: Option<String>,
     request_timeout: Option<Duration>,
+    draft_model: Option<String>,
 }
 
 struct RunArgs {
@@ -59,6 +60,8 @@ struct RunArgs {
     kv_quant: common::kv_quant::KvQuantMode,
     qjl_quantization: bool,
     require_gpu: bool,
+    /// Optional speculative-decoding draft model as (resolved_dir, id).
+    draft_model: Option<(String, String)>,
 }
 
 struct RmArgs {
@@ -179,6 +182,7 @@ Server options (start):
   --max-queued-requests <N>  Max requests queued per model before returning 429 (default: 200, env: OXYDLLM_MAX_QUEUED_REQUESTS)
   --api-key <KEY>            Require `Authorization: Bearer <KEY>` (or `X-API-Key`) on /v1/* and /metrics (default: disabled, env: OXYDLLM_API_KEY)
   --request-timeout <SECS>   Wall-clock timeout per chat completion request; 0 disables (default: 300, env: OXYDLLM_REQUEST_TIMEOUT)
+  --draft-model <NAME>       Enable greedy speculative decoding with this draft model (env: OXYDLLM_DRAFT_MODEL)
 
 Chat options (run):
   --models-dir <DIR>         Models directory (default: ~/.oxydllm/models/)
@@ -187,6 +191,7 @@ Chat options (run):
   --kv-quant <MODE>          KV cache quantization: off, lossless, balanced, aggressive
   --qjl-quantization         Enable Stage-2 QJL key residual quantization (default: disabled)
   --allow-cpu                Allow CPU fallback when no GPU is available (default: GPU required, env: OXYDLLM_ALLOW_CPU)
+  --draft-model <NAME>       Enable greedy speculative decoding with this draft model
   --temperature <T>          Sampling temperature (default: 0.7)
   --top-k <K>                Top-k filtering (default: 0, disabled)
   --top-p <P>                Nucleus sampling (default: 1.0)
@@ -726,6 +731,7 @@ fn parse_start_args(args: &[String]) -> Result<StartArgs, String> {
     let mut require_gpu = !env_allow_cpu;
     let mut max_num_seqs: Option<usize> = env_usize("OXYDLLM_MAX_NUM_SEQS");
     let mut max_queued_requests: usize = env_usize("OXYDLLM_MAX_QUEUED_REQUESTS").unwrap_or(200);
+    let mut draft_model: Option<String> = std::env::var("OXYDLLM_DRAFT_MODEL").ok();
     let mut api_key: Option<String> = std::env::var("OXYDLLM_API_KEY")
         .ok()
         .map(|s| s.trim().to_string())
@@ -842,6 +848,10 @@ fn parse_start_args(args: &[String]) -> Result<StartArgs, String> {
                         |_| "Invalid request-timeout value (expected non-negative integer seconds)",
                     )?;
             }
+            "--draft-model" => {
+                i += 1;
+                draft_model = Some(args.get(i).ok_or("--draft-model requires a value")?.clone());
+            }
             other => return Err(format!("Unknown option: {}", other)),
         }
         i += 1;
@@ -868,11 +878,13 @@ fn parse_start_args(args: &[String]) -> Result<StartArgs, String> {
         max_queued_requests,
         api_key,
         request_timeout,
+        draft_model,
     })
 }
 
 fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
     let mut model_name = String::new();
+    let mut draft_name: Option<String> = None;
     let mut models_dir: Option<PathBuf> = None;
     let mut devices_raw: Option<Vec<usize>> = None;
     let mut max_context_len: usize = 4096;
@@ -968,6 +980,10 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
             "--qjl-quantization" => {
                 qjl_quantization = true;
             }
+            "--draft-model" => {
+                i += 1;
+                draft_name = Some(args.get(i).ok_or("--draft-model requires a value")?.clone());
+            }
             "--allow-cpu" => {
                 require_gpu = false;
             }
@@ -983,15 +999,19 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
         return Err("Missing <model-name>".to_string());
     }
 
-    let model_dir = if std::path::Path::new(&model_name).is_absolute() {
-        model_name.clone()
-    } else {
-        let base = models_dir.unwrap_or_else(default_models_dir);
-        models::loader::resolve_model_path(&base, &model_name)
-            .unwrap_or_else(|| base.join(&model_name))
-            .to_string_lossy()
-            .to_string()
+    let base = models_dir.unwrap_or_else(default_models_dir);
+    let resolve = |name: &str| -> String {
+        if std::path::Path::new(name).is_absolute() {
+            name.to_string()
+        } else {
+            models::loader::resolve_model_path(&base, name)
+                .unwrap_or_else(|| base.join(name))
+                .to_string_lossy()
+                .to_string()
+        }
     };
+    let model_dir = resolve(&model_name);
+    let draft_model = draft_name.map(|n| (resolve(&n), n));
 
     Ok(RunArgs {
         model_dir,
@@ -1002,6 +1022,7 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
         kv_quant,
         qjl_quantization,
         require_gpu,
+        draft_model,
     })
 }
 
@@ -1120,6 +1141,33 @@ fn run_interactive(args: &RunArgs) -> anyhow::Result<()> {
         total_bytes as f64 / 1_073_741_824.0,
     );
 
+    let draft_model = if let Some((draft_dir, draft_id)) = &args.draft_model {
+        println!("Loading draft model from '{draft_dir}'...");
+        let (draft, _) = models::loader::load_batch_model(
+            draft_dir,
+            draft_id,
+            &device,
+            models::loader::LoadBatchOptions {
+                max_context_len: args.max_context_len,
+                max_num_sequences: 1,
+                kv_budget: &kv_budget,
+                kv_quant: args.kv_quant,
+                qjl_quantization: args.qjl_quantization,
+            },
+        )?;
+        if draft.vocab_size() != batch_model.vocab_size() {
+            anyhow::bail!(
+                "draft vocab_size {} != target vocab_size {} — draft and target must share a tokenizer",
+                draft.vocab_size(),
+                batch_model.vocab_size()
+            );
+        }
+        println!("Draft model loaded — speculative decoding enabled.");
+        Some(draft)
+    } else {
+        None
+    };
+
     let config = scheduler::SchedulerConfig {
         max_num_sequences: 1,
         max_tokens_per_step: 4096,
@@ -1132,6 +1180,9 @@ fn run_interactive(args: &RunArgs) -> anyhow::Result<()> {
         &extra_stop_ids,
         &extra_stop_sequences,
     );
+    if let Some(draft) = draft_model {
+        engine = engine.with_draft_model(draft);
+    }
 
     let mut messages: Vec<ChatMessage> = vec![ChatMessage {
         role: "system".to_string(),
@@ -1352,6 +1403,7 @@ fn main() -> anyhow::Result<()> {
                 max_queued_requests: start_args.max_queued_requests,
                 api_key: start_args.api_key,
                 request_timeout: start_args.request_timeout,
+                draft_model: start_args.draft_model,
             })?
         }
         "run" => {

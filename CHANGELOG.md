@@ -2,6 +2,28 @@
 
 All notable changes to this project will be documented in this file.
 
+## 0.0.0-alpha.12.0.1
+
+- Fixed nondeterministic garbage output on Metal under concurrent serving — including the intermittent `Qwen3-4B-Instruct-2507-FP8` gibberish — by pinning candle's Metal command-buffer pool to a single buffer; throughput is unchanged.
+- Fixed every Docker image build (CPU and all CUDA architectures) failing on a missing compile-time `OXYDLLM_BUILD_TS`.
+- Silenced a `dead_code` warning emitted on the non-Metal CI test builds.
+- Removed a full-vocabulary F32 materialization from the greedy per-token NaN guard.
+
+### Reliability and Correctness
+- **Metal command-buffer pool corruption under concurrency** (`src/main.rs`): `candle-metal-kernels` 0.10.2 spreads GPU work across a pool of command buffers (`CANDLE_METAL_COMMAND_POOL_SIZE`, default 5) that is not safe for concurrent encoding. When more than one thread touches the device at once — the server's tokio workers, the model-load/warmup thread, and off-thread `Tensor` drops freeing `MTLBuffer`s — operations collide and the output is silently corrupted (gibberish or `NaN`). This is why `Qwen3-4B-Instruct-2507-FP8` decoded coherently on some loads and produced garbage on others, but it affected any model served under concurrency. `main()` now sets `CANDLE_METAL_COMMAND_POOL_SIZE=1` at startup, before any device or thread is created, serializing onto one command buffer. GPU work is already serialized per device by the internal GPU lock, so there is no throughput cost — measured 53.32 vs 53.30 tok/s on Qwen3-0.6B (pool size 1 vs 5). Set the environment variable explicitly to override. With the fix the full `stress_baseline.py` run passes 25/25 models on the coherence check (the FP8 model previously failed).
+
+### Performance and Efficiency
+- **Greedy decode NaN guard** (`src/sampling.rs`): the `temperature == 0` fast path no longer promotes the entire logit row (~152 K values on the Qwen vocab) to F32 just to check for NaN. It reduces in the native dtype and casts only the one-element sum, so the argmax token id is the only value copied off the GPU per step.
+
+### CI / Infra
+- **Docker / CUDA image builds fixed** (`src/main.rs`, `build.rs`): every Docker target (CPU and all CUDA architectures) failed with `error: environment variable OXYDLLM_BUILD_TS not defined at compile time`. The Dockerfile's dummy-build layer — build dependencies with a stub `main`, then rebuild against the real sources — does not reliably reapply the build script's compile env to the final compile. `env!("OXYDLLM_BUILD_TS")` is now `option_env!(…)`: it is optional build metadata and the code already defaulted to `0`. The `dist_build` cfg gating `oxydllm update` / `uninstall` was likewise replaced by an `OXYDLLM_DIST_BUILD` compile env (emitted by `build.rs`, read via `option_env!`), removing the custom cfg, its `cargo::rustc-check-cfg` declaration, and any need for an `#[allow(unexpected_cfgs)]`.
+- **`dead_code` warning on non-Metal builds** (`src/common/awq.rs`): `QuantWeight::runtime_size_bytes` and `to_device` are Metal-only but were gated `#[cfg(any(feature = "metal", test))]`, so they compiled — unused — into the CUDA/CPU test binaries and emitted a `dead_code` warning on those CI jobs. Narrowed to `#[cfg(feature = "metal")]`.
+
+### Tests
+- **Metal command-buffer race reproducer** (`src/common/linear.rs::metal_pool_ordering_race_repro`, env-gated): several threads run the same deterministic candle-matmul + custom Metal `rms_norm` chain on one shared device; identical results across threads prove correctness, while divergence or `NaN` exposes the pool race. Documents the bug and confirms `CANDLE_METAL_COMMAND_POOL_SIZE=1` fixes it.
+
+**Full Changelog**: https://github.com/giovannifil-64/oxydllm/compare/0.0.0-alpha.12...0.0.0-alpha.12.0.1
+
 ## 0.0.0-alpha.12
 
 - Mixture-of-Experts support shipped end-to-end: `Qwen3MoeForCausalLM` and `OlmoeForCausalLM` are routed through a new `MoeFeedForward` module with top-k router, hybrid sparse/naive dispatch chosen per call from `n_tokens` vs `top_k`, and runtime-verified output coherence on `allenai/OLMoE-1B-7B-0924-Instruct`.

@@ -209,14 +209,10 @@ impl StandardTransformer {
                 QLinear::from_arc(qt, dtype)
                     .map_err(|e| anyhow::anyhow!("Failed to load output.weight: {e}"))?,
             ),
-            None => {
-                let w = embed_qt
-                    .dequantize(device)
-                    .map_err(|e| anyhow::anyhow!("dequantize embed for tie: {e}"))?
-                    .to_dtype(dtype)
-                    .map_err(|e| anyhow::anyhow!("dtype cast: {e}"))?;
-                AnyLinear::from_weight(w, None).map_err(|e| anyhow::anyhow!("{e}"))?
-            }
+            None => AnyLinear::Quantized(
+                QLinear::from_arc(embed_qt.clone(), dtype)
+                    .map_err(|e| anyhow::anyhow!("tied lm_head from embedding: {e}"))?,
+            ),
         };
 
         let sliding_window_meta =

@@ -1,3 +1,4 @@
+use super::decode_profile;
 use super::{
     attention::{Attention, SegmentInfo},
     config::{Activation, BlockConfig},
@@ -238,11 +239,13 @@ impl TransformerBlock {
         mask: Option<&Tensor>,
         segments: &mut [SegmentInfo],
     ) -> Result<Tensor> {
+        let dev = x.device().clone();
         let residual = x;
-        let normed = self.input_norm.forward(x)?;
-        let mut attn_out =
+        let mut attn_out = decode_profile::phase(&dev, "attn", || {
+            let normed = self.input_norm.forward(x)?;
             self.attention
-                .forward_batch(&normed, rope, position_ids, mask, segments)?;
+                .forward_batch(&normed, rope, position_ids, mask, segments)
+        })?;
 
         if self.pre_ffn_norm.is_some() {
             attn_out = self.ffn_norm.forward(&attn_out)?;
@@ -251,14 +254,14 @@ impl TransformerBlock {
         let mut x = (residual + attn_out)?;
         let residual = x.clone();
 
-        let ffn_inp;
-        if let Some(pre_norm) = &self.pre_ffn_norm {
-            ffn_inp = pre_norm.forward(&x)?;
-        } else {
-            ffn_inp = self.ffn_norm.forward(&x)?;
-        }
-
-        let mut ffn_out = self.ffn.forward(&ffn_inp)?;
+        let mut ffn_out = decode_profile::phase(&dev, "ffn", || {
+            let ffn_inp = if let Some(pre_norm) = &self.pre_ffn_norm {
+                pre_norm.forward(&x)?
+            } else {
+                self.ffn_norm.forward(&x)?
+            };
+            self.ffn.forward(&ffn_inp)
+        })?;
         if let Some(post_norm) = &self.post_ffn_norm {
             ffn_out = post_norm.forward(&ffn_out)?;
         }
@@ -343,7 +346,11 @@ pub fn run_transformer_layers_batch(
         "token_ids and position_ids must live on the same device",
     );
 
-    let mut x = c.embed_tokens.forward(token_ids)?;
+    decode_profile::set_active(token_counts.iter().all(|&t| t == 1));
+    let dev = token_ids.device().clone();
+    decode_profile::barrier(&dev);
+
+    let mut x = decode_profile::phase(&dev, "embed", || c.embed_tokens.forward(token_ids))?;
     if let Some(scale) = c.embed_scale {
         x = (x * scale)?;
     }
@@ -420,10 +427,10 @@ pub fn run_transformer_layers_batch(
         )?;
     }
 
-    let x = c.norm.forward(&x)?;
-    let logits = c.lm_head.forward(&x)?;
+    let x = decode_profile::phase(&dev, "final_norm", || c.norm.forward(&x))?;
+    let logits = decode_profile::phase(&dev, "lm_head", || c.lm_head.forward(&x))?;
 
-    if let Some(cap) = c.logit_softcap {
+    let out = if let Some(cap) = c.logit_softcap {
         #[cfg(feature = "metal")]
         {
             if logits.device().is_metal() {
@@ -439,7 +446,9 @@ pub fn run_transformer_layers_batch(
         }
     } else {
         Ok(logits)
-    }
+    };
+    decode_profile::mark_forward_end();
+    out
 }
 
 pub fn flush_caches(seq_caches: &mut [&mut [PagedKvCache]]) -> Result<()> {

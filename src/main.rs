@@ -524,7 +524,7 @@ fn run_update_stable(include_pre: bool) -> anyhow::Result<()> {
         "Update available: {} → {remote_tag}",
         env!("CARGO_PKG_VERSION")
     );
-    run_install_sh("stable")
+    run_install_sh("stable", &remote_tag)
 }
 
 fn run_update_nightly() -> anyhow::Result<()> {
@@ -564,15 +564,18 @@ fn run_update_nightly() -> anyhow::Result<()> {
     }
 
     println!("Nightly update available.");
-    run_install_sh("nightly")
+    run_install_sh("nightly", "nightly")
 }
 
-fn run_install_sh(channel: &str) -> anyhow::Result<()> {
-    println!("Updating to latest {channel} release...");
+fn run_install_sh(channel: &str, version: &str) -> anyhow::Result<()> {
+    println!("Updating to {version} ({channel})...");
     let status = std::process::Command::new("sh")
         .arg("-c")
         .arg("curl -fsSL https://raw.githubusercontent.com/giovannifil-64/oxydllm/main/install.sh | sh")
         .env("OXYDLLM_CHANNEL", channel)
+        // Pin the exact resolved tag so install.sh installs it directly instead of
+        // re-querying /releases/latest (which 404s when only pre-releases exist).
+        .env("OXYDLLM_VERSION", version)
         .status()?;
     if !status.success() {
         anyhow::bail!("Update failed (install.sh exited with non-zero status).");
@@ -1355,13 +1358,16 @@ fn run_interactive(args: &RunArgs) -> anyhow::Result<()> {
 }
 
 fn main() -> anyhow::Result<()> {
-    // candle-metal-kernels 0.10.2's command-buffer pool is not thread-safe under
-    // concurrent encoding (corrupts output on Metal); a single buffer serializes
-    // it. gpu_lock already serializes GPU work, so this costs no throughput.
+    // candle-metal-kernels 0.10.2's command-buffer pool corrupts output under
+    // concurrent encoding (cross-buffer read-before-write hazard); pool=1
+    // serializes encoding into one buffer where Metal tracks hazards. Forced
+    // unconditionally: it's a correctness requirement, not a tunable — a larger
+    // value (even user-set) reintroduces the race and gains nothing, since
+    // gpu_lock already serializes GPU work per device.
+    // SAFETY: first statement in main(), before any thread or Metal device exists.
     #[cfg(feature = "metal")]
-    if std::env::var_os("CANDLE_METAL_COMMAND_POOL_SIZE").is_none() {
-        // SAFETY: first statement in main(), before any thread/device exists.
-        unsafe { std::env::set_var("CANDLE_METAL_COMMAND_POOL_SIZE", "1") };
+    unsafe {
+        std::env::set_var("CANDLE_METAL_COMMAND_POOL_SIZE", "1");
     }
 
     init_tracing();

@@ -7,9 +7,13 @@
 # Nightly:
 #   curl -fsSL https://raw.githubusercontent.com/giovannifil-64/oxydllm/main/install.sh | OXYDLLM_CHANNEL=nightly sh
 #
+# Pre-release (alpha/beta/rc), or before any stable release exists:
+#   curl -fsSL https://raw.githubusercontent.com/giovannifil-64/oxydllm/main/install.sh | OXYDLLM_PRE=1 sh
+#
 # Environment overrides:
 #   OXYDLLM_CHANNEL     - stable (default) or nightly
 #   OXYDLLM_VERSION     - install a specific version tag, e.g. v0.1.0 (ignored for nightly)
+#   OXYDLLM_PRE         - set to 1 to install the latest pre-release (alpha/beta/rc)
 #   OXYDLLM_NO_GPU      - set to 1 to force CPU binary on Linux
 #   OXYDLLM_CUDA_TARGET - auto (default), ada, hopper, blackwell, blackwell-ultra, blackwell-desktop (Linux x86_64);
 #                         hopper, blackwell, blackwell-ultra, thor, blackwell-desktop (Linux arm64)
@@ -452,6 +456,16 @@ case "${OS}" in
         ;;
 esac
 
+# Most-recent release tag of any kind (pre-release included), excluding the
+# rolling "nightly" tag. Used for OXYDLLM_PRE and the no-stable-yet fallback.
+# /releases lists every release newest-first; /releases/latest skips pre-releases.
+latest_any_release_tag() {
+    curl -fsSL "${GITHUB_API}/releases" \
+    | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+    | grep -v '^nightly$' \
+    | head -1
+}
+
 case "${CHANNEL}" in
     nightly)
         OXYDLLM_VERSION="nightly"
@@ -460,6 +474,11 @@ case "${CHANNEL}" in
     stable)
         if [ -n "${OXYDLLM_VERSION:-}" ]; then
             say "Installing ${OXYDLLM_VERSION} (${PLATFORM})..."
+        elif [ "${OXYDLLM_PRE:-0}" = "1" ]; then
+            say "Fetching latest release (pre-releases included)..."
+            OXYDLLM_VERSION="$(latest_any_release_tag)"
+            [ -n "${OXYDLLM_VERSION}" ] || err "No releases found. Set OXYDLLM_VERSION manually."
+            say "Installing ${OXYDLLM_VERSION} (${PLATFORM})..."
         else
             say "Fetching latest stable release..."
             OXYDLLM_VERSION="$(
@@ -467,8 +486,15 @@ case "${CHANNEL}" in
                 | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
                 | head -1
             )"
-            [ -n "${OXYDLLM_VERSION}" ] || err "Could not determine latest release tag. Set OXYDLLM_VERSION manually."
-            say "Installing ${OXYDLLM_VERSION} (${PLATFORM})..."
+            if [ -n "${OXYDLLM_VERSION}" ]; then
+                say "Installing ${OXYDLLM_VERSION} (${PLATFORM})..."
+            else
+                # No stable (non-prerelease) release exists yet: fall back to the
+                # most recent pre-release so the default one-liner still works.
+                OXYDLLM_VERSION="$(latest_any_release_tag)"
+                [ -n "${OXYDLLM_VERSION}" ] || err "No releases found. Set OXYDLLM_VERSION manually."
+                say "No stable release yet — installing latest pre-release ${OXYDLLM_VERSION} (${PLATFORM}). Pin with OXYDLLM_VERSION, or set OXYDLLM_PRE=1 to silence this notice."
+            fi
         fi
         ;;
     *)

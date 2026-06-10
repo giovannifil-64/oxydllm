@@ -3500,9 +3500,8 @@ struct GgufBatchParams {
     m_batch: u32,
 }
 
-// Batched Q4_K decode: M activation vectors share one weight read. Routed for
-// 2 <= M <= GGUF_BATCH_MAX (small batched decode), where the mul_mm prefill kernel
-// has a crippling fixed overhead (profiled M=2 = 3.7x the M=1 gemv cost).
+// Batched decode (2 <= M <= GGUF_BATCH_MAX): M activation vectors share one
+// weight read; above the cap, mul_mm is already efficient for the shape.
 struct GgufBatchMatmul {
     x: Tensor,
     weight_bytes: Tensor,
@@ -3883,11 +3882,8 @@ mod decode_batch_scaling_tests {
         }
     }
 
-    // Root-cause probe for poor concurrent throughput: batched decode (M sequences
-    // in one forward) takes QLinear's m>1 path = gguf_quant_mul_mm (prefill kernel),
-    // while single-stream decode (M=1) uses the fast gemv. If per-token cost RISES
-    // with M instead of falling, batching is a net loss — explaining the measured
-    // 0.53x at concurrency 2.
+    // Perf contract: the batched decode gemv must beat mul_mm (the alternative
+    // M>1 path) and its per-token cost should fall as M grows.
     #[test]
     fn gguf_decode_batch_scaling() {
         let Ok(dev) = Device::new_metal(0) else {

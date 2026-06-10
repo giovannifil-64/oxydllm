@@ -248,8 +248,13 @@ fn top_k_by_logprob(log_probs: &[f32], k: usize) -> Vec<(u32, f32)> {
         .enumerate()
         .map(|(i, &lp)| (i as u32, lp))
         .collect();
-    indexed.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    indexed.truncate(k);
+    let desc =
+        |a: &(u32, f32), b: &(u32, f32)| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal);
+    if k < indexed.len() {
+        indexed.select_nth_unstable_by(k, desc);
+        indexed.truncate(k);
+    }
+    indexed.sort_unstable_by(desc);
     indexed
 }
 
@@ -567,9 +572,8 @@ fn thread_rand_f32() -> f32 {
 mod tests {
     use super::*;
 
-    // Decomposition bench for the non-greedy per-token sampling cost (E2E measured
-    // ~2.2 ms/token vs greedy). Times each stage on a realistic peaked 151936-vocab
-    // distribution so the dominant cost is identified by measurement, not guessed.
+    // Decomposition bench for the non-greedy per-token sampling cost: times each
+    // stage on a peaked full-vocab distribution so the dominant cost is measured.
     #[cfg(feature = "metal")]
     #[test]
     fn sampling_cost_decomposition() {

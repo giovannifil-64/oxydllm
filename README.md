@@ -12,8 +12,8 @@
     <a href="https://github.com/giovannifil-64/oxydllm/actions/workflows/nightly.yml">
         <img src="https://github.com/giovannifil-64/oxydllm/actions/workflows/nightly.yml/badge.svg?branch=main" />
     </a>
-    <a href="https://github.com/giovannifil-64/oxydllm/actions/workflows/release.yml">
-        <img src="https://github.com/giovannifil-64/oxydllm/actions/workflows/release.yml/badge.svg?branch=main" />
+    <a href="https://github.com/giovannifil-64/oxydllm/releases">
+        <img src="https://img.shields.io/github/v/release/giovannifil-64/oxydllm?include_prereleases&label=release&logo=github" />
     </a>
 </p>
 

@@ -233,3 +233,24 @@ jobs:
 
       - name: Check (CUDA)
         run: cargo check --no-default-features --features cuda
+
+  ci-ok:
+    name: CI OK
+    if: always()
+    needs:
+      - fmt
+      - audit
+      - check-macos
+      - check-linux-cpu
+      - check-linux-cuda
+      - check-linux-arm64-cpu
+      - check-linux-arm64-cuda
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Verify all jobs passed
+        run: |
+          if [[ "${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}" == "true" ]]; then
+            echo "::error::One or more CI jobs failed"
+            exit 1
+          fi
+          echo "All CI jobs passed"

@@ -3289,10 +3289,16 @@ impl GgufFastQuant {
     // kernel yet → batched decode falls back to mul_mm. Added per quant as shipped.
     fn batch_kernel(self) -> Option<&'static str> {
         match self {
+            Self::Q4_0 => Some("gguf_q4_0_gemv_batch_bf16"),
+            Self::Q4_1 => Some("gguf_q4_1_gemv_batch_bf16"),
+            Self::Q5_0 => Some("gguf_q5_0_gemv_batch_bf16"),
+            Self::Q5_1 => Some("gguf_q5_1_gemv_batch_bf16"),
+            Self::Q8_0 => Some("gguf_q8_0_gemv_batch_bf16"),
+            Self::Q2K => Some("gguf_q2k_gemv_batch_bf16"),
+            Self::Q3K => Some("gguf_q3k_gemv_batch_bf16"),
             Self::Q4K => Some("gguf_q4k_gemv_batch_bf16"),
             Self::Q5K => Some("gguf_q5k_gemv_batch_bf16"),
             Self::Q6K => Some("gguf_q6k_gemv_batch_bf16"),
-            _ => None,
         }
     }
 
@@ -3807,6 +3813,13 @@ mod decode_batch_scaling_tests {
             return;
         };
         let quants = [
+            (GgmlDType::Q4_0, GgufFastQuant::Q4_0, "Q4_0"),
+            (GgmlDType::Q4_1, GgufFastQuant::Q4_1, "Q4_1"),
+            (GgmlDType::Q5_0, GgufFastQuant::Q5_0, "Q5_0"),
+            (GgmlDType::Q5_1, GgufFastQuant::Q5_1, "Q5_1"),
+            (GgmlDType::Q8_0, GgufFastQuant::Q8_0, "Q8_0"),
+            (GgmlDType::Q2K, GgufFastQuant::Q2K, "Q2K"),
+            (GgmlDType::Q3K, GgufFastQuant::Q3K, "Q3K"),
             (GgmlDType::Q4K, GgufFastQuant::Q4K, "Q4K"),
             (GgmlDType::Q5K, GgufFastQuant::Q5K, "Q5K"),
             (GgmlDType::Q6K, GgufFastQuant::Q6K, "Q6K"),
@@ -3883,6 +3896,11 @@ mod decode_batch_scaling_tests {
         let (n, k) = (2560usize, 2560usize); // Qwen3-4B hidden, square (q/o/gate-ish)
         let iters = 200;
         let quants = [
+            (GgmlDType::Q4_0, GgufFastQuant::Q4_0, "Q4_0"),
+            (GgmlDType::Q5_0, GgufFastQuant::Q5_0, "Q5_0"),
+            (GgmlDType::Q8_0, GgufFastQuant::Q8_0, "Q8_0"),
+            (GgmlDType::Q2K, GgufFastQuant::Q2K, "Q2_K"),
+            (GgmlDType::Q3K, GgufFastQuant::Q3K, "Q3_K"),
             (GgmlDType::Q4K, GgufFastQuant::Q4K, "Q4_K"),
             (GgmlDType::Q5K, GgufFastQuant::Q5K, "Q5_K"),
             (GgmlDType::Q6K, GgufFastQuant::Q6K, "Q6_K"),

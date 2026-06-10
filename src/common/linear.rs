@@ -137,11 +137,7 @@ pub fn gelu_tanh(x: &Tensor) -> Result<Tensor> {
 pub fn softmax_last_dim(x: &Tensor) -> Result<Tensor> {
     #[cfg(feature = "metal")]
     if x.device().is_metal() {
-        let x_c = if x.is_contiguous() {
-            x.clone()
-        } else {
-            x.contiguous()?
-        };
+        let x_c = x.contiguous()?;
         return super::metal_ops::softmax_fused(&x_c);
     }
     let max = x.max_keepdim(candle_core::D::Minus1)?;
@@ -222,16 +218,13 @@ impl GgufFastPath {
         }))
     }
 
+    // Decode path (1 <= m <= GGUF_BATCH_MAX): gemv for m=1, batched gemv above.
     fn forward_decode(&self, x: &Tensor) -> Result<Tensor> {
         let dims = x.dims().to_vec();
         let in_features = *dims.last().unwrap();
-        let m: usize = dims[..dims.len() - 1].iter().product();
-        debug_assert_eq!(
-            m, 1,
-            "GgufFastPath::forward_decode must only be called for M=1"
-        );
         debug_assert_eq!(in_features, self.in_features);
-        let x_2d = x.reshape((1, in_features))?.contiguous()?;
+        let m: usize = dims[..dims.len() - 1].iter().product();
+        let x_2d = x.reshape((m, in_features))?.contiguous()?;
         let y_2d = super::metal_ops::gguf_quant_matmul(
             &x_2d,
             &self.weight_bytes,
@@ -256,26 +249,6 @@ impl GgufFastPath {
             self.in_features,
             self.out_features,
             self.quant,
-        )?;
-        let mut new_dims = original_dims;
-        *new_dims.last_mut().unwrap() = self.out_features;
-        y_2d.reshape(new_dims)
-    }
-
-    // Small batched decode (2..=GGUF_BATCH_MAX): weights read once for all M tokens.
-    fn forward_batch_decode(&self, x: &Tensor) -> Result<Tensor> {
-        let original_dims = x.dims().to_vec();
-        let in_features = *original_dims.last().unwrap();
-        debug_assert_eq!(in_features, self.in_features);
-        let m: usize = original_dims[..original_dims.len() - 1].iter().product();
-        let x_2d = x.reshape((m, in_features))?.contiguous()?;
-        let y_2d = super::metal_ops::gguf_quant_batch_matmul(
-            &x_2d,
-            &self.weight_bytes,
-            self.in_features,
-            self.out_features,
-            self.quant,
-            m,
         )?;
         let mut new_dims = original_dims;
         *new_dims.last_mut().unwrap() = self.out_features;
@@ -330,10 +303,8 @@ impl QLinear {
             && x.dtype() == DType::BF16
         {
             let m: usize = original_dims[..original_dims.len() - 1].iter().product();
-            let out = if m == 1 {
+            let out = if (1..=super::metal_ops::GGUF_BATCH_MAX).contains(&m) {
                 fast.forward_decode(x)?
-            } else if (2..=super::metal_ops::GGUF_BATCH_MAX).contains(&m) {
-                fast.forward_batch_decode(x)?
             } else {
                 fast.forward_prefill(x)?
             };

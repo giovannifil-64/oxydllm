@@ -90,6 +90,13 @@ fn dirs_home() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from("."))
 }
 
+fn next_arg<'a>(args: &'a [String], i: &mut usize, flag: &str) -> Result<&'a str, String> {
+    *i += 1;
+    args.get(*i)
+        .map(|s| s.as_str())
+        .ok_or_else(|| format!("{flag} requires a value"))
+}
+
 fn parse_devices(s: &str) -> Result<Vec<usize>, String> {
     s.split(',')
         .map(|part| {
@@ -229,28 +236,18 @@ fn parse_estimate_args(args: &[String]) -> Result<EstimateArgs, String> {
     while i < args.len() {
         match args[i].as_str() {
             "--models-dir" => {
-                i += 1;
-                models_dir = Some(PathBuf::from(
-                    args.get(i).ok_or("--models-dir requires a value")?,
-                ));
+                models_dir = Some(PathBuf::from(next_arg(args, &mut i, "--models-dir")?));
             }
             "--token" => {
-                i += 1;
-                token = Some(args.get(i).ok_or("--token requires a value")?.clone());
+                token = Some(next_arg(args, &mut i, "--token")?.to_string());
             }
             "--context-len" => {
-                i += 1;
-                context_len = args
-                    .get(i)
-                    .ok_or("--context-len requires a value")?
+                context_len = next_arg(args, &mut i, "--context-len")?
                     .parse()
                     .map_err(|_| "Invalid context-len (expected integer)")?;
             }
             "--num-sequences" => {
-                i += 1;
-                num_sequences = args
-                    .get(i)
-                    .ok_or("--num-sequences requires a value")?
+                num_sequences = next_arg(args, &mut i, "--num-sequences")?
                     .parse()
                     .map_err(|_| "Invalid num-sequences (expected integer)")?;
             }
@@ -289,22 +286,16 @@ fn parse_pull_args(args: &[String]) -> Result<PullArgs, String> {
     while i < args.len() {
         match args[i].as_str() {
             "--models-dir" => {
-                i += 1;
-                models_dir = Some(PathBuf::from(
-                    args.get(i).ok_or("--models-dir requires a value")?,
-                ));
+                models_dir = Some(PathBuf::from(next_arg(args, &mut i, "--models-dir")?));
             }
             "--name" => {
-                i += 1;
-                name = Some(args.get(i).ok_or("--name requires a value")?.clone());
+                name = Some(next_arg(args, &mut i, "--name")?.to_string());
             }
             "--token" => {
-                i += 1;
-                token = Some(args.get(i).ok_or("--token requires a value")?.clone());
+                token = Some(next_arg(args, &mut i, "--token")?.to_string());
             }
             "--variant" => {
-                i += 1;
-                variant = Some(args.get(i).ok_or("--variant requires a value")?.clone());
+                variant = Some(next_arg(args, &mut i, "--variant")?.to_string());
             }
             "--force" => {
                 force = true;
@@ -346,10 +337,7 @@ fn parse_rm_args(args: &[String]) -> Result<RmArgs, String> {
     while i < args.len() {
         match args[i].as_str() {
             "--models-dir" => {
-                i += 1;
-                models_dir = Some(PathBuf::from(
-                    args.get(i).ok_or("--models-dir requires a value")?,
-                ));
+                models_dir = Some(PathBuf::from(next_arg(args, &mut i, "--models-dir")?));
             }
             "--force" | "-f" => {
                 force = true;
@@ -746,61 +734,38 @@ fn parse_start_args(args: &[String]) -> Result<StartArgs, String> {
     while i < args.len() {
         match args[i].as_str() {
             "--port" => {
-                i += 1;
-                port = args
-                    .get(i)
-                    .ok_or("--port requires a value")?
+                port = next_arg(args, &mut i, "--port")?
                     .parse()
                     .map_err(|_| "Invalid port number")?;
             }
             "--models-dir" => {
-                i += 1;
-                models_dir = Some(PathBuf::from(
-                    args.get(i).ok_or("--models-dir requires a value")?,
-                ));
+                models_dir = Some(PathBuf::from(next_arg(args, &mut i, "--models-dir")?));
             }
             "--keep-alive" => {
-                i += 1;
-                keep_alive_secs = args
-                    .get(i)
-                    .ok_or("--keep-alive requires a value")?
+                keep_alive_secs = next_arg(args, &mut i, "--keep-alive")?
                     .parse()
                     .map_err(|_| "Invalid keep-alive value")?;
             }
             "--memory-budget" => {
-                i += 1;
-                let mb: usize = args
-                    .get(i)
-                    .ok_or("--memory-budget requires a value")?
+                let mb: usize = next_arg(args, &mut i, "--memory-budget")?
                     .parse()
                     .map_err(|_| "Invalid memory-budget value (expected MB integer)")?;
                 memory_budget_mb = Some(mb);
             }
             "--devices" => {
-                i += 1;
-                devices_raw = Some(parse_devices(
-                    args.get(i).ok_or("--devices requires a value")?,
-                )?);
+                devices_raw = Some(parse_devices(next_arg(args, &mut i, "--devices")?)?);
             }
             "--max-context-len" => {
-                i += 1;
-                max_context_len = args
-                    .get(i)
-                    .ok_or("--max-context-len requires a value")?
+                max_context_len = next_arg(args, &mut i, "--max-context-len")?
                     .parse()
                     .map_err(|_| "Invalid max-context-len value (expected integer)")?;
             }
             "--kv-quant" => {
-                i += 1;
-                kv_quant = common::kv_quant::KvQuantMode::parse(
-                    args.get(i).ok_or("--kv-quant requires a value")?,
-                )?;
+                kv_quant =
+                    common::kv_quant::KvQuantMode::parse(next_arg(args, &mut i, "--kv-quant")?)?;
             }
             "--shutdown-timeout" => {
-                i += 1;
-                shutdown_timeout_secs = args
-                    .get(i)
-                    .ok_or("--shutdown-timeout requires a value")?
+                shutdown_timeout_secs = next_arg(args, &mut i, "--shutdown-timeout")?
                     .parse()
                     .map_err(|_| "Invalid shutdown-timeout value (expected integer seconds)")?;
             }
@@ -811,10 +776,7 @@ fn parse_start_args(args: &[String]) -> Result<StartArgs, String> {
                 require_gpu = false;
             }
             "--max-num-seqs" => {
-                i += 1;
-                let n: usize = args
-                    .get(i)
-                    .ok_or("--max-num-seqs requires a value")?
+                let n: usize = next_arg(args, &mut i, "--max-num-seqs")?
                     .parse()
                     .map_err(|_| "Invalid max-num-seqs value (expected positive integer)")?;
                 if n == 0 {
@@ -823,10 +785,7 @@ fn parse_start_args(args: &[String]) -> Result<StartArgs, String> {
                 max_num_seqs = Some(n);
             }
             "--max-queued-requests" => {
-                i += 1;
-                max_queued_requests = args
-                    .get(i)
-                    .ok_or("--max-queued-requests requires a value")?
+                max_queued_requests = next_arg(args, &mut i, "--max-queued-requests")?
                     .parse()
                     .map_err(|_| "Invalid max-queued-requests value (expected positive integer)")?;
                 if max_queued_requests == 0 {
@@ -834,26 +793,21 @@ fn parse_start_args(args: &[String]) -> Result<StartArgs, String> {
                 }
             }
             "--api-key" => {
-                i += 1;
-                let key = args.get(i).ok_or("--api-key requires a value")?.trim();
+                let key = next_arg(args, &mut i, "--api-key")?.trim();
                 if key.is_empty() {
                     return Err("--api-key must not be empty".to_string());
                 }
                 api_key = Some(key.to_string());
             }
             "--request-timeout" => {
-                i += 1;
-                request_timeout_secs = args
-                    .get(i)
-                    .ok_or("--request-timeout requires a value")?
+                request_timeout_secs = next_arg(args, &mut i, "--request-timeout")?
                     .parse()
                     .map_err(
                         |_| "Invalid request-timeout value (expected non-negative integer seconds)",
                     )?;
             }
             "--draft-model" => {
-                i += 1;
-                draft_model = Some(args.get(i).ok_or("--draft-model requires a value")?.clone());
+                draft_model = Some(next_arg(args, &mut i, "--draft-model")?.to_string());
             }
             other => return Err(format!("Unknown option: {}", other)),
         }
@@ -907,85 +861,57 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
     while i < args.len() {
         match args[i].as_str() {
             "--models-dir" => {
-                i += 1;
-                models_dir = Some(PathBuf::from(
-                    args.get(i).ok_or("--models-dir requires a value")?,
-                ));
+                models_dir = Some(PathBuf::from(next_arg(args, &mut i, "--models-dir")?));
             }
             "--devices" => {
-                i += 1;
-                let raw = args.get(i).ok_or("--devices requires a value")?;
+                let raw = next_arg(args, &mut i, "--devices")?;
                 let d = parse_devices(raw)?;
                 devices_raw = Some(d);
             }
             "--max-context-len" => {
-                i += 1;
-                max_context_len = args
-                    .get(i)
-                    .ok_or("--max-context-len requires a value")?
+                max_context_len = next_arg(args, &mut i, "--max-context-len")?
                     .parse()
                     .map_err(|_| "Invalid max-context-len value")?;
             }
             "--temperature" | "-t" => {
-                i += 1;
-                params.temperature = args
-                    .get(i)
-                    .ok_or("--temperature requires a value")?
+                params.temperature = next_arg(args, &mut i, "--temperature")?
                     .parse()
                     .map_err(|_| "Invalid temperature")?;
             }
             "--top-k" => {
-                i += 1;
-                params.top_k = args
-                    .get(i)
-                    .ok_or("--top-k requires a value")?
+                params.top_k = next_arg(args, &mut i, "--top-k")?
                     .parse()
                     .map_err(|_| "Invalid top-k")?;
             }
             "--top-p" => {
-                i += 1;
-                params.top_p = args
-                    .get(i)
-                    .ok_or("--top-p requires a value")?
+                params.top_p = next_arg(args, &mut i, "--top-p")?
                     .parse()
                     .map_err(|_| "Invalid top-p")?;
             }
             "--min-p" => {
-                i += 1;
-                params.min_p = args
-                    .get(i)
-                    .ok_or("--min-p requires a value")?
+                params.min_p = next_arg(args, &mut i, "--min-p")?
                     .parse()
                     .map_err(|_| "Invalid min-p")?;
             }
             "--repeat-penalty" => {
-                i += 1;
-                params.repetition_penalty = args
-                    .get(i)
-                    .ok_or("--repeat-penalty requires a value")?
+                params.repetition_penalty = next_arg(args, &mut i, "--repeat-penalty")?
                     .parse()
                     .map_err(|_| "Invalid repeat-penalty")?;
             }
             "--repeat-window" => {
-                i += 1;
-                params.repetition_window = args
-                    .get(i)
-                    .ok_or("--repeat-window requires a value")?
+                params.repetition_window = next_arg(args, &mut i, "--repeat-window")?
                     .parse()
                     .map_err(|_| "Invalid repeat-window")?;
             }
             "--kv-quant" => {
-                i += 1;
-                kv_quant = common::kv_quant::KvQuantMode::parse(
-                    args.get(i).ok_or("--kv-quant requires a value")?,
-                )?;
+                kv_quant =
+                    common::kv_quant::KvQuantMode::parse(next_arg(args, &mut i, "--kv-quant")?)?;
             }
             "--qjl-quantization" => {
                 qjl_quantization = true;
             }
             "--draft-model" => {
-                i += 1;
-                draft_name = Some(args.get(i).ok_or("--draft-model requires a value")?.clone());
+                draft_name = Some(next_arg(args, &mut i, "--draft-model")?.to_string());
             }
             "--allow-cpu" => {
                 require_gpu = false;

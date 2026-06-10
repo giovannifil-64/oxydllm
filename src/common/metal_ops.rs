@@ -3285,20 +3285,19 @@ impl GgufFastQuant {
         }
     }
 
-    // Batched-decode gemv (M activations share one weight read). None = no batch
-    // kernel yet → batched decode falls back to mul_mm. Added per quant as shipped.
-    fn batch_kernel(self) -> Option<&'static str> {
+    // Batched-decode gemv (M activations share one weight read).
+    fn batch_kernel(self) -> &'static str {
         match self {
-            Self::Q4_0 => Some("gguf_q4_0_gemv_batch_bf16"),
-            Self::Q4_1 => Some("gguf_q4_1_gemv_batch_bf16"),
-            Self::Q5_0 => Some("gguf_q5_0_gemv_batch_bf16"),
-            Self::Q5_1 => Some("gguf_q5_1_gemv_batch_bf16"),
-            Self::Q8_0 => Some("gguf_q8_0_gemv_batch_bf16"),
-            Self::Q2K => Some("gguf_q2k_gemv_batch_bf16"),
-            Self::Q3K => Some("gguf_q3k_gemv_batch_bf16"),
-            Self::Q4K => Some("gguf_q4k_gemv_batch_bf16"),
-            Self::Q5K => Some("gguf_q5k_gemv_batch_bf16"),
-            Self::Q6K => Some("gguf_q6k_gemv_batch_bf16"),
+            Self::Q4_0 => "gguf_q4_0_gemv_batch_bf16",
+            Self::Q4_1 => "gguf_q4_1_gemv_batch_bf16",
+            Self::Q5_0 => "gguf_q5_0_gemv_batch_bf16",
+            Self::Q5_1 => "gguf_q5_1_gemv_batch_bf16",
+            Self::Q8_0 => "gguf_q8_0_gemv_batch_bf16",
+            Self::Q2K => "gguf_q2k_gemv_batch_bf16",
+            Self::Q3K => "gguf_q3k_gemv_batch_bf16",
+            Self::Q4K => "gguf_q4k_gemv_batch_bf16",
+            Self::Q5K => "gguf_q5k_gemv_batch_bf16",
+            Self::Q6K => "gguf_q6k_gemv_batch_bf16",
         }
     }
 
@@ -3332,12 +3331,27 @@ impl GgufFastQuant {
     }
 }
 
+/// Max batch the batched-decode gemv kernels handle (register cap); above this,
+/// the mul_mm prefill kernel is already efficient. Must match GGUF_BATCH_MAX in
+/// quant_kernels.metal.
+pub const GGUF_BATCH_MAX: usize = 8;
+
+#[repr(C)]
+struct GgufBatchParams {
+    in_features: u32,
+    out_features: u32,
+    m_batch: u32,
+}
+
+// Decode matmul for 1 <= M <= GGUF_BATCH_MAX: M=1 runs the plain gemv kernel,
+// M>=2 the batched gemv (M activation vectors share one weight read).
 struct GgufQuantMatmul {
     x: Tensor,
     weight_bytes: Tensor,
     in_features: usize,
     out_features: usize,
     quant: GgufFastQuant,
+    m: usize,
 }
 
 impl InplaceOp1 for GgufQuantMatmul {
@@ -3380,6 +3394,13 @@ impl InplaceOp1 for GgufQuantMatmul {
                 block_elems,
             );
         }
+        if !(1..=GGUF_BATCH_MAX).contains(&self.m) {
+            candle_core::bail!(
+                "GgufQuantMatmul ({:?}): m {} out of [1, {GGUF_BATCH_MAX}]",
+                self.quant,
+                self.m
+            );
+        }
 
         let x_sl = self.x.storage_and_layout();
         let x_l = x_sl.1;
@@ -3387,25 +3408,26 @@ impl InplaceOp1 for GgufQuantMatmul {
             candle_core::bail!("GgufQuantMatmul ({:?}): x must be contiguous", self.quant);
         }
         let x_dims = x_l.dims();
-        if x_dims.len() != 2 || x_dims[0] != 1 || x_dims[1] != self.in_features {
+        if x_dims != [self.m, self.in_features] {
             candle_core::bail!(
-                "GgufQuantMatmul ({:?}): x shape {:?} != [1, {}]",
+                "GgufQuantMatmul ({:?}): x shape {:?} != [{}, {}]",
                 self.quant,
                 x_dims,
+                self.m,
                 self.in_features
             );
         }
-        if out_l.dims() != [1, self.out_features] {
+        if out_l.dims() != [self.m, self.out_features] {
             candle_core::bail!(
-                "GgufQuantMatmul ({:?}): output shape {:?} != [1, {}]",
+                "GgufQuantMatmul ({:?}): output shape {:?} != [{}, {}]",
                 self.quant,
                 out_l.dims(),
+                self.m,
                 self.out_features
             );
         }
         let expected_bytes = self.out_features * (self.in_features / block_elems) * block_bytes;
-        let w_dims = self.weight_bytes.dims();
-        let w_elems: usize = w_dims.iter().product();
+        let w_elems: usize = self.weight_bytes.dims().iter().product();
         if w_elems != expected_bytes {
             candle_core::bail!(
                 "GgufQuantMatmul ({:?}): weight_bytes has {} bytes, expected {} (out={} × blocks_per_row={} × {})",
@@ -3417,11 +3439,6 @@ impl InplaceOp1 for GgufQuantMatmul {
                 block_bytes,
             );
         }
-
-        let params = GgufParams {
-            in_features: self.in_features as u32,
-            out_features: self.out_features as u32,
-        };
 
         let device = out.device();
         let x_buf = match &*x_sl.0 {
@@ -3440,17 +3457,40 @@ impl InplaceOp1 for GgufQuantMatmul {
             ),
         };
 
-        let pipeline = get_or_compile_quant_pipeline(device.device(), self.quant.gemv_kernel())?;
+        let kernel = if self.m == 1 {
+            self.quant.gemv_kernel()
+        } else {
+            self.quant.batch_kernel()
+        };
+        let pipeline = get_or_compile_quant_pipeline(device.device(), kernel)?;
         let encoder = device.command_encoder()?;
         encoder.set_compute_pipeline_state(&pipeline);
         encoder.set_buffer(0, Some(x_buf), x_l.start_offset() * 2);
         encoder.set_buffer(1, Some(w_buf), w_sl.1.start_offset());
         encoder.set_buffer(2, Some(out.buffer()), out_l.start_offset() * 2);
-        encoder.set_bytes(3, &params);
+        if self.m == 1 {
+            encoder.set_bytes(
+                3,
+                &GgufParams {
+                    in_features: self.in_features as u32,
+                    out_features: self.out_features as u32,
+                },
+            );
+        } else {
+            encoder.set_bytes(
+                3,
+                &GgufBatchParams {
+                    in_features: self.in_features as u32,
+                    out_features: self.out_features as u32,
+                    m_batch: self.m as u32,
+                },
+            );
+        }
         encoder.use_resource(x_buf, MTLResourceUsage::Read);
         encoder.use_resource(w_buf, MTLResourceUsage::Read);
         encoder.use_resource(out.buffer(), MTLResourceUsage::Write);
 
+        // Batch kernels keep the gemv geometry (same threads/rows per TG).
         let (tg_threads, rows_per_tg) = self.quant.dispatch_geometry();
         encoder.dispatch_thread_groups(
             MTLSize {
@@ -3469,6 +3509,8 @@ impl InplaceOp1 for GgufQuantMatmul {
     }
 }
 
+/// Decode matmul for x of shape [m, in_features] with 1 <= m <= GGUF_BATCH_MAX;
+/// larger m belongs on gguf_quant_mul_mm.
 pub fn gguf_quant_matmul(
     x: &Tensor,
     weight_bytes: &Tensor,
@@ -3476,174 +3518,17 @@ pub fn gguf_quant_matmul(
     out_features: usize,
     quant: GgufFastQuant,
 ) -> Result<Tensor> {
-    let device = x.device();
-    let out = Tensor::zeros((1, out_features), DType::BF16, device)?;
+    let m = x.dim(0)?;
+    let out = Tensor::zeros((m, out_features), DType::BF16, x.device())?;
     out.inplace_op1(&GgufQuantMatmul {
         x: x.clone(),
         weight_bytes: weight_bytes.clone(),
         in_features,
         out_features,
         quant,
+        m,
     })?;
     Ok(out)
-}
-
-/// Max batch the Q4_K batched-decode gemv handles (register cap); above this,
-/// the mul_mm prefill kernel is already efficient. Must match GGUF_BATCH_MAX in
-/// quant_kernels.metal.
-pub const GGUF_BATCH_MAX: usize = 8;
-
-#[repr(C)]
-struct GgufBatchParams {
-    in_features: u32,
-    out_features: u32,
-    m_batch: u32,
-}
-
-// Batched decode (2 <= M <= GGUF_BATCH_MAX): M activation vectors share one
-// weight read; above the cap, mul_mm is already efficient for the shape.
-struct GgufBatchMatmul {
-    x: Tensor,
-    weight_bytes: Tensor,
-    in_features: usize,
-    out_features: usize,
-    quant: GgufFastQuant,
-    m: usize,
-}
-
-impl InplaceOp1 for GgufBatchMatmul {
-    fn name(&self) -> &'static str {
-        "gguf-batch-matmul"
-    }
-
-    fn cpu_fwd(&self, _s: &mut CpuStorage, _l: &Layout) -> Result<()> {
-        candle_core::bail!("GgufBatchMatmul: Metal-only path")
-    }
-
-    fn metal_fwd(&self, out: &mut MetalStorage, out_l: &Layout) -> Result<()> {
-        let (block_elems, _) = self.quant.block_layout();
-        let kernel = self.quant.batch_kernel().ok_or_else(|| {
-            candle_core::Error::Msg(format!(
-                "GgufBatchMatmul: no batch kernel for {:?}",
-                self.quant
-            ))
-        })?;
-        if out.dtype() != DType::BF16 {
-            candle_core::bail!("GgufBatchMatmul: out must be BF16, got {:?}", out.dtype());
-        }
-        if self.x.dtype() != DType::BF16 {
-            candle_core::bail!("GgufBatchMatmul: x must be BF16, got {:?}", self.x.dtype());
-        }
-        if self.weight_bytes.dtype() != DType::U8 {
-            candle_core::bail!(
-                "GgufBatchMatmul: weight_bytes must be U8, got {:?}",
-                self.weight_bytes.dtype()
-            );
-        }
-        if !self.in_features.is_multiple_of(block_elems) {
-            candle_core::bail!(
-                "GgufBatchMatmul: in_features {} must be a multiple of {}",
-                self.in_features,
-                block_elems
-            );
-        }
-        if !(2..=GGUF_BATCH_MAX).contains(&self.m) {
-            candle_core::bail!("GgufBatchMatmul: m {} out of [2, {GGUF_BATCH_MAX}]", self.m);
-        }
-
-        let x_sl = self.x.storage_and_layout();
-        let x_l = x_sl.1;
-        if !x_l.is_contiguous() {
-            candle_core::bail!("GgufBatchMatmul: x must be contiguous");
-        }
-        let x_dims = x_l.dims();
-        if x_dims != [self.m, self.in_features] {
-            candle_core::bail!(
-                "GgufBatchMatmul: x shape {:?} != [{}, {}]",
-                x_dims,
-                self.m,
-                self.in_features
-            );
-        }
-        if out_l.dims() != [self.m, self.out_features] {
-            candle_core::bail!(
-                "GgufBatchMatmul: output shape {:?} != [{}, {}]",
-                out_l.dims(),
-                self.m,
-                self.out_features
-            );
-        }
-
-        let params = GgufBatchParams {
-            in_features: self.in_features as u32,
-            out_features: self.out_features as u32,
-            m_batch: self.m as u32,
-        };
-
-        let device = out.device();
-        let x_buf = match &*x_sl.0 {
-            candle_core::Storage::Metal(ms) => ms.buffer(),
-            _ => candle_core::bail!("GgufBatchMatmul: x must be Metal-resident"),
-        };
-        let w_sl = self.weight_bytes.storage_and_layout();
-        let w_buf = match &*w_sl.0 {
-            candle_core::Storage::Metal(ms) => ms.buffer(),
-            _ => candle_core::bail!("GgufBatchMatmul: weight_bytes must be Metal-resident"),
-        };
-
-        let pipeline = get_or_compile_quant_pipeline(device.device(), kernel)?;
-        let encoder = device.command_encoder()?;
-        encoder.set_compute_pipeline_state(&pipeline);
-        encoder.set_buffer(0, Some(x_buf), x_l.start_offset() * 2);
-        encoder.set_buffer(1, Some(w_buf), w_sl.1.start_offset());
-        encoder.set_buffer(2, Some(out.buffer()), out_l.start_offset() * 2);
-        encoder.set_bytes(3, &params);
-        encoder.use_resource(x_buf, MTLResourceUsage::Read);
-        encoder.use_resource(w_buf, MTLResourceUsage::Read);
-        encoder.use_resource(out.buffer(), MTLResourceUsage::Write);
-
-        // Batch kernels keep their gemv geometry (same threads/rows per TG).
-        let (tg_threads, rows_per_tg) = self.quant.dispatch_geometry();
-        encoder.dispatch_thread_groups(
-            MTLSize {
-                width: self.out_features.div_ceil(rows_per_tg),
-                height: 1,
-                depth: 1,
-            },
-            MTLSize {
-                width: tg_threads,
-                height: 1,
-                depth: 1,
-            },
-        );
-
-        Ok(())
-    }
-}
-
-/// Batched decode matmul (2 <= M <= GGUF_BATCH_MAX). Q4_K uses the dedicated
-/// batched gemv (weights read once); other quants fall back to mul_mm.
-pub fn gguf_quant_batch_matmul(
-    x: &Tensor,
-    weight_bytes: &Tensor,
-    in_features: usize,
-    out_features: usize,
-    quant: GgufFastQuant,
-    m: usize,
-) -> Result<Tensor> {
-    if quant.batch_kernel().is_some() && (2..=GGUF_BATCH_MAX).contains(&m) {
-        let out = Tensor::zeros((m, out_features), DType::BF16, x.device())?;
-        out.inplace_op1(&GgufBatchMatmul {
-            x: x.clone(),
-            weight_bytes: weight_bytes.clone(),
-            in_features,
-            out_features,
-            quant,
-            m,
-        })?;
-        return Ok(out);
-    }
-    gguf_quant_mul_mm(x, weight_bytes, in_features, out_features, quant)
 }
 
 const GGUF_MM_BM: usize = 16;
@@ -3665,18 +3550,7 @@ struct GgufQuantMulMM {
 
 impl CustomOp1 for GgufQuantMulMM {
     fn name(&self) -> &'static str {
-        match self.quant {
-            GgufFastQuant::Q4_0 => "gguf-q4_0-mul-mm",
-            GgufFastQuant::Q4_1 => "gguf-q4_1-mul-mm",
-            GgufFastQuant::Q5_0 => "gguf-q5_0-mul-mm",
-            GgufFastQuant::Q5_1 => "gguf-q5_1-mul-mm",
-            GgufFastQuant::Q8_0 => "gguf-q8_0-mul-mm",
-            GgufFastQuant::Q2K => "gguf-q2k-mul-mm",
-            GgufFastQuant::Q3K => "gguf-q3k-mul-mm",
-            GgufFastQuant::Q4K => "gguf-q4k-mul-mm",
-            GgufFastQuant::Q5K => "gguf-q5k-mul-mm",
-            GgufFastQuant::Q6K => "gguf-q6k-mul-mm",
-        }
+        self.quant.op_name()
     }
 
     fn cpu_fwd(&self, _s: &CpuStorage, _l: &Layout) -> Result<(CpuStorage, Shape)> {
@@ -3845,7 +3719,7 @@ mod decode_batch_scaling_tests {
                         .unwrap()
                         .to_dtype(DType::BF16)
                         .unwrap();
-                    let y_kernel = gguf_quant_batch_matmul(&x, &wb, k, n, fast, m).unwrap();
+                    let y_kernel = gguf_quant_matmul(&x, &wb, k, n, fast).unwrap();
                     let x_cpu = Tensor::from_vec(x_data, (m, k), &Device::Cpu).unwrap();
                     let y_ref = x_cpu.matmul(&w_ref_t).unwrap();
 
@@ -3927,9 +3801,7 @@ mod decode_batch_scaling_tests {
             );
             for m in [2usize, 4, 8] {
                 let x = Tensor::zeros((m, k), DType::BF16, &dev).unwrap();
-                let batch = timeit(&x, &|x| {
-                    gguf_quant_batch_matmul(x, &wb, k, n, fast, m).unwrap()
-                });
+                let batch = timeit(&x, &|x| gguf_quant_matmul(x, &wb, k, n, fast).unwrap());
                 let mm = timeit(&x, &|x| gguf_quant_mul_mm(x, &wb, k, n, fast).unwrap());
                 println!(
                     "  M={m}: batch {batch:6.1}us ({:5.1}/tok)  mul_mm {mm:6.1}us ({:5.1}/tok)  speedup {:.2}x",

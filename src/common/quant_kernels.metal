@@ -905,9 +905,7 @@ kernel void gguf_q8_0_gemv_bf16(
     }
 }
 
-// Batched Q8_0 decode GEMV (2 simdgroups x GGUF_N_DST rows per TG). Same as
-// gguf_q8_0_gemv_bf16 with an inner M-loop; weight (qs,d) per (row, super-block),
-// dotted with M activation vectors.
+// Batched Q8_0 decode GEMV (2 simdgroups x GGUF_N_DST rows per TG).
 kernel void gguf_q8_0_gemv_batch_bf16(
     device const bfloat        *x        [[buffer(0)]],   // [M, K]
     device const void          *weight   [[buffer(1)]],
@@ -1307,9 +1305,7 @@ kernel void gguf_q5k_gemv_bf16(
     }
 }
 
-// Batched Q5_K decode GEMV (2 simdgroups x 2 rows per TG). Same as gguf_q5k_gemv_bf16
-// with an inner M-loop; weight (q1/q2/qh/sc/d) per (row, super-block), dotted with M
-// activation vectors. Weight pointers advance by `step` per row as in the gemv.
+// Batched Q5_K decode GEMV (2 simdgroups x 2 rows per TG, step-advance per row).
 kernel void gguf_q5k_gemv_batch_bf16(
     device const bfloat        *x        [[buffer(0)]],   // [M, K]
     device const void          *weight   [[buffer(1)]],
@@ -1505,9 +1501,7 @@ kernel void gguf_q6k_gemv_bf16(
     }
 }
 
-// Batched Q6_K decode GEMV (2 simdgroups x 1 row per TG). Same as gguf_q6k_gemv_bf16
-// with an inner M-loop: weight (q1/q2/qh/sc/dall) loaded per super-block, dotted
-// with M activation vectors (weights L2-amortized across M).
+// Batched Q6_K decode GEMV (2 simdgroups x 1 row per TG).
 kernel void gguf_q6k_gemv_batch_bf16(
     device const bfloat        *x        [[buffer(0)]],   // [M, K]
     device const void          *weight   [[buffer(1)]],
@@ -1686,8 +1680,6 @@ kernel void gguf_q2k_gemv_bf16(
 }
 
 // Batched Q2_K decode GEMV (2 simdgroups x GGUF_N_DST rows per TG, step-advance).
-// Same as gguf_q2k_gemv_bf16 with an inner M-loop; weight (qs/sc/d) per (row,
-// super-block), dotted with M activation vectors.
 kernel void gguf_q2k_gemv_batch_bf16(
     device const bfloat        *x        [[buffer(0)]],   // [M, K]
     device const void          *weight   [[buffer(1)]],

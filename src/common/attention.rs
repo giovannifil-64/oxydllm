@@ -721,36 +721,16 @@ impl Attention {
             #[cfg(not(feature = "metal"))]
             let use_seg_sdpa = false;
 
+            // Tensor::contiguous() short-circuits to a cheap clone when the
+            // tensor is already contiguous, so no borrow-or-own dance is needed.
             if use_metal_fa {
                 #[cfg(feature = "metal")]
                 {
-                    let q_c_owned;
-                    let q_c = if q_seg.is_contiguous() {
-                        &q_seg
-                    } else {
-                        q_c_owned = q_seg.contiguous()?;
-                        &q_c_owned
-                    };
-                    let k_c_owned;
-                    let k_c = if k_seg.is_contiguous() {
-                        &k_seg
-                    } else {
-                        k_c_owned = k_seg.contiguous()?;
-                        &k_c_owned
-                    };
-                    let v_c_owned;
-                    let v_c = if v_seg.is_contiguous() {
-                        &v_seg
-                    } else {
-                        v_c_owned = v_seg.contiguous()?;
-                        &v_c_owned
-                    };
-
                     let prefix_len = kv_len - seg.num_tokens;
                     let seg_out = super::metal_ops::flash_attention_metal_prefill(
-                        q_c,
-                        k_c,
-                        v_c,
+                        &q_seg.contiguous()?,
+                        &k_seg.contiguous()?,
+                        &v_seg.contiguous()?,
                         self.scale as f32,
                         self.attn_softcap.map(|s| s as f32),
                         prefix_len,
@@ -761,32 +741,10 @@ impl Attention {
                 #[cfg(feature = "metal")]
                 {
                     // SDPA handles GQA natively.
-                    let q_c_owned;
-                    let q_c = if q_seg.is_contiguous() {
-                        &q_seg
-                    } else {
-                        q_c_owned = q_seg.contiguous()?;
-                        &q_c_owned
-                    };
-                    let k_c_owned;
-                    let k_c = if k_seg.is_contiguous() {
-                        &k_seg
-                    } else {
-                        k_c_owned = k_seg.contiguous()?;
-                        &k_c_owned
-                    };
-                    let v_c_owned;
-                    let v_c = if v_seg.is_contiguous() {
-                        &v_seg
-                    } else {
-                        v_c_owned = v_seg.contiguous()?;
-                        &v_c_owned
-                    };
-
                     let seg_out = super::metal_ops::sdpa(
-                        q_c,
-                        k_c,
-                        v_c,
+                        &q_seg.contiguous()?,
+                        &k_seg.contiguous()?,
+                        &v_seg.contiguous()?,
                         None,
                         seg.num_tokens > 1,
                         self.scale as f32,

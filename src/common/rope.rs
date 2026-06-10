@@ -168,21 +168,9 @@ impl RotaryEmbedding {
 
         #[cfg(feature = "metal")]
         if x.device().is_metal() {
-            let x_c = if x.is_contiguous() {
-                x.clone()
-            } else {
-                x.contiguous()?
-            };
-            let cos_c = if cos.is_contiguous() {
-                cos.clone()
-            } else {
-                cos.contiguous()?
-            };
-            let sin_c = if sin.is_contiguous() {
-                sin.clone()
-            } else {
-                sin.contiguous()?
-            };
+            let x_c = x.contiguous()?;
+            let cos_c = cos.contiguous()?;
+            let sin_c = sin.contiguous()?;
             return super::metal_ops::rope_fused(&x_c, &cos_c, &sin_c);
         }
 
@@ -229,21 +217,9 @@ impl RotaryEmbedding {
             let sin = self.sin.index_select(position_ids, 0)?;
 
             let qk = Tensor::cat(&[q, k], 1)?;
-            let qk_c = if qk.is_contiguous() {
-                qk
-            } else {
-                qk.contiguous()?
-            };
-            let cos_c = if cos.is_contiguous() {
-                cos
-            } else {
-                cos.contiguous()?
-            };
-            let sin_c = if sin.is_contiguous() {
-                sin
-            } else {
-                sin.contiguous()?
-            };
+            let qk_c = qk.contiguous()?;
+            let cos_c = cos.contiguous()?;
+            let sin_c = sin.contiguous()?;
 
             let rotated = super::metal_ops::rope_fused(&qk_c, &cos_c, &sin_c)?;
             let q_rot = rotated.narrow(1, 0, qh)?;

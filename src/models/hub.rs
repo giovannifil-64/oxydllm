@@ -217,6 +217,35 @@ fn is_incomplete_download(dir: &Path) -> bool {
         return true;
     }
 
+    // Sharded safetensors: every shard listed in the index must exist and the
+    // on-disk bytes must cover the index's total_size — a bare existence check
+    // would accept a shard truncated by an interrupted download.
+    let st_index = dir.join("model.safetensors.index.json");
+    if st_index.exists() {
+        let Ok(raw) = std::fs::read_to_string(&st_index) else {
+            return true;
+        };
+        let Ok(json) = serde_json::from_str::<serde_json::Value>(&raw) else {
+            return true;
+        };
+        let Some(map) = json["weight_map"].as_object() else {
+            return true;
+        };
+        let shards: std::collections::HashSet<&str> =
+            map.values().filter_map(|v| v.as_str()).collect();
+        let mut disk_bytes: u64 = 0;
+        for shard in &shards {
+            match dir.join(shard).metadata() {
+                Ok(m) => disk_bytes += m.len(),
+                Err(_) => return true,
+            }
+        }
+        if let Some(total) = json["metadata"]["total_size"].as_u64() {
+            return disk_bytes < total;
+        }
+        return false;
+    }
+
     if dir.join("config.json").exists() {
         let has_weights = std::fs::read_dir(dir)
             .into_iter()
@@ -364,13 +393,20 @@ pub fn pull(config: &PullConfig) -> anyhow::Result<()> {
     }
 
     if download_safetensors && dest.exists() {
-        if config.force || is_incomplete_download(&dest) {
-            if !config.force {
-                println!("Resuming interrupted download — removing partial files...");
-            } else {
-                println!("Removing existing model at {}...", dest.display());
-            }
+        if config.force {
+            println!("Removing existing model at {}...", dest.display());
             std::fs::remove_dir_all(&dest)?;
+        } else if is_incomplete_download(&dest) {
+            // Resume at file granularity: drop only files whose size doesn't
+            // match the upstream listing; complete files are skipped by the
+            // to_download filter below.
+            println!("Resuming interrupted download...");
+            for (name, size) in &metadata_files {
+                let p = dest.join(name);
+                if *size > 0 && p.exists() && p.metadata().map(|m| m.len()).unwrap_or(0) != *size {
+                    let _ = std::fs::remove_file(&p);
+                }
+            }
         } else {
             anyhow::bail!(
                 "A model named '{}' already exists at {}.\n\
@@ -399,8 +435,8 @@ pub fn pull(config: &PullConfig) -> anyhow::Result<()> {
 
     std::fs::create_dir_all(&dest)?;
 
-    let mut download_ok = true;
     let mut downloaded_files: Vec<String> = Vec::new();
+    let mut failed_file: Option<String> = None;
     for filename in &to_download {
         match download_file(
             &client,
@@ -412,25 +448,21 @@ pub fn pull(config: &PullConfig) -> anyhow::Result<()> {
             Ok(()) => downloaded_files.push(filename.clone()),
             Err(e) => {
                 tracing::error!(filename = %filename, error = %e, "error downloading model file");
-                download_ok = false;
+                failed_file = Some(filename.clone());
                 break;
             }
         }
     }
 
-    if !download_ok {
-        tracing::warn!("cleaning up partial download");
-        for f in &downloaded_files {
-            let _ = std::fs::remove_file(dest.join(f));
-        }
-        if dest
-            .read_dir()
-            .map(|mut d| d.next().is_none())
-            .unwrap_or(true)
-        {
-            let _ = std::fs::remove_dir(&dest);
-        }
-        anyhow::bail!("Download incomplete.");
+    if let Some(failed) = failed_file {
+        // Keep completed files so a retry resumes from them; drop only the
+        // truncated in-flight file.
+        let _ = std::fs::remove_file(dest.join(&failed));
+        anyhow::bail!(
+            "Download incomplete ({} of {} files done). Re-run the same pull to resume.",
+            downloaded_files.len(),
+            to_download.len()
+        );
     }
 
     let new_shards: Vec<&str> = gguf_to_download
@@ -792,6 +824,47 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("config.json"), "{}").unwrap();
         std::fs::write(tmp.path().join("model.safetensors"), b"weights").unwrap();
+        assert!(!is_incomplete_download(tmp.path()));
+    }
+
+    // Contract: a sharded safetensors dir is incomplete when a shard is missing
+    // OR truncated (on-disk bytes < index total_size); complete otherwise.
+    #[test]
+    fn sharded_safetensors_truncated_shard_is_incomplete() {
+        let tmp = tempfile::tempdir().unwrap();
+        let index = serde_json::json!({
+            "metadata": { "total_size": 16 },
+            "weight_map": { "a": "model-00000-of-00002.safetensors",
+                            "b": "model-00001-of-00002.safetensors" }
+        });
+        std::fs::write(
+            tmp.path().join("model.safetensors.index.json"),
+            index.to_string(),
+        )
+        .unwrap();
+
+        // Missing second shard.
+        std::fs::write(
+            tmp.path().join("model-00000-of-00002.safetensors"),
+            [0u8; 8],
+        )
+        .unwrap();
+        assert!(is_incomplete_download(tmp.path()));
+
+        // Both present but truncated (8 + 4 < 16).
+        std::fs::write(
+            tmp.path().join("model-00001-of-00002.safetensors"),
+            [0u8; 4],
+        )
+        .unwrap();
+        assert!(is_incomplete_download(tmp.path()));
+
+        // Both present, full size.
+        std::fs::write(
+            tmp.path().join("model-00001-of-00002.safetensors"),
+            [0u8; 8],
+        )
+        .unwrap();
         assert!(!is_incomplete_download(tmp.path()));
     }
 }

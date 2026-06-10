@@ -36,19 +36,20 @@ A rust-based inference engine for Large Language Models.
 
 ## Features
 - OpenAI-compatible chat completions endpoint (`/v1/chat/completions`)
-- Function calling / tool use (function tools) — `tools`, `tool_choice` (`auto`, `required`, `none`, forced function, and `allowed_tools`), and `parallel_tool_calls`; assistant tool calls are returned as proper `tool_calls` with `finish_reason: "tool_calls"`, and streaming emits incremental tool-call deltas
-- Structured output — `response_format` with `json_object` and `json_schema`; request-time schema validation includes strict-mode requirements plus recursive `$ref` / `$defs`, `anyOf`, enums, nested objects/arrays, and nullable unions
+- Function calling / tool use (function tools): `tools`, `tool_choice` (`auto`, `required`, `none`, forced function, and `allowed_tools`), and `parallel_tool_calls`; assistant tool calls are returned as proper `tool_calls` with `finish_reason: "tool_calls"`, and streaming emits incremental tool-call deltas
+- Structured output: `response_format` with `json_object` and `json_schema`; request-time schema validation includes strict-mode requirements plus recursive `$ref` / `$defs`, `anyOf`, enums, nested objects/arrays, and nullable unions
 - Metal acceleration on Apple Silicon with fused attention, RMSNorm, RoPE, and Softmax kernels
 - Paged KV cache with prefix caching for reduced redundant computation
 - Batched scheduler, where all active sequences share each GPU forward pass so throughput scales with concurrent users rather than collapsing to serial execution. At startup the scheduler computes `max_num_seqs` automatically as `total_kv_blocks / ceil(context_len / block_size)`, capped to 256; the value is logged and can be overridden with `--max-num-seqs`. Incoming requests are held in a bounded `tokio::sync::mpsc` channel of capacity `--max-queued-requests` (default 200); once full, new arrivals receive HTTP 429 immediately, bounding memory consumption under sustained load.
 - KV cache quantization (Lossless/Balanced/Aggressive) to reduce memory footprint by 2-4x
 - Multi-model server: load several models simultaneously with LRU eviction and configurable memory budgets
-- Thinking/reasoning model support with separated `reasoning_content` field
-- GGUF quantized model support — bf16 Metal fast path for ten quant types (`Q4_0`, `Q4_1`, `Q5_0`, `Q5_1`, `Q8_0`, `Q2_K`, `Q3_K`, `Q4_K`, `Q5_K`, `Q6_K`); zero-copy mmap loader (Qwen3-4B-Q4_K_M loads in ~2.7 s); fused `mul_mm` for prefill so weights are never held twice. Sharded GGUF loading supported.
-- AWQ 4-bit and 8-bit quantization — fused W4A16 / W8A16 GEMV kernels keep packed weights resident on Metal (Qwen3-4B-AWQ goes from ~7.5 GB to ~2.5 GB resident); QKV and gate+up are fused at load; auto-detected per checkpoint with no flag.
-- GPTQ 4-bit and 8-bit quantization — `desc_act=false` checkpoints route through a dedicated Metal resident kernel family (Qwen3-0.6B-GPTQ-Int8 ~89 tok/s decode); CPU / non-bf16 paths still dequantize at load.
-- FP8 (E4M3) block-wise weight loading — `Qwen3-4B-Instruct-2507-FP8` and similar checkpoints; the load-time `weight × scale_inv` multiply is performed in F32 to preserve precision across deep block-wise rescaling.
-- Mixture-of-Experts — `Qwen3MoeForCausalLM` and `OlmoeForCausalLM` with top-k routing and a hybrid sparse/naive dispatch (decode-friendly + prefill-friendly). Tested on `allenai/OLMoE-1B-7B-0924-Instruct`.
+- Thinking/reasoning model support with separated `reasoning_content` field: both `<think>`-style models (Qwen3, toggled with `enable_thinking`) and harmony channel models (gpt-oss, scaled with `reasoning_effort: low|medium|high`; reasoning cannot be disabled on that architecture)
+- GGUF quantized model support: bf16 Metal fast path for ten quant types (`Q4_0`, `Q4_1`, `Q5_0`, `Q5_1`, `Q8_0`, `Q2_K`, `Q3_K`, `Q4_K`, `Q5_K`, `Q6_K`); zero-copy mmap loader (Qwen3-4B-Q4_K_M loads in ~2.7 s); fused `mul_mm` for prefill so weights are never held twice. Sharded GGUF loading supported.
+- AWQ 4-bit and 8-bit quantization: fused W4A16 / W8A16 GEMV kernels keep packed weights resident on Metal (Qwen3-4B-AWQ goes from ~7.5 GB to ~2.5 GB resident); QKV and gate+up are fused at load; auto-detected per checkpoint with no flag.
+- GPTQ 4-bit and 8-bit quantization: `desc_act=false` checkpoints route through a dedicated Metal resident kernel family (Qwen3-0.6B-GPTQ-Int8 ~89 tok/s decode); CPU / non-bf16 paths still dequantize at load.
+- FP8 (E4M3) block-wise weight loading: `Qwen3-4B-Instruct-2507-FP8` and similar checkpoints; the load-time `weight × scale_inv` multiply is performed in F32 to preserve precision across deep block-wise rescaling.
+- MXFP4 (OCP microscaling FP4): GPT-OSS expert weights stay packed on Metal with fused dequant GEMV/GEMM kernels; `openai/gpt-oss-20b` (20.9B params) runs in ~13 GB resident on a 24 GB machine.
+- Mixture-of-Experts: `Qwen3MoeForCausalLM`, `OlmoeForCausalLM`, and `GptOssForCausalLM` (interleaved clamped-swiglu experts, attention sinks via a dedicated fused decode kernel, alternating sliding/full attention layers) with top-k routing and a hybrid sparse/naive dispatch (decode-friendly + prefill-friendly). Tested on `allenai/OLMoE-1B-7B-0924-Instruct` and `openai/gpt-oss-20b`.
 - Streaming responses via Server-Sent Events
 - Model download directly from HuggingFace with interactive variant selection
 
@@ -60,7 +61,7 @@ KV cache quantization uses TurboQuant with MSE-based quantization during the dec
 > Note on `--kv-quant`: the quantization step currently runs on CPU, each KV write transfers the new K/V tensors from GPU to CPU and casts them to F32 before packing. On unified-memory Apple Silicon the transfer is cheap, but on discrete CUDA GPUs the per-step roundtrip can dominate. Enable `--kv-quant` for memory-constrained deployments; leave it `off` when throughput matters and KV memory is not the bottleneck. On-device kernels are on the roadmap.
 
 ## Tested Models
-The following 25 checkpoints are all currently in the local registry and pass the deterministic coherence check in `scripts/stress_baseline.py` on the Apple Silicon reference machine (M5, 24 GB unified memory). Decode `tok/s` is the steady-state median over five 150-token runs after one warm-up.
+The following 26 checkpoints are all currently in the local registry and pass the deterministic coherence check in `scripts/stress_baseline.py` on the Apple Silicon reference machine (M5, 24 GB unified memory). Decode `tok/s` is the steady-state median over five 150-token runs after one warm-up.
 
 | Model | Architecture | Format | Decode tok/s |
 |---|---|---|---|
@@ -89,16 +90,17 @@ The following 25 checkpoints are all currently in the local registry and pass th
 | `google/gemma-4-E2B-it` | Gemma4ForConditionalGeneration | BF16 safetensors | 15.4 |
 | `mistralai/Ministral-3-3B-Instruct-25` | Mistral3ForConditionalGeneration | BF16 safetensors | 12.1 |
 | `allenai/OLMoE-1B-7B-0924-Instruct` | OlmoeForCausalLM (MoE) | BF16 safetensors, 64 experts × top-k 8 | 13.6 |
+| `openai/gpt-oss-20b` | GptOssForCausalLM (MoE) | MXFP4 experts + BF16, 32 experts × top-k 4 | 14.3 |
 
 > [!NOTE]
 > All Qwen3 models have been tested with and without thinking enabled. Other checkpoints in the same architecture families (e.g. other Llama 3.2, Gemma 3, Qwen2.5 sizes) are likely to work but are not in the regression suite.
 
 ## Unsupported Model Families
 The following model families are not currently supported:
-- Mixtral (`MixtralForCausalLM`) — uses `block_sparse_moe.experts.{e}.{w1,w2,w3}` tensor naming, not yet routed in the loader (the MoE infrastructure itself is in place via `Qwen3MoeForCausalLM` and `OlmoeForCausalLM`).
-- DeepSeek-V2/V3 — Mixture-of-Experts plus Multi-head Latent Attention (MLA); MLA is not implemented yet.
+- Mixtral (`MixtralForCausalLM`): uses `block_sparse_moe.experts.{e}.{w1,w2,w3}` tensor naming, not yet routed in the loader (the MoE infrastructure itself is in place via `Qwen3MoeForCausalLM` and `OlmoeForCausalLM`).
+- DeepSeek-V2/V3: Mixture-of-Experts plus Multi-head Latent Attention (MLA); MLA is not implemented yet.
 - Hybrid linear-attention models (Qwen3.5)
-- GGUF MoE checkpoints — quant-per-expert tensor layout not yet wired; safetensors MoE works.
+- GGUF MoE checkpoints: quant-per-expert tensor layout not yet wired; safetensors MoE works.
 - Multimodal inference (vision+language) is not supported yet; text-only paths from some multimodal checkpoints may work.
 - Encoder-only models (BERT, etc.)
 
@@ -135,7 +137,7 @@ Replace `<value>` with the compute capability of your GPU:
 | 8.9 | NVIDIA L4<br>NVIDIA L40<br>NVIDIA L40S | NVIDIA RTX 6000/5000/4500/4000/2000 Ada<br>GeForce RTX 4090, 4080, 4070 Ti, 4070, 4060 Ti, 4060, 4050 | |
 
 > [!NOTE]
-> `CUDA_COMPUTE_CAP` is validated at compile time — passing an unsupported value is a build error. If not set, Candle attempts auto-detection via `nvidia-smi`.
+> `CUDA_COMPUTE_CAP` is validated at compile time: passing an unsupported value is a build error. If not set, Candle attempts auto-detection via `nvidia-smi`.
 
 Run the server
 
@@ -176,18 +178,18 @@ If you prefer to manually download the installer, you can find the latest releas
 #### Linux (CUDA)
 
 ##### x86_64
-- `oxydllm-linux-x86_64-cuda-ada.tar.gz` for Ada Lovelace (sm_89 — RTX 40xx, L4, L40/L40S)
-- `oxydllm-linux-x86_64-cuda-hopper.tar.gz` for Hopper (sm_90 — H100, H200)
-- `oxydllm-linux-x86_64-cuda-blackwell.tar.gz` for Blackwell datacenter (sm_100 — B100, B200, GB200)
-- `oxydllm-linux-x86_64-cuda-blackwell-ultra.tar.gz` for Blackwell Ultra (sm_103 — B300, GB300)
-- `oxydllm-linux-x86_64-cuda-blackwell-desktop.tar.gz` for Blackwell Desktop (sm_120 — RTX 50xx, RTX PRO)
+- `oxydllm-linux-x86_64-cuda-ada.tar.gz` for Ada Lovelace (sm_89: RTX 40xx, L4, L40/L40S)
+- `oxydllm-linux-x86_64-cuda-hopper.tar.gz` for Hopper (sm_90: H100, H200)
+- `oxydllm-linux-x86_64-cuda-blackwell.tar.gz` for Blackwell datacenter (sm_100: B100, B200, GB200)
+- `oxydllm-linux-x86_64-cuda-blackwell-ultra.tar.gz` for Blackwell Ultra (sm_103: B300, GB300)
+- `oxydllm-linux-x86_64-cuda-blackwell-desktop.tar.gz` for Blackwell Desktop (sm_120: RTX 50xx, RTX PRO)
 
 ##### arm64 (GH200 / GB300 / Jetson / DGX Spark)
-- `oxydllm-linux-arm64-cuda-hopper.tar.gz` for Hopper (sm_90 — GH200)
-- `oxydllm-linux-arm64-cuda-blackwell.tar.gz` for Blackwell datacenter (sm_100 — B200, GB200)
-- `oxydllm-linux-arm64-cuda-blackwell-ultra.tar.gz` for Blackwell Ultra (sm_103 — GB300)
-- `oxydllm-linux-arm64-cuda-thor.tar.gz` for Jetson GB (sm_110 — T4000, T5000)
-- `oxydllm-linux-arm64-cuda-blackwell-desktop.tar.gz` for Blackwell Desktop (sm_121 — DGX Spark / GB10)
+- `oxydllm-linux-arm64-cuda-hopper.tar.gz` for Hopper (sm_90: GH200)
+- `oxydllm-linux-arm64-cuda-blackwell.tar.gz` for Blackwell datacenter (sm_100: B200, GB200)
+- `oxydllm-linux-arm64-cuda-blackwell-ultra.tar.gz` for Blackwell Ultra (sm_103: GB300)
+- `oxydllm-linux-arm64-cuda-thor.tar.gz` for Jetson GB (sm_110: T4000, T5000)
+- `oxydllm-linux-arm64-cuda-blackwell-desktop.tar.gz` for Blackwell Desktop (sm_121: DGX Spark / GB10)
 
 ## Usage
 Download a model from HuggingFace using the `user/model` repo ID. For GGUF repos, an interactive prompt lists available quantizations and lets you pick one; variants already on disk are shown with a check mark and excluded from the numbered choices. Use `--variant Q4_K_M` to skip the prompt, `--token` for gated models, and `--name` to save under a custom local name instead of the default `user/model` path.
@@ -264,6 +266,18 @@ curl http://localhost:11313/v1/chat/completions \
   }'
 ```
 
+Reasoning effort for harmony models (gpt-oss). These models cannot disable reasoning; `reasoning_effort` scales it (`low`, `medium`, `high`; default `medium`). The reasoning stream is returned separately in `reasoning_content`, the final answer in `content`:
+
+```bash
+curl http://localhost:11313/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "openai/gpt-oss-20b",
+    "messages": [{"role": "user", "content": "Explain quantum entanglement"}],
+    "reasoning_effort": "low"
+  }'
+```
+
 ### Observability
 
 #### Prometheus metrics (`GET /metrics`)
@@ -279,13 +293,13 @@ curl http://localhost:11313/metrics
 | `oxydllm_ttft_milliseconds` | Histogram | `model` | Time-to-first-token in ms, from request enqueue to first generated token. Includes prefill and queue wait. Buckets: 10, 50, 100, 200, 500, 1000, 2000, 5000 ms. |
 | `oxydllm_tokens_per_second` | Histogram | `model` | Decode throughput in tokens/s from first token to completion. Buckets: 1, 5, 10, 20, 50, 100, 200 tok/s. |
 | `oxydllm_requests_total` | Counter | `model`, `status` | Total completed requests. `status` is `ok` or `error`. |
-| `oxydllm_queue_depth` | Gauge | — | Current number of sequences in the engine (waiting + running). Updated each engine step. |
+| `oxydllm_queue_depth` | Gauge | - | Current number of sequences in the engine (waiting + running). Updated each engine step. |
 | `oxydllm_prefix_cache_requests_total` | Counter | `model`, `result` | Prefix KV cache lookups by result (`hit` or `miss`). Compute hit ratio with `rate(hit[5m]) / rate(total[5m])`. |
 | `oxydllm_model_weights_bytes` | Gauge | `model` | Weight memory in bytes, set at load and cleared at unload. |
 | `oxydllm_kv_cache_allocated_bytes` | Gauge | `model` | KV cache memory reserved at load time per model. Not the dynamically occupied portion. |
-| `oxydllm_vram_used_bytes` | Gauge | — | Total inference memory: `model_weights_bytes + kv_cache_allocated_bytes` across all loaded models. |
+| `oxydllm_vram_used_bytes` | Gauge | - | Total inference memory: `model_weights_bytes + kv_cache_allocated_bytes` across all loaded models. |
 
-> Apple Silicon note: there is no discrete VRAM on Apple Silicon — all memory metrics measure unified system memory shared between CPU and GPU.
+> Apple Silicon note: there is no discrete VRAM on Apple Silicon; all memory metrics measure unified system memory shared between CPU and GPU.
 
 Example Prometheus queries:
 ```promql
@@ -302,7 +316,7 @@ rate(oxydllm_requests_total[1m])
 
 #### Structured logs and request tracing
 
-Every request is assigned a `request_id` (UUID v4) at the HTTP handler entry point. This ID appears in all log events for that request — from template rendering to the final token — making it possible to trace a single request end-to-end across concurrent traffic:
+Every request is assigned a `request_id` (UUID v4) at the HTTP handler entry point. This ID appears in all log events for that request, from template rendering to the final token, making it possible to trace a single request end-to-end across concurrent traffic:
 
 ```bash
 grep 'request_id=abc-123' app.log
@@ -333,14 +347,14 @@ Every option can be set via a CLI flag or an environment variable. CLI flags tak
 | `--port <PORT>` | `OXYDLLM_PORT` | `11313` | Listen port |
 | `--models-dir <DIR>` | `OXYDLLM_MODELS_DIR` | `~/.oxydllm/models` | Model storage directory |
 | `--keep-alive <SECS>` | `OXYDLLM_KEEP_ALIVE` | `900` | Idle seconds before model eviction |
-| `--memory-budget <MB>` | `OXYDLLM_MEMORY_BUDGET` | — | Max VRAM for loaded models; LRU eviction when exceeded |
+| `--memory-budget <MB>` | `OXYDLLM_MEMORY_BUDGET` | - | Max VRAM for loaded models; LRU eviction when exceeded |
 | `--max-context-len <N>` | `OXYDLLM_MAX_CONTEXT_LEN` | `4096` | KV cache context length per sequence |
 | `--max-num-seqs <N>` | `OXYDLLM_MAX_NUM_SEQS` | auto | Max concurrent sequences per model (auto-computed from KV block budget at load time) |
 | `--max-queued-requests <N>` | `OXYDLLM_MAX_QUEUED_REQUESTS` | `200` | Request queue depth; returns HTTP 429 when full |
 | `--devices <IDS>` | `OXYDLLM_DEVICES` | auto | Comma-separated CUDA device indices |
 | `--kv-quant <MODE>` | `OXYDLLM_KV_QUANT` | `off` | KV cache quantization: `off`, `lossless`, `balanced`, `aggressive` |
 | `--shutdown-timeout <SECS>` | `OXYDLLM_SHUTDOWN_TIMEOUT` | `30` | Grace period for in-flight requests on shutdown |
-| `--qjl-quantization` | — | disabled | Enable Stage-2 QJL key residual quantization |
+| `--qjl-quantization` | - | disabled | Enable Stage-2 QJL key residual quantization |
 | `--allow-cpu` | `OXYDLLM_ALLOW_CPU` | disabled | Permit CPU fallback when no GPU is available. By default startup fails fast on a GPU-less host. |
 | `--api-key <KEY>` | `OXYDLLM_API_KEY` | disabled | When set, every `/v1/*` and `/metrics` request must present the key via `Authorization: Bearer <KEY>` (or `X-API-Key: <KEY>`). `/health` remains unauthenticated for liveness probes. |
 | `--request-timeout <SECS>` | `OXYDLLM_REQUEST_TIMEOUT` | `300` | Wall-clock timeout per `/v1/chat/completions` request. Non-streaming responses are returned as `408 Request Timeout`; streaming responses emit a final `request_timeout` error chunk followed by `[DONE]`. Set to `0` to disable. |
@@ -349,7 +363,7 @@ To produce machine-parseable JSON log output (useful with Loki, Datadog, or `jq`
 
 ### Configuration examples
 
-**systemd (Linux)** — edit `/etc/default/oxydllm`, then `sudo systemctl restart oxydllm`:
+**systemd (Linux)**: edit `/etc/default/oxydllm`, then `sudo systemctl restart oxydllm`:
 ```
 OXYDLLM_MAX_CONTEXT_LEN=8192
 OXYDLLM_MAX_NUM_SEQS=16
@@ -357,7 +371,7 @@ OXYDLLM_KV_QUANT=balanced
 LOG_FORMAT=json
 ```
 
-**launchd (macOS)** — edit `~/Library/LaunchAgents/com.oxydllm.oxydllmd.plist` under `EnvironmentVariables`, then reload the agent:
+**launchd (macOS)**: edit `~/Library/LaunchAgents/com.oxydllm.oxydllmd.plist` under `EnvironmentVariables`, then reload the agent:
 ```xml
 <key>OXYDLLM_MAX_CONTEXT_LEN</key><string>8192</string>
 <key>OXYDLLM_MAX_NUM_SEQS</key><string>16</string>
@@ -370,7 +384,7 @@ docker run -e OXYDLLM_MAX_CONTEXT_LEN=8192 -e OXYDLLM_MAX_NUM_SEQS=16 -e LOG_FOR
   -p 11313:11313 ghcr.io/giovannifil-64/oxydllm:latest start --models-dir /root/.oxydllm/models
 ```
 
-**docker compose** — set variables in your shell or a `.env` file:
+**docker compose**: set variables in your shell or a `.env` file:
 ```
 OXYDLLM_MAX_CONTEXT_LEN=8192
 OXYDLLM_MAX_NUM_SEQS=16
@@ -388,7 +402,7 @@ The HTTP API has **no authentication by default**. Without `--api-key` set, any 
 Request-side hardening already enforced by the server (no configuration needed):
 
 - Per-request wall-clock timeout (`--request-timeout`, default 300s) bounds the time a single chat-completion request can hold a slot. On expiry the engine sequence is aborted, the client receives `408` (non-streaming) or an error chunk + `[DONE]` (streaming).
-- Sampling parameter ranges are validated up-front (`temperature ∈ [0, 2]`, `top_p ∈ [0, 1]`, `frequency_penalty`/`presence_penalty ∈ [-2, 2]`, `top_logprobs ∈ [0, 20]`, `repetition_penalty > 0`, `n ∈ [1, 128]`, `max_tokens ≥ 1`). Out-of-range values return `400 invalid_request_error` rather than silently degrading the sampler.
+- Sampling parameter ranges are validated up-front (`temperature ∈ [0, 2]`, `top_p ∈ [0, 1]`, `frequency_penalty`/`presence_penalty ∈ [-2, 2]`, `top_logprobs ∈ [0, 20]`, `repetition_penalty > 0`, `n ∈ [1, 128]`, `max_tokens ≥ 1`, `reasoning_effort ∈ {low, medium, high}`). Out-of-range values return `400 invalid_request_error` rather than silently degrading the sampler.
 
 ## Run Options
 Options specific to the `oxydllm run` interactive chat command (not available in the server):
@@ -412,6 +426,7 @@ The following options are shared between `start` and `run`:
 - Only function tools are implemented: OpenAI custom tools are not supported on `/v1/chat/completions` yet.
 - Gemma4 edge cases: Some checkpoints may require architecture-specific tuning.
 - Metal softcap SDPA policy: The Metal SDPA path with attention softcap is currently hard-disabled in runtime (no experimental toggle) and falls back to the standard attention path.
+- Attention-sink models (gpt-oss): decode runs a dedicated fused sink-aware SDPA kernel; prefill falls back to the standard attention path, so long-prompt TTFT is higher than on comparable non-sink models.
 - Metal SDPA head-dim coverage: The fused Metal SDPA kernel supports head dimensions `32, 64, 72, 80, 96, 128, 256`. Models with other head dimensions remain functionally correct but fall back to the non-fused attention path with a measurable throughput cost.
 - CUDA optimization: Support exists but is not optimized for production use.
 - GPTQ act-order (`desc_act=true`) not supported: load fails fast; only sequential `desc_act=false` checkpoints are accepted. `g_idx` is loaded but ignored on the supported path.
@@ -447,7 +462,7 @@ CUDA is currently a functional compatibility path, not a performance-tuned backe
 | `cuda-thor-arm64` | 110 | arm64 | Jetson GB (T4000, T5000) |
 | `cuda-blackwell-desktop-arm64` | 121 | arm64 | Blackwell Desktop (DGX Spark / GB10) |
 
-- `latest` and `cuda` point to `cuda-ada` (stable default — widest x86_64 compatibility).
+- `latest` and `cuda` point to `cuda-ada` (stable default, widest x86_64 compatibility).
 - `nightly` and `nightly-cuda` point to nightly `cuda-ada`.
 - Cross-generation SASS is **not** compatible: a Hopper binary will not run on Blackwell and vice versa. Pick the tag that matches your GPU.
 

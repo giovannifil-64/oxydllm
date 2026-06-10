@@ -466,6 +466,35 @@ async fn empty_messages_returns_400() {
     );
 }
 
+// Contract: reasoning_effort accepts only low|medium|high and is rejected
+// before any model is resolved or loaded.
+#[tokio::test]
+async fn invalid_reasoning_effort_returns_400() {
+    let (app, _tmp) = build_test_app(vec![]).expect("test app");
+    let response = post_chat(
+        &app,
+        json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoning_effort": "maximum"
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: Value = serde_json::from_slice(
+        &to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body"),
+    )
+    .expect("json");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("reasoning_effort")
+    );
+}
+
 #[tokio::test]
 async fn missing_model_returns_400() {
     let (app, _tmp) = build_test_app(vec![]).expect("test app");

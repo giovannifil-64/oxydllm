@@ -13,6 +13,9 @@ pub struct ArchDefaults {
     pub extra_eos_ids: &'static [u32],
     pub default_sliding_window: Option<usize>,
     pub alternating_sliding_window: bool,
+    /// GPT-OSS MoE: MXFP4 stacked experts, interleaved gate/up, clamped swiglu,
+    /// attention sinks (the sink tensor itself is detected by presence).
+    pub gpt_oss_moe: bool,
 }
 
 impl ArchDefaults {
@@ -58,6 +61,7 @@ impl Default for ArchDefaults {
             default_rope_theta: 10_000.0,
             extra_eos_ids: &[],
             default_sliding_window: None,
+            gpt_oss_moe: false,
             alternating_sliding_window: false,
         }
     }
@@ -77,6 +81,7 @@ pub fn llama_defaults() -> ArchDefaults {
         extra_eos_ids: &[128009, 128008],
         default_sliding_window: None,
         alternating_sliding_window: false,
+        gpt_oss_moe: false,
     }
 }
 
@@ -135,6 +140,12 @@ pub fn arch_defaults(arch: &str) -> Option<ArchDefaults> {
         // q_norm/k_norm (qk_norm=true), MoE FFN, rope_theta=10k. `clip_qkv`
         // (sometimes set in OLMoE configs) is currently ignored; on the
         // 0924-Instruct checkpoint it's `null` so this is a no-op.
+        "gpt_oss" | "GptOssForCausalLM" => Some(ArchDefaults {
+            default_rope_theta: 150_000.0,
+            gpt_oss_moe: true,
+            ..Default::default()
+        }),
+
         "olmoe" | "OlmoeForCausalLM" => Some(ArchDefaults {
             qk_norm: true,
             default_rope_theta: 10_000.0,

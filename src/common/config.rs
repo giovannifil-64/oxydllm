@@ -29,12 +29,16 @@ pub struct BlockConfig {
     pub moe: Option<MoeConfig>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct MoeConfig {
     pub num_experts: usize,
     pub num_experts_per_tok: usize,
     /// True for Qwen3-MoE / Mixtral; false for OLMoE.
     pub norm_topk_prob: bool,
+    /// GPT-OSS experts: MXFP4 stacked tensors, interleaved gate/up, clamped
+    /// swiglu. `swiglu_limit` is the clamp bound (gpt-oss-20b: 7.0).
+    pub gpt_oss: bool,
+    pub swiglu_limit: f64,
 }
 
 pub struct StandardTransformerConfig {
@@ -78,6 +82,8 @@ pub struct StandardTransformerConfig {
     pub moe_num_experts_per_tok: Option<usize>,
     /// `None` defaults to `true` (Qwen3-MoE / Mixtral); OLMoE sets `false`.
     pub moe_norm_topk_prob: Option<bool>,
+    pub moe_gpt_oss: bool,
+    pub moe_swiglu_limit: Option<f64>,
 }
 
 impl StandardTransformerConfig {
@@ -87,6 +93,8 @@ impl StandardTransformerConfig {
                 num_experts: n,
                 num_experts_per_tok: k,
                 norm_topk_prob: self.moe_norm_topk_prob.unwrap_or(true),
+                gpt_oss: self.moe_gpt_oss,
+                swiglu_limit: self.moe_swiglu_limit.unwrap_or(7.0),
             }),
             _ => None,
         };

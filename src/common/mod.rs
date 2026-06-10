@@ -11,6 +11,7 @@ pub mod mask;
 #[cfg(feature = "metal")]
 pub mod metal_ops;
 pub mod moe;
+pub mod mxfp4;
 pub mod norm;
 pub mod paged;
 pub mod prefix_cache;

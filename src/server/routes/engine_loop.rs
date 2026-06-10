@@ -72,6 +72,109 @@ fn build_logprob_entry(
 type RawTopLogprobs = Vec<(u32, f32)>;
 type PendingRawLogprob = (u32, f32, RawTopLogprobs);
 
+/// GPT-OSS harmony channel protocol: the model emits
+/// `<|channel|>NAME<|message|>BODY<|end|>` sequences; analysis/commentary
+/// bodies are reasoning, the final channel is user-visible content. Activated
+/// only when the tokenizer has the harmony marker tokens.
+#[derive(Clone, Copy, PartialEq)]
+enum HarmonyState {
+    /// Between messages — expecting marker tokens.
+    Markers,
+    /// After `<|start|>` — plain role-name tokens until the next marker.
+    Role,
+    /// After `<|channel|>` — collecting the channel name until `<|message|>`.
+    Header,
+    Body {
+        final_channel: bool,
+    },
+}
+
+struct HarmonyIds {
+    channel: u32,
+    message: u32,
+    end: Option<u32>,
+    start: Option<u32>,
+}
+
+/// Returns `None` when the token is protocol framing (skip it), otherwise
+/// whether the token belongs to reasoning (`true`) or content (`false`).
+/// Unknown structure fails open to content.
+fn harmony_route(
+    state: &mut HarmonyState,
+    header_ids: &mut Vec<u32>,
+    ids: &HarmonyIds,
+    tokenizer: &Tokenizer,
+    tok: u32,
+) -> Option<bool> {
+    let is_end = ids.end == Some(tok) || ids.start == Some(tok);
+    match *state {
+        HarmonyState::Markers => {
+            if tok == ids.channel {
+                header_ids.clear();
+                *state = HarmonyState::Header;
+                return None;
+            }
+            if ids.start == Some(tok) {
+                *state = HarmonyState::Role;
+                return None;
+            }
+            if ids.end == Some(tok) {
+                return None;
+            }
+            if tok == ids.message {
+                *state = HarmonyState::Body {
+                    final_channel: true,
+                };
+                return None;
+            }
+            // Plain token where a marker was expected: content.
+            *state = HarmonyState::Body {
+                final_channel: true,
+            };
+            Some(false)
+        }
+        HarmonyState::Role => {
+            if tok == ids.channel {
+                header_ids.clear();
+                *state = HarmonyState::Header;
+            } else if tok == ids.message {
+                *state = HarmonyState::Body {
+                    final_channel: true,
+                };
+            } else if ids.end == Some(tok) {
+                *state = HarmonyState::Markers;
+            }
+            // Plain tokens here are the role name — protocol framing, skip.
+            None
+        }
+        HarmonyState::Header => {
+            if tok == ids.message {
+                let name = tokenizer.decode(header_ids).unwrap_or_default();
+                *state = HarmonyState::Body {
+                    final_channel: name.contains("final"),
+                };
+            } else if is_end {
+                *state = HarmonyState::Markers;
+            } else {
+                header_ids.push(tok);
+            }
+            None
+        }
+        HarmonyState::Body { final_channel } => {
+            if is_end {
+                *state = HarmonyState::Markers;
+                return None;
+            }
+            if tok == ids.channel {
+                header_ids.clear();
+                *state = HarmonyState::Header;
+                return None;
+            }
+            Some(!final_channel)
+        }
+    }
+}
+
 struct SeqTracker {
     tx: tokio_mpsc::UnboundedSender<EngineEvent>,
     request_id: String,
@@ -89,6 +192,8 @@ struct SeqTracker {
     out_stable_text: String,
     think_stable_end: usize,
     think_stable_text: String,
+    harmony_state: HarmonyState,
+    harmony_header_ids: Vec<u32>,
 }
 
 fn abort_sequences(
@@ -158,6 +263,8 @@ fn enqueue_request(
             out_stable_text: String::new(),
             think_stable_end: 0,
             think_stable_text: String::new(),
+            harmony_state: HarmonyState::Markers,
+            harmony_header_ids: Vec::new(),
         },
     );
 }
@@ -346,6 +453,18 @@ pub fn engine_loop(
 
     let think_start_id = tokenizer.special_token_id("<think>");
     let think_end_id = tokenizer.special_token_id("</think>");
+    let harmony_ids = match (
+        tokenizer.special_token_id("<|channel|>"),
+        tokenizer.special_token_id("<|message|>"),
+    ) {
+        (Some(channel), Some(message)) => Some(HarmonyIds {
+            channel,
+            message,
+            end: tokenizer.special_token_id("<|end|>"),
+            start: tokenizer.special_token_id("<|start|>"),
+        }),
+        _ => None,
+    };
     let mut decode_cache = TokenDecodeCache::new();
 
     let neutral_id = tokenizer
@@ -415,26 +534,40 @@ pub fn engine_loop(
                             }
                             tracker.token_count += 1;
 
-                            if tracker.in_thinking {
-                                let raw = tokenizer
-                                    .decode_with_special(&[tok.token])
-                                    .unwrap_or_default();
-
-                                let is_think_start =
-                                    think_start_id == Some(tok.token) || raw.contains("<think>");
-                                if is_think_start {
-                                    continue;
+                            let route_reasoning = if let Some(ref hids) = harmony_ids {
+                                match harmony_route(
+                                    &mut tracker.harmony_state,
+                                    &mut tracker.harmony_header_ids,
+                                    hids,
+                                    &tokenizer,
+                                    tok.token,
+                                ) {
+                                    None => continue,
+                                    Some(r) => r,
                                 }
+                            } else {
+                                if tracker.in_thinking {
+                                    let raw = tokenizer
+                                        .decode_with_special(&[tok.token])
+                                        .unwrap_or_default();
 
-                                let is_think_end =
-                                    think_end_id == Some(tok.token) || raw.contains("</think>");
-                                if is_think_end {
-                                    tracker.in_thinking = false;
-                                    continue;
+                                    let is_think_start = think_start_id == Some(tok.token)
+                                        || raw.contains("<think>");
+                                    if is_think_start {
+                                        continue;
+                                    }
+
+                                    let is_think_end =
+                                        think_end_id == Some(tok.token) || raw.contains("</think>");
+                                    if is_think_end {
+                                        tracker.in_thinking = false;
+                                        continue;
+                                    }
                                 }
-                            }
+                                tracker.in_thinking
+                            };
 
-                            if tracker.in_thinking {
+                            if route_reasoning {
                                 tracker.thinking_ids.push(tok.token);
                                 if let Some(text) = prefix_decode_incremental(
                                     &tokenizer,

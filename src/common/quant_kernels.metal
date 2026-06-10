@@ -2848,3 +2848,225 @@ kernel void gguf_q3k_mul_mm_bf16(
         out[(ulong)m * (ulong)N + (ulong)n] = (bfloat)acc;
     }
 }
+
+// ── MXFP4 (OCP microscaling FP4 — GPT-OSS experts) ─────────────────────────
+// 32-element blocks: 16 bytes of FP4 (E2M1, low nibble first) + one E8M0
+// scale byte per block (value = 2^(s-127)). Weights stay packed; both kernels
+// dequantize inline.
+
+constant float MXFP4_LUT16[16] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
+                                  -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f};
+#define MXFP4_BLOCK 32
+
+// Batched decode GEMV (1 <= M <= GGUF_BATCH_MAX), 2 simdgroups x GGUF_N_DST rows.
+kernel void mxfp4_gemv_batch_bf16(
+    device const bfloat        *x       [[buffer(0)]],   // [M, K]
+    device const uint8_t       *blocks  [[buffer(1)]],   // [N, K/32, 16] flat
+    device const uint8_t       *scales  [[buffer(2)]],   // [N, K/32] flat
+    device       bfloat        *out     [[buffer(3)]],   // [M, N]
+    constant     GgufBatchParams &p     [[buffer(4)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    uint tiisg  [[thread_index_in_simdgroup]],
+    uint sgitg  [[simdgroup_index_in_threadgroup]])
+{
+    const uint N  = p.out_features;
+    const uint K  = p.in_features;
+    const uint M  = min(p.m_batch, (uint)GGUF_BATCH_MAX);
+    const uint nb = K / MXFP4_BLOCK;
+
+    const uint r0 = tgpig.x;
+    const uint first_row = (r0 * GGUF_N_SIMDGROUP + sgitg) * GGUF_N_DST;
+    if (first_row >= N) return;
+
+    const uint ix = tiisg / 4;
+    const uint il = tiisg % 4;
+    const uint y_off = 8 * il;
+
+    float sumf[GGUF_N_DST][GGUF_BATCH_MAX];
+    for (uint row = 0; row < GGUF_N_DST; ++row)
+        for (uint m = 0; m < GGUF_BATCH_MAX; ++m) sumf[row][m] = 0.f;
+
+    for (uint ib = ix; ib < nb; ib += GGUF_N_SIMDWIDTH / 4) {
+        for (uint row = 0; row < GGUF_N_DST; ++row) {
+            if (first_row + row >= N) continue;
+            const ulong base = (ulong)(first_row + row) * (ulong)nb + ib;
+            device const uint8_t *qs = blocks + base * 16 + 4 * il;
+            const float scale = exp2((float)scales[base] - 127.0f);
+            // Dequantize once into registers (scale folded); m-loop is pure FMA.
+            float w[8];
+            for (uint i = 0; i < 4; ++i) {
+                const uint8_t byte = qs[i];
+                w[2*i]   = scale * MXFP4_LUT16[byte & 0xF];
+                w[2*i+1] = scale * MXFP4_LUT16[byte >> 4];
+            }
+            for (uint m = 0; m < M; ++m) {
+                device const bfloat *y =
+                    x + (ulong)m * (ulong)K + (ulong)ib * MXFP4_BLOCK + y_off;
+                float acc = 0.f;
+                for (uint j = 0; j < 8; ++j) {
+                    acc += (float)y[j] * w[j];
+                }
+                sumf[row][m] += acc;
+            }
+        }
+    }
+
+    for (uint row = 0; row < GGUF_N_DST; ++row) {
+        const uint r = first_row + row;
+        for (uint m = 0; m < M; ++m) {
+            const float tot = simd_sum(sumf[row][m]);
+            if (tiisg == 0 && r < N) out[(ulong)m * (ulong)N + r] = (bfloat)tot;
+        }
+    }
+}
+
+inline void mxfp4_dequant_strip_into(
+    threadgroup bfloat (&w_tile)[GGUF_MM_BN][MXFP4_BLOCK],
+    device const uint8_t *blocks,
+    device const uint8_t *scales,
+    uint n_base,
+    uint n_total,
+    uint nb,
+    uint b,
+    uint tg_tid)
+{
+    for (uint kk = tg_tid; kk < GGUF_MM_BN * MXFP4_BLOCK; kk += GGUF_MM_TG) {
+        const uint c = kk / MXFP4_BLOCK;
+        const uint j = kk % MXFP4_BLOCK;
+        const uint n = n_base + c;
+        if (n >= n_total) { continue; }
+        const ulong base = (ulong)n * (ulong)nb + b;
+        const uint8_t byte = blocks[base * 16 + j / 2];
+        const uint8_t nib = (j & 1) ? (byte >> 4) : (byte & 0xF);
+        w_tile[c][j] = (bfloat)(exp2((float)scales[base] - 127.0f) * MXFP4_LUT16[nib]);
+    }
+}
+
+kernel void mxfp4_mul_mm_bf16(
+    device const bfloat            *x       [[buffer(0)]],
+    device const uint8_t           *blocks  [[buffer(1)]],
+    device const uint8_t           *scales  [[buffer(2)]],
+    device       bfloat            *out     [[buffer(3)]],
+    constant     GgufMatmulParams  &p       [[buffer(4)]],
+    uint3  tg_tid_xy [[thread_position_in_threadgroup]],
+    uint3  tgpig     [[threadgroup_position_in_grid]])
+{
+    threadgroup bfloat w_tile[GGUF_MM_BN][MXFP4_BLOCK];
+
+    const uint M  = p.m_total;
+    const uint N  = p.n_total;
+    const uint K  = p.k_total;
+    const uint nb = K / MXFP4_BLOCK;
+
+    const uint n_base = tgpig.x * GGUF_MM_BN;
+    const uint m_base = tgpig.y * GGUF_MM_BM;
+    const uint n_off  = tg_tid_xy.x;
+    const uint m_off  = tg_tid_xy.y;
+    const uint n      = n_base + n_off;
+    const uint m      = m_base + m_off;
+    const uint tg_tid = m_off * GGUF_MM_BN + n_off;
+
+    float acc = 0.0f;
+    for (uint b = 0; b < nb; ++b) {
+        mxfp4_dequant_strip_into(w_tile, blocks, scales, n_base, N, nb, b, tg_tid);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (m < M && n < N) {
+            device const bfloat *x_chunk = x + (ulong)m * (ulong)K + (ulong)b * (ulong)MXFP4_BLOCK;
+            float partial = 0.0f;
+            for (uint j = 0; j < MXFP4_BLOCK; ++j) {
+                partial += (float)x_chunk[j] * (float)w_tile[n_off][j];
+            }
+            acc += partial;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (m < M && n < N) {
+        out[(ulong)m * (ulong)N + (ulong)n] = (bfloat)acc;
+    }
+}
+
+// ── Decode SDPA with attention sinks (GPT-OSS) ──────────────────────────────
+// One simdgroup per (q-head): online softmax over the kv positions with the
+// per-head sink logit folded into the denominator (the sink contributes no
+// value vector). Reads K/V per kv-head directly — GQA without repeat_kv.
+// q: [H, D] (q_len = 1), k/v: [KVH, L, D], sinks: [H], out: [H, D]. BF16 I/O,
+// F32 accumulation. D <= SDPA_SINK_MAX_D.
+
+#define SDPA_SINK_MAX_D 128
+
+struct SdpaSinkParams {
+    uint  n_heads;
+    uint  n_kv_heads;
+    uint  kv_len;
+    uint  head_dim;
+    float scale;
+};
+
+kernel void sdpa_vector_sink_bf16(
+    device const bfloat  *q      [[buffer(0)]],
+    device const bfloat  *k      [[buffer(1)]],
+    device const bfloat  *v      [[buffer(2)]],
+    device const bfloat  *sinks  [[buffer(3)]],
+    device       bfloat  *out    [[buffer(4)]],
+    constant SdpaSinkParams &p   [[buffer(5)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    uint tiisg  [[thread_index_in_simdgroup]])
+{
+    const uint h = tgpig.x;
+    if (h >= p.n_heads) return;
+    const uint D = p.head_dim;
+    const uint kvh = h / (p.n_heads / p.n_kv_heads);
+
+    threadgroup float q_s[SDPA_SINK_MAX_D];
+    for (uint d = tiisg; d < D; d += 32) {
+        q_s[d] = (float)q[(ulong)h * D + d] * p.scale;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    device const bfloat *k_base = k + (ulong)kvh * (ulong)p.kv_len * D;
+    device const bfloat *v_base = v + (ulong)kvh * (ulong)p.kv_len * D;
+
+    // Per-thread online softmax over a strided slice of kv positions.
+    float m = -INFINITY;
+    float l = 0.0f;
+    float acc[SDPA_SINK_MAX_D];
+    for (uint d = 0; d < D; ++d) {
+        acc[d] = 0.0f;
+    }
+
+    for (uint j = tiisg; j < p.kv_len; j += 32) {
+        device const bfloat *kj = k_base + (ulong)j * D;
+        float s = 0.0f;
+        for (uint d = 0; d < D; ++d) {
+            s += q_s[d] * (float)kj[d];
+        }
+        const float m_new = max(m, s);
+        const float corr = exp(m - m_new);
+        const float w = exp(s - m_new);
+        l = l * corr + w;
+        device const bfloat *vj = v_base + (ulong)j * D;
+        for (uint d = 0; d < D; ++d) {
+            acc[d] = acc[d] * corr + w * (float)vj[d];
+        }
+        m = m_new;
+    }
+
+    // Combine the 32 per-thread partials, then fold in the sink logit.
+    const float m_g = simd_max(m);
+    const float corr_g = (m == -INFINITY) ? 0.0f : exp(m - m_g);
+    float l_g = simd_sum(l * corr_g);
+
+    const float sink = (float)sinks[h];
+    const float m_f = max(m_g, sink);
+    const float denom = l_g * exp(m_g - m_f) + exp(sink - m_f);
+    const float acc_scale = exp(m_g - m_f) / denom;
+
+    for (uint d = 0; d < D; ++d) {
+        const float num = simd_sum(acc[d] * corr_g);
+        if (tiisg == 0) {
+            out[(ulong)h * D + d] = (bfloat)(num * acc_scale);
+        }
+    }
+}

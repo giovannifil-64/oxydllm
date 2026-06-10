@@ -6,14 +6,22 @@ use crate::server::ChatMessage;
 
 const MAX_STRFTIME_FMT_LEN: usize = 128;
 
+#[derive(Default)]
+pub struct TemplateOptions<'a> {
+    pub bos_token: Option<&'a str>,
+    pub eos_token: Option<&'a str>,
+    pub add_generation_prompt: bool,
+    pub enable_thinking: bool,
+    /// Harmony models (gpt-oss): low | medium | high. Omitted from the Jinja
+    /// context when None so the template's own default applies.
+    pub reasoning_effort: Option<&'a str>,
+    pub tools: Option<serde_json::Value>,
+}
+
 pub fn apply_chat_template(
     template: &str,
     messages: &[ChatMessage],
-    bos_token: Option<&str>,
-    eos_token: Option<&str>,
-    add_generation_prompt: bool,
-    enable_thinking: bool,
-    tools: Option<serde_json::Value>,
+    opts: TemplateOptions<'_>,
 ) -> Result<String> {
     let template = preprocess_template(template);
 
@@ -43,11 +51,12 @@ pub fn apply_chat_template(
                 name: m.name.as_deref(),
             })
             .collect(),
-        bos_token: bos_token.unwrap_or(""),
-        eos_token: eos_token.unwrap_or(""),
-        add_generation_prompt,
-        enable_thinking,
-        tools,
+        bos_token: opts.bos_token.unwrap_or(""),
+        eos_token: opts.eos_token.unwrap_or(""),
+        add_generation_prompt: opts.add_generation_prompt,
+        enable_thinking: opts.enable_thinking,
+        reasoning_effort: opts.reasoning_effort,
+        tools: opts.tools,
     };
 
     let rendered = tmpl
@@ -238,6 +247,9 @@ struct TemplateContext<'a> {
     eos_token: &'a str,
     add_generation_prompt: bool,
     enable_thinking: bool,
+    /// Omitted when None so the template's own default ("medium") applies.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<serde_json::Value>,
 }
@@ -334,15 +346,91 @@ mod tests {
         let rendered = apply_chat_template(
             "{% for m in messages %}{{ m.role }}: {{ m.content }}{% endfor %}",
             &messages,
-            None,
-            None,
-            false,
-            false,
-            None,
+            TemplateOptions::default(),
         )
         .expect("template should render");
 
         assert_eq!(rendered, "user: hello");
+    }
+
+    // Contract: reasoning_effort reaches the template when set, and is ABSENT
+    // (not null) when None — the harmony template's `is not defined` default
+    // ("medium") must fire. This mirrors gpt-oss's chat_template.jinja lines
+    // 203-206.
+    #[test]
+    fn reasoning_effort_renders_and_defaults_via_is_not_defined() {
+        let template = "{%- if reasoning_effort is not defined %}\
+                        {%- set reasoning_effort = \"medium\" %}\
+                        {%- endif %}Reasoning: {{ reasoning_effort }}";
+        let messages = vec![ChatMessage {
+            role: "user".to_string(),
+            content: Some("hi".to_string()),
+            reasoning_content: None,
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        }];
+
+        let low = apply_chat_template(
+            template,
+            &messages,
+            TemplateOptions {
+                reasoning_effort: Some("low"),
+                ..Default::default()
+            },
+        )
+        .expect("render with effort");
+        assert_eq!(low, "Reasoning: low");
+
+        let default = apply_chat_template(template, &messages, TemplateOptions::default())
+            .expect("render without effort");
+        assert_eq!(default, "Reasoning: medium");
+    }
+
+    // Renders the real downloaded gpt-oss harmony template (skipped when the
+    // checkpoint isn't present): the rendered prompt must carry the requested
+    // reasoning effort, and default to medium when the field is absent.
+    #[test]
+    fn gpt_oss_real_template_renders_reasoning_effort() {
+        let home = std::env::var("HOME").unwrap_or_default();
+        let path = format!("{home}/.oxydllm/models/openai/gpt-oss-20b/chat_template.jinja");
+        let Ok(template) = std::fs::read_to_string(&path) else {
+            return;
+        };
+        let messages = vec![ChatMessage {
+            role: "user".to_string(),
+            content: Some("hello".to_string()),
+            reasoning_content: None,
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        }];
+
+        let low = apply_chat_template(
+            &template,
+            &messages,
+            TemplateOptions {
+                add_generation_prompt: true,
+                reasoning_effort: Some("low"),
+                ..Default::default()
+            },
+        )
+        .expect("harmony template should render");
+        assert!(low.contains("Reasoning: low"), "missing 'Reasoning: low'");
+
+        let default = apply_chat_template(
+            &template,
+            &messages,
+            TemplateOptions {
+                add_generation_prompt: true,
+                ..Default::default()
+            },
+        )
+        .expect("harmony template should render");
+        assert!(
+            default.contains("Reasoning: medium"),
+            "missing default 'Reasoning: medium'"
+        );
     }
 
     #[test]
@@ -365,7 +453,7 @@ mod tests {
     fn apply_chat_template_fails_on_invalid_strftime_format() {
         let fmt = "x".repeat(MAX_STRFTIME_FMT_LEN + 1);
         let template = format!("{{{{ strftime_now(\"{}\") }}}}", fmt);
-        let result = apply_chat_template(&template, &[], None, None, false, false, None);
+        let result = apply_chat_template(&template, &[], TemplateOptions::default());
         assert!(result.is_err());
     }
 }

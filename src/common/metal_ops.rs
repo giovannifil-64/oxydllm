@@ -3669,6 +3669,386 @@ pub fn gguf_quant_mul_mm(
     })
 }
 
+// ── MXFP4 (GPT-OSS experts): packed FP4 blocks + E8M0 scales ───────────────
+
+struct Mxfp4Matmul {
+    x: Tensor,
+    blocks: Tensor,
+    scales: Tensor,
+    k: usize,
+    n: usize,
+    m: usize,
+}
+
+impl InplaceOp1 for Mxfp4Matmul {
+    fn name(&self) -> &'static str {
+        "mxfp4-matmul"
+    }
+
+    fn cpu_fwd(&self, _s: &mut CpuStorage, _l: &Layout) -> Result<()> {
+        candle_core::bail!("Mxfp4Matmul: Metal-only path")
+    }
+
+    fn metal_fwd(&self, out: &mut MetalStorage, out_l: &Layout) -> Result<()> {
+        const BLOCK: usize = 32;
+        if out.dtype() != DType::BF16 || self.x.dtype() != DType::BF16 {
+            candle_core::bail!(
+                "Mxfp4Matmul: x/out must be BF16, got {:?}/{:?}",
+                self.x.dtype(),
+                out.dtype()
+            );
+        }
+        if self.blocks.dtype() != DType::U8 || self.scales.dtype() != DType::U8 {
+            candle_core::bail!("Mxfp4Matmul: blocks/scales must be U8");
+        }
+        if !self.k.is_multiple_of(BLOCK) {
+            candle_core::bail!("Mxfp4Matmul: K {} must be a multiple of {BLOCK}", self.k);
+        }
+        if !(1..=GGUF_BATCH_MAX).contains(&self.m) {
+            candle_core::bail!("Mxfp4Matmul: m {} out of [1, {GGUF_BATCH_MAX}]", self.m);
+        }
+        let nb = self.k / BLOCK;
+        if self.blocks.elem_count() != self.n * nb * 16 || self.scales.elem_count() != self.n * nb {
+            candle_core::bail!(
+                "Mxfp4Matmul: blocks {} / scales {} elements don't match [{}, {}]",
+                self.blocks.elem_count(),
+                self.scales.elem_count(),
+                self.n,
+                self.k
+            );
+        }
+
+        let x_sl = self.x.storage_and_layout();
+        let x_l = x_sl.1;
+        if !x_l.is_contiguous() {
+            candle_core::bail!("Mxfp4Matmul: x must be contiguous");
+        }
+        if x_l.dims() != [self.m, self.k] {
+            candle_core::bail!(
+                "Mxfp4Matmul: x shape {:?} != [{}, {}]",
+                x_l.dims(),
+                self.m,
+                self.k
+            );
+        }
+        if out_l.dims() != [self.m, self.n] {
+            candle_core::bail!(
+                "Mxfp4Matmul: output shape {:?} != [{}, {}]",
+                out_l.dims(),
+                self.m,
+                self.n
+            );
+        }
+
+        let params = GgufBatchParams {
+            in_features: self.k as u32,
+            out_features: self.n as u32,
+            m_batch: self.m as u32,
+        };
+
+        let device = out.device();
+        let x_buf = match &*x_sl.0 {
+            candle_core::Storage::Metal(ms) => ms.buffer(),
+            _ => candle_core::bail!("Mxfp4Matmul: x must be Metal-resident"),
+        };
+        let b_sl = self.blocks.storage_and_layout();
+        let b_buf = match &*b_sl.0 {
+            candle_core::Storage::Metal(ms) => ms.buffer(),
+            _ => candle_core::bail!("Mxfp4Matmul: blocks must be Metal-resident"),
+        };
+        let s_sl = self.scales.storage_and_layout();
+        let s_buf = match &*s_sl.0 {
+            candle_core::Storage::Metal(ms) => ms.buffer(),
+            _ => candle_core::bail!("Mxfp4Matmul: scales must be Metal-resident"),
+        };
+
+        let pipeline = get_or_compile_quant_pipeline(device.device(), "mxfp4_gemv_batch_bf16")?;
+        let encoder = device.command_encoder()?;
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(x_buf), x_l.start_offset() * 2);
+        encoder.set_buffer(1, Some(b_buf), b_sl.1.start_offset());
+        encoder.set_buffer(2, Some(s_buf), s_sl.1.start_offset());
+        encoder.set_buffer(3, Some(out.buffer()), out_l.start_offset() * 2);
+        encoder.set_bytes(4, &params);
+        encoder.use_resource(x_buf, MTLResourceUsage::Read);
+        encoder.use_resource(b_buf, MTLResourceUsage::Read);
+        encoder.use_resource(s_buf, MTLResourceUsage::Read);
+        encoder.use_resource(out.buffer(), MTLResourceUsage::Write);
+
+        // 2 simdgroups x GGUF_N_DST(4) rows per TG — must match the kernel.
+        encoder.dispatch_thread_groups(
+            MTLSize {
+                width: self.n.div_ceil(8),
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: 64,
+                height: 1,
+                depth: 1,
+            },
+        );
+
+        Ok(())
+    }
+}
+
+struct Mxfp4MulMM {
+    blocks: Tensor,
+    scales: Tensor,
+    k: usize,
+    n: usize,
+}
+
+impl CustomOp1 for Mxfp4MulMM {
+    fn name(&self) -> &'static str {
+        "mxfp4-mul-mm"
+    }
+
+    fn cpu_fwd(&self, _s: &CpuStorage, _l: &Layout) -> Result<(CpuStorage, Shape)> {
+        candle_core::bail!("Mxfp4MulMM: Metal-only path")
+    }
+
+    fn metal_fwd(&self, x: &MetalStorage, x_l: &Layout) -> Result<(MetalStorage, Shape)> {
+        if x.dtype() != DType::BF16 {
+            candle_core::bail!("Mxfp4MulMM: x must be BF16, got {:?}", x.dtype());
+        }
+        if !x_l.is_contiguous() {
+            candle_core::bail!("Mxfp4MulMM: x must be contiguous");
+        }
+        let x_dims = x_l.dims();
+        if x_dims.len() != 2 || x_dims[1] != self.k {
+            candle_core::bail!("Mxfp4MulMM: x shape {:?} != [M, {}]", x_dims, self.k);
+        }
+        let m = x_dims[0];
+
+        let params = GgufMatmulParams {
+            m_total: m as u32,
+            n_total: self.n as u32,
+            k_total: self.k as u32,
+        };
+
+        let device = x.device();
+        let out_elems = m * self.n;
+        let output = device.new_buffer(out_elems, DType::BF16, "mxfp4-mul-mm")?;
+
+        let x_buf = x.buffer();
+        let b_sl = self.blocks.storage_and_layout();
+        let b_buf = match &*b_sl.0 {
+            candle_core::Storage::Metal(ms) => ms.buffer(),
+            _ => candle_core::bail!("Mxfp4MulMM: blocks must be Metal-resident"),
+        };
+        let s_sl = self.scales.storage_and_layout();
+        let s_buf = match &*s_sl.0 {
+            candle_core::Storage::Metal(ms) => ms.buffer(),
+            _ => candle_core::bail!("Mxfp4MulMM: scales must be Metal-resident"),
+        };
+
+        let pipeline = get_or_compile_quant_pipeline(device.device(), "mxfp4_mul_mm_bf16")?;
+        let encoder = device.command_encoder()?;
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(x_buf), x_l.start_offset() * 2);
+        encoder.set_buffer(1, Some(b_buf), b_sl.1.start_offset());
+        encoder.set_buffer(2, Some(s_buf), s_sl.1.start_offset());
+        encoder.set_buffer(3, Some(&*output), 0);
+        encoder.set_bytes(4, &params);
+        encoder.use_resource(x_buf, MTLResourceUsage::Read);
+        encoder.use_resource(b_buf, MTLResourceUsage::Read);
+        encoder.use_resource(s_buf, MTLResourceUsage::Read);
+        encoder.use_resource(&*output, MTLResourceUsage::Write);
+
+        encoder.dispatch_thread_groups(
+            MTLSize {
+                width: self.n.div_ceil(GGUF_MM_BN),
+                height: m.div_ceil(GGUF_MM_BM),
+                depth: 1,
+            },
+            MTLSize {
+                width: GGUF_MM_BN,
+                height: GGUF_MM_BM,
+                depth: 1,
+            },
+        );
+
+        let storage = MetalStorage::new(output, device.clone(), out_elems, DType::BF16);
+        Ok((storage, Shape::from(vec![m, self.n])))
+    }
+}
+
+/// MXFP4 matmul for x `[m, k]`: batched gemv for m <= GGUF_BATCH_MAX,
+/// tiled mul_mm above.
+pub fn mxfp4_matmul(
+    x: &Tensor,
+    blocks: &Tensor,
+    scales: &Tensor,
+    k: usize,
+    n: usize,
+) -> Result<Tensor> {
+    let m = x.dim(0)?;
+    if m <= GGUF_BATCH_MAX {
+        let out = Tensor::zeros((m, n), DType::BF16, x.device())?;
+        out.inplace_op1(&Mxfp4Matmul {
+            x: x.clone(),
+            blocks: blocks.clone(),
+            scales: scales.clone(),
+            k,
+            n,
+            m,
+        })?;
+        return Ok(out);
+    }
+    x.apply_op1(Mxfp4MulMM {
+        blocks: blocks.clone(),
+        scales: scales.clone(),
+        k,
+        n,
+    })
+}
+
+// ── Decode SDPA with attention sinks (GPT-OSS) ─────────────────────────────
+
+#[repr(C)]
+struct SdpaSinkParams {
+    n_heads: u32,
+    n_kv_heads: u32,
+    kv_len: u32,
+    head_dim: u32,
+    scale: f32,
+}
+
+struct SdpaVectorSink {
+    sinks: Tensor,
+    scale: f32,
+}
+
+impl CustomOp3 for SdpaVectorSink {
+    fn name(&self) -> &'static str {
+        "sdpa-vector-sink"
+    }
+
+    fn cpu_fwd(
+        &self,
+        _s1: &CpuStorage,
+        _l1: &Layout,
+        _s2: &CpuStorage,
+        _l2: &Layout,
+        _s3: &CpuStorage,
+        _l3: &Layout,
+    ) -> Result<(CpuStorage, Shape)> {
+        candle_core::bail!("SdpaVectorSink: Metal-only path")
+    }
+
+    fn metal_fwd(
+        &self,
+        q: &MetalStorage,
+        q_l: &Layout,
+        k: &MetalStorage,
+        k_l: &Layout,
+        v: &MetalStorage,
+        v_l: &Layout,
+    ) -> Result<(MetalStorage, Shape)> {
+        if q.dtype() != DType::BF16 || k.dtype() != DType::BF16 || v.dtype() != DType::BF16 {
+            candle_core::bail!("SdpaVectorSink: q/k/v must be BF16");
+        }
+        if !q_l.is_contiguous() || !k_l.is_contiguous() || !v_l.is_contiguous() {
+            candle_core::bail!("SdpaVectorSink: q/k/v must be contiguous");
+        }
+        let qd = q_l.dims();
+        let kd = k_l.dims();
+        let vd = v_l.dims();
+        if qd.len() != 4 || qd[0] != 1 || qd[2] != 1 {
+            candle_core::bail!("SdpaVectorSink: q shape {qd:?} != [1, H, 1, D]");
+        }
+        let (h, d) = (qd[1], qd[3]);
+        if kd != vd || kd.len() != 4 || kd[0] != 1 || kd[3] != d {
+            candle_core::bail!("SdpaVectorSink: k/v shape {kd:?} incompatible with q {qd:?}");
+        }
+        let (kvh, kv_len) = (kd[1], kd[2]);
+        if kvh == 0 || !h.is_multiple_of(kvh) {
+            candle_core::bail!("SdpaVectorSink: n_heads {h} not divisible by kv heads {kvh}");
+        }
+        if d > 128 {
+            candle_core::bail!("SdpaVectorSink: head_dim {d} > 128");
+        }
+        if self.sinks.elem_count() != h || self.sinks.dtype() != DType::BF16 {
+            candle_core::bail!(
+                "SdpaVectorSink: sinks must be BF16 with {h} elements, got {} {:?}",
+                self.sinks.elem_count(),
+                self.sinks.dtype()
+            );
+        }
+
+        let params = SdpaSinkParams {
+            n_heads: h as u32,
+            n_kv_heads: kvh as u32,
+            kv_len: kv_len as u32,
+            head_dim: d as u32,
+            scale: self.scale,
+        };
+
+        let device = q.device();
+        let out_elems = h * d;
+        let output = device.new_buffer(out_elems, DType::BF16, "sdpa-vector-sink")?;
+
+        let s_sl = self.sinks.storage_and_layout();
+        let s_buf = match &*s_sl.0 {
+            candle_core::Storage::Metal(ms) => ms.buffer(),
+            _ => candle_core::bail!("SdpaVectorSink: sinks must be Metal-resident"),
+        };
+
+        let pipeline = get_or_compile_quant_pipeline(device.device(), "sdpa_vector_sink_bf16")?;
+        let encoder = device.command_encoder()?;
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(q.buffer()), q_l.start_offset() * 2);
+        encoder.set_buffer(1, Some(k.buffer()), k_l.start_offset() * 2);
+        encoder.set_buffer(2, Some(v.buffer()), v_l.start_offset() * 2);
+        encoder.set_buffer(3, Some(s_buf), s_sl.1.start_offset() * 2);
+        encoder.set_buffer(4, Some(&*output), 0);
+        encoder.set_bytes(5, &params);
+        encoder.use_resource(q.buffer(), MTLResourceUsage::Read);
+        encoder.use_resource(k.buffer(), MTLResourceUsage::Read);
+        encoder.use_resource(v.buffer(), MTLResourceUsage::Read);
+        encoder.use_resource(s_buf, MTLResourceUsage::Read);
+        encoder.use_resource(&*output, MTLResourceUsage::Write);
+
+        encoder.dispatch_thread_groups(
+            MTLSize {
+                width: h,
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: 32,
+                height: 1,
+                depth: 1,
+            },
+        );
+
+        let storage = MetalStorage::new(output, device.clone(), out_elems, DType::BF16);
+        Ok((storage, Shape::from(vec![1, h, 1, d])))
+    }
+}
+
+/// Decode attention (q_len = 1) with a per-head sink logit in the softmax
+/// denominator. K/V are the unrepeated per-kv-head tensors (GQA handled in
+/// kernel). Shapes: q [1, H, 1, D], k/v [1, KVH, L, D], sinks H elements.
+pub fn sdpa_vector_sink(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    sinks: &Tensor,
+    scale: f32,
+) -> Result<Tensor> {
+    q.apply_op3_no_bwd(
+        k,
+        v,
+        &SdpaVectorSink {
+            sinks: sinks.clone(),
+            scale,
+        },
+    )
+}
+
 #[cfg(all(test, feature = "metal"))]
 mod decode_batch_scaling_tests {
     use super::*;
@@ -3752,6 +4132,134 @@ mod decode_batch_scaling_tests {
                         "{tag} M={m} n={n} k={k}: max_abs_diff {diff} (tol {tol})"
                     );
                 }
+            }
+        }
+    }
+
+    // Contract: both MXFP4 kernels (batched gemv m<=8, tiled mul_mm above)
+    // equal the CPU reference dequant + matmul, incl. unaligned N.
+    #[test]
+    fn mxfp4_matmul_matches_reference() {
+        let Ok(dev) = Device::new_metal(0) else {
+            return;
+        };
+        let (n, k) = (10usize, 64usize); // N unaligned to 8-row TGs; K = 2 blocks
+        let nb = k / 32;
+        let blocks: Vec<u8> = (0..n * nb * 16).map(|i| (i * 37 + 11) as u8).collect();
+        // E8M0 around 127 so magnitudes stay ~1.
+        let scales: Vec<u8> = (0..n * nb).map(|i| 125 + (i % 5) as u8).collect();
+        let w_ref = crate::common::mxfp4::dequantize_mxfp4_f32(&blocks, &scales, n, k).unwrap();
+        let w_ref_t = Tensor::from_vec(w_ref, (n, k), &Device::Cpu)
+            .unwrap()
+            .t()
+            .unwrap()
+            .contiguous()
+            .unwrap();
+        let blocks_t = Tensor::from_vec(blocks, n * nb * 16, &dev).unwrap();
+        let scales_t = Tensor::from_vec(scales, n * nb, &dev).unwrap();
+
+        for m in [1usize, 4, 8, 33] {
+            let x_data: Vec<f32> = (0..m * k).map(|i| ((i % 13) as f32 - 6.0) * 0.05).collect();
+            let x = Tensor::from_vec(x_data.clone(), (m, k), &dev)
+                .unwrap()
+                .to_dtype(DType::BF16)
+                .unwrap();
+            let y = mxfp4_matmul(&x, &blocks_t, &scales_t, k, n).unwrap();
+            let x_cpu = Tensor::from_vec(x_data, (m, k), &Device::Cpu).unwrap();
+            let y_ref = x_cpu.matmul(&w_ref_t).unwrap();
+
+            assert_eq!(y.dims2().unwrap(), (m, n), "M={m}: shape");
+            let f = y
+                .to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            let r = y_ref.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+            assert!(f.iter().all(|v| v.is_finite()), "M={m}: non-finite");
+            let max_abs = r.iter().fold(0f32, |a, &v| a.max(v.abs()));
+            let tol = 0.06 * max_abs + 1e-2;
+            let diff = f
+                .iter()
+                .zip(&r)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max);
+            assert!(diff < tol, "M={m}: max_abs_diff {diff} (tol {tol})");
+        }
+    }
+
+    // Contract: sdpa_vector_sink equals the scalar reference — softmax over
+    // [scores, sink] with the sink column dropped — including GQA head mapping
+    // and kv lengths not aligned to the 32-thread stride.
+    #[test]
+    fn sdpa_vector_sink_matches_reference() {
+        let Ok(dev) = Device::new_metal(0) else {
+            return;
+        };
+        let (h, kvh, d, l) = (4usize, 2usize, 64usize, 37usize);
+        let scale = 1.0f32 / (d as f32).sqrt();
+
+        let mk = |n: usize, salt: u64| -> Vec<f32> {
+            (0..n)
+                .map(|i| {
+                    let r = (i as u64)
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(salt);
+                    ((r >> 33) & 0xFFFF) as f32 / 65535.0 - 0.5
+                })
+                .collect()
+        };
+        let q_data = mk(h * d, 1);
+        let k_data = mk(kvh * l * d, 2);
+        let v_data = mk(kvh * l * d, 3);
+        let sink_data: Vec<f32> = (0..h).map(|i| (i as f32) * 0.7 - 1.0).collect();
+
+        let to_bf16 = |data: &[f32], shape: Vec<usize>| -> Tensor {
+            Tensor::from_vec(data.to_vec(), shape, &dev)
+                .unwrap()
+                .to_dtype(DType::BF16)
+                .unwrap()
+        };
+        let q = to_bf16(&q_data, vec![1, h, 1, d]);
+        let k = to_bf16(&k_data, vec![1, kvh, l, d]);
+        let v = to_bf16(&v_data, vec![1, kvh, l, d]);
+        let sinks = to_bf16(&sink_data, vec![h]);
+
+        let out = sdpa_vector_sink(&q, &k, &v, &sinks, scale)
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+
+        // Scalar reference (f32). BF16 inputs are exactly representable after
+        // the round-trip, so only accumulation order differs.
+        let bf = |x: f32| f32::from_bits(x.to_bits() & 0xFFFF_0000);
+        for head in 0..h {
+            let kv_head = head / (h / kvh);
+            let scores: Vec<f32> = (0..l)
+                .map(|j| {
+                    (0..d)
+                        .map(|x| bf(q_data[head * d + x]) * bf(k_data[(kv_head * l + j) * d + x]))
+                        .sum::<f32>()
+                        * scale
+                })
+                .collect();
+            let sink = bf(sink_data[head]);
+            let m = scores.iter().fold(sink, |a, &b| a.max(b));
+            let denom: f32 = scores.iter().map(|&s| (s - m).exp()).sum::<f32>() + (sink - m).exp();
+            for x in 0..d {
+                let expect: f32 = (0..l)
+                    .map(|j| (scores[j] - m).exp() / denom * bf(v_data[(kv_head * l + j) * d + x]))
+                    .sum();
+                let got = out[head * d + x];
+                assert!(
+                    (got - expect).abs() < 0.02,
+                    "head {head} dim {x}: got {got}, expected {expect}"
+                );
             }
         }
     }

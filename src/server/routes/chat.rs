@@ -996,6 +996,7 @@ pub fn apply_chat_template(
     tokenizer: &Tokenizer,
     messages: &[ChatMessage],
     enable_thinking: bool,
+    reasoning_effort: Option<&str>,
     tools: Option<serde_json::Value>,
 ) -> anyhow::Result<String> {
     let Some(template) = tokenizer.chat_template() else {
@@ -1043,11 +1044,14 @@ pub fn apply_chat_template(
         chat_template::apply_chat_template(
             template,
             msgs,
-            tokenizer.bos_token(),
-            tokenizer.eos_token(),
-            true,
-            enable_thinking,
-            t,
+            chat_template::TemplateOptions {
+                bos_token: tokenizer.bos_token(),
+                eos_token: tokenizer.eos_token(),
+                add_generation_prompt: true,
+                enable_thinking,
+                reasoning_effort,
+                tools: t,
+            },
         )
     };
 
@@ -1225,6 +1229,16 @@ pub(super) async fn chat_completions(
         ));
     }
 
+    if let Some(ref effort) = body.reasoning_effort
+        && !matches!(effort.as_str(), "low" | "medium" | "high")
+    {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            format!("reasoning_effort must be 'low', 'medium', or 'high'; got '{effort}'"),
+            "invalid_request_error",
+        ));
+    }
+
     let n = body.n.unwrap_or(1);
     if n == 0 {
         return Err(error_response(
@@ -1327,6 +1341,8 @@ pub(super) async fn chat_completions(
     let enable_thinking =
         body.enable_thinking.unwrap_or(false) && handle.tokenizer.has_thinking_support();
 
+    let reasoning_effort = body.reasoning_effort.clone();
+
     let json_mode = body
         .response_format
         .as_ref()
@@ -1386,6 +1402,7 @@ pub(super) async fn chat_completions(
         &handle.tokenizer,
         &messages_for_prompt,
         enable_thinking,
+        reasoning_effort.as_deref(),
         tools_value,
     )
     .map_err(|e| {

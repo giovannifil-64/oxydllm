@@ -547,6 +547,7 @@ fn is_relevant_file(f: &str) -> bool {
         || l.ends_with(".gguf")
         || l.ends_with(".model")
         || l.ends_with(".tiktoken")
+        || l.ends_with(".jinja")
 }
 
 fn download_file(

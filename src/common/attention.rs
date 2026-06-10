@@ -62,6 +62,11 @@ pub struct Attention {
     q_norm: Option<RMSNorm>,
     k_norm: Option<RMSNorm>,
     qk_norm_layout: QkNormLayout,
+    /// GPT-OSS attention sinks: per-head learned logit folded into the softmax
+    /// denominator (stored [1, n_heads, 1, 1]). Decode uses the dedicated
+    /// sink-aware SDPA kernel; prefill takes the fallback path (FA/stock SDPA
+    /// can't inject the extra softmax column).
+    sinks: Option<Tensor>,
     n_heads: usize,
     n_kv_heads: usize,
     head_dim: usize,
@@ -124,6 +129,10 @@ fn rms_norm_no_weight(x: &Tensor, eps: f64) -> Result<Tensor> {
 
 impl Attention {
     pub fn load(cfg: &BlockConfig, layer_idx: usize, weights: &ModelWeights) -> Result<Self> {
+        let sinks = weights
+            .try_get(&format!("model.layers.{layer_idx}.self_attn.sinks"))
+            .map(|t| t.reshape((1, cfg.n_heads, 1, 1)))
+            .transpose()?;
         let p = format!("model.layers.{}.self_attn", layer_idx);
         let hd = cfg.head_dim;
         let q_dim = cfg.n_heads * hd;
@@ -213,7 +222,8 @@ impl Attention {
                 o_weight_name
             );
         }
-        let o_proj = AnyLinear::from_weight_with_scale_inv(o_weight, o_scale_inv, None)?;
+        let o_bias = weights.try_get(&format!("{}.o_proj.bias", p)).cloned();
+        let o_proj = AnyLinear::from_weight_with_scale_inv(o_weight, o_scale_inv, o_bias)?;
 
         let (q_norm, k_norm, qk_norm_layout) = if cfg.qk_norm {
             let q_w = weights.get(&format!("{}.q_norm.weight", p))?.clone();
@@ -251,6 +261,7 @@ impl Attention {
             q_norm,
             k_norm,
             qk_norm_layout,
+            sinks: sinks.clone(),
             n_heads: cfg.n_heads,
             n_kv_heads: cfg.n_kv_heads,
             head_dim: hd,
@@ -387,6 +398,8 @@ impl Attention {
             q_norm,
             k_norm,
             qk_norm_layout,
+            // No AWQ GPT-OSS checkpoints exist; sinks are safetensors-only.
+            sinks: None,
             n_heads: cfg.n_heads,
             n_kv_heads: cfg.n_kv_heads,
             head_dim: hd,
@@ -502,6 +515,7 @@ impl Attention {
             q_norm,
             k_norm,
             qk_norm_layout: QkNormLayout::PerHead,
+            sinks: None,
             n_heads: cfg.n_heads,
             n_kv_heads: cfg.n_kv_heads,
             head_dim: hd,
@@ -704,6 +718,7 @@ impl Attention {
             // prefill is rare so falls back. METAL_FA_MIN_KV gates on cache size.
             #[cfg(feature = "metal")]
             let use_metal_fa = metal_fa_base_ok
+                && self.sinks.is_none()
                 && seg.num_tokens > 1
                 && mask.is_none()
                 && self.sliding_window.is_none()
@@ -714,12 +729,26 @@ impl Attention {
 
             #[cfg(feature = "metal")]
             let use_seg_sdpa = sdpa_base_ok
+                && self.sinks.is_none()
                 && !use_metal_fa
                 && seg.num_tokens == 1
                 && !(seg.num_tokens > 1 && kv_lengths[i] > seg.num_tokens)
                 && (self.attn_softcap.is_none() || seg.num_tokens <= 8);
             #[cfg(not(feature = "metal"))]
             let use_seg_sdpa = false;
+
+            // Sink-aware decode SDPA (GPT-OSS): our kernel folds the per-head
+            // sink into the softmax and reads unrepeated GQA K/V directly.
+            #[cfg(feature = "metal")]
+            let use_sink_sdpa = device.is_metal()
+                && self.sinks.is_some()
+                && seg.num_tokens == 1
+                && q.dtype() == DType::BF16
+                && self.head_dim <= 128
+                && self.attn_softcap.is_none()
+                && mask.is_none();
+            #[cfg(not(feature = "metal"))]
+            let use_sink_sdpa = false;
 
             // Tensor::contiguous() short-circuits to a cheap clone when the
             // tensor is already contiguous, so no borrow-or-own dance is needed.
@@ -749,6 +778,19 @@ impl Attention {
                         seg.num_tokens > 1,
                         self.scale as f32,
                         self.attn_softcap.map(|s| s as f32).unwrap_or(1.0),
+                    )?;
+                    out_buf.slice_set(&seg_out.contiguous()?, 2, q_offset)?;
+                }
+            } else if use_sink_sdpa {
+                #[cfg(feature = "metal")]
+                {
+                    let sinks = self.sinks.as_ref().expect("gated on sinks.is_some()");
+                    let seg_out = super::metal_ops::sdpa_vector_sink(
+                        &q_seg.contiguous()?,
+                        &k_seg.contiguous()?,
+                        &v_seg.contiguous()?,
+                        sinks,
+                        self.scale as f32,
                     )?;
                     out_buf.slice_set(&seg_out.contiguous()?, 2, q_offset)?;
                 }
@@ -801,7 +843,20 @@ impl Attention {
                     scores
                 };
 
-                let attn = softmax_last_dim(&scores)?;
+                let attn = match &self.sinks {
+                    Some(sinks) => {
+                        let (sb, sh, sq, sk) = scores.dims4()?;
+                        let sink_col = sinks
+                            .to_dtype(scores.dtype())?
+                            .broadcast_as((sb, sh, sq, 1))?
+                            .contiguous()?;
+                        let with_sink = Tensor::cat(&[&scores, &sink_col], D::Minus1)?;
+                        softmax_last_dim(&with_sink)?
+                            .narrow(D::Minus1, 0, sk)?
+                            .contiguous()?
+                    }
+                    None => softmax_last_dim(&scores)?,
+                };
                 let seg_out = attn.matmul(&v_seg)?.contiguous()?;
                 out_buf.slice_set(&seg_out, 2, q_offset)?;
             }
@@ -841,6 +896,7 @@ impl Attention {
             q_norm: None,
             k_norm: None,
             qk_norm_layout: QkNormLayout::PerHead,
+            sinks: None,
             n_heads,
             n_kv_heads,
             head_dim,

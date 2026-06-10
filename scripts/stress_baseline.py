@@ -91,6 +91,7 @@ CORE_MODELS = [
 
 SLOW_MODELS = [
     "microsoft/Phi-3.5-mini-instruct",  # ~8 tok/s on Metal (no Q4_K fast path for Phi-3)
+    "openai/gpt-oss-20b",
 ]
 
 WARMUP_PROMPT = "Reply with the single word ready."

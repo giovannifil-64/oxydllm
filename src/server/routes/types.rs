@@ -126,6 +126,10 @@ pub struct ChatCompletionRequest {
     pub keep_alive: Option<u64>,
     #[serde(default)]
     pub enable_thinking: Option<bool>,
+    /// Reasoning effort for harmony-format models (gpt-oss): low | medium | high.
+    /// These models cannot disable reasoning — this only scales it.
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
     #[serde(default)]
     pub response_format: Option<ResponseFormat>,
     #[serde(default)]

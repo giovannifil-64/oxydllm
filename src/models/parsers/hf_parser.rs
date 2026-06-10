@@ -121,6 +121,7 @@ pub fn parse(config_path: &str) -> Result<StandardTransformerConfig> {
         .filter(|&n| n > 1);
     let moe_num_experts_per_tok = v["num_experts_per_tok"].as_u64().map(|x| x as usize);
     let moe_norm_topk_prob = v["norm_topk_prob"].as_bool();
+    let moe_swiglu_limit = v["swiglu_limit"].as_f64();
 
     let layer_types =
         parse_string_array(&v["layer_types"]).filter(|x| x.len() == num_hidden_layers);
@@ -280,6 +281,8 @@ pub fn parse(config_path: &str) -> Result<StandardTransformerConfig> {
         moe_num_experts,
         moe_num_experts_per_tok,
         moe_norm_topk_prob,
+        moe_gpt_oss: arch_def.gpt_oss_moe,
+        moe_swiglu_limit,
     })
 }
 
@@ -367,6 +370,15 @@ fn validate_quantization_config(v: &Value) -> Result<Option<crate::common::weigh
             tracing::info!(
                 quant = "fp8",
                 "FP8 checkpoint detected; weights will be dequantized at load time (CPU path on Metal)"
+            );
+            Ok(None)
+        }
+        // MXFP4 (GPT-OSS) only quantizes the MoE expert tensors, which the MoE
+        // loader consumes directly as packed U8 — no global scheme needed.
+        "mxfp4" => {
+            tracing::info!(
+                quant = "mxfp4",
+                "MXFP4 checkpoint detected (GPT-OSS experts stay packed; fused Metal matmul)"
             );
             Ok(None)
         }

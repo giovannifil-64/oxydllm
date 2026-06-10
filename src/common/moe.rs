@@ -46,25 +46,70 @@
 
 use super::config::Activation;
 use super::linear::{AnyLinear, gelu_tanh, silu, softmax_last_dim};
+use super::mxfp4::Mxfp4Linear;
 use super::weights::ModelWeights;
 use candle_core::{D, DType, Result, Tensor};
 
-struct MoeExpert {
-    gate_proj: AnyLinear,
-    up_proj: AnyLinear,
-    down_proj: AnyLinear,
+enum MoeExpert {
+    Standard {
+        gate_proj: AnyLinear,
+        up_proj: AnyLinear,
+        down_proj: AnyLinear,
+    },
+    /// GPT-OSS expert: MXFP4 weights, gate/up INTERLEAVED in one projection
+    /// (even columns gate, odd columns up), clamped swiglu with alpha = 1.702
+    /// and a `+1` on the up branch:
+    ///   glu = min(gate, limit) * sigmoid(1.702 * min(gate, limit))
+    ///   out = down((clamp(up, ±limit) + 1) * glu)
+    GptOss {
+        gate_up: Mxfp4Linear,
+        down: Mxfp4Linear,
+        limit: f64,
+    },
 }
+
+const GPT_OSS_SWIGLU_ALPHA: f64 = 1.702;
 
 impl MoeExpert {
     fn forward(&self, x: &Tensor, activation: Activation) -> Result<Tensor> {
-        let gate = self.gate_proj.forward(x)?;
-        let up = self.up_proj.forward(x)?;
-        let activated = match activation {
-            Activation::SiLU => silu(&gate)?,
-            Activation::GeLUTanh => gelu_tanh(&gate)?,
-        };
-        let gated = (activated * up)?;
-        self.down_proj.forward(&gated)
+        match self {
+            Self::Standard {
+                gate_proj,
+                up_proj,
+                down_proj,
+            } => {
+                let gate = gate_proj.forward(x)?;
+                let up = up_proj.forward(x)?;
+                let activated = match activation {
+                    Activation::SiLU => silu(&gate)?,
+                    Activation::GeLUTanh => gelu_tanh(&gate)?,
+                };
+                let gated = (activated * up)?;
+                down_proj.forward(&gated)
+            }
+            Self::GptOss {
+                gate_up,
+                down,
+                limit,
+            } => {
+                let gu = gate_up.forward(x)?;
+                let mut dims = gu.dims().to_vec();
+                let inter = dims.last().unwrap() / 2;
+                *dims.last_mut().unwrap() = inter;
+                dims.push(2);
+                let gu = gu.reshape(dims)?;
+                let gate = gu.narrow(D::Minus1, 0, 1)?.squeeze(D::Minus1)?;
+                let up = gu.narrow(D::Minus1, 1, 1)?.squeeze(D::Minus1)?;
+
+                let gate = gate.clamp(f64::NEG_INFINITY, *limit)?;
+                let up = up.clamp(-*limit, *limit)?;
+                let z = gate.affine(GPT_OSS_SWIGLU_ALPHA, 0.0)?;
+                let sig = (z.neg()?.exp()?.affine(1.0, 1.0)?).recip()?;
+                let glu = (gate * sig)?;
+                let h = (up.affine(1.0, 1.0)? * glu)?;
+                down.forward(&h)
+            }
+        }
     }
 }
 
@@ -107,7 +152,7 @@ impl MoeFeedForward {
             let gate = weights.get(&format!("{prefix}.gate_proj.weight"))?.clone();
             let up = weights.get(&format!("{prefix}.up_proj.weight"))?.clone();
             let down = weights.get(&format!("{prefix}.down_proj.weight"))?.clone();
-            experts.push(MoeExpert {
+            experts.push(MoeExpert::Standard {
                 gate_proj: AnyLinear::from_weight(gate, None)?,
                 up_proj: AnyLinear::from_weight(up, None)?,
                 down_proj: AnyLinear::from_weight(down, None)?,
@@ -120,6 +165,81 @@ impl MoeFeedForward {
             top_k,
             activation,
             norm_topk,
+        })
+    }
+
+    /// GPT-OSS layout: stacked MXFP4 expert tensors
+    /// (`mlp.experts.{gate_up,down}_proj_{blocks,scales,bias}`, expert dim 0)
+    /// and a router with bias. Routing is softmax-over-top-k, which equals the
+    /// standard path with `norm_topk = true`.
+    pub fn load_gpt_oss(
+        layer_idx: usize,
+        weights: &ModelWeights,
+        num_experts: usize,
+        top_k: usize,
+        swiglu_limit: f64,
+    ) -> Result<Self> {
+        if top_k == 0 || top_k > num_experts {
+            candle_core::bail!("MoE top_k={top_k} must be in (0, {num_experts}] (num_experts)");
+        }
+        let p = format!("model.layers.{layer_idx}.mlp");
+
+        let router_w = weights.get(&format!("{p}.router.weight"))?.clone();
+        let router_b = weights.try_get(&format!("{p}.router.bias")).cloned();
+        let router = AnyLinear::from_weight(router_w, router_b)?;
+
+        let slice_expert = |t: &Tensor, e: usize| -> Result<Tensor> {
+            t.narrow(0, e, 1)?.squeeze(0)?.contiguous()
+        };
+        let gu_blocks = weights.get(&format!("{p}.experts.gate_up_proj_blocks"))?;
+        let gu_scales = weights.get(&format!("{p}.experts.gate_up_proj_scales"))?;
+        let gu_bias = weights.get(&format!("{p}.experts.gate_up_proj_bias"))?;
+        let dn_blocks = weights.get(&format!("{p}.experts.down_proj_blocks"))?;
+        let dn_scales = weights.get(&format!("{p}.experts.down_proj_scales"))?;
+        let dn_bias = weights.get(&format!("{p}.experts.down_proj_bias"))?;
+
+        // [E, out, K/32, 16] blocks: derive (out, in) from the stacked shapes.
+        let dims_of = |t: &Tensor, what: &str| -> Result<(usize, usize)> {
+            let d = t.dims();
+            if d.len() != 4 || d[3] != 16 {
+                candle_core::bail!(
+                    "GPT-OSS MoE layer {layer_idx}: {what} shape {d:?} != [E, out, K/32, 16]"
+                );
+            }
+            Ok((d[1], d[2] * 32))
+        };
+        let (gu_out, gu_in) = dims_of(gu_blocks, "gate_up_proj_blocks")?;
+        let (dn_out, dn_in) = dims_of(dn_blocks, "down_proj_blocks")?;
+
+        let mut experts = Vec::with_capacity(num_experts);
+        for e in 0..num_experts {
+            let gate_up = Mxfp4Linear::new(
+                slice_expert(gu_blocks, e)?,
+                slice_expert(gu_scales, e)?,
+                Some(slice_expert(gu_bias, e)?),
+                gu_in,
+                gu_out,
+            )?;
+            let down = Mxfp4Linear::new(
+                slice_expert(dn_blocks, e)?,
+                slice_expert(dn_scales, e)?,
+                Some(slice_expert(dn_bias, e)?),
+                dn_in,
+                dn_out,
+            )?;
+            experts.push(MoeExpert::GptOss {
+                gate_up,
+                down,
+                limit: swiglu_limit,
+            });
+        }
+
+        Ok(Self {
+            router,
+            experts,
+            top_k,
+            activation: Activation::SiLU,
+            norm_topk: true,
         })
     }
 
@@ -164,20 +284,31 @@ impl MoeFeedForward {
     ) -> Result<Tensor> {
         let num_experts = self.experts.len();
         let device = x_flat.device();
-        let gate_f32 = Tensor::zeros((n_tokens, num_experts), DType::F32, device)?;
-        let gate_f32 = gate_f32.scatter_add(top_idx, top_vals, D::Minus1)?;
-        let gate = gate_f32.to_dtype(x_flat.dtype())?;
 
-        let per_expert_mass: Vec<f32> = gate_f32.sum(0)?.flatten_all()?.to_vec1::<f32>()?;
+        // Decode-sized batches: read the (tiny) routing decision once and run
+        // only the chosen experts — no dense gate tensor or full-vocab-of-experts
+        // mass readback on the serialized decode path.
+        let top_idx_cpu: Vec<u32> = top_idx.flatten_all()?.to_vec1::<u32>()?;
+        let top_vals_cpu: Vec<f32> = top_vals.flatten_all()?.to_vec1::<f32>()?;
+        let mut per_expert_w: Vec<Option<Vec<f32>>> = vec![None; num_experts];
+        for token in 0..n_tokens {
+            for slot in 0..self.top_k {
+                let flat = token * self.top_k + slot;
+                let e = top_idx_cpu[flat] as usize;
+                per_expert_w[e].get_or_insert_with(|| vec![0.0; n_tokens])[token] +=
+                    top_vals_cpu[flat];
+            }
+        }
 
         let mut acc: Option<Tensor> = None;
         for (e, expert) in self.experts.iter().enumerate() {
-            if per_expert_mass[e] == 0.0 {
+            let Some(w) = &per_expert_w[e] else {
                 continue;
-            }
-            let weight_e = gate.narrow(D::Minus1, e, 1)?;
+            };
+            let w_t =
+                Tensor::from_vec(w.clone(), (n_tokens, 1), device)?.to_dtype(x_flat.dtype())?;
             let expert_out = expert.forward(x_flat, self.activation)?;
-            let weighted = expert_out.broadcast_mul(&weight_e)?;
+            let weighted = expert_out.broadcast_mul(&w_t)?;
             acc = Some(match acc {
                 Some(a) => (a + weighted)?,
                 None => weighted,
@@ -271,7 +402,7 @@ mod tests {
         let mut experts = Vec::with_capacity(num_experts);
         for e in 0..num_experts {
             let off = 1000 + e as u64 * 17;
-            experts.push(MoeExpert {
+            experts.push(MoeExpert::Standard {
                 gate_proj: AnyLinear::Float(Linear::new(mk(intermediate, hidden, off)?, None)?),
                 up_proj: AnyLinear::Float(Linear::new(mk(intermediate, hidden, off + 1)?, None)?),
                 down_proj: AnyLinear::Float(Linear::new(mk(hidden, intermediate, off + 2)?, None)?),
@@ -325,6 +456,124 @@ mod tests {
         let y_mag: f32 = y_norm.iter().map(|v| v.abs()).sum::<f32>() / y_norm.len() as f32;
         let r_mag: f32 = ref_norm.iter().map(|v| v.abs()).sum::<f32>() / ref_norm.len() as f32;
         assert!(y_mag < 10.0 * r_mag && r_mag < 10.0 * y_mag);
+        Ok(())
+    }
+
+    // Contract: the GPT-OSS expert math — interleaved gate/up split, clamping
+    // at swiglu_limit, alpha=1.702 sigmoid gate, and the (up + 1) branch —
+    // matches a scalar reference computed independently in f32.
+    #[test]
+    fn gpt_oss_expert_matches_scalar_reference() -> Result<()> {
+        use crate::common::mxfp4::Mxfp4Linear;
+        let device = Device::Cpu;
+        let (hidden, inter) = (32usize, 32usize);
+        let limit = 7.0f32;
+
+        // MXFP4 weights with non-trivial codes: gate_up rows cycle FP4 codes,
+        // scales cycle around 127 so magnitudes vary.
+        let gu_out = 2 * inter;
+        let nb = hidden / 32;
+        let gu_blocks: Vec<u8> = (0..gu_out * nb * 16).map(|i| (i * 23 + 7) as u8).collect();
+        let gu_scales: Vec<u8> = (0..gu_out * nb).map(|i| 125 + (i % 5) as u8).collect();
+        let dn_blocks: Vec<u8> = (0..hidden * nb * 16).map(|i| (i * 41 + 3) as u8).collect();
+        let dn_scales: Vec<u8> = (0..hidden * nb).map(|i| 126 + (i % 3) as u8).collect();
+        let gu_bias: Vec<f32> = (0..gu_out).map(|i| (i as f32 * 0.7).sin() * 2.0).collect();
+        let dn_bias: Vec<f32> = (0..hidden).map(|i| (i as f32 * 0.3).cos() * 0.5).collect();
+
+        let expert = MoeExpert::GptOss {
+            gate_up: Mxfp4Linear::new(
+                Tensor::from_vec(gu_blocks.clone(), gu_out * nb * 16, &device)?,
+                Tensor::from_vec(gu_scales.clone(), gu_out * nb, &device)?,
+                Some(Tensor::from_vec(gu_bias.clone(), gu_out, &device)?),
+                hidden,
+                gu_out,
+            )?,
+            down: Mxfp4Linear::new(
+                Tensor::from_vec(dn_blocks.clone(), hidden * nb * 16, &device)?,
+                Tensor::from_vec(dn_scales.clone(), hidden * nb, &device)?,
+                Some(Tensor::from_vec(dn_bias.clone(), hidden, &device)?),
+                inter,
+                hidden,
+            )?,
+            limit: limit as f64,
+        };
+
+        let x_data: Vec<f32> = (0..hidden)
+            .map(|i| ((i as f32) * 0.21).sin() * 3.0)
+            .collect();
+        let x = Tensor::from_vec(x_data.clone(), (1, hidden), &device)?;
+        let y = expert
+            .forward(&x, Activation::SiLU)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+
+        // Independent scalar reference.
+        let w_gu =
+            crate::common::mxfp4::dequantize_mxfp4_f32(&gu_blocks, &gu_scales, gu_out, hidden)?;
+        let w_dn =
+            crate::common::mxfp4::dequantize_mxfp4_f32(&dn_blocks, &dn_scales, hidden, inter)?;
+        let mut gate_up = vec![0f32; gu_out];
+        for (o, gu) in gate_up.iter_mut().enumerate() {
+            *gu = gu_bias[o]
+                + x_data
+                    .iter()
+                    .enumerate()
+                    .map(|(k, &xv)| xv * w_gu[o * hidden + k])
+                    .sum::<f32>();
+        }
+        let mut h = vec![0f32; inter];
+        for (k, hv) in h.iter_mut().enumerate() {
+            let gate = gate_up[2 * k].min(limit);
+            let up = gate_up[2 * k + 1].clamp(-limit, limit);
+            let glu = gate * (1.0 / (1.0 + (-gate * 1.702f32).exp()));
+            *hv = (up + 1.0) * glu;
+        }
+        let mut expected = vec![0f32; hidden];
+        for (o, ev) in expected.iter_mut().enumerate() {
+            *ev = dn_bias[o]
+                + h.iter()
+                    .enumerate()
+                    .map(|(k, &hv)| hv * w_dn[o * inter + k])
+                    .sum::<f32>();
+        }
+
+        let max_abs = expected.iter().fold(0f32, |a, &v| a.max(v.abs()));
+        let tol = 1e-3 * max_abs + 1e-3;
+        for (i, (&got, &exp)) in y.iter().zip(&expected).enumerate() {
+            assert!(
+                (got - exp).abs() < tol,
+                "out[{i}]: got {got}, expected {exp} (tol {tol})"
+            );
+        }
+        Ok(())
+    }
+
+    // Contract: the naive decode dispatch must produce the same output as the
+    // sparse dispatch for the same input (they are alternative evaluations of
+    // the same routing).
+    #[test]
+    fn naive_and_sparse_dispatch_agree() -> Result<()> {
+        let device = Device::Cpu;
+        let (hidden, intermediate, num_experts, top_k) = (8, 16, 4, 2);
+        let moe = build_synth_moe(&device, hidden, intermediate, num_experts, top_k, 0xbeef)?;
+
+        // 2 tokens with top_k=2: n_tokens <= top_k -> forward takes the naive
+        // path; compute the sparse path directly on the same routing.
+        let x_data: Vec<f32> = (0..2 * hidden).map(|i| (i as f32 * 0.05).sin()).collect();
+        let x_flat = Tensor::from_vec(x_data, (2, hidden), &device)?;
+
+        let logits = moe.router.forward(&x_flat)?;
+        let probs = softmax_last_dim(&logits.to_dtype(DType::F32)?)?;
+        let sorted_idx = probs.arg_sort_last_dim(false)?;
+        let top_idx = sorted_idx.narrow(D::Minus1, 0, top_k)?.contiguous()?;
+        let top_vals = probs.gather(&top_idx, D::Minus1)?;
+        let denom = top_vals.sum_keepdim(D::Minus1)?;
+        let top_vals = top_vals.broadcast_div(&denom)?;
+
+        let naive = moe.dispatch_naive(&x_flat, &top_idx, &top_vals, 2, hidden)?;
+        let sparse = moe.dispatch_sparse(&x_flat, &top_idx, &top_vals, 2, hidden)?;
+        let diff = (naive - sparse)?.abs()?.max_all()?.to_scalar::<f32>()?;
+        assert!(diff < 1e-5, "naive vs sparse max_abs_diff = {diff}");
         Ok(())
     }
 

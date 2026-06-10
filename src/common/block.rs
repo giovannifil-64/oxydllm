@@ -81,6 +81,15 @@ impl TransformerBlock {
         )?;
         let attention = Attention::load(cfg, layer_idx, weights)?;
         let ffn = match cfg.moe {
+            Some(moe_cfg) if moe_cfg.gpt_oss => {
+                FeedForwardLayer::Moe(MoeFeedForward::load_gpt_oss(
+                    layer_idx,
+                    weights,
+                    moe_cfg.num_experts,
+                    moe_cfg.num_experts_per_tok,
+                    moe_cfg.swiglu_limit,
+                )?)
+            }
             Some(moe_cfg) => FeedForwardLayer::Moe(MoeFeedForward::load(
                 layer_idx,
                 weights,

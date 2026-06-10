@@ -1522,37 +1522,35 @@ kernel void gguf_q5k_gemv_batch_bf16(
             const float dall = (float)dh[0];
             const float dmin = (float)dh[1];
 
+            // Dequantize ONCE into registers, affine fold: w = d*sc*q5 - dmin*msc
+            // (the q5 value is (4-bit nibble) + 16*high-bit; the original kernel's
+            // /16 and ×16 tricks are absorbed here). m-loop below is pure FMA.
+            const float d0 = dall * sc8[0];
+            const float d1 = dall * sc8[1];
+            const float d4 = dall * sc8[4];
+            const float d5 = dall * sc8[5];
+            const float mn2 = dmin * sc8[2];
+            const float mn3 = dmin * sc8[3];
+            const float mn6 = dmin * sc8[6];
+            const float mn7 = dmin * sc8[7];
+            float w0[8], w1[8], w2[8], w3[8];
+            for (uint l = 0; l < nn; ++l) {
+                const uint8_t h = qh[l];
+                w0[l] = d0 * (float)((q1[l] & 0x0F)        + ((h & hm1) ? 16 : 0)) - mn2;
+                w1[l] = d1 * (float)(((q1[l] & 0xF0) >> 4) + ((h & hm2) ? 16 : 0)) - mn3;
+                w2[l] = d4 * (float)((q2[l] & 0x0F)        + ((h & hm3) ? 16 : 0)) - mn6;
+                w3[l] = d5 * (float)(((q2[l] & 0xF0) >> 4) + ((h & hm4) ? 16 : 0)) - mn7;
+            }
+
             for (uint m = 0; m < M; ++m) {
                 device const bfloat *y1 = x + (ulong)m * (ulong)K + (ulong)i * QK_K + y_offset;
                 device const bfloat *y2 = y1 + 128;
-                float yl[16], yh[16];
-                float4 sumy = {0.f, 0.f, 0.f, 0.f};
-                for (uint l = 0; l < 8; ++l) {
-                    yl[l+0] = (float)y1[l+ 0]; sumy[0] += yl[l+0];
-                    yl[l+8] = (float)y1[l+32]; sumy[1] += yl[l+8];
-                    yh[l+0] = (float)y2[l+ 0]; sumy[2] += yh[l+0];
-                    yh[l+8] = (float)y2[l+32]; sumy[3] += yh[l+8];
-                }
-
-                float4 acc1 = {0.f, 0.f, 0.f, 0.f};
-                float4 acc2 = {0.f, 0.f, 0.f, 0.f};
+                float acc = 0.f;
                 for (uint l = 0; l < nn; ++l) {
-                    uint8_t h = qh[l];
-                    acc1[0] += yl[l+0] * (q1[l] & 0x0F);
-                    acc1[1] += yl[l+8] * (q1[l] & 0xF0);
-                    acc1[2] += yh[l+0] * (q2[l] & 0x0F);
-                    acc1[3] += yh[l+8] * (q2[l] & 0xF0);
-                    acc2[0] += (h & hm1) ? yl[l+0] : 0.f;
-                    acc2[1] += (h & hm2) ? yl[l+8] : 0.f;
-                    acc2[2] += (h & hm3) ? yh[l+0] : 0.f;
-                    acc2[3] += (h & hm4) ? yh[l+8] : 0.f;
+                    acc += (float)y1[l+ 0] * w0[l] + (float)y1[l+32] * w1[l] +
+                           (float)y2[l+ 0] * w2[l] + (float)y2[l+32] * w3[l];
                 }
-                sumf[row][m] += dall * (sc8[0] * (acc1[0]      + 16.f*acc2[0]) +
-                                        sc8[1] * (acc1[1]/16.f + 16.f*acc2[1]) +
-                                        sc8[4] * (acc1[2]      + 16.f*acc2[2]) +
-                                        sc8[5] * (acc1[3]/16.f + 16.f*acc2[3])) -
-                                dmin * (sumy[0]*sc8[2] + sumy[1]*sc8[3] +
-                                        sumy[2]*sc8[6] + sumy[3]*sc8[7]);
+                sumf[row][m] += acc;
             }
 
             q1 = (device const uint8_t *)((device const uint8_t *)q1 + step);
@@ -1703,21 +1701,28 @@ kernel void gguf_q6k_gemv_batch_bf16(
         device const int8_t  *sc = xb->scales + is;
         const float dall = (float)xb->d;
 
+        // Dequantize ONCE into registers (group scales folded in); the m-loop
+        // below is then pure FMA — this is what lets per-token cost drop with M.
+        const float ds0 = dall * sc[0];
+        const float ds2 = dall * sc[2];
+        const float ds4 = dall * sc[4];
+        const float ds6 = dall * sc[6];
+        float w0[4], w1[4], w2[4], w3[4];
+        for (uint l = 0; l < nn; ++l) {
+            w0[l] = ds0 * (float)((int8_t)((q1[l] & 0xF) | ((qh[l] & kmask1) << 4)) - 32);
+            w1[l] = ds2 * (float)((int8_t)((q2[l] & 0xF) | ((qh[l] & kmask2) << 2)) - 32);
+            w2[l] = ds4 * (float)((int8_t)((q1[l]  >> 4) | ((qh[l] & kmask3) << 0)) - 32);
+            w3[l] = ds6 * (float)((int8_t)((q2[l]  >> 4) | ((qh[l] & kmask4) >> 2)) - 32);
+        }
+
         for (uint m = 0; m < M; ++m) {
             device const bfloat *y = x + (ulong)m * (ulong)K + (ulong)i * QK_K + y_offset;
-            float4 sums = {0.f, 0.f, 0.f, 0.f};
+            float acc = 0.f;
             for (uint l = 0; l < nn; ++l) {
-                sums[0] += (float)y[l+ 0] *
-                           (float)((int8_t)((q1[l] & 0xF) | ((qh[l] & kmask1) << 4)) - 32);
-                sums[1] += (float)y[l+32] *
-                           (float)((int8_t)((q2[l] & 0xF) | ((qh[l] & kmask2) << 2)) - 32);
-                sums[2] += (float)y[l+64] *
-                           (float)((int8_t)((q1[l]  >> 4) | ((qh[l] & kmask3) << 0)) - 32);
-                sums[3] += (float)y[l+96] *
-                           (float)((int8_t)((q2[l]  >> 4) | ((qh[l] & kmask4) >> 2)) - 32);
+                acc += (float)y[l+ 0] * w0[l] + (float)y[l+32] * w1[l] +
+                       (float)y[l+64] * w2[l] + (float)y[l+96] * w3[l];
             }
-            sumf[m] += dall * (sums[0]*sc[0] + sums[1]*sc[2] +
-                               sums[2]*sc[4] + sums[3]*sc[6]);
+            sumf[m] += acc;
         }
     }
 
@@ -2102,14 +2107,10 @@ kernel void gguf_q3k_gemv_batch_bf16(
                            {0x0004, 0x0400, 0x0008, 0x0800},
                            {0x0010, 0x1000, 0x0020, 0x2000},
                            {0x0040, 0x4000, 0x0080, 0x8000}};
-    const int4 qm[2] = {{0x0003, 0x0300, 0x000c, 0x0c00},
-                        {0x0030, 0x3000, 0x00c0, 0xc000}};
 
     const ushort4 hm = mm[2u * ip + il / 2u];
 
     const uint shift = 2u * il;
-    const float v1 = (il == 0u) ? 4.f : 64.f;
-    const float v2 = 4.f * v1;
 
     const uint16_t s_shift1 = 4u * (uint16_t)ip;
     const uint16_t s_shift2 = s_shift1 + (uint16_t)il;
@@ -2123,12 +2124,12 @@ kernel void gguf_q3k_gemv_batch_bf16(
     thread uint16_t   *scales16 = (thread uint16_t   *)&scales32;
     thread const int8_t *scales = (thread const int8_t *)&scales32;
 
-    float sumf1[2][GGUF_BATCH_MAX];
-    float sumf2[2][GGUF_BATCH_MAX];
+    const ushort hmv[4] = {hm[0], hm[1], hm[2], hm[3]};
+
+    float sumf[2][GGUF_BATCH_MAX];
     for (uint row = 0; row < 2; ++row) {
         for (uint m = 0; m < GGUF_BATCH_MAX; ++m) {
-            sumf1[row][m] = 0.f;
-            sumf2[row][m] = 0.f;
+            sumf[row][m] = 0.f;
         }
     }
 
@@ -2148,49 +2149,37 @@ kernel void gguf_q3k_gemv_batch_bf16(
             scales16[1] = a[il + 1u];
             scales32 = ((scales32 >> s_shift1) & 0x0f0f0f0fu) | aux32;
 
+            // Dequantize ONCE into registers. True per-element value:
+            // d*(sc-32)*(q2bit - (hbit ? 0 : 4)) — extracting the 2-bit values
+            // directly cancels the template's in-place <<shift, /256 odd-byte and
+            // 0.25*sumf2 normalizations, so no final rescale is needed.
+            const float dsA = d_all * (float)(scales[0] - 32);
+            const float dsB = d_all * (float)(scales[1] - 32);
+            const float dsC = d_all * (float)(scales[2] - 32);
+            const float dsD = d_all * (float)(scales[3] - 32);
+            float wA[8], wB[8], wC[8], wD[8];
+            for (uint l = 0; l < n; ++l) {
+                const uint sh  = shift + 8u * (l & 1u);
+                const uint qlo = (uint)q[l / 2];
+                const uint qhi = (uint)q[l / 2 + 8];
+                const uint hlo = (uint)h[l / 2];
+                const uint hhi = (uint)h[l / 2 + 8];
+                const ushort hm01 = hmv[l & 1u];
+                const ushort hm23 = hmv[2u + (l & 1u)];
+                wA[l] = dsA * ((float)((qlo >> sh) & 3u)        - ((hlo & hm01) ? 0.f : 4.f));
+                wB[l] = dsB * ((float)((qhi >> sh) & 3u)        - ((hhi & hm01) ? 0.f : 4.f));
+                wC[l] = dsC * ((float)((qlo >> (sh + 2u)) & 3u) - ((hlo & hm23) ? 0.f : 4.f));
+                wD[l] = dsD * ((float)((qhi >> (sh + 2u)) & 3u) - ((hhi & hm23) ? 0.f : 4.f));
+            }
+
             for (uint m = 0; m < M; ++m) {
                 device const bfloat *y1 = x + (ulong)m * (ulong)K + (ulong)i * QK_K + y_offset;
-                float yl[32];
-                for (uint l = 0; l < 8; ++l) {
-                    yl[l +  0] = (float)y1[l +  0];
-                    yl[l +  8] = (float)y1[l + 16];
-                    yl[l + 16] = (float)y1[l + 32];
-                    yl[l + 24] = (float)y1[l + 48];
+                float acc = 0.f;
+                for (uint l = 0; l < n; ++l) {
+                    acc += (float)y1[l +  0] * wA[l] + (float)y1[l + 16] * wB[l] +
+                           (float)y1[l + 32] * wC[l] + (float)y1[l + 48] * wD[l];
                 }
-
-                float s1 = 0.f, s2 = 0.f, s3 = 0.f, s4 = 0.f, s5 = 0.f, s6 = 0.f;
-                for (uint l = 0; l < n; l += 2) {
-                    const int32_t qs = (int32_t)q[l / 2];
-                    s1 += yl[l + 0] * (float)(qs & qm[il / 2u][0]);
-                    s2 += yl[l + 1] * (float)(qs & qm[il / 2u][1]);
-                    s3 += ((h[l / 2] & hm[0]) ? 0.f : yl[l + 0]) +
-                          ((h[l / 2] & hm[1]) ? 0.f : yl[l + 1]);
-                    s4 += yl[l + 16] * (float)(qs & qm[il / 2u][2]);
-                    s5 += yl[l + 17] * (float)(qs & qm[il / 2u][3]);
-                    s6 += ((h[l / 2] & hm[2]) ? 0.f : yl[l + 16]) +
-                          ((h[l / 2] & hm[3]) ? 0.f : yl[l + 17]);
-                }
-                float d1 = d_all * (s1 + 1.f / 256.f * s2 - s3 * v1);
-                float d2 = d_all * (s4 + 1.f / 256.f * s5 - s6 * v2);
-                sumf1[row][m] += d1 * (float)(scales[0] - 32);
-                sumf2[row][m] += d2 * (float)(scales[2] - 32);
-
-                s1 = s2 = s3 = s4 = s5 = s6 = 0.f;
-                for (uint l = 0; l < n; l += 2) {
-                    const int32_t qs = (int32_t)q[l / 2 + 8];
-                    s1 += yl[l + 8] * (float)(qs & qm[il / 2u][0]);
-                    s2 += yl[l + 9] * (float)(qs & qm[il / 2u][1]);
-                    s3 += ((h[l / 2 + 8] & hm[0]) ? 0.f : yl[l +  8]) +
-                          ((h[l / 2 + 8] & hm[1]) ? 0.f : yl[l +  9]);
-                    s4 += yl[l + 24] * (float)(qs & qm[il / 2u][2]);
-                    s5 += yl[l + 25] * (float)(qs & qm[il / 2u][3]);
-                    s6 += ((h[l / 2 + 8] & hm[2]) ? 0.f : yl[l + 24]) +
-                          ((h[l / 2 + 8] & hm[3]) ? 0.f : yl[l + 25]);
-                }
-                d1 = d_all * (s1 + 1.f / 256.f * s2 - s3 * v1);
-                d2 = d_all * (s4 + 1.f / 256.f * s5 - s6 * v2);
-                sumf1[row][m] += d1 * (float)(scales[1] - 32);
-                sumf2[row][m] += d2 * (float)(scales[3] - 32);
+                sumf[row][m] += acc;
             }
 
             q  = (device const uint16_t *)((device const uint8_t *)q  + step_bytes);
@@ -2203,8 +2192,7 @@ kernel void gguf_q3k_gemv_batch_bf16(
     for (uint row = 0; row < 2; ++row) {
         const uint r = first_row + row;
         for (uint m = 0; m < M; ++m) {
-            const float sumf = (sumf1[row][m] + 0.25f * sumf2[row][m]) / (float)(1u << shift);
-            const float tot = simd_sum(sumf);
+            const float tot = simd_sum(sumf[row][m]);
             if (tiisg == 0 && r < N) {
                 out[(ulong)m * (ulong)N + r] = (bfloat)tot;
             }

@@ -163,7 +163,11 @@ pub fn sample(
             })
         }
     } else {
-        let (log_probs, mut probs_vec) = compute_log_probs(&logits_vec, params.temperature);
+        let mut probs_vec = softmax_probs(&logits_vec, params.temperature);
+        // Log-probs must reflect the PRE-filter distribution; computed lazily —
+        // skipping the full-vocab ln pass when logprobs aren't requested.
+        let log_probs: Option<Vec<f32>> =
+            (params.top_logprobs_k > 0).then(|| log_probs_from(&probs_vec));
 
         if params.min_p > 0.0 {
             apply_min_p(&mut probs_vec, params.min_p);
@@ -182,7 +186,7 @@ pub fn sample(
 
         let token = categorical_sample(&probs_vec, params.seed, prev_tokens.len() as u64)?;
 
-        if params.top_logprobs_k > 0 {
+        if let Some(log_probs) = log_probs {
             let lp = log_probs
                 .get(token as usize)
                 .copied()
@@ -211,7 +215,7 @@ fn repetition_window_slice(prev_tokens: &[u32], repetition_window: usize) -> &[u
     }
 }
 
-fn compute_log_probs(logits: &[f32], temperature: f32) -> (Vec<f32>, Vec<f32>) {
+fn softmax_probs(logits: &[f32], temperature: f32) -> Vec<f32> {
     let temp = temperature.max(1e-8_f32);
     let max_logit = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
     let mut probs: Vec<f32> = logits
@@ -223,8 +227,16 @@ fn compute_log_probs(logits: &[f32], temperature: f32) -> (Vec<f32>, Vec<f32>) {
     for p in probs.iter_mut() {
         *p *= inv_sum;
     }
-    let log_probs: Vec<f32> = probs.iter().map(|&p| p.ln().max(-100.0_f32)).collect();
-    (log_probs, probs)
+    probs
+}
+
+fn log_probs_from(probs: &[f32]) -> Vec<f32> {
+    probs.iter().map(|&p| p.ln().max(-100.0_f32)).collect()
+}
+
+fn compute_log_probs(logits: &[f32], temperature: f32) -> (Vec<f32>, Vec<f32>) {
+    let probs = softmax_probs(logits, temperature);
+    (log_probs_from(&probs), probs)
 }
 
 fn top_k_by_logprob(log_probs: &[f32], k: usize) -> Vec<(u32, f32)> {
@@ -409,33 +421,86 @@ fn tie_break_seed(seed: Option<u64>, step: u64) -> u64 {
     base.wrapping_add(step) ^ TIE_BREAK_NAMESPACE
 }
 
+// Given the candidate list sorted descending by prob, keep the smallest prefix
+// whose cumulative mass reaches top_p; zero everything else and renormalize.
+fn keep_top_p_prefix(probs: &mut [f32], sorted: &[(usize, f32)], top_p: f32) {
+    let mut cumulative = 0.0;
+    let mut keep_count = 0;
+    for &(_, prob) in sorted.iter() {
+        if cumulative >= top_p && cumulative > 0.0 {
+            break;
+        }
+        cumulative += prob;
+        keep_count += 1;
+    }
+
+    for p in probs.iter_mut() {
+        *p = 0.0;
+    }
+    let mut sum = 0.0;
+    for &(idx, prob) in sorted.iter().take(keep_count) {
+        probs[idx] = prob;
+        sum += prob;
+    }
+    renormalize_in_place(probs, sum);
+}
+
 fn apply_top_p(probs: &mut [f32], top_p: f32) {
     IDX_SCRATCH.with(|s| {
         let mut indexed = s.borrow_mut();
         indexed.clear();
-        indexed.extend(probs.iter().enumerate().map(|(i, &p)| (i, p)));
-        indexed.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
-        let mut cumulative = 0.0;
-        let mut keep_count = 0;
-        for &(_, prob) in indexed.iter() {
-            if cumulative >= top_p && cumulative > 0.0 {
-                break;
+        // Fast path: LLM distributions are concentrated, so the tokens above a
+        // max-relative threshold (typically hundreds, not the full vocab) almost
+        // always carry >= top_p mass. Every candidate prob >= threshold > every
+        // non-candidate prob, so when the candidate mass covers top_p the global
+        // descending-order prefix is provably contained in the candidates — the
+        // full-vocab sort reduces to sorting just the candidates.
+        let max_prob = probs.iter().cloned().fold(0.0_f32, f32::max);
+        let threshold = max_prob * 1e-4;
+        let mut candidate_mass = 0.0_f32;
+        for (i, &p) in probs.iter().enumerate() {
+            if p >= threshold {
+                indexed.push((i, p));
+                candidate_mass += p;
             }
-            cumulative += prob;
-            keep_count += 1;
         }
-
-        for p in probs.iter_mut() {
-            *p = 0.0;
+        let fast_hit = candidate_mass >= top_p;
+        if !fast_hit {
+            // Flat distribution: candidates don't cover top_p — full sort.
+            indexed.clear();
+            indexed.extend(probs.iter().enumerate().map(|(i, &p)| (i, p)));
         }
-        let mut sum = 0.0;
-        for &(idx, prob) in indexed.iter().take(keep_count) {
-            probs[idx] = prob;
-            sum += prob;
-        }
-        renormalize_in_place(probs, sum);
+        top_p_probe(fast_hit, indexed.len());
+        indexed.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        keep_top_p_prefix(probs, &indexed, top_p);
     });
+}
+
+// Gated diagnostics (OXYDLLM_PROFILE_DECODE=1): fast-path hit rate + candidate
+// count for apply_top_p on real model logits, reported every 256 calls.
+fn top_p_probe(fast_hit: bool, candidates: usize) {
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static EN: OnceLock<bool> = OnceLock::new();
+    if !*EN.get_or_init(|| std::env::var("OXYDLLM_PROFILE_DECODE").as_deref() == Ok("1")) {
+        return;
+    }
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+    static HITS: AtomicU64 = AtomicU64::new(0);
+    static CAND: AtomicU64 = AtomicU64::new(0);
+    let n = CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+    if fast_hit {
+        HITS.fetch_add(1, Ordering::Relaxed);
+    }
+    CAND.fetch_add(candidates as u64, Ordering::Relaxed);
+    if n.is_multiple_of(256) {
+        eprintln!(
+            "top_p probe: calls={n} fast_hit={:.1}% avg_candidates={}",
+            HITS.load(Ordering::Relaxed) as f64 / n as f64 * 100.0,
+            CAND.load(Ordering::Relaxed) / n
+        );
+    }
 }
 
 fn categorical_sample(probs: &[f32], seed: Option<u64>, step: u64) -> Result<u32> {
@@ -501,6 +566,139 @@ fn thread_rand_f32() -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Decomposition bench for the non-greedy per-token sampling cost (E2E measured
+    // ~2.2 ms/token vs greedy). Times each stage on a realistic peaked 151936-vocab
+    // distribution so the dominant cost is identified by measurement, not guessed.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn sampling_cost_decomposition() {
+        use std::time::Instant;
+        let Ok(dev) = candle_core::Device::new_metal(0) else {
+            return;
+        };
+        let vocab = 151_936usize;
+        // Peaked, LLM-like spectrum: a strong head + noise tail.
+        let logits_f32: Vec<f32> = (0..vocab)
+            .map(|i| {
+                let noise = ((i * 2654435761) % 1000) as f32 / 1000.0;
+                if i < 512 {
+                    8.0 - (i as f32) * 0.02 + noise
+                } else {
+                    noise
+                }
+            })
+            .collect();
+        let logits_gpu = Tensor::from_vec(logits_f32.clone(), (vocab,), &dev)
+            .unwrap()
+            .to_dtype(candle_core::DType::BF16)
+            .unwrap();
+
+        let iters = 100;
+        let timeit = |f: &mut dyn FnMut()| -> f64 {
+            for _ in 0..5 {
+                f();
+            }
+            let t = Instant::now();
+            for _ in 0..iters {
+                f();
+            }
+            t.elapsed().as_secs_f64() * 1e6 / iters as f64
+        };
+
+        let cast_copy = timeit(&mut || {
+            let v: Vec<f32> = logits_gpu
+                .to_dtype(candle_core::DType::F32)
+                .unwrap()
+                .to_vec1()
+                .unwrap();
+            std::hint::black_box(v);
+        });
+        let v = logits_f32.clone();
+        let nan_scan = timeit(&mut || {
+            std::hint::black_box(v.iter().any(|l| l.is_nan()));
+        });
+        let softmax_full = timeit(&mut || {
+            std::hint::black_box(compute_log_probs(&v, 0.8));
+        });
+        // The ln pass alone (the part wasted when top_logprobs_k == 0).
+        let probs_only: Vec<f32> = {
+            let (_, p) = compute_log_probs(&v, 0.8);
+            p
+        };
+        let ln_pass = timeit(&mut || {
+            let lp: Vec<f32> = probs_only.iter().map(|&p| p.ln().max(-100.0)).collect();
+            std::hint::black_box(lp);
+        });
+        let top_p = timeit(&mut || {
+            let mut p = probs_only.clone();
+            apply_top_p(&mut p, 0.95);
+            std::hint::black_box(p);
+        });
+        let clone_cost = timeit(&mut || {
+            std::hint::black_box(probs_only.clone());
+        });
+        let categorical = timeit(&mut || {
+            let _ = categorical_sample(&probs_only, Some(7), 0);
+        });
+
+        println!("sampling decomposition (vocab={vocab}, us/token):");
+        println!("  gpu cast+copy : {cast_copy:8.1}");
+        println!("  nan scan      : {nan_scan:8.1}");
+        println!("  softmax+ln    : {softmax_full:8.1}  (ln pass alone: {ln_pass:.1})");
+        println!(
+            "  top_p (sort)  : {:8.1}  (minus clone {clone_cost:.1})",
+            top_p - clone_cost
+        );
+        println!("  categorical   : {categorical:8.1}");
+    }
+
+    // Contract: the threshold fast path in apply_top_p produces EXACTLY the same
+    // filtered+renormalized distribution as the reference full-vocab sort, across
+    // peaked (fast path) and near-flat (fallback path) continuous distributions.
+    #[test]
+    fn top_p_fast_path_matches_full_sort_reference() {
+        fn reference_top_p(probs: &mut [f32], top_p: f32) {
+            let mut indexed: Vec<(usize, f32)> =
+                probs.iter().enumerate().map(|(i, &p)| (i, p)).collect();
+            indexed.sort_unstable_by(|a, b| {
+                b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            keep_top_p_prefix(probs, &indexed, top_p);
+        }
+
+        let mut rng: u64 = 0x1234_5678;
+        let mut next_f32 = move || {
+            rng = splitmix64_u64(rng);
+            (rng >> 40) as f32 / (1u64 << 24) as f32
+        };
+
+        for (case, vocab, peak) in [
+            ("peaked-small", 512usize, 12.0f32),
+            ("peaked-large", 50_000, 10.0),
+            ("mild", 50_000, 3.0),
+            ("near-flat (fallback)", 50_000, 0.01),
+        ] {
+            // Continuous random logits (ties have measure zero) + a decaying head.
+            let logits: Vec<f32> = (0..vocab)
+                .map(|i| {
+                    let head = if i < 64 { peak - i as f32 * 0.1 } else { 0.0 };
+                    head + next_f32()
+                })
+                .collect();
+            for top_p in [0.5f32, 0.9, 0.95, 0.99] {
+                let base = softmax_probs(&logits, 0.8);
+                let mut fast = base.clone();
+                let mut reference = base;
+                apply_top_p(&mut fast, top_p);
+                reference_top_p(&mut reference, top_p);
+                assert_eq!(
+                    fast, reference,
+                    "{case} top_p={top_p}: fast path diverged from full-sort reference"
+                );
+            }
+        }
+    }
 
     #[test]
     fn greedy_returns_argmax() {

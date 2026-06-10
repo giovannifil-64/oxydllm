@@ -48,7 +48,7 @@ A rust-based inference engine for Large Language Models.
 - AWQ 4-bit and 8-bit quantization: fused W4A16 / W8A16 GEMV kernels keep packed weights resident on Metal (Qwen3-4B-AWQ goes from ~7.5 GB to ~2.5 GB resident); QKV and gate+up are fused at load; auto-detected per checkpoint with no flag.
 - GPTQ 4-bit and 8-bit quantization: `desc_act=false` checkpoints route through a dedicated Metal resident kernel family (Qwen3-0.6B-GPTQ-Int8 ~89 tok/s decode); CPU / non-bf16 paths still dequantize at load.
 - FP8 (E4M3) block-wise weight loading: `Qwen3-4B-Instruct-2507-FP8` and similar checkpoints; the load-time `weight × scale_inv` multiply is performed in F32 to preserve precision across deep block-wise rescaling.
-- MXFP4 (OCP microscaling FP4): GPT-OSS expert weights stay packed on Metal with fused dequant GEMV/GEMM kernels; `openai/gpt-oss-20b` (20.9B params) runs in ~13 GB resident on a 24 GB machine.
+- MXFP4 (OCP microscaling FP4): GPT-OSS expert weights stay packed on Metal with fused dequant GEMV/GEMM kernels; `openai/gpt-oss-20b` (20.9B params) runs in ~13 GB resident on a 24 GB machine. `gpt-oss-120b` shares the same architecture and should load on machines with enough memory, but is untested.
 - Mixture-of-Experts: `Qwen3MoeForCausalLM`, `OlmoeForCausalLM`, and `GptOssForCausalLM` (interleaved clamped-swiglu experts, attention sinks via a dedicated fused decode kernel, alternating sliding/full attention layers) with top-k routing and a hybrid sparse/naive dispatch (decode-friendly + prefill-friendly). Tested on `allenai/OLMoE-1B-7B-0924-Instruct` and `openai/gpt-oss-20b`.
 - Streaming responses via Server-Sent Events
 - Model download directly from HuggingFace with interactive variant selection

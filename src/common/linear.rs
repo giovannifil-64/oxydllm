@@ -261,6 +261,26 @@ impl GgufFastPath {
         *new_dims.last_mut().unwrap() = self.out_features;
         y_2d.reshape(new_dims)
     }
+
+    // Small batched decode (2..=GGUF_BATCH_MAX): weights read once for all M tokens.
+    fn forward_batch_decode(&self, x: &Tensor) -> Result<Tensor> {
+        let original_dims = x.dims().to_vec();
+        let in_features = *original_dims.last().unwrap();
+        debug_assert_eq!(in_features, self.in_features);
+        let m: usize = original_dims[..original_dims.len() - 1].iter().product();
+        let x_2d = x.reshape((m, in_features))?.contiguous()?;
+        let y_2d = super::metal_ops::gguf_quant_batch_matmul(
+            &x_2d,
+            &self.weight_bytes,
+            self.in_features,
+            self.out_features,
+            self.quant,
+            m,
+        )?;
+        let mut new_dims = original_dims;
+        *new_dims.last_mut().unwrap() = self.out_features;
+        y_2d.reshape(new_dims)
+    }
 }
 
 impl QLinear {
@@ -312,6 +332,8 @@ impl QLinear {
             let m: usize = original_dims[..original_dims.len() - 1].iter().product();
             let out = if m == 1 {
                 fast.forward_decode(x)?
+            } else if (2..=super::metal_ops::GGUF_BATCH_MAX).contains(&m) {
+                fast.forward_batch_decode(x)?
             } else {
                 fast.forward_prefill(x)?
             };

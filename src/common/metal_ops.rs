@@ -3471,6 +3471,166 @@ pub fn gguf_quant_matmul(
     Ok(out)
 }
 
+/// Max batch the Q4_K batched-decode gemv handles (register cap); above this,
+/// the mul_mm prefill kernel is already efficient. Must match GGUF_BATCH_MAX in
+/// quant_kernels.metal.
+pub const GGUF_BATCH_MAX: usize = 8;
+
+#[repr(C)]
+struct GgufBatchParams {
+    in_features: u32,
+    out_features: u32,
+    m_batch: u32,
+}
+
+// Batched Q4_K decode: M activation vectors share one weight read. Routed for
+// 2 <= M <= GGUF_BATCH_MAX (small batched decode), where the mul_mm prefill kernel
+// has a crippling fixed overhead (profiled M=2 = 3.7x the M=1 gemv cost).
+struct GgufQ4KBatchMatmul {
+    x: Tensor,
+    weight_bytes: Tensor,
+    in_features: usize,
+    out_features: usize,
+    m: usize,
+}
+
+impl InplaceOp1 for GgufQ4KBatchMatmul {
+    fn name(&self) -> &'static str {
+        "gguf-q4k-batch-matmul"
+    }
+
+    fn cpu_fwd(&self, _s: &mut CpuStorage, _l: &Layout) -> Result<()> {
+        candle_core::bail!("GgufQ4KBatchMatmul: Metal-only path")
+    }
+
+    fn metal_fwd(&self, out: &mut MetalStorage, out_l: &Layout) -> Result<()> {
+        const QK_K: usize = 256;
+        const ROWS_PER_TG: usize = 4; // GGUF_N_DST
+        const TG_THREADS: usize = 32; // one simdgroup
+        if out.dtype() != DType::BF16 {
+            candle_core::bail!(
+                "GgufQ4KBatchMatmul: out must be BF16, got {:?}",
+                out.dtype()
+            );
+        }
+        if self.x.dtype() != DType::BF16 {
+            candle_core::bail!(
+                "GgufQ4KBatchMatmul: x must be BF16, got {:?}",
+                self.x.dtype()
+            );
+        }
+        if self.weight_bytes.dtype() != DType::U8 {
+            candle_core::bail!(
+                "GgufQ4KBatchMatmul: weight_bytes must be U8, got {:?}",
+                self.weight_bytes.dtype()
+            );
+        }
+        if !self.in_features.is_multiple_of(QK_K) {
+            candle_core::bail!(
+                "GgufQ4KBatchMatmul: in_features {} must be a multiple of {}",
+                self.in_features,
+                QK_K
+            );
+        }
+        if !(2..=GGUF_BATCH_MAX).contains(&self.m) {
+            candle_core::bail!(
+                "GgufQ4KBatchMatmul: m {} out of [2, {GGUF_BATCH_MAX}]",
+                self.m
+            );
+        }
+
+        let x_sl = self.x.storage_and_layout();
+        let x_l = x_sl.1;
+        if !x_l.is_contiguous() {
+            candle_core::bail!("GgufQ4KBatchMatmul: x must be contiguous");
+        }
+        let x_dims = x_l.dims();
+        if x_dims != [self.m, self.in_features] {
+            candle_core::bail!(
+                "GgufQ4KBatchMatmul: x shape {:?} != [{}, {}]",
+                x_dims,
+                self.m,
+                self.in_features
+            );
+        }
+        if out_l.dims() != [self.m, self.out_features] {
+            candle_core::bail!(
+                "GgufQ4KBatchMatmul: output shape {:?} != [{}, {}]",
+                out_l.dims(),
+                self.m,
+                self.out_features
+            );
+        }
+
+        let params = GgufBatchParams {
+            in_features: self.in_features as u32,
+            out_features: self.out_features as u32,
+            m_batch: self.m as u32,
+        };
+
+        let device = out.device();
+        let x_buf = match &*x_sl.0 {
+            candle_core::Storage::Metal(ms) => ms.buffer(),
+            _ => candle_core::bail!("GgufQ4KBatchMatmul: x must be Metal-resident"),
+        };
+        let w_sl = self.weight_bytes.storage_and_layout();
+        let w_buf = match &*w_sl.0 {
+            candle_core::Storage::Metal(ms) => ms.buffer(),
+            _ => candle_core::bail!("GgufQ4KBatchMatmul: weight_bytes must be Metal-resident"),
+        };
+
+        let pipeline = get_or_compile_quant_pipeline(device.device(), "gguf_q4k_gemv_batch_bf16")?;
+        let encoder = device.command_encoder()?;
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(x_buf), x_l.start_offset() * 2);
+        encoder.set_buffer(1, Some(w_buf), w_sl.1.start_offset());
+        encoder.set_buffer(2, Some(out.buffer()), out_l.start_offset() * 2);
+        encoder.set_bytes(3, &params);
+        encoder.use_resource(x_buf, MTLResourceUsage::Read);
+        encoder.use_resource(w_buf, MTLResourceUsage::Read);
+        encoder.use_resource(out.buffer(), MTLResourceUsage::Write);
+
+        encoder.dispatch_thread_groups(
+            MTLSize {
+                width: self.out_features.div_ceil(ROWS_PER_TG),
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: TG_THREADS,
+                height: 1,
+                depth: 1,
+            },
+        );
+
+        Ok(())
+    }
+}
+
+/// Batched decode matmul (2 <= M <= GGUF_BATCH_MAX). Q4_K uses the dedicated
+/// batched gemv (weights read once); other quants fall back to mul_mm.
+pub fn gguf_quant_batch_matmul(
+    x: &Tensor,
+    weight_bytes: &Tensor,
+    in_features: usize,
+    out_features: usize,
+    quant: GgufFastQuant,
+    m: usize,
+) -> Result<Tensor> {
+    if matches!(quant, GgufFastQuant::Q4K) && (2..=GGUF_BATCH_MAX).contains(&m) {
+        let out = Tensor::zeros((m, out_features), DType::BF16, x.device())?;
+        out.inplace_op1(&GgufQ4KBatchMatmul {
+            x: x.clone(),
+            weight_bytes: weight_bytes.clone(),
+            in_features,
+            out_features,
+            m,
+        })?;
+        return Ok(out);
+    }
+    gguf_quant_mul_mm(x, weight_bytes, in_features, out_features, quant)
+}
+
 const GGUF_MM_BM: usize = 16;
 const GGUF_MM_BN: usize = 16;
 
@@ -3618,4 +3778,126 @@ pub fn gguf_quant_mul_mm(
         k: in_features,
         quant,
     })
+}
+
+#[cfg(all(test, feature = "metal"))]
+mod decode_batch_scaling_tests {
+    use super::*;
+    use candle_core::Device;
+    use candle_core::quantized::{GgmlDType, QTensor};
+    use std::time::Instant;
+
+    // Contract: the batched Q4_K decode gemv equals candle's dequant+matmul across
+    // M=2,4,8 and shapes incl. N not a multiple of GGUF_N_DST=4 (exercises the
+    // row-bound) and varying nb (K/256). Fails if the M-loop or dequant is wrong.
+    #[test]
+    fn gguf_q4k_batch_matches_reference() {
+        let Ok(dev) = Device::new_metal(0) else {
+            return;
+        };
+        for (n, k) in [(128usize, 256usize), (100, 2560), (256, 512)] {
+            let w_data: Vec<f32> = (0..n * k).map(|i| ((i % 17) as f32 - 8.0) * 0.05).collect();
+            let w_src = Tensor::from_vec(w_data, (n, k), &Device::Cpu).unwrap();
+            let qt = QTensor::quantize(&w_src, GgmlDType::Q4K).unwrap();
+            let bytes = qt.data().unwrap().into_owned();
+            let blen = bytes.len();
+            let wb = Tensor::from_vec(bytes, (blen,), &dev).unwrap();
+            let w_ref = qt
+                .dequantize(&Device::Cpu)
+                .unwrap()
+                .to_dtype(DType::F32)
+                .unwrap();
+            let w_ref_t = w_ref.t().unwrap().contiguous().unwrap();
+
+            for m in [2usize, 4, 8] {
+                let x_data: Vec<f32> = (0..m * k).map(|i| ((i % 13) as f32 - 6.0) * 0.03).collect();
+                let x = Tensor::from_vec(x_data.clone(), (m, k), &dev)
+                    .unwrap()
+                    .to_dtype(DType::BF16)
+                    .unwrap();
+                let y_kernel =
+                    gguf_quant_batch_matmul(&x, &wb, k, n, GgufFastQuant::Q4K, m).unwrap();
+                let x_cpu = Tensor::from_vec(x_data, (m, k), &Device::Cpu).unwrap();
+                let y_ref = x_cpu.matmul(&w_ref_t).unwrap();
+
+                assert_eq!(
+                    y_kernel.dims2().unwrap(),
+                    (m, n),
+                    "M={m} n={n} k={k}: shape"
+                );
+                let f = y_kernel
+                    .to_dtype(DType::F32)
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap();
+                let r = y_ref.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+                assert!(f.iter().all(|v| v.is_finite()), "M={m} n={n}: non-finite");
+                let max_abs = r.iter().fold(0f32, |a, &v| a.max(v.abs()));
+                let tol = 0.06 * max_abs + 1e-2;
+                let diff = f
+                    .iter()
+                    .zip(&r)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0f32, f32::max);
+                assert!(
+                    diff < tol,
+                    "M={m} n={n} k={k}: max_abs_diff {diff} (tol {tol})"
+                );
+            }
+        }
+    }
+
+    // Root-cause probe for poor concurrent throughput: batched decode (M sequences
+    // in one forward) takes QLinear's m>1 path = gguf_quant_mul_mm (prefill kernel),
+    // while single-stream decode (M=1) uses the fast gemv. If per-token cost RISES
+    // with M instead of falling, batching is a net loss — explaining the measured
+    // 0.53x at concurrency 2.
+    #[test]
+    fn gguf_decode_batch_scaling() {
+        let Ok(dev) = Device::new_metal(0) else {
+            return;
+        };
+        let (n, k) = (2560usize, 2560usize); // Qwen3-4B hidden, square (q/o/gate-ish)
+        let w = Tensor::randn(0f32, 1f32, (n, k), &Device::Cpu).unwrap();
+        let qt = QTensor::quantize(&w, GgmlDType::Q4K).unwrap();
+        let bytes = qt.data().unwrap().into_owned();
+        let blen = bytes.len();
+        let wb = Tensor::from_vec(bytes, (blen,), &dev).unwrap();
+        let iters = 200;
+
+        println!("Q4_K [{n}x{k}] forward vs batch M (M=1 gemv decode, M>1 mul_mm):");
+        for m in [1usize, 2, 4, 8, 16] {
+            let x = Tensor::zeros((m, k), DType::BF16, &dev).unwrap();
+            let call = || -> Tensor {
+                if m == 1 {
+                    gguf_quant_matmul(&x, &wb, k, n, GgufFastQuant::Q4K).unwrap()
+                } else {
+                    gguf_quant_batch_matmul(&x, &wb, k, n, GgufFastQuant::Q4K, m).unwrap()
+                }
+            };
+            for _ in 0..15 {
+                let _ = call();
+            }
+            let t = Instant::now();
+            let mut sink = Vec::with_capacity(iters);
+            for _ in 0..iters {
+                sink.push(call());
+            }
+            sink.last().unwrap().to_device(&Device::Cpu).unwrap();
+            let per_call = t.elapsed().as_secs_f64() * 1e6 / iters as f64;
+            let kind = if m == 1 {
+                "gemv"
+            } else if m <= GGUF_BATCH_MAX {
+                "batch"
+            } else {
+                "mul_mm"
+            };
+            println!(
+                "  M={m:2}  {per_call:8.1} us/call   {:7.1} us/token   [{kind}]",
+                per_call / m as f64
+            );
+        }
+    }
 }

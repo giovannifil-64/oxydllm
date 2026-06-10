@@ -945,6 +945,127 @@ kernel void gguf_q4k_gemv_bf16(
     }
 }
 
+// Batched Q4_K decode GEMV: M activation vectors share each weight read (weights
+// fetched ONCE for all M tokens). Fixes the fixed per-call overhead that makes the
+// mul_mm prefill kernel a net loss for small batched-decode M (M=2..8 = the common
+// concurrent-serving regime). Same geometry as gguf_q4k_gemv_bf16 (1 simdgroup x
+// GGUF_N_DST rows); the weight load + dequant per (row, super-block) is done once
+// and reused across the inner M-loop.
+#define GGUF_BATCH_MAX 8
+
+struct GgufBatchParams {
+    uint in_features;
+    uint out_features;
+    uint m_batch;
+};
+
+kernel void gguf_q4k_gemv_batch_bf16(
+    device const bfloat        *x        [[buffer(0)]],   // [M, K]
+    device const void          *weight   [[buffer(1)]],
+    device       bfloat        *out      [[buffer(2)]],   // [M, N]
+    constant     GgufBatchParams &p      [[buffer(3)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    uint tiisg  [[thread_index_in_simdgroup]],
+    uint sgitg  [[simdgroup_index_in_threadgroup]])
+{
+    const uint16_t kmask1 = 0x3f3f;
+    const uint16_t kmask2 = 0x0f0f;
+    const uint16_t kmask3 = 0xc0c0;
+
+    const uint ix = tiisg / 8;
+    const uint it = tiisg % 8;
+    const uint iq = it / 4;
+    const uint ir = it % 4;
+
+    const uint N  = p.out_features;
+    const uint K  = p.in_features;
+    const uint M  = min(p.m_batch, (uint)GGUF_BATCH_MAX);
+    const uint nb = K / QK_K;
+
+    const uint r0 = tgpig.x;
+    const uint first_row = r0 * GGUF_N_DST;
+    if (first_row >= N) return;
+
+    device const block_q4_K *x_base = (device const block_q4_K *)weight;
+    device const block_q4_K *x_row0 = x_base + (ulong)first_row * (ulong)nb;
+
+    const uint y_off = 64 * iq + 8 * ir;
+
+    float sumf[GGUF_N_DST][GGUF_BATCH_MAX];
+    for (uint row = 0; row < GGUF_N_DST; ++row) {
+        for (uint m = 0; m < GGUF_BATCH_MAX; ++m) {
+            sumf[row][m] = 0.f;
+        }
+    }
+
+    uint16_t sc16[4];
+    thread const uint8_t *sc8 = (thread const uint8_t *)sc16;
+
+    for (uint ib = ix; ib < nb; ib += 4) {
+        for (uint row = 0; row < GGUF_N_DST; ++row) {
+            if (first_row + row >= N) break;
+            device const block_q4_K *xb = x_row0 + ib + row * nb;
+            device const uint16_t *sc = (device const uint16_t *)xb->scales + iq;
+            device const uint16_t *q1 = (device const uint16_t *)xb->qs + 16 * iq + 4 * ir;
+            device const half     *dh = &xb->d;
+
+            sc16[0] = sc[0] & kmask1;
+            sc16[1] = sc[2] & kmask1;
+            sc16[2] = ((sc[4] >> 0) & kmask2) | ((sc[0] & kmask3) >> 2);
+            sc16[3] = ((sc[4] >> 4) & kmask2) | ((sc[2] & kmask3) >> 2);
+
+            device const uint16_t *q2 = q1 + 32;
+            const float dall = (float)dh[0];
+            const float dmin = (float)dh[1];
+
+            // Weight (q1/q2/sc16/dall/dmin) is now resident in registers; reuse it
+            // across all M activation vectors — this is the one weight read.
+            for (uint m = 0; m < M; ++m) {
+                device const bfloat *y4 =
+                    x + (ulong)m * (ulong)K + (ulong)ib * QK_K + y_off;
+                float yl[16], yh[16];
+                float4 sumy = {0.f, 0.f, 0.f, 0.f};
+                for (int i = 0; i < 8; ++i) {
+                    yl[i+0] = (float)y4[i+  0]; sumy[0] += yl[i+0];
+                    yl[i+8] = (float)y4[i+ 32]; sumy[1] += yl[i+8];
+                    yh[i+0] = (float)y4[i+128]; sumy[2] += yh[i+0];
+                    yh[i+8] = (float)y4[i+160]; sumy[3] += yh[i+8];
+                }
+
+                float4 acc1 = {0.f, 0.f, 0.f, 0.f};
+                float4 acc2 = {0.f, 0.f, 0.f, 0.f};
+                for (int i = 0; i < 8; i += 2) {
+                    acc1[0] += yl[i+0] * (q1[i/2] & 0x000F);
+                    acc1[1] += yl[i+1] * (q1[i/2] & 0x0F00);
+                    acc1[2] += yl[i+8] * (q1[i/2] & 0x00F0);
+                    acc1[3] += yl[i+9] * (q1[i/2] & 0xF000);
+                    acc2[0] += yh[i+0] * (q2[i/2] & 0x000F);
+                    acc2[1] += yh[i+1] * (q2[i/2] & 0x0F00);
+                    acc2[2] += yh[i+8] * (q2[i/2] & 0x00F0);
+                    acc2[3] += yh[i+9] * (q2[i/2] & 0xF000);
+                }
+
+                sumf[row][m] += dall * ((acc1[0] + 1.f/256.f * acc1[1]) * sc8[0] +
+                                        (acc1[2] + 1.f/256.f * acc1[3]) * sc8[1] * 1.f/16.f +
+                                        (acc2[0] + 1.f/256.f * acc2[1]) * sc8[4] +
+                                        (acc2[2] + 1.f/256.f * acc2[3]) * sc8[5] * 1.f/16.f) -
+                                dmin * (sumy[0] * sc8[2] + sumy[1] * sc8[3] +
+                                        sumy[2] * sc8[6] + sumy[3] * sc8[7]);
+            }
+        }
+    }
+
+    for (uint row = 0; row < GGUF_N_DST; ++row) {
+        const uint r = first_row + row;
+        for (uint m = 0; m < M; ++m) {
+            const float tot = simd_sum(sumf[row][m]);
+            if (tiisg == 0 && r < N) {
+                out[(ulong)m * (ulong)N + r] = (bfloat)tot;
+            }
+        }
+    }
+}
+
 // Q5_K geometry: 2 simdgroups × 2 rows per TG.
 typedef struct {
     half     d;

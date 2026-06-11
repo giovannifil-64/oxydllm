@@ -326,7 +326,15 @@ ARCH="$(uname -m)"
 case "${OS}" in
     Darwin)
         case "${ARCH}" in
-            arm64) PLATFORM="macos-arm64" ;;
+            arm64)
+                # The Metal kernels use bfloat, which requires Metal 3.1 (macOS 14+).
+                MACOS_VERSION="$(sw_vers -productVersion 2>/dev/null)"
+                MACOS_MAJOR="${MACOS_VERSION%%.*}"
+                if [ -n "${MACOS_MAJOR}" ] && [ "${MACOS_MAJOR}" -lt 14 ] 2>/dev/null; then
+                    err "oxydLLM requires macOS 14 (Sonoma) or newer; found macOS ${MACOS_VERSION}. The Metal kernels rely on bfloat support introduced with Metal 3.1 in macOS 14."
+                fi
+                PLATFORM="macos-arm64"
+                ;;
             *) err "oxydLLM supports only Apple Silicon (arm64) on macOS." ;;
         esac
         ;;
@@ -493,7 +501,7 @@ case "${CHANNEL}" in
                 # most recent pre-release so the default one-liner still works.
                 OXYDLLM_VERSION="$(latest_any_release_tag)"
                 [ -n "${OXYDLLM_VERSION}" ] || err "No releases found. Set OXYDLLM_VERSION manually."
-                say "No stable release yet — installing latest pre-release ${OXYDLLM_VERSION} (${PLATFORM}). Pin with OXYDLLM_VERSION, or set OXYDLLM_PRE=1 to silence this notice."
+                say "No stable release yet: installing latest pre-release ${OXYDLLM_VERSION} (${PLATFORM}). Pin with OXYDLLM_VERSION, or set OXYDLLM_PRE=1 to silence this notice."
             fi
         fi
         ;;
@@ -540,7 +548,7 @@ case "${PLATFORM}" in
         CANDIDATE_TARBALLS="oxydllm-linux-arm64-cuda-thor.tar.gz"
         ;;
     linux-arm64-cuda-blackwell-desktop)
-        # sm_121 (DGX Spark / GB10) — Blackwell Desktop on arm64.
+        # sm_121 (DGX Spark / GB10): Blackwell Desktop on arm64.
         CANDIDATE_TARBALLS="oxydllm-linux-arm64-cuda-blackwell-desktop.tar.gz"
         ;;
     *)

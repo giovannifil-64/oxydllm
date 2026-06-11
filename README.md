@@ -13,7 +13,7 @@
         <img src="https://github.com/giovannifil-64/oxydllm/actions/workflows/nightly.yml/badge.svg?branch=main" />
     </a>
     <a href="https://github.com/giovannifil-64/oxydllm/releases">
-        <img src="https://img.shields.io/github/v/release/giovannifil-64/oxydllm?include_prereleases&label=release&logo=github" />
+        <img src="https://img.shields.io/github/v/release/giovannifil-64/oxydllm?include_prereleases&sort=semver&label=release&logo=github" />
     </a>
 </p>
 
@@ -119,6 +119,8 @@ cd oxydllm
 cargo build --release --features metal
 ```
 
+Requires macOS 14 (Sonoma) or newer: the Metal kernels rely on bfloat support introduced with Metal 3.1. Supported releases: macOS 14 (Sonoma), 15 (Sequoia), and 26 (Tahoe).
+
 #### NVIDIA CUDA
 ```bash
 CUDA_COMPUTE_CAP=<value> cargo build --release --features cuda
@@ -172,7 +174,7 @@ If you prefer to manually download the installer, you can find the latest releas
 
 #### macOS (Apple Silicon)
 > [!IMPORTANT]
-> Intel-based Macs are not supported
+> Intel-based Macs are not supported. Requires macOS 14 (Sonoma) or newer; supported releases are macOS 14, 15, and 26 (Tahoe). The installer refuses older versions because the Metal kernels need bfloat support (Metal 3.1, macOS 14+).
 - `oxydllm-macos-arm64`
 
 #### Linux (CUDA)

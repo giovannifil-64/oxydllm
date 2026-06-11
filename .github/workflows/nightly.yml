@@ -30,7 +30,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # ── Guard: skip if no new commits since last nightly ────────────────────────
+  # ── Guard: skip when HEAD is already covered by a nightly or release ────────
   check-changes:
     name: Check for new commits
     runs-on: ubuntu-22.04
@@ -41,27 +41,27 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Check for commits in last 25 hours
+      - name: Check whether HEAD is already built or released
         id: check
         run: |
           # For manual dispatch, always build
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             echo "should_build=true" >> "$GITHUB_OUTPUT"
-            echo "Manual dispatch — building."
+            echo "Manual dispatch: building."
             exit 0
           fi
 
-          LAST_COMMIT=$(git log -1 --format=%ct)
-          NOW=$(date +%s)
-          DIFF=$((NOW - LAST_COMMIT))
-          THRESHOLD=90000  # 25 hours in seconds
-
-          if [ "$DIFF" -lt "$THRESHOLD" ]; then
-            echo "should_build=true" >> "$GITHUB_OUTPUT"
-            echo "New commits found (${DIFF}s ago) — building."
-          else
+          # Skip when HEAD is already tagged: either by the rolling "nightly"
+          # tag (the last nightly built this exact commit) or by a release tag
+          # (a nightly would be identical to the published release).
+          # Any new commit on main leaves HEAD untagged, so we build.
+          TAGS_AT_HEAD=$(git tag --points-at HEAD)
+          if [ -n "$TAGS_AT_HEAD" ]; then
             echo "should_build=false" >> "$GITHUB_OUTPUT"
-            echo "No new commits (last: ${DIFF}s ago) — skipping."
+            echo "HEAD already tagged ($(echo "$TAGS_AT_HEAD" | tr '\n' ' ')): skipping."
+          else
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            echo "HEAD not tagged yet: new commits since last nightly/release, building."
           fi
 
   build:

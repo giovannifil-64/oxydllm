@@ -162,7 +162,7 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Check (CUDA)
-        run: cargo check --no-default-features --features cuda
+        run: PATH="$HOME/.cargo/bin:$PATH" cargo check --no-default-features --features cuda
 
       - name: Prepare CUDA driver stubs for test runtime
         run: |
@@ -173,6 +173,7 @@ jobs:
       - name: Model architecture regression tests (CPU logic, sm_89 compile target)
         if: matrix.cuda_arch == '89'
         run: |
+          export PATH="$HOME/.cargo/bin:$PATH"
           export LD_LIBRARY_PATH="/tmp/cuda-stubs:/usr/local/cuda/lib64/stubs:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}"
           cargo test --release --no-default-features --features cuda -- --test-threads=4 arch_
 
@@ -247,7 +248,7 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Check (CUDA)
-        run: cargo check --no-default-features --features cuda
+        run: PATH="$HOME/.cargo/bin:$PATH" cargo check --no-default-features --features cuda
 
   ci-ok:
     name: CI OK

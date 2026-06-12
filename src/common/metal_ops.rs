@@ -1173,7 +1173,11 @@ pub fn flash_attention_metal_prefill(
         && let candle_core::Device::Metal(md) = q.device()
         && mpp_gemm_available(md.device())
     {
-        return q.apply_op3_no_bwd(k, v, &MppFlashAttn { scale, prefix_len });
+        match q.apply_op3_no_bwd(k, v, &MppFlashAttn { scale, prefix_len }) {
+            Ok(y) => return Ok(y),
+            Err(_) if mpp_runtime_broken() => {}
+            Err(e) => return Err(e),
+        }
     }
     let (br, bc) = fa_tile_sizes(head_dim);
     q.apply_op3_no_bwd(
@@ -1993,9 +1997,25 @@ static MPP_LIBRARIES: OnceLock<Mutex<HashMap<u64, Option<Library>>>> = OnceLock:
 static MPP_PIPELINES: OnceLock<Mutex<HashMap<(u64, &'static str), ComputePipeline>>> =
     OnceLock::new();
 
+/// Set when the MPP library compiles but a pipeline fails to build (seen on
+/// virtualized GPUs that expose Metal 4 without full backend support). Once
+/// set, every selector reports unavailable and callers stay on the fallback
+/// kernels for the rest of the process.
+static MPP_RUNTIME_BROKEN: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn mpp_runtime_broken() -> bool {
+    MPP_RUNTIME_BROKEN.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 fn mpp_library(device: &candle_metal_kernels::metal::Device) -> Option<Library> {
+    if mpp_runtime_broken() {
+        return None;
+    }
     let cache = MPP_LIBRARIES.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut guard = cache.lock().ok()?;
+    let mut guard = cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     guard
         .entry(device.registry_id())
         .or_insert_with(|| {
@@ -2041,18 +2061,35 @@ fn get_or_compile_mpp_pipeline(
     let key = (device.registry_id(), kernel_name);
     let mut guard = cache
         .lock()
-        .map_err(|e| candle_core::Error::Msg(format!("mpp pipeline cache poisoned: {e}")))?;
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some(p) = guard.get(&key) {
         return Ok(p.clone());
     }
     let lib = mpp_library(device)
         .ok_or_else(|| candle_core::Error::Msg("mpp library unavailable".into()))?;
-    let func = lib
-        .get_function(kernel_name, None)
-        .map_err(|e| candle_core::Error::Msg(format!("mpp kernel '{kernel_name}': {e}")))?;
-    let pipeline = device
-        .new_compute_pipeline_state_with_function(&func)
-        .map_err(|e| candle_core::Error::Msg(format!("mpp pipeline: {e}")))?;
+    let func = lib.get_function(kernel_name, None).map_err(|e| {
+        MPP_RUNTIME_BROKEN.store(true, std::sync::atomic::Ordering::Relaxed);
+        tracing::warn!("TensorOps disabled: kernel '{kernel_name}' missing from library: {e}");
+        candle_core::Error::Msg(format!("mpp kernel '{kernel_name}': {e}"))
+    })?;
+    let pipeline = match device
+        .as_ref()
+        .newComputePipelineStateWithFunction_error(func.as_ref())
+    {
+        Ok(raw) => ComputePipeline::new(raw),
+        Err(e) => {
+            MPP_RUNTIME_BROKEN.store(true, std::sync::atomic::Ordering::Relaxed);
+            tracing::warn!(
+                "TensorOps disabled: pipeline '{kernel_name}' failed to build on this GPU, \
+                 falling back to standard kernels: {}",
+                e.localizedDescription()
+            );
+            return Err(candle_core::Error::Msg(format!(
+                "mpp pipeline '{kernel_name}': {}",
+                e.localizedDescription()
+            )));
+        }
+    };
     guard.insert(key, pipeline.clone());
     Ok(pipeline)
 }
@@ -2179,7 +2216,11 @@ pub fn maybe_mpp_matmul(x: &Tensor, b: &Tensor) -> Result<Option<Tensor>> {
     if !mpp_gemm_available(md.device()) {
         return Ok(None);
     }
-    mpp_matmul(x, b).map(Some)
+    match mpp_matmul(x, b) {
+        Ok(y) => Ok(Some(y)),
+        Err(_) if mpp_runtime_broken() => Ok(None),
+        Err(e) => Err(e),
+    }
 }
 
 #[repr(C)]
@@ -2365,7 +2406,11 @@ pub fn maybe_mpp_quant_matmul(
     if !mpp_gemm_available(md.device()) {
         return Ok(None);
     }
-    mpp_quant_matmul(x, qweight, qzeros, scales, bits, pack_dim).map(Some)
+    match mpp_quant_matmul(x, qweight, qzeros, scales, bits, pack_dim) {
+        Ok(y) => Ok(Some(y)),
+        Err(_) if mpp_runtime_broken() => Ok(None),
+        Err(e) => Err(e),
+    }
 }
 
 #[repr(C)]
@@ -4057,11 +4102,25 @@ mod fused_kernel_parity_tests {
 
     // ---- TensorOps (MPP) GEMM tests ----
 
+    // The library can compile on GPUs whose backend still rejects the
+    // cooperative-tensor pipelines (e.g. virtualized CI runners), so the
+    // guard must build a representative pipeline from every kernel family,
+    // not just compile the source.
     fn mpp_available(dev: &Device) -> bool {
-        match dev {
-            Device::Metal(md) => mpp_gemm_available(md.device()),
-            _ => false,
-        }
+        let Device::Metal(md) = dev else {
+            return false;
+        };
+        let device = md.device();
+        mpp_gemm_available(device)
+            && [
+                "mpp_gemm_bf16_nn",
+                "mpp_gemm_bf16_nt",
+                "mpp_gemm_w4_staged",
+                "mpp_gemm_gptq4_staged",
+                "mpp_fa_bf16_d64",
+            ]
+            .iter()
+            .all(|k| get_or_compile_mpp_pipeline(device, k).is_ok())
     }
 
     #[test]

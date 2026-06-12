@@ -1609,6 +1609,7 @@ struct GptqParams {
     group_shift: u32,
     k_splits: u32,
     chunk: u32,
+    m: u32,
 }
 
 struct GptqShape {
@@ -1640,7 +1641,7 @@ impl GptqShape {
         })
     }
 
-    fn params(&self, group_shift: usize, k_splits: usize, chunk: usize) -> GptqParams {
+    fn params(&self, group_shift: usize, k_splits: usize, chunk: usize, m: usize) -> GptqParams {
         GptqParams {
             in_features: self.in_features as u32,
             out_features: self.out_features as u32,
@@ -1648,6 +1649,7 @@ impl GptqShape {
             group_shift: group_shift as u32,
             k_splits: k_splits as u32,
             chunk: chunk as u32,
+            m: m as u32,
         }
     }
 }
@@ -1686,9 +1688,12 @@ impl InplaceOp1 for GptqMatmul {
             candle_core::bail!("GptqMatmul: x must be contiguous");
         }
         let x_dims = x_l.dims();
-        if x_dims.len() != 2 || x_dims[0] != 1 {
-            candle_core::bail!("GptqMatmul: x must be [1, in] (M=1 decode path), got {x_dims:?}");
+        if x_dims.len() != 2 || !(1..=8).contains(&x_dims[0]) {
+            candle_core::bail!(
+                "GptqMatmul: x must be [m, in] with m in 1..=8 (decode GEMV path), got {x_dims:?}"
+            );
         }
+        let m = x_dims[0];
         let in_features = x_dims[1];
 
         let (packed_in, qw_out) = self.qweight.dims2()?;
@@ -1714,9 +1719,9 @@ impl InplaceOp1 for GptqMatmul {
                 shape.in_features
             );
         }
-        if out_l.dims() != [1, shape.out_features] {
+        if out_l.dims() != [m, shape.out_features] {
             candle_core::bail!(
-                "GptqMatmul: accumulator shape {:?} != [1, {}]",
+                "GptqMatmul: accumulator shape {:?} != [{m}, {}]",
                 out_l.dims(),
                 shape.out_features
             );
@@ -1735,12 +1740,16 @@ impl InplaceOp1 for GptqMatmul {
             );
         }
 
-        let kernel_name = match (self.bits, self.x.dtype()) {
-            (4, DType::F16) => "gptq4_gemv_f16",
-            (4, DType::BF16) => "gptq4_gemv_bf16",
-            (8, DType::F16) => "gptq8_gemv_f16",
-            (8, DType::BF16) => "gptq8_gemv_bf16",
-            (bits, other) => candle_core::bail!(
+        let kernel_name = match (self.bits, self.x.dtype(), m) {
+            (4, DType::F16, 1) => "gptq4_gemv_f16",
+            (4, DType::BF16, 1) => "gptq4_gemv_bf16",
+            (8, DType::F16, 1) => "gptq8_gemv_f16",
+            (8, DType::BF16, 1) => "gptq8_gemv_bf16",
+            (4, DType::F16, _) => "gptq4_gemv_batch_f16",
+            (4, DType::BF16, _) => "gptq4_gemv_batch_bf16",
+            (8, DType::F16, _) => "gptq8_gemv_batch_f16",
+            (8, DType::BF16, _) => "gptq8_gemv_batch_bf16",
+            (bits, other, _) => candle_core::bail!(
                 "GptqMatmul: unsupported (bits, dtype) combo ({bits}, {other:?})"
             ),
         };
@@ -1754,7 +1763,7 @@ impl InplaceOp1 for GptqMatmul {
         let chunk = raw_chunk.div_ceil(pack_factor) * pack_factor;
         let k_splits = shape.in_features.div_ceil(chunk);
         let group_shift = shape.group_size.trailing_zeros() as usize;
-        let params = shape.params(group_shift, k_splits, chunk);
+        let params = shape.params(group_shift, k_splits, chunk, m);
 
         let dtype_bytes = self.x.dtype().size_in_bytes();
         let device = out.device();
@@ -1878,7 +1887,7 @@ impl CustomOp1 for DequantizeGptqPacked {
         let out_elems = shape.in_features * shape.out_features;
         let device = qweight.device();
         let output = device.new_buffer(out_elems, out_dtype, "dequant_gptq")?;
-        let params = shape.params(0, 0, 0);
+        let params = shape.params(0, 0, 0, 1);
 
         let qz_sl = self.qzeros.storage_and_layout();
         let sc_sl = self.scales.storage_and_layout();
@@ -1933,7 +1942,8 @@ pub fn gptq_matmul(
     bits: u32,
 ) -> Result<Tensor> {
     let out_features = scales.dim(1)?;
-    let out = Tensor::zeros((1, out_features), DType::F32, x.device())?;
+    let m = x.dim(0)?;
+    let out = Tensor::zeros((m, out_features), DType::F32, x.device())?;
     out.inplace_op1(&GptqMatmul {
         x: x.clone(),
         qweight: qweight.clone(),
@@ -3227,6 +3237,93 @@ mod fused_kernel_parity_tests {
         run_gptq_dequant_parity(&dev, DType::BF16, 8, 256, 128, 128, "gptq8/bf16/g128");
     }
 
+    fn run_gptq_gemv_batch_parity(dev: &Device, dtype: DType, bits: u32, m: usize, label: &str) {
+        let (in_features, out_features, group_size) = (256usize, 128usize, 64usize);
+        let raw = build_gptq_triplet(dev, dtype, bits, in_features, out_features, group_size);
+        let x = batch_x(dev, dtype, m, in_features);
+
+        let y_kernel = gptq_matmul(
+            &x,
+            &raw.qweight,
+            raw.qzeros.as_ref().expect("GPTQ qzeros"),
+            &raw.scales,
+            bits,
+        )
+        .expect("batched gptq kernel must not error");
+
+        let w_ref = crate::common::awq::dequantize_gptq(&raw, dev, DType::F32).unwrap();
+        let y_ref = x
+            .to_dtype(DType::F32)
+            .unwrap()
+            .matmul(&w_ref.t().unwrap().contiguous().unwrap())
+            .unwrap();
+        assert_batch_parity(&y_kernel, &y_ref, m, out_features, label);
+    }
+
+    #[test]
+    fn gptq4_gemv_batch_bf16_matches_reference() {
+        let Some(dev) = metal_device_or_skip() else {
+            return;
+        };
+        for m in [2usize, 4, 8] {
+            run_gptq_gemv_batch_parity(&dev, DType::BF16, 4, m, "gptq4 batch bf16");
+        }
+    }
+
+    #[test]
+    fn gptq8_gemv_batch_bf16_matches_reference() {
+        let Some(dev) = metal_device_or_skip() else {
+            return;
+        };
+        for m in [2usize, 5, 8] {
+            run_gptq_gemv_batch_parity(&dev, DType::BF16, 8, m, "gptq8 batch bf16");
+        }
+    }
+
+    #[test]
+    fn gptq4_gemv_batch_f16_matches_reference() {
+        let Some(dev) = metal_device_or_skip() else {
+            return;
+        };
+        run_gptq_gemv_batch_parity(&dev, DType::F16, 4, 3, "gptq4 batch f16");
+    }
+
+    #[test]
+    fn packed_quant_linear_chunked_m_gt8_matches_dequant() {
+        let Some(dev) = metal_device_or_skip() else {
+            return;
+        };
+        use crate::common::linear::PackedQuantLinear;
+        let dtype = DType::BF16;
+        let (in_features, out_features, group_size) = (256usize, 128usize, 64usize);
+
+        let awq = build_awq_triplet(&dev, dtype, in_features, out_features, group_size);
+        let w_awq = dequantize_awq(&awq, &dev, DType::F32).unwrap();
+        let lin = PackedQuantLinear::new(awq, None, dtype).unwrap();
+        let m = 12usize;
+        let x = batch_x(&dev, dtype, m, in_features);
+        let y = lin.forward(&x).unwrap().to_dtype(DType::F32).unwrap();
+        let y_ref = x
+            .to_dtype(DType::F32)
+            .unwrap()
+            .matmul(&w_awq.t().unwrap().contiguous().unwrap())
+            .unwrap();
+        assert_batch_parity(&y, &y_ref, m, out_features, "awq chunked m=12");
+
+        let gptq = build_gptq_triplet(&dev, dtype, 4, in_features, out_features, group_size);
+        let w_gptq = crate::common::awq::dequantize_gptq(&gptq, &dev, DType::F32).unwrap();
+        let lin = PackedQuantLinear::new(gptq, None, dtype).unwrap();
+        let m = 20usize;
+        let x = batch_x(&dev, dtype, m, in_features);
+        let y = lin.forward(&x).unwrap().to_dtype(DType::F32).unwrap();
+        let y_ref = x
+            .to_dtype(DType::F32)
+            .unwrap()
+            .matmul(&w_gptq.t().unwrap().contiguous().unwrap())
+            .unwrap();
+        assert_batch_parity(&y, &y_ref, m, out_features, "gptq chunked m=20");
+    }
+
     #[test]
     #[ignore = "perf diagnostic"]
     fn w4a16_decode_perf_diagnostic() {
@@ -3313,6 +3410,101 @@ mod fused_kernel_parity_tests {
         println!("[w4a16 {n}x{n}] per-call us  (iters={iters}):");
         println!("  independent : w4a16 {w4_indep:8.1}   bf16 {bf16_indep:8.1}");
         println!("  chained     : w4a16 {w4_chain:8.1}   bf16 {bf16_chain:8.1}");
+    }
+
+    #[test]
+    #[ignore = "perf diagnostic"]
+    fn packed_quant_m_gt8_chunked_vs_dequant_gemm() {
+        let Some(dev) = metal_device_or_skip() else {
+            return;
+        };
+        use std::time::Instant;
+
+        let dtype = DType::BF16;
+        let group_size = 128usize;
+        let iters = 30;
+        for (in_features, out_features) in [(2560usize, 9728usize), (2560, 2560), (1024, 3072)] {
+            let awq = build_awq_triplet(&dev, dtype, in_features, out_features, group_size);
+            let awq_qz = awq.qzeros.as_ref().expect("AWQ qzeros");
+            let gptq = build_gptq_triplet(&dev, dtype, 4, in_features, out_features, group_size);
+            let gptq_qz = gptq.qzeros.as_ref().expect("GPTQ qzeros");
+
+            let chunked_awq = |x: &Tensor| -> Tensor {
+                let m = x.dim(0).unwrap();
+                let mut parts = Vec::with_capacity(m.div_ceil(8));
+                let mut row = 0;
+                while row < m {
+                    let rows = (m - row).min(8);
+                    let xc = x.narrow(0, row, rows).unwrap();
+                    parts.push(w4a16_matmul(&xc, &awq.qweight, awq_qz, &awq.scales).unwrap());
+                    row += rows;
+                }
+                Tensor::cat(&parts, 0).unwrap()
+            };
+            let dequant_awq = |x: &Tensor| -> Tensor {
+                let w = dequantize_w4(&awq.qweight, awq_qz, &awq.scales).unwrap();
+                x.matmul(&w).unwrap()
+            };
+            let chunked_gptq = |x: &Tensor| -> Tensor {
+                let m = x.dim(0).unwrap();
+                let mut parts = Vec::with_capacity(m.div_ceil(8));
+                let mut row = 0;
+                while row < m {
+                    let rows = (m - row).min(8);
+                    let xc = x.narrow(0, row, rows).unwrap();
+                    parts.push(gptq_matmul(&xc, &gptq.qweight, gptq_qz, &gptq.scales, 4).unwrap());
+                    row += rows;
+                }
+                Tensor::cat(&parts, 0).unwrap()
+            };
+            let dequant_gptq = |x: &Tensor| -> Tensor {
+                let w = dequantize_gptq_packed(&gptq.qweight, gptq_qz, &gptq.scales, 4).unwrap();
+                x.matmul(&w).unwrap()
+            };
+
+            println!(
+                "[{in_features}x{out_features} g{group_size} bf16] per-call us (iters={iters}):"
+            );
+            println!(
+                "{:>4}  {:>12} {:>12}  {:>12} {:>12}",
+                "M", "awq-chunk", "awq-dequant", "gptq-chunk", "gptq-dequant"
+            );
+            for m in [2usize, 4, 8, 12, 16, 24, 32, 48, 64, 96, 128] {
+                let x = batch_x(&dev, dtype, m, in_features);
+                // warm up every path before timing any of them
+                for _ in 0..3 {
+                    chunked_awq(&x).to_device(&Device::Cpu).unwrap();
+                    dequant_awq(&x).to_device(&Device::Cpu).unwrap();
+                    chunked_gptq(&x).to_device(&Device::Cpu).unwrap();
+                    dequant_gptq(&x).to_device(&Device::Cpu).unwrap();
+                }
+                let time = |f: &dyn Fn(&Tensor) -> Tensor| -> f64 {
+                    let t = Instant::now();
+                    let mut sink = Vec::with_capacity(iters);
+                    for _ in 0..iters {
+                        sink.push(f(&x));
+                    }
+                    sink.last().unwrap().to_device(&Device::Cpu).unwrap();
+                    t.elapsed().as_secs_f64() * 1e6 / iters as f64
+                };
+                // interleave A/B to keep thermal state comparable
+                let ac1 = time(&chunked_awq);
+                let ad1 = time(&dequant_awq);
+                let gc1 = time(&chunked_gptq);
+                let gd1 = time(&dequant_gptq);
+                let ac2 = time(&chunked_awq);
+                let ad2 = time(&dequant_awq);
+                let gc2 = time(&chunked_gptq);
+                let gd2 = time(&dequant_gptq);
+                println!(
+                    "{m:>4}  {:>12.1} {:>12.1}  {:>12.1} {:>12.1}",
+                    ac1.min(ac2),
+                    ad1.min(ad2),
+                    gc1.min(gc2),
+                    gd1.min(gd2)
+                );
+            }
+        }
     }
 }
 

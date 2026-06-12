@@ -419,6 +419,38 @@ impl PackedQuantLinear {
         })
     }
 
+    fn gemv_max_m(&self) -> usize {
+        match self.pack_dim {
+            PackDim::Out => 16,
+            PackDim::In => 32,
+        }
+    }
+
+    fn chunked_batch_gemv(&self, x_2d: &Tensor, m: usize) -> Result<Tensor> {
+        let gemv = |xc: &Tensor| match (self.pack_dim, self.bits) {
+            (PackDim::Out, 8) => {
+                super::metal_ops::w8a16_matmul(xc, &self.qweight, &self.qzeros, &self.scales)
+            }
+            (PackDim::Out, _) => {
+                super::metal_ops::w4a16_matmul(xc, &self.qweight, &self.qzeros, &self.scales)
+            }
+            (PackDim::In, bits) => {
+                super::metal_ops::gptq_matmul(xc, &self.qweight, &self.qzeros, &self.scales, bits)
+            }
+        };
+        if m <= 8 {
+            return gemv(x_2d);
+        }
+        let mut parts = Vec::with_capacity(m.div_ceil(8));
+        let mut row = 0;
+        while row < m {
+            let rows = (m - row).min(8);
+            parts.push(gemv(&x_2d.narrow(0, row, rows)?)?);
+            row += rows;
+        }
+        Tensor::cat(&parts, 0)
+    }
+
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let dims = x.dims().to_vec();
         let in_features = *dims.last().unwrap();
@@ -431,37 +463,24 @@ impl PackedQuantLinear {
         let m: usize = dims[..dims.len() - 1].iter().product();
         let x_2d = x.reshape((m, in_features))?.contiguous()?;
 
-        let y_2d = match (self.pack_dim, self.bits, m) {
-            (PackDim::Out, 8, 1..=8) => {
-                super::metal_ops::w8a16_matmul(&x_2d, &self.qweight, &self.qzeros, &self.scales)?
-            }
-            (PackDim::Out, _, 1..=8) => {
-                super::metal_ops::w4a16_matmul(&x_2d, &self.qweight, &self.qzeros, &self.scales)?
-            }
-            (PackDim::In, bits, 1) => super::metal_ops::gptq_matmul(
-                &x_2d,
-                &self.qweight,
-                &self.qzeros,
-                &self.scales,
-                bits,
-            )?,
-            (PackDim::Out, 8, _) => {
-                let w = super::metal_ops::dequantize_w8(&self.qweight, &self.qzeros, &self.scales)?;
-                x_2d.matmul(&w)?
-            }
-            (PackDim::Out, _, _) => {
-                let w = super::metal_ops::dequantize_w4(&self.qweight, &self.qzeros, &self.scales)?;
-                x_2d.matmul(&w)?
-            }
-            (PackDim::In, bits, _) => {
-                let w = super::metal_ops::dequantize_gptq_packed(
+        let y_2d = if m <= self.gemv_max_m() {
+            self.chunked_batch_gemv(&x_2d, m)?
+        } else {
+            let w = match (self.pack_dim, self.bits) {
+                (PackDim::Out, 8) => {
+                    super::metal_ops::dequantize_w8(&self.qweight, &self.qzeros, &self.scales)?
+                }
+                (PackDim::Out, _) => {
+                    super::metal_ops::dequantize_w4(&self.qweight, &self.qzeros, &self.scales)?
+                }
+                (PackDim::In, bits) => super::metal_ops::dequantize_gptq_packed(
                     &self.qweight,
                     &self.qzeros,
                     &self.scales,
                     bits,
-                )?;
-                x_2d.matmul(&w)?
-            }
+                )?,
+            };
+            x_2d.matmul(&w)?
         };
 
         let mut out_dims = dims;

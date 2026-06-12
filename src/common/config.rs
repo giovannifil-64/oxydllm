@@ -12,6 +12,23 @@ pub enum NormType {
     Gemma,
 }
 
+/// Per-layer token-mixer kind for hybrid architectures (Qwen3.5 / Qwen3-Next).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LayerType {
+    FullAttention,
+    LinearAttention,
+}
+
+/// Gated DeltaNet (linear attention) geometry, shared by all linear layers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LinearAttnConfig {
+    pub num_k_heads: usize,
+    pub num_v_heads: usize,
+    pub head_k_dim: usize,
+    pub head_v_dim: usize,
+    pub conv_kernel: usize,
+}
+
 pub struct BlockConfig {
     pub n_heads: usize,
     pub n_kv_heads: usize,
@@ -27,6 +44,15 @@ pub struct BlockConfig {
     pub sliding_window: Option<usize>,
 
     pub moe: Option<MoeConfig>,
+
+    /// `Some` ⇒ this layer's token mixer is a Gated DeltaNet, not attention.
+    pub linear_attn: Option<LinearAttnConfig>,
+    /// Qwen3.5 gated attention: q_proj emits per-head [query | gate]; the gate
+    /// multiplies (sigmoid) the attention output before o_proj.
+    pub attn_output_gate: bool,
+    /// Partial RoPE: rotate only the first `rotary_dim` dims of each head.
+    /// `None` ⇒ full head_dim.
+    pub rotary_dim: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -84,6 +110,13 @@ pub struct StandardTransformerConfig {
     pub moe_norm_topk_prob: Option<bool>,
     pub moe_gpt_oss: bool,
     pub moe_swiglu_limit: Option<f64>,
+
+    /// Hybrid models (Qwen3.5): per-layer mixer kinds + shared DeltaNet
+    /// geometry. Both `None` for standard transformers.
+    pub layer_types: Option<Vec<LayerType>>,
+    pub linear_attn: Option<LinearAttnConfig>,
+    pub attn_output_gate: bool,
+    pub rotary_dim: Option<usize>,
 }
 
 impl StandardTransformerConfig {
@@ -112,6 +145,10 @@ impl StandardTransformerConfig {
             has_ffn_norms: self.has_ffn_norms,
             sliding_window: self.sliding_window,
             moe,
+            // Per-layer: the loader overrides this for linear-attention layers.
+            linear_attn: None,
+            attn_output_gate: self.attn_output_gate,
+            rotary_dim: self.rotary_dim,
         }
     }
 }

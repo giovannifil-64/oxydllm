@@ -13,6 +13,9 @@ struct PrefixEntry {
 
 pub struct PrefixCache {
     entries: LruCache<u64, PrefixEntry>,
+    /// Recurrent (linear-attention) models can't skip prefix tokens — their
+    /// state must observe every token — so the engine disables the cache.
+    disabled: bool,
 }
 
 impl PrefixCache {
@@ -20,10 +23,21 @@ impl PrefixCache {
         let cap = NonZeroUsize::new(capacity.max(1)).unwrap();
         Self {
             entries: LruCache::new(cap),
+            disabled: false,
+        }
+    }
+
+    pub fn disabled() -> Self {
+        Self {
+            entries: LruCache::new(NonZeroUsize::new(1).unwrap()),
+            disabled: true,
         }
     }
 
     pub fn count_cached_blocks(&self, tokens: &[u32], block_size: usize) -> usize {
+        if self.disabled {
+            return 0;
+        }
         let num_full_blocks = tokens.len() / block_size;
         let mut prev_hash: u64 = 0;
         let mut count = 0;
@@ -44,6 +58,9 @@ impl PrefixCache {
     }
 
     pub fn lookup(&mut self, tokens: &[u32], block_size: usize) -> (usize, Vec<Vec<usize>>) {
+        if self.disabled {
+            return (0, Vec::new());
+        }
         let num_full_blocks = tokens.len() / block_size;
         let mut prev_hash: u64 = 0;
         let mut matched: Vec<Vec<usize>> = Vec::new();
@@ -75,6 +92,9 @@ impl PrefixCache {
         allocators: &[SharedBlockAllocator],
         block_size: usize,
     ) {
+        if self.disabled {
+            return;
+        }
         let num_full_blocks = tokens.len() / block_size;
         debug_assert!(start_block + new_block_ids.len() <= num_full_blocks);
 

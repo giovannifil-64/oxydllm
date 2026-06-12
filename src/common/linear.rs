@@ -134,6 +134,10 @@ pub fn gelu_tanh(x: &Tensor) -> Result<Tensor> {
     x.gelu()
 }
 
+pub fn sigmoid(x: &Tensor) -> Result<Tensor> {
+    ((x.neg()?.exp()? + 1.0)?).recip()
+}
+
 pub fn softmax_last_dim(x: &Tensor) -> Result<Tensor> {
     #[cfg(feature = "metal")]
     if x.device().is_metal() {

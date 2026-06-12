@@ -598,7 +598,12 @@ impl Engine {
         let scheduler_allocators: Vec<SharedBlockAllocator> =
             allocators.iter().map(Arc::clone).collect();
         let scheduler = Scheduler::new(config, scheduler_allocators, num_layers);
-        let prefix_cache = PrefixCache::new(512);
+        let prefix_cache = if model.has_recurrent_state() {
+            tracing::info!("recurrent (hybrid linear-attention) model: prefix cache disabled");
+            PrefixCache::disabled()
+        } else {
+            PrefixCache::new(512)
+        };
         Self {
             model,
             draft_model: None,
@@ -615,6 +620,15 @@ impl Engine {
     /// Enable greedy speculative decoding with `draft` as the proposer. The draft
     /// must share the target's tokenizer/vocab and run on the same device.
     pub fn with_draft_model(mut self, draft: Box<dyn BatchModel>) -> Self {
+        // Rejected speculative tokens roll the cache back via truncation, which
+        // a recurrent state cannot do — silently corrupting generation. Refuse.
+        if self.model.has_recurrent_state() {
+            tracing::error!(
+                "speculative decoding is not supported for recurrent (hybrid \
+                 linear-attention) models; draft model ignored"
+            );
+            return self;
+        }
         let draft_allocators: Vec<SharedBlockAllocator> =
             draft.allocators().iter().map(Arc::clone).collect();
         self.scheduler.set_draft_allocators(draft_allocators);

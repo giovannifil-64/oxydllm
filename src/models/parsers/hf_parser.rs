@@ -1,4 +1,4 @@
-use crate::common::config::StandardTransformerConfig;
+use crate::common::config::{LayerType, LinearAttnConfig, StandardTransformerConfig};
 use anyhow::{Context, Result};
 use serde_json::Value;
 
@@ -151,6 +151,44 @@ pub fn parse(config_path: &str) -> Result<StandardTransformerConfig> {
         .or(full_rope_theta)
         .unwrap_or(arch_def.default_rope_theta);
 
+    // Hybrid linear+full attention (Qwen3.5 / Qwen3-Next family): typed layer
+    // list + shared Gated DeltaNet geometry.
+    let hybrid_layer_types: Option<Vec<LayerType>> = match layer_types.as_ref() {
+        Some(types) if types.iter().any(|t| t == "linear_attention") => Some(
+            types
+                .iter()
+                .map(|t| match t.as_str() {
+                    "full_attention" => Ok(LayerType::FullAttention),
+                    "linear_attention" => Ok(LayerType::LinearAttention),
+                    other => Err(anyhow::anyhow!(
+                        "unsupported layer_types entry '{other}' in hybrid model"
+                    )),
+                })
+                .collect::<Result<Vec<_>>>()?,
+        ),
+        _ => None,
+    };
+    let linear_attn = if hybrid_layer_types.is_some() {
+        Some(LinearAttnConfig {
+            num_k_heads: req_usize(&v, "linear_num_key_heads")?,
+            num_v_heads: req_usize(&v, "linear_num_value_heads")?,
+            head_k_dim: req_usize(&v, "linear_key_head_dim")?,
+            head_v_dim: req_usize(&v, "linear_value_head_dim")?,
+            conv_kernel: req_usize(&v, "linear_conv_kernel_dim")?,
+        })
+    } else {
+        None
+    };
+    let attn_output_gate = v["attn_output_gate"].as_bool().unwrap_or(false);
+    let partial_rotary_factor = v["partial_rotary_factor"].as_f64().or_else(|| {
+        rope_parameters
+            .get("partial_rotary_factor")
+            .and_then(Value::as_f64)
+    });
+    let rotary_dim = partial_rotary_factor
+        .filter(|&f| f > 0.0 && f < 1.0)
+        .map(|f| (head_dim as f64 * f) as usize);
+
     let per_layer_head_dims = layer_types.as_ref().map(|types| {
         types
             .iter()
@@ -283,6 +321,10 @@ pub fn parse(config_path: &str) -> Result<StandardTransformerConfig> {
         moe_norm_topk_prob,
         moe_gpt_oss: arch_def.gpt_oss_moe,
         moe_swiglu_limit,
+        layer_types: hybrid_layer_types,
+        linear_attn,
+        attn_output_gate,
+        rotary_dim,
     })
 }
 
@@ -421,10 +463,49 @@ fn validate_quantization_config(v: &Value) -> Result<Option<crate::common::weigh
                 sym,
             }))
         }
+        "compressed-tensors" => {
+            let format = v["format"].as_str().unwrap_or("");
+            if format != "pack-quantized" {
+                anyhow::bail!(
+                    "compressed-tensors format '{format}' not supported (only 'pack-quantized')"
+                );
+            }
+            let groups = v["config_groups"].as_object().map(|g| g.len()).unwrap_or(0);
+            let w = &v["config_groups"]["group_0"]["weights"];
+            let num_bits = w["num_bits"].as_u64().unwrap_or(0);
+            let symmetric = w["symmetric"].as_bool().unwrap_or(false);
+            let wtype = w["type"].as_str().unwrap_or("");
+            let strategy = w["strategy"].as_str().unwrap_or("");
+            let actorder = w["actorder"].as_str();
+            if groups != 1
+                || num_bits != 4
+                || !symmetric
+                || wtype != "int"
+                || strategy != "group"
+                || actorder.is_some()
+            {
+                anyhow::bail!(
+                    "compressed-tensors config not supported: requires a single group with \
+                     int4 symmetric group-strategy weights, no actorder \
+                     (got groups={groups}, bits={num_bits}, sym={symmetric}, type='{wtype}', \
+                     strategy='{strategy}', actorder={actorder:?})"
+                );
+            }
+            tracing::info!(
+                quant = "compressed-tensors",
+                bits = 4,
+                "pack-quantized int4 checkpoint detected (converted to AWQ layout at load; \
+                 W4A16 fused matmul on Metal)"
+            );
+            Ok(Some(
+                crate::common::weights::QuantScheme::CompressedTensors4,
+            ))
+        }
         "" => Ok(None),
         other => anyhow::bail!(
             "Unknown quantization method '{other}' in quantization_config. \
-             Supported: awq (gemm, 4-bit), gptq (4/8-bit, desc_act=false), fp8."
+             Supported: awq (gemm, 4-bit), gptq (4/8-bit, desc_act=false), \
+             compressed-tensors (pack-quantized int4), fp8."
         ),
     }
 }
@@ -454,6 +535,8 @@ fn parse_rope_scaling(v: &Value) -> RopeScaling {
     let factor = v["factor"].as_f64().unwrap_or(1.0);
 
     match rope_type {
+        // Explicit "no scaling" marker used by rope_parameters-style configs.
+        "default" => RopeScaling::None,
         "linear" => RopeScaling::Linear { factor },
         "llama3" => {
             let low_freq_factor = v["low_freq_factor"].as_f64().unwrap_or(1.0);

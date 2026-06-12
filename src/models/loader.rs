@@ -691,10 +691,31 @@ fn load_standard_safetensors(
         .filter(|v| v.len() == num_layers)
         .unwrap_or_else(|| vec![cfg.rope_theta; num_layers]);
 
+    // Hybrid models: linear-attention layers keep recurrent state instead of
+    // KV blocks, so they contribute neither to the KV budget nor real pools.
+    let layer_is_linear: Vec<bool> = match (&cfg.layer_types, cfg.linear_attn) {
+        (Some(types), Some(_)) => {
+            if types.len() != num_layers {
+                anyhow::bail!(
+                    "layer_types length {} != num_hidden_layers {num_layers}",
+                    types.len()
+                );
+            }
+            types
+                .iter()
+                .map(|t| *t == crate::common::config::LayerType::LinearAttention)
+                .collect()
+        }
+        _ => vec![false; num_layers],
+    };
+
     let layer_kv_specs: Vec<(usize, usize)> = per_layer_kv_heads
         .iter()
         .copied()
         .zip(per_layer_head_dims.iter().copied())
+        .zip(layer_is_linear.iter().copied())
+        .filter(|&(_, is_linear)| !is_linear)
+        .map(|(spec, _)| spec)
         .collect();
 
     let ctx = opts.max_context_len.min(cfg.max_position_embeddings);
@@ -818,6 +839,9 @@ fn load_standard_safetensors(
                 block_cfg.head_dim = per_layer_head_dims[i];
                 block_cfg.n_kv_heads = per_layer_kv_heads[i];
                 block_cfg.sliding_window = per_layer_sliding_windows[i];
+                if layer_is_linear[i] {
+                    block_cfg.linear_attn = cfg.linear_attn;
+                }
                 TransformerBlock::load(&block_cfg, i, &weights)
             })
             .collect::<candle_core::Result<Vec<_>>>()?;
@@ -827,7 +851,7 @@ fn load_standard_safetensors(
         let ropes = (0..cfg.num_hidden_layers)
             .map(|i| {
                 RotaryEmbedding::new_with_scaling(
-                    per_layer_head_dims[i],
+                    cfg.rotary_dim.unwrap_or(per_layer_head_dims[i]),
                     ctx,
                     per_layer_rope_thetas[i],
                     cfg.rope_scaling.clone(),
@@ -837,19 +861,31 @@ fn load_standard_safetensors(
             })
             .collect::<candle_core::Result<Vec<_>>>()?;
 
-        let allocators = (0..cfg.num_hidden_layers)
-            .map(|i| -> candle_core::Result<SharedBlockAllocator> {
-                Ok(Arc::new(Mutex::new(BlockAllocator::new(
-                    num_blocks,
-                    DEFAULT_BLOCK_SIZE,
-                    per_layer_kv_heads[i],
-                    per_layer_head_dims[i],
-                    dtype,
-                    device,
-                    layer_quantizers[i].clone(),
-                )?)))
-            })
-            .collect::<candle_core::Result<Vec<_>>>()?;
+        // Linear-attention layers never allocate KV blocks; they alias the
+        // first full-attention layer's allocator so the scheduler's
+        // free-block accounting (allocators[0]) tracks a real pool.
+        let allocators: Vec<SharedBlockAllocator> = {
+            let mut real: Vec<Option<SharedBlockAllocator>> = vec![None; cfg.num_hidden_layers];
+            for i in 0..cfg.num_hidden_layers {
+                if !layer_is_linear[i] {
+                    real[i] = Some(Arc::new(Mutex::new(BlockAllocator::new(
+                        num_blocks,
+                        DEFAULT_BLOCK_SIZE,
+                        per_layer_kv_heads[i],
+                        per_layer_head_dims[i],
+                        dtype,
+                        device,
+                        layer_quantizers[i].clone(),
+                    )?)));
+                }
+            }
+            let first_full = real.iter().flatten().next().cloned().ok_or_else(|| {
+                anyhow::anyhow!("hybrid model needs at least one full_attention layer")
+            })?;
+            real.into_iter()
+                .map(|a| a.unwrap_or_else(|| Arc::clone(&first_full)))
+                .collect()
+        };
 
         let has_per_layer_stream = cfg.per_layer_input_hidden_size.is_some()
             && cfg.per_layer_input_vocab_size.is_some()
@@ -921,6 +957,7 @@ fn load_standard_safetensors(
                 per_layer_projection_norm,
                 per_layer_input_scale: cfg.per_layer_input_scale,
                 kv_shared_layer_map: cfg.kv_shared_layer_map.clone(),
+                has_recurrent_state: layer_is_linear.iter().any(|&b| b),
             }),
             weights_size,
         ))
@@ -975,7 +1012,12 @@ fn load_batch_model_gguf(
 
     let topo = crate::models::gguf_model::parse_gguf_topology(&gguf)?;
     let ctx = opts.max_context_len.min(topo.context_length);
-    let layer_kv_specs = vec![(topo.num_key_value_heads, topo.head_dim); topo.num_hidden_layers];
+    // Hybrid models budget KV only for their full-attention layers; the
+    // linear layers keep O(1) recurrent state instead.
+    let layer_kv_specs: Vec<(usize, usize)> = (0..topo.num_hidden_layers)
+        .filter(|&i| !topo.layer_is_linear(i))
+        .map(|_| (topo.num_key_value_heads, topo.head_dim))
+        .collect();
     let (num_blocks, acquired_kv_bytes) = compute_kv_blocks(
         &KvBlockParams {
             layer_kv_specs,

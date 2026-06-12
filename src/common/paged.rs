@@ -602,6 +602,17 @@ struct BgFlushItem {
     n_tokens: usize,
 }
 
+/// Per-sequence state of a recurrent (linear-attention) layer: the causal-conv
+/// input window and the DeltaNet memory matrix. Lives in the same per-(seq,
+/// layer) slot as paged KV so sequence lifecycle (retire / preempt / abort)
+/// manages both uniformly.
+pub struct RecurrentState {
+    /// Last `conv_kernel - 1` raw conv inputs, shape [1, kernel-1, conv_dim].
+    pub conv: Tensor,
+    /// DeltaNet memory, shape [num_v_heads, head_k_dim, head_v_dim], F32.
+    pub s: Tensor,
+}
+
 pub struct PagedKvCache {
     allocator: SharedBlockAllocator,
     // Cached at construction so the hot path never relocks the allocator.
@@ -616,6 +627,9 @@ pub struct PagedKvCache {
     contig_v: Option<Tensor>,
     contig_len: usize,
     pending_writes: Vec<PendingWrite>,
+    /// `Some` only on linear-attention layers of hybrid models; such layers
+    /// never touch the paged pool.
+    recurrent: Option<RecurrentState>,
 }
 
 impl PagedKvCache {
@@ -640,7 +654,13 @@ impl PagedKvCache {
             contig_v: None,
             contig_len: 0,
             pending_writes: Vec::new(),
+            recurrent: None,
         }
+    }
+
+    /// Mutable access to the recurrent-state slot (linear-attention layers).
+    pub fn recurrent_mut(&mut self) -> &mut Option<RecurrentState> {
+        &mut self.recurrent
     }
 
     /// Lock is released before `Tensor::zeros` so GPU alloc doesn't serialize with other layers.
@@ -919,6 +939,9 @@ impl PagedKvCache {
     }
 
     pub fn clear(&mut self) {
+        // Preempted sequences re-run prefill from position 0, so the recurrent
+        // state must restart from zero alongside the freed KV blocks.
+        self.recurrent = None;
         self.pending_writes.clear();
         let retired_contig = match (self.contig_k.take(), self.contig_v.take()) {
             (Some(k), Some(v)) => k.dim(2).ok().filter(|&c| c > 0).map(|cap| (k, v, cap)),

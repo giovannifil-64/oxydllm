@@ -4,6 +4,7 @@ pub mod block;
 pub mod config;
 pub mod decode_profile;
 pub mod ffn;
+pub mod gdn;
 pub mod gguf_weights;
 pub mod kv_quant;
 pub mod linear;

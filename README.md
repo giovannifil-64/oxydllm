@@ -50,6 +50,8 @@ A rust-based inference engine for Large Language Models.
 - FP8 (E4M3) block-wise weight loading: `Qwen3-4B-Instruct-2507-FP8` and similar checkpoints; the load-time `weight × scale_inv` multiply is performed in F32 to preserve precision across deep block-wise rescaling.
 - MXFP4 (OCP microscaling FP4): GPT-OSS expert weights stay packed on Metal with fused dequant GEMV/GEMM kernels; `openai/gpt-oss-20b` (20.9B params) runs in ~13 GB resident on a 24 GB machine. `gpt-oss-120b` shares the same architecture and should load on machines with enough memory, but is untested.
 - Mixture-of-Experts: `Qwen3MoeForCausalLM`, `OlmoeForCausalLM`, and `GptOssForCausalLM` (interleaved clamped-swiglu experts, attention sinks via a dedicated fused decode kernel, alternating sliding/full attention layers) with top-k routing and a hybrid sparse/naive dispatch (decode-friendly + prefill-friendly). Tested on `allenai/OLMoE-1B-7B-0924-Instruct` and `openai/gpt-oss-20b`.
+- Hybrid linear-attention models (`Qwen3_5ForConditionalGeneration` and the GGUF `qwen35` arch, text-only): Gated DeltaNet layers run a chunked parallel scan for prefill and an O(1) recurrent step for decode, with per-sequence recurrent state managed alongside the paged KV cache; full-attention layers use gated attention (sigmoid output gate) with partial RoPE. Prefix caching and speculative decoding are automatically disabled for these models (recurrent state can neither skip tokens nor roll back). Vision tower and MTP weights are skipped at load. Supported checkpoint formats: BF16 safetensors, compressed-tensors pack-quantized INT4 (full or mixed BF16/INT4), and GGUF (llama.cpp `qwen35` tensor layout: tiled V-heads, pre-baked norm shift and `-exp(A_log)`).
+- compressed-tensors "pack-quantized" INT4 (llm-compressor output, symmetric, group strategy): converted to the AWQ layout at load (nibbles transfer verbatim — the format is already offset-binary; zero-points are constant 8) so the resident W4A16 Metal kernels apply unchanged. Works for both fully-quantized and mixed-precision (`ignore` list) checkpoints.
 - Streaming responses via Server-Sent Events
 - Model download directly from HuggingFace with interactive variant selection
 
@@ -61,7 +63,7 @@ KV cache quantization uses TurboQuant with MSE-based quantization during the dec
 > Note on `--kv-quant`: the quantization step currently runs on CPU, each KV write transfers the new K/V tensors from GPU to CPU and casts them to F32 before packing. On unified-memory Apple Silicon the transfer is cheap, but on discrete CUDA GPUs the per-step roundtrip can dominate. Enable `--kv-quant` for memory-constrained deployments; leave it `off` when throughput matters and KV memory is not the bottleneck. On-device kernels are on the roadmap.
 
 ## Tested Models
-The following 26 checkpoints are all currently in the local registry and pass the deterministic coherence check in `scripts/stress_baseline.py` on the Apple Silicon reference machine (M5, 24 GB unified memory). Decode `tok/s` is the steady-state median over five 150-token runs after one warm-up.
+The following models all pass the deterministic coherence check in `scripts/stress_baseline.py` on the Apple Silicon reference machine (M5, 24 GB unified memory); the Qwen3.5 family is covered separately [below](#qwen35-hybrid-linear-attention) with its own adversarial battery. Decode `tok/s` is the steady-state median over five 150-token runs after one warm-up.
 
 | Model | Architecture | Format | Decode tok/s |
 |---|---|---|---|
@@ -95,11 +97,26 @@ The following 26 checkpoints are all currently in the local registry and pass th
 > [!NOTE]
 > All Qwen3 models have been tested with and without thinking enabled. Other checkpoints in the same architecture families (e.g. other Llama 3.2, Gemma 3, Qwen2.5 sizes) are likely to work but are not in the regression suite.
 
+### Qwen3.5 (hybrid linear attention)
+
+Qwen3.5 runs on a dedicated hybrid runtime (Gated DeltaNet + gated full attention). Thinking mode works with `enable_thinking` on/off, with reasoning separated into `reasoning_content` in both streaming and non-streaming responses.
+
+| Model | Format | Resident | Decode tok/s* | Battery |
+|---|---|---|---|---|
+| `Qwen/Qwen3.5-4B` | BF16 safetensors | 8.7 GB | 8.9 | 13/13 |
+| `cyankiwi/Qwen3.5-4B-AWQ-4bit` | compressed-tensors INT4 (W4A16 resident) | 3.1 GB | 19.5 | 13/13 |
+| `cyankiwi/Qwen3.5-4B-AWQ-BF16-INT4` | mixed BF16 DeltaNet + INT4 attn/MLP | 4.4 GB | 14.7 | 13/13 |
+| `unsloth/Qwen3.5-4B-GGUF` (Q4_K_M) | GGUF (`qwen35` arch) | 2.5 GB | 24.1 | 12/13** |
+
+\* Median of three 150-token completions, prefill included.
+
+\*\* Quality loss of the Q4_K_M quantization on one marginal reasoning prompt, not a runtime defect: the same weights answer correctly when prompted step-by-step, and batched-vs-single decode stays byte-identical.
+
+
 ## Unsupported Model Families
 The following model families are not currently supported:
 - Mixtral (`MixtralForCausalLM`): uses `block_sparse_moe.experts.{e}.{w1,w2,w3}` tensor naming, not yet routed in the loader (the MoE infrastructure itself is in place via `Qwen3MoeForCausalLM` and `OlmoeForCausalLM`).
 - DeepSeek-V2/V3: Mixture-of-Experts plus Multi-head Latent Attention (MLA); MLA is not implemented yet.
-- Hybrid linear-attention models (Qwen3.5)
 - GGUF MoE checkpoints: quant-per-expert tensor layout not yet wired; safetensors MoE works.
 - Multimodal inference (vision+language) is not supported yet; text-only paths from some multimodal checkpoints may work.
 - Encoder-only models (BERT, etc.)

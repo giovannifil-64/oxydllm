@@ -178,6 +178,81 @@ fn read_packed_to_u32(t: &Tensor) -> Result<Vec<u32>> {
     }
 }
 
+/// Convert a compressed-tensors "pack-quantized" int4 symmetric weight
+/// (llm-compressor output: `weight_packed` [out, in/8] i32 with sequential
+/// LSB-first nibbles already offset-binary q+8, `weight_scale` [out, in/g])
+/// into the canonical AWQ layout so the resident W4A16 Metal kernel and all
+/// downstream paths apply unchanged. Symmetric ⇒ qzeros are constant 8
+/// (0x88888888 words); nibble values transfer verbatim.
+pub fn compressed_to_awq(weight_packed: &Tensor, weight_scale: &Tensor) -> Result<QuantWeight> {
+    let (out_f, packed_in) = weight_packed
+        .dims2()
+        .context("weight_packed must be 2-D [out, in/8]")?;
+    let in_f = packed_in * AWQ_PACK_FACTOR;
+    let (scale_out, groups) = weight_scale
+        .dims2()
+        .context("weight_scale must be 2-D [out, groups]")?;
+    if scale_out != out_f {
+        anyhow::bail!("weight_scale dim0 {scale_out} != weight_packed out_features {out_f}");
+    }
+    if groups == 0 || !in_f.is_multiple_of(groups) {
+        anyhow::bail!("in_features {in_f} not divisible by scale groups {groups}");
+    }
+    if out_f % AWQ_PACK_FACTOR != 0 {
+        anyhow::bail!("out_features {out_f} not divisible by pack factor {AWQ_PACK_FACTOR}");
+    }
+    let packed_out = out_f / AWQ_PACK_FACTOR;
+
+    let ct = read_packed_to_u32(weight_packed)?; // row-major [out][in/8]
+    let scales_ct: Vec<f32> = weight_scale
+        .to_device(&Device::Cpu)?
+        .to_dtype(DType::F32)?
+        .flatten_all()?
+        .to_vec1()?;
+
+    // AWQ qweight [in, out/8]: word (i, jw) nibble k holds out column
+    // jw*8 + AWQ_PACK_ORDER[k]; CT word (o, i/8) holds column i at nibble i%8.
+    let mut qweight = vec![0u32; in_f * packed_out];
+    {
+        use rayon::prelude::*;
+        qweight
+            .par_chunks_mut(packed_out)
+            .enumerate()
+            .for_each(|(i, row)| {
+                let c = i / AWQ_PACK_FACTOR;
+                let sh = 4 * (i % AWQ_PACK_FACTOR) as u32;
+                for (jw, word) in row.iter_mut().enumerate() {
+                    let mut w = 0u32;
+                    for (k, &offset) in AWQ_PACK_ORDER.iter().enumerate() {
+                        let o = jw * AWQ_PACK_FACTOR + offset;
+                        let nib = (ct[o * packed_in + c] >> sh) & 0xF;
+                        w |= nib << (4 * k as u32);
+                    }
+                    *word = w;
+                }
+            });
+    }
+
+    let qzeros = vec![0x8888_8888u32; groups * packed_out];
+    let mut scales = vec![0f32; groups * out_f];
+    for o in 0..out_f {
+        for g in 0..groups {
+            scales[g * out_f + o] = scales_ct[o * groups + g];
+        }
+    }
+
+    // Materialise on the checkpoint's device — downstream loaders derive the
+    // compute device from these tensors.
+    let device = weight_packed.device();
+    let qweight = Tensor::from_vec(qweight, (in_f, packed_out), &Device::Cpu)?.to_device(device)?;
+    let qzeros = Tensor::from_vec(qzeros, (groups, packed_out), &Device::Cpu)?.to_device(device)?;
+    let scales = Tensor::from_vec(scales, (groups, out_f), &Device::Cpu)?
+        .to_dtype(weight_scale.dtype())
+        .context("compressed_to_awq: cast scales to checkpoint dtype")?
+        .to_device(device)?;
+    Ok(QuantWeight::new_awq(4, qweight, qzeros, scales))
+}
+
 pub fn concat_awq_along_out(parts: &[AwqRawTensors]) -> Result<AwqRawTensors> {
     if parts.is_empty() {
         anyhow::bail!("concat_awq_along_out: no parts");
@@ -669,6 +744,60 @@ pub fn rtn_quantize_awq(weight: &Tensor, group_size: usize) -> Result<AwqRawTens
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Contract: a compressed-tensors pack-quantized int4 weight converts to
+    /// the canonical AWQ layout such that AWQ dequantisation reproduces the
+    /// original `q · scale` values exactly. Packing ground truth verified
+    /// against compressed-tensors 0.17.0 `pack_to_int32`: sequential
+    /// LSB-first nibbles, offset-binary (stored nibble = q_signed + 8).
+    #[test]
+    fn compressed_to_awq_matches_direct_dequant() -> Result<()> {
+        let device = Device::Cpu;
+        let (out_f, in_f, group) = (16usize, 64usize, 32usize);
+        let groups = in_f / group;
+
+        // Deterministic signed int4 values in [-8, 7] and positive scales.
+        let q: Vec<i32> = (0..out_f * in_f).map(|i| (i % 16) as i32 - 8).collect();
+        let scale: Vec<f32> = (0..out_f * groups)
+            .map(|i| 0.01 + (i % 7) as f32 * 0.003)
+            .collect();
+
+        // CT packing: word (o, c) holds columns c*8..c*8+8, nibble k = q+8.
+        let packed_in = in_f / 8;
+        let mut packed = vec![0i32; out_f * packed_in];
+        for o in 0..out_f {
+            for c in 0..packed_in {
+                let mut w = 0u32;
+                for k in 0..8 {
+                    let nib = (q[o * in_f + c * 8 + k] + 8) as u32 & 0xF;
+                    w |= nib << (4 * k);
+                }
+                packed[o * packed_in + c] = w as i32;
+            }
+        }
+        let weight_packed = Tensor::from_vec(packed, (out_f, packed_in), &device)?;
+        let weight_scale = Tensor::from_vec(scale.clone(), (out_f, groups), &device)?;
+
+        let raw = compressed_to_awq(&weight_packed, &weight_scale)?;
+        assert_eq!(raw.qweight.dims(), [in_f, out_f / 8]);
+        assert_eq!(raw.scales.dims(), [groups, out_f]);
+        assert_eq!(raw.group_size()?, group);
+
+        let dq: Vec<f32> = dequantize_awq(&raw, &device, DType::F32)?
+            .flatten_all()?
+            .to_vec1()?;
+        for o in 0..out_f {
+            for i in 0..in_f {
+                let expected = q[o * in_f + i] as f32 * scale[o * groups + i / group];
+                let got = dq[o * in_f + i];
+                assert!(
+                    (got - expected).abs() < 1e-6,
+                    "w[{o}][{i}]: got {got}, want {expected}"
+                );
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn rtn_quantize_awq_round_trips() -> Result<()> {

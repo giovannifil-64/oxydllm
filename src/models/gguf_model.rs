@@ -49,6 +49,9 @@ pub struct StandardTransformer {
     pub(crate) per_layer_projection_norm: Option<RMSNorm>,
     pub(crate) per_layer_input_scale: Option<f64>,
     pub(crate) kv_shared_layer_map: Option<Vec<Option<usize>>>,
+    /// True when any layer is a recurrent (linear-attention) mixer — disables
+    /// prefix caching and speculative decoding.
+    pub(crate) has_recurrent_state: bool,
 }
 
 pub(crate) struct GgufTopology {
@@ -57,6 +60,19 @@ pub(crate) struct GgufTopology {
     pub num_key_value_heads: usize,
     pub head_dim: usize,
     pub context_length: usize,
+    /// Hybrid (qwen35-class): layer i is full attention iff
+    /// (i+1) % interval == 0; the rest are recurrent linear-attention layers
+    /// without KV cache. `None` for standard transformers.
+    pub full_attention_interval: Option<usize>,
+}
+
+impl GgufTopology {
+    pub fn layer_is_linear(&self, layer_idx: usize) -> bool {
+        match self.full_attention_interval {
+            Some(interval) => !(layer_idx + 1).is_multiple_of(interval),
+            None => false,
+        }
+    }
 }
 
 pub(crate) fn parse_gguf_topology(gguf: &GgufWeights) -> anyhow::Result<GgufTopology> {
@@ -90,12 +106,18 @@ pub(crate) fn parse_gguf_topology(gguf: &GgufWeights) -> anyhow::Result<GgufTopo
         }
     };
     let context_length = gguf.metadata_u32_or(&format!("{prefix}.context_length"), 131072) as usize;
+    let full_attention_interval =
+        match gguf.metadata_u32_or(&format!("{prefix}.full_attention_interval"), 0) as usize {
+            0 | 1 => None,
+            interval => Some(interval),
+        };
     Ok(GgufTopology {
         num_hidden_layers,
         num_attention_heads,
         num_key_value_heads,
         head_dim,
         context_length,
+        full_attention_interval,
     })
 }
 
@@ -145,6 +167,38 @@ impl StandardTransformer {
         let num_attention_heads = topo.num_attention_heads;
         let num_key_value_heads = topo.num_key_value_heads;
         let head_dim = topo.head_dim;
+
+        // Hybrid (qwen35-class): Gated DeltaNet geometry from ssm.* metadata.
+        let linear_attn_cfg: Option<crate::common::config::LinearAttnConfig> =
+            if topo.full_attention_interval.is_some() {
+                let num_k_heads = gguf.metadata_u32(&format!("{prefix}.ssm.group_count"))? as usize;
+                let num_v_heads =
+                    gguf.metadata_u32(&format!("{prefix}.ssm.time_step_rank"))? as usize;
+                let head_k_dim = gguf.metadata_u32(&format!("{prefix}.ssm.state_size"))? as usize;
+                let inner = gguf.metadata_u32(&format!("{prefix}.ssm.inner_size"))? as usize;
+                let conv_kernel = gguf.metadata_u32(&format!("{prefix}.ssm.conv_kernel"))? as usize;
+                if num_v_heads == 0 || !inner.is_multiple_of(num_v_heads) {
+                    anyhow::bail!(
+                        "GGUF ssm.inner_size {inner} not divisible by time_step_rank {num_v_heads}"
+                    );
+                }
+                Some(crate::common::config::LinearAttnConfig {
+                    num_k_heads,
+                    num_v_heads,
+                    head_k_dim,
+                    head_v_dim: inner / num_v_heads,
+                    conv_kernel,
+                })
+            } else {
+                None
+            };
+        // Partial RoPE: rope.dimension_count < head_dim ⇒ rotate the leading
+        // dims only (qwen35: 64 of 256). Standard models publish the full
+        // head_dim here, which leaves rotary_dim disabled.
+        let rotary_dim = {
+            let rd = gguf.metadata_u32_or(&format!("{prefix}.rope.dimension_count"), 0) as usize;
+            (rd > 0 && rd < head_dim).then_some(rd)
+        };
 
         let hidden_size = gguf.metadata_u32_or(
             &format!("{prefix}.embedding_length"),
@@ -240,6 +294,13 @@ impl StandardTransformer {
                     sliding_window: arch_def.resolve_sliding_window_for_layer(sliding_window, i),
                     // GGUF runtime is dense-only; MoE GGUF support is future work.
                     moe: None,
+                    linear_attn: if topo.layer_is_linear(i) {
+                        linear_attn_cfg
+                    } else {
+                        None
+                    },
+                    attn_output_gate: arch_def.attn_output_gate,
+                    rotary_dim,
                 };
                 TransformerBlock::load_gguf(&block_cfg, i, gguf, device, dtype, intermediate_size)
             })
@@ -254,28 +315,45 @@ impl StandardTransformer {
 
         let mut ropes = Vec::with_capacity(num_hidden_layers);
         for _ in 0..num_hidden_layers {
-            let rope =
-                RotaryEmbedding::new(head_dim, max_position_embeddings, rope_theta, dtype, device)
-                    .map_err(|e| anyhow::anyhow!("Failed to create RoPE: {e}"))?;
+            let rope = RotaryEmbedding::new(
+                rotary_dim.unwrap_or(head_dim),
+                max_position_embeddings,
+                rope_theta,
+                dtype,
+                device,
+            )
+            .map_err(|e| anyhow::anyhow!("Failed to create RoPE: {e}"))?;
             ropes.push(rope);
         }
 
-        let mut allocators = Vec::with_capacity(num_hidden_layers);
-        for _ in 0..num_hidden_layers {
-            let allocator = Arc::new(Mutex::new(
-                BlockAllocator::new(
-                    num_kv_blocks,
-                    DEFAULT_BLOCK_SIZE,
-                    num_key_value_heads,
-                    head_dim,
-                    dtype,
-                    device,
-                    kv_quantizer.clone(),
-                )
-                .map_err(|e| anyhow::anyhow!("Failed to create block allocator: {e}"))?,
-            ));
-            allocators.push(allocator);
-        }
+        // Linear-attention layers never allocate KV blocks; they alias the
+        // first full-attention layer's allocator so the scheduler's
+        // free-block accounting (allocators[0]) tracks a real pool.
+        let allocators: Vec<SharedBlockAllocator> = {
+            let mut real: Vec<Option<SharedBlockAllocator>> = vec![None; num_hidden_layers];
+            for (i, slot) in real.iter_mut().enumerate() {
+                if !topo.layer_is_linear(i) {
+                    *slot = Some(Arc::new(Mutex::new(
+                        BlockAllocator::new(
+                            num_kv_blocks,
+                            DEFAULT_BLOCK_SIZE,
+                            num_key_value_heads,
+                            head_dim,
+                            dtype,
+                            device,
+                            kv_quantizer.clone(),
+                        )
+                        .map_err(|e| anyhow::anyhow!("Failed to create block allocator: {e}"))?,
+                    )));
+                }
+            }
+            let first_full = real.iter().flatten().next().cloned().ok_or_else(|| {
+                anyhow::anyhow!("hybrid GGUF model needs at least one full_attention layer")
+            })?;
+            real.into_iter()
+                .map(|a| a.unwrap_or_else(|| Arc::clone(&first_full)))
+                .collect()
+        };
 
         let stop_token_ids = gguf.eos_token_ids();
 
@@ -299,6 +377,7 @@ impl StandardTransformer {
             per_layer_projection_norm: None,
             per_layer_input_scale: None,
             kv_shared_layer_map: None,
+            has_recurrent_state: topo.full_attention_interval.is_some(),
         })
     }
 }
@@ -337,5 +416,8 @@ impl BatchModel for StandardTransformer {
     }
     fn allocators(&self) -> &[SharedBlockAllocator] {
         &self.allocators
+    }
+    fn has_recurrent_state(&self) -> bool {
+        self.has_recurrent_state
     }
 }

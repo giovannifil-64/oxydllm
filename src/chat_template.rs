@@ -46,7 +46,8 @@ pub fn apply_chat_template(
                 tool_calls: m
                     .tool_calls
                     .as_ref()
-                    .and_then(|tc| serde_json::to_value(tc).ok()),
+                    .and_then(|tc| serde_json::to_value(tc).ok())
+                    .map(parse_arguments_for_template),
                 tool_call_id: m.tool_call_id.as_deref(),
                 name: m.name.as_deref(),
             })
@@ -64,6 +65,26 @@ pub fn apply_chat_template(
         .context("Failed to render chat template")?;
 
     Ok(rendered)
+}
+
+/// HF chat templates are written against the transformers convention where
+/// `tool_call.function.arguments` is a mapping (Qwen3.5 iterates it with
+/// `|items`; Qwen3 serializes it with `|tojson`). The OpenAI wire format we
+/// receive stores arguments as a JSON *string* — parse it for the template
+/// context so both conventions render correctly. Unparseable strings are
+/// passed through unchanged.
+fn parse_arguments_for_template(mut tool_calls: serde_json::Value) -> serde_json::Value {
+    if let Some(calls) = tool_calls.as_array_mut() {
+        for call in calls {
+            if let Some(args) = call.pointer_mut("/function/arguments")
+                && let Some(s) = args.as_str()
+                && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(s)
+            {
+                *args = parsed;
+            }
+        }
+    }
+    tool_calls
 }
 
 pub fn format_plain_chat(messages: &[ChatMessage]) -> String {
@@ -351,6 +372,38 @@ mod tests {
         .expect("template should render");
 
         assert_eq!(rendered, "user: hello");
+    }
+
+    /// Contract: tool-call `arguments` reach the template as a MAPPING, not
+    /// the OpenAI wire string — Qwen3.5's template iterates them with
+    /// `|items` (a string there fails the whole render with a 500), and
+    /// Qwen3-style `|tojson` would double-encode a string.
+    #[test]
+    fn tool_call_arguments_are_parsed_to_a_mapping_for_the_template() {
+        let msg: ChatMessage = serde_json::from_value(serde_json::json!({
+            "role": "assistant",
+            "content": null,
+            "tool_calls": [{
+                "id": "call_1",
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "arguments": "{\"city\": \"Rome\", \"days\": 3}"
+                }
+            }]
+        }))
+        .expect("valid assistant tool-call message");
+        let messages = vec![msg];
+
+        // Mirrors Qwen3.5's `for name, value in tool_call.arguments|items`.
+        let rendered = apply_chat_template(
+            "{% for m in messages %}{% for tc in m.tool_calls %}{{ tc.function.name }}({% for k, v in tc.function.arguments|items %}{{ k }}={{ v }};{% endfor %}){% endfor %}{% endfor %}",
+            &messages,
+            TemplateOptions::default(),
+        )
+        .expect("template with |items over arguments must render");
+
+        assert_eq!(rendered, "get_weather(city=Rome;days=3;)");
     }
 
     // Contract: reasoning_effort reaches the template when set, and is ABSENT

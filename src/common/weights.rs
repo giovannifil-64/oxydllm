@@ -5,13 +5,29 @@ use rustc_hash::FxHashMap;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum QuantScheme {
-    Awq { bits: u32 },
-    Gptq { bits: u32, sym: bool },
+    Awq {
+        bits: u32,
+    },
+    Gptq {
+        bits: u32,
+        sym: bool,
+    },
+    /// compressed-tensors "pack-quantized" int4 symmetric (llm-compressor).
+    /// Converted to the AWQ layout at load; runs on the resident W4A16 path.
+    CompressedTensors4,
 }
 
 pub struct ModelWeights {
     tensors: FxHashMap<String, Tensor>,
     quant_scheme: Option<QuantScheme>,
+}
+
+/// Gated DeltaNet scalar parameters are stored F32 and consumed F32 (the
+/// decay recurrence is precision-sensitive); never round-trip them via BF16.
+fn keeps_file_dtype(name: &str) -> bool {
+    name.ends_with(".linear_attn.A_log")
+        || name.ends_with(".linear_attn.dt_bias")
+        || name.ends_with(".linear_attn.norm.weight")
 }
 
 fn load_tensor_with_dtype(
@@ -25,6 +41,10 @@ fn load_tensor_with_dtype(
     let t = mmap
         .load(name, device)
         .with_context(|| format!("Failed to load tensor {}", name))?;
+
+    if keeps_file_dtype(name) {
+        return Ok(t);
+    }
 
     let target_dtype = if force_f32 { DType::F32 } else { dtype };
 
@@ -188,7 +208,15 @@ impl ModelWeights {
             MmapedSafetensors::multi(paths).context("Failed to memory-map weight files")?
         };
 
-        let names: Vec<String> = mmap.tensors().into_iter().map(|(n, _)| n).collect();
+        // Text-only runtime: the vision tower and MTP (multi-token prediction)
+        // head of Qwen3.5-class checkpoints are never read — don't spend ~2 GB
+        // materializing them.
+        let names: Vec<String> = mmap
+            .tensors()
+            .into_iter()
+            .map(|(n, _)| n)
+            .filter(|n| !n.starts_with("model.visual.") && !n.starts_with("mtp."))
+            .collect();
         let scale_inv_names: std::collections::HashSet<String> = names
             .iter()
             .filter(|name| name.ends_with(".weight_scale_inv"))
@@ -315,10 +343,23 @@ impl ModelWeights {
         Some(QuantWeight::new_gptq(bits, sym, qweight, qzeros, scales))
     }
 
+    pub fn try_get_compressed(&self, prefix: &str) -> Option<QuantWeight> {
+        let packed = self.try_get(&format!("{prefix}.weight_packed"))?;
+        let scale = self.try_get(&format!("{prefix}.weight_scale"))?;
+        match crate::common::awq::compressed_to_awq(packed, scale) {
+            Ok(raw) => Some(raw),
+            Err(e) => {
+                tracing::error!("compressed-tensors conversion failed at {prefix}: {e:#}");
+                None
+            }
+        }
+    }
+
     pub fn try_get_quant(&self, prefix: &str) -> Option<QuantWeight> {
         match self.quant_scheme {
             Some(QuantScheme::Awq { bits }) => self.try_get_awq(prefix, bits),
             Some(QuantScheme::Gptq { bits, sym }) => self.try_get_gptq(prefix, bits, sym),
+            Some(QuantScheme::CompressedTensors4) => self.try_get_compressed(prefix),
             None => None,
         }
     }

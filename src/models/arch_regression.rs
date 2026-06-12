@@ -188,6 +188,9 @@ mod tests {
             has_ffn_norms: spec.has_ffn_norms,
             sliding_window: spec.sliding_window,
             moe: None,
+            linear_attn: None,
+            attn_output_gate: false,
+            rotary_dim: None,
         };
 
         let blocks = (0..LAYERS)
@@ -241,6 +244,7 @@ mod tests {
             per_layer_projection_norm: None,
             per_layer_input_scale: None,
             kv_shared_layer_map: None,
+            has_recurrent_state: false,
         })
     }
 

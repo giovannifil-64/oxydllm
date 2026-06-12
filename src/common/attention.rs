@@ -77,6 +77,11 @@ pub struct Attention {
     sliding_window: Option<usize>,
     v_norm: bool,
     rms_norm_eps: f64,
+    /// Qwen3.5 gated attention: q_proj emits per-head [query | gate]; the
+    /// sigmoid gate multiplies the attention output before o_proj.
+    output_gate: bool,
+    /// Partial RoPE: only the first `rotary_dim` dims of each head rotate.
+    rotary_dim: Option<usize>,
     out_buf: std::cell::RefCell<Option<Tensor>>,
 }
 
@@ -135,7 +140,8 @@ impl Attention {
             .transpose()?;
         let p = format!("model.layers.{}.self_attn", layer_idx);
         let hd = cfg.head_dim;
-        let q_dim = cfg.n_heads * hd;
+        // Gated attention doubles the q projection: per-head [query | gate].
+        let q_dim = cfg.n_heads * hd * if cfg.attn_output_gate { 2 } else { 1 };
         let kv_dim = cfg.n_kv_heads * hd;
         let q_prefix = format!("{}.q_proj", p);
 
@@ -244,6 +250,11 @@ impl Attention {
                     cfg.n_kv_heads * cfg.head_dim,
                 ),
             };
+            if cfg.attn_output_gate && layout == QkNormLayout::Flat {
+                candle_core::bail!(
+                    "gated attention requires per-head qk_norm (layer {layer_idx} has flat layout)"
+                );
+            }
             (
                 Some(RMSNorm::new(q_w, cfg.rms_norm_eps, cfg.norm_type)?),
                 Some(RMSNorm::new(k_w, cfg.rms_norm_eps, cfg.norm_type)?),
@@ -272,6 +283,8 @@ impl Attention {
             sliding_window: actual_window,
             v_norm: cfg.v_norm,
             rms_norm_eps: cfg.rms_norm_eps,
+            output_gate: cfg.attn_output_gate,
+            rotary_dim: cfg.rotary_dim,
             out_buf: std::cell::RefCell::new(None),
         })
     }
@@ -284,7 +297,10 @@ impl Attention {
         layer_idx: usize,
     ) -> Result<Self> {
         let hd = cfg.head_dim;
-        let q_dim = cfg.n_heads * hd;
+        // Gated attention doubles the q projection (per-head [query | gate]);
+        // the split happens on the projected activations, so the packed-quant
+        // matmul itself is unaffected.
+        let q_dim = cfg.n_heads * hd * if cfg.attn_output_gate { 2 } else { 1 };
         let kv_dim = cfg.n_kv_heads * hd;
 
         let device = q_raw.scales.device().clone();
@@ -318,7 +334,7 @@ impl Attention {
 
         if q_raw.scales.dim(1)? != q_dim {
             candle_core::bail!(
-                "AWQ q_proj out_features {} != n_heads*head_dim {q_dim} at {p}",
+                "AWQ q_proj out_features {} != expected {q_dim} at {p}",
                 q_raw.scales.dim(1)?
             );
         }
@@ -410,6 +426,8 @@ impl Attention {
             sliding_window: actual_window,
             v_norm: cfg.v_norm,
             rms_norm_eps: cfg.rms_norm_eps,
+            output_gate: cfg.attn_output_gate,
+            rotary_dim: cfg.rotary_dim,
             out_buf: std::cell::RefCell::new(None),
         })
     }
@@ -430,6 +448,14 @@ impl Attention {
             }
         };
         let qkv = if let Some(qkv_qt) = gguf.try_get(&format!("{prefix}.attn_qkv.weight")) {
+            // Known gated GGUF archs (qwen35) ship separate q/k/v on full
+            // layers; a fused-qkv gated checkpoint would need its own q split
+            // and would mis-validate below — fail loudly instead.
+            if cfg.attn_output_gate {
+                candle_core::bail!(
+                    "gated attention with fused GGUF attn_qkv is not supported at {prefix}"
+                );
+            }
             let q_dim = cfg.n_heads * hd;
             let kv_dim = cfg.n_kv_heads * hd;
             let expected = q_dim + 2 * kv_dim;
@@ -503,7 +529,8 @@ impl Attention {
             None
         };
 
-        let q_dim = cfg.n_heads * hd;
+        // Gated attention (qwen35): q projection is per-head [query | gate].
+        let q_dim = cfg.n_heads * hd * if cfg.attn_output_gate { 2 } else { 1 };
         let kv_dim = cfg.n_kv_heads * hd;
 
         let actual_window = compute_sliding_window(cfg);
@@ -526,6 +553,8 @@ impl Attention {
             sliding_window: actual_window,
             v_norm: cfg.v_norm,
             rms_norm_eps: cfg.rms_norm_eps,
+            output_gate: cfg.attn_output_gate,
+            rotary_dim: cfg.rotary_dim,
             out_buf: std::cell::RefCell::new(None),
         })
     }
@@ -610,6 +639,21 @@ impl Attention {
             QkNormLayout::PerHead => (q_raw, k_raw),
         };
 
+        // Gated attention: q projection is per-head [query(hd) | gate(hd)];
+        // the gate multiplies (sigmoid) the attention output before o_proj.
+        let (q_raw, out_gate) = if self.output_gate {
+            let q_full = q_raw.reshape((b, total_seq, self.n_heads, 2 * hd))?;
+            let q = q_full.narrow(D::Minus1, 0, hd)?.contiguous()?;
+            let gate = q_full.narrow(D::Minus1, hd, hd)?.contiguous()?.reshape((
+                b,
+                total_seq,
+                self.n_heads * hd,
+            ))?;
+            (q.reshape((b, total_seq, self.n_heads * hd))?, Some(gate))
+        } else {
+            (q_raw, None)
+        };
+
         let q = q_raw
             .reshape((b, total_seq, self.n_heads, hd))?
             .transpose(1, 2)?;
@@ -642,7 +686,22 @@ impl Attention {
         };
 
         let (q, k) = if let Some((r, position_ids)) = rope {
-            r.apply_qk_with_positions(&q, &k, position_ids)?
+            match self.rotary_dim {
+                // Partial RoPE: rotate the leading rotary_dim dims, pass the
+                // rest through (the rope tables are built at rotary_dim).
+                Some(rd) if rd < hd => {
+                    let q_rot = q.narrow(D::Minus1, 0, rd)?.contiguous()?;
+                    let k_rot = k.narrow(D::Minus1, 0, rd)?.contiguous()?;
+                    let (q_rot, k_rot) = r.apply_qk_with_positions(&q_rot, &k_rot, position_ids)?;
+                    let q_pass = q.narrow(D::Minus1, rd, hd - rd)?.contiguous()?;
+                    let k_pass = k.narrow(D::Minus1, rd, hd - rd)?.contiguous()?;
+                    (
+                        Tensor::cat(&[&q_rot, &q_pass], D::Minus1)?,
+                        Tensor::cat(&[&k_rot, &k_pass], D::Minus1)?,
+                    )
+                }
+                _ => r.apply_qk_with_positions(&q, &k, position_ids)?,
+            }
         } else {
             (q, k)
         };
@@ -867,6 +926,10 @@ impl Attention {
         let out = out_buf
             .transpose(1, 2)?
             .reshape((b, total_seq, self.n_heads * hd))?;
+        let out = match &out_gate {
+            Some(gate) => (out * super::linear::sigmoid(gate)?)?,
+            None => out,
+        };
         self.o_proj.forward(&out)
     }
 }
@@ -907,6 +970,8 @@ impl Attention {
             sliding_window: None,
             v_norm: false,
             rms_norm_eps: 1e-5,
+            output_gate: false,
+            rotary_dim: None,
             out_buf: std::cell::RefCell::new(None),
         })
     }
@@ -933,6 +998,9 @@ mod tests {
             has_ffn_norms: false,
             sliding_window,
             moe: None,
+            linear_attn: None,
+            attn_output_gate: false,
+            rotary_dim: None,
         }
     }
 

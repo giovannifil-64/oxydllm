@@ -16,6 +16,10 @@ pub struct ArchDefaults {
     /// GPT-OSS MoE: MXFP4 stacked experts, interleaved gate/up, clamped swiglu,
     /// attention sinks (the sink tensor itself is detected by presence).
     pub gpt_oss_moe: bool,
+    /// Qwen3.5 gated attention (q_proj emits per-head [query | gate]). Only
+    /// consulted by the GGUF loader; safetensors reads `attn_output_gate`
+    /// from config.json.
+    pub attn_output_gate: bool,
 }
 
 impl ArchDefaults {
@@ -63,6 +67,7 @@ impl Default for ArchDefaults {
             default_sliding_window: None,
             gpt_oss_moe: false,
             alternating_sliding_window: false,
+            attn_output_gate: false,
         }
     }
 }
@@ -82,6 +87,7 @@ pub fn llama_defaults() -> ArchDefaults {
         default_sliding_window: None,
         alternating_sliding_window: false,
         gpt_oss_moe: false,
+        attn_output_gate: false,
     }
 }
 
@@ -93,9 +99,6 @@ pub fn known_unsupported_reason(arch: &str) -> Option<&'static str> {
         // supported via the `mlp.experts.{e}.{gate,up,down}_proj` convention.
         "MixtralForCausalLM" | "DeepseekV2ForCausalLM" | "DeepseekV3ForCausalLM" => {
             Some("This MoE variant (Mixtral / DeepSeek) uses a tensor naming we don't load yet")
-        }
-        "Qwen3_5ForConditionalGeneration" => {
-            Some("Hybrid linear+full attention models are not yet supported")
         }
         _ => None,
     }
@@ -126,6 +129,33 @@ pub fn arch_defaults(arch: &str) -> Option<ArchDefaults> {
             qk_norm: true,
             default_rope_theta: 1_000_000.0,
             extra_eos_ids: &[],
+            ..llama_defaults()
+        }),
+        // Qwen3.5 — hybrid Gated DeltaNet + gated full attention. HF
+        // checkpoints store all RMSNorms zero-centered (Gemma-style ×(1+w));
+        // activation SiLU; embeddings unscaled. Hybrid layout comes from
+        // `layer_types`; gate/partial-RoPE from
+        // `attn_output_gate`/`partial_rotary_factor`.
+        "qwen3_5" | "qwen3_5_text" | "Qwen3_5ForConditionalGeneration" | "Qwen3_5ForCausalLM" => {
+            Some(ArchDefaults {
+                qk_norm: true,
+                norm_type: NormType::Gemma,
+                default_rope_theta: 10_000_000.0,
+                extra_eos_ids: &[],
+                attn_output_gate: true,
+                ..llama_defaults()
+            })
+        }
+        // GGUF flavour of the same arch: llama.cpp's converter bakes the +1
+        // into every norm weight (except the DeltaNet gated norm), so the
+        // runtime must NOT re-shift — Standard norms here. Hybrid layout
+        // comes from `full_attention_interval` + ssm.* metadata.
+        "qwen35" => Some(ArchDefaults {
+            qk_norm: true,
+            norm_type: NormType::Standard,
+            default_rope_theta: 10_000_000.0,
+            extra_eos_ids: &[],
+            attn_output_gate: true,
             ..llama_defaults()
         }),
         // Qwen3-MoE — same attention defaults as Qwen3, MoE FFN handled by

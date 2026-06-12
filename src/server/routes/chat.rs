@@ -620,7 +620,85 @@ fn tool_exists(tools: &[ToolDefinition], name: &str) -> bool {
     tools.iter().any(|tool| tool.function.name == name)
 }
 
+/// Parse the XML-ish tool-call format emitted by Qwen3.5-class templates:
+/// `<tool_call>\n<function=NAME>\n<parameter=KEY>\nVALUE\n</parameter>…
+/// </function>\n</tool_call>`, possibly preceded by free-form reasoning text
+/// and possibly repeated for parallel calls. Parameter values are typed
+/// best-effort: anything that parses as JSON (numbers, booleans, null,
+/// objects, arrays, quoted strings) is kept as that value, bare text stays a
+/// string.
+fn parse_function_xml_tool_calls(raw: &str) -> Option<Vec<ToolCall>> {
+    let mut calls = Vec::new();
+    let mut rest = raw;
+    while let Some(start) = rest.find("<tool_call>") {
+        let after = &rest[start + "<tool_call>".len()..];
+        let Some(end) = after.find("</tool_call>") else {
+            break;
+        };
+        let block = &after[..end];
+        rest = &after[end + "</tool_call>".len()..];
+
+        let Some(fstart) = block.find("<function=") else {
+            continue;
+        };
+        let fname_rest = &block[fstart + "<function=".len()..];
+        let Some(fname_end) = fname_rest.find('>') else {
+            continue;
+        };
+        let name = fname_rest[..fname_end].trim().to_string();
+        let body = &fname_rest[fname_end + 1..];
+        let body = body.split("</function>").next().unwrap_or(body);
+
+        let mut args = serde_json::Map::new();
+        let mut prest = body;
+        while let Some(ps) = prest.find("<parameter=") {
+            let pr = &prest[ps + "<parameter=".len()..];
+            let Some(pe) = pr.find('>') else { break };
+            let key = pr[..pe].trim().to_string();
+            let vrest = &pr[pe + 1..];
+            let Some(vend) = vrest.find("</parameter>") else {
+                break;
+            };
+            // The template frames the value with one newline on each side;
+            // strip exactly that framing, preserving interior whitespace.
+            let val_raw = &vrest[..vend];
+            let val_raw = val_raw.strip_prefix('\n').unwrap_or(val_raw);
+            let val_raw = val_raw.strip_suffix('\n').unwrap_or(val_raw);
+            let value = serde_json::from_str::<serde_json::Value>(val_raw.trim())
+                .unwrap_or_else(|_| serde_json::Value::String(val_raw.to_string()));
+            args.insert(key, value);
+            prest = &vrest[vend + "</parameter>".len()..];
+        }
+
+        calls.push(ToolCall {
+            id: make_tool_call_id(),
+            call_type: "function".to_string(),
+            function: ToolCallFunction {
+                name,
+                arguments: serde_json::Value::Object(args).to_string(),
+            },
+        });
+    }
+    if calls.is_empty() { None } else { Some(calls) }
+}
+
 fn try_parse_tool_calls(raw: &str, config: &ToolConfig) -> Option<Vec<ToolCall>> {
+    if let Some(mut result) = parse_function_xml_tool_calls(raw) {
+        result.retain(|call| tool_exists(&config.tools, &call.function.name));
+        if !result.is_empty() {
+            if !config.parallel_tool_calls && result.len() > 1 {
+                result.truncate(1);
+            }
+            if let ToolChoiceMode::ForcedFunction { name } = &config.choice_mode {
+                result.retain(|call| call.function.name == *name);
+                result.truncate(1);
+            }
+            if !result.is_empty() {
+                return Some(result);
+            }
+        }
+    }
+
     let stripped = strip_json_fences(raw.trim());
     let value: serde_json::Value = serde_json::from_str(stripped).ok()?;
     let mut result: Vec<ToolCall> = if let Some(calls) =
@@ -2466,6 +2544,35 @@ mod tests {
         assert_eq!(parsed[0].id, "call_123");
         assert_eq!(parsed[0].function.name, "get_weather");
         assert_eq!(parsed[0].function.arguments, "{\"location\":\"Paris\"}");
+    }
+
+    /// Contract: the XML-ish format emitted by Qwen3.5-class templates
+    /// (`<tool_call><function=NAME><parameter=K>V</parameter>…`) parses into
+    /// proper tool calls — multiline values preserved, JSON-typed scalars
+    /// coerced, free-form reasoning before the block tolerated, parallel
+    /// calls supported, unknown functions filtered out.
+    #[test]
+    fn try_parse_tool_calls_accepts_qwen35_function_xml() {
+        let config = ToolConfig {
+            tools: sample_tools(),
+            choice_mode: ToolChoiceMode::Auto,
+            parallel_tool_calls: true,
+        };
+        let raw = "I should check the weather first.\n\n<tool_call>\n<function=get_weather>\n<parameter=location>\nRome\n</parameter>\n<parameter=days>\n3\n</parameter>\n<parameter=note>\nline one\nline two\n</parameter>\n</function>\n</tool_call>";
+        let parsed = try_parse_tool_calls(raw, &config).expect("xml tool call should parse");
+
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].function.name, "get_weather");
+        let args: serde_json::Value = serde_json::from_str(&parsed[0].function.arguments).unwrap();
+        assert_eq!(args["location"], "Rome");
+        assert_eq!(args["days"], 3, "bare integers must coerce to numbers");
+        assert_eq!(args["note"], "line one\nline two");
+
+        // Parallel calls: two blocks → two calls; unknown function dropped.
+        let raw2 = "<tool_call>\n<function=get_weather>\n<parameter=location>\nParis\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=not_a_real_tool>\n<parameter=x>\n1\n</parameter>\n</function>\n</tool_call>";
+        let parsed2 = try_parse_tool_calls(raw2, &config).expect("should parse");
+        assert_eq!(parsed2.len(), 1, "unknown function must be filtered");
+        assert_eq!(parsed2[0].function.name, "get_weather");
     }
 
     #[test]

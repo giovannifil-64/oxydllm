@@ -3,6 +3,7 @@ use super::{
     attention::{Attention, SegmentInfo},
     config::{Activation, BlockConfig},
     ffn::FeedForward,
+    gdn::GatedDeltaNet,
     gguf_weights::GgufWeights,
     linear::{AnyLinear, Embedding},
     moe::MoeFeedForward,
@@ -32,9 +33,48 @@ impl FeedForwardLayer {
     }
 }
 
+/// Token mixer of a layer: softmax attention or, on the linear-attention
+/// layers of hybrid models (Qwen3.5), a Gated DeltaNet with per-sequence
+/// recurrent state instead of a KV cache.
+enum TokenMixer {
+    Attention(Attention),
+    Gdn(GatedDeltaNet),
+}
+
+impl TokenMixer {
+    fn forward_batch(
+        &self,
+        normed: &Tensor,
+        rope: &RotaryEmbedding,
+        position_ids: &Tensor,
+        mask: Option<&Tensor>,
+        segments: &mut [SegmentInfo],
+    ) -> Result<Tensor> {
+        match self {
+            Self::Attention(attn) => attn.forward_batch(normed, rope, position_ids, mask, segments),
+            Self::Gdn(gdn) => {
+                // Each sequence carries its own recurrent state; process the
+                // batch segment by segment.
+                let mut outs = Vec::with_capacity(segments.len());
+                let mut offset = 0usize;
+                for seg in segments.iter_mut() {
+                    let x_seg = normed.narrow(1, offset, seg.num_tokens)?.contiguous()?;
+                    outs.push(gdn.forward_segment(&x_seg, seg.cache.recurrent_mut())?);
+                    offset += seg.num_tokens;
+                }
+                if outs.len() == 1 {
+                    Ok(outs.pop().expect("one segment"))
+                } else {
+                    Tensor::cat(&outs, 1)
+                }
+            }
+        }
+    }
+}
+
 pub struct TransformerBlock {
     input_norm: RMSNorm,
-    attention: Attention,
+    attention: TokenMixer,
     ffn_norm: RMSNorm,
     ffn: FeedForwardLayer,
     pre_ffn_norm: Option<RMSNorm>,
@@ -79,7 +119,11 @@ impl TransformerBlock {
             cfg.rms_norm_eps,
             cfg.norm_type,
         )?;
-        let attention = Attention::load(cfg, layer_idx, weights)?;
+        let attention = if cfg.linear_attn.is_some() {
+            TokenMixer::Gdn(GatedDeltaNet::load(cfg, layer_idx, weights)?)
+        } else {
+            TokenMixer::Attention(Attention::load(cfg, layer_idx, weights)?)
+        };
         let ffn = match cfg.moe {
             Some(moe_cfg) if moe_cfg.gpt_oss => {
                 FeedForwardLayer::Moe(MoeFeedForward::load_gpt_oss(
@@ -203,11 +247,22 @@ impl TransformerBlock {
             cfg.norm_type,
         )?;
 
-        let ffn_norm_qt = gguf.get(&format!("{prefix}.ffn_norm.weight"))?;
+        // llama.cpp names the pre-FFN norm `ffn_norm` on standard archs and
+        // `post_attention_norm` on qwen35.
+        let ffn_norm_qt = match gguf.try_get(&format!("{prefix}.ffn_norm.weight")) {
+            Some(qt) => qt,
+            None => gguf.get(&format!("{prefix}.post_attention_norm.weight"))?,
+        };
         let ffn_norm =
             RMSNorm::from_qtensor(&ffn_norm_qt, device, dtype, cfg.rms_norm_eps, cfg.norm_type)?;
 
-        let attention = Attention::load_gguf(cfg, layer_idx, gguf, device, dtype)?;
+        let attention = if cfg.linear_attn.is_some() {
+            TokenMixer::Gdn(GatedDeltaNet::load_gguf(
+                cfg, layer_idx, gguf, device, dtype,
+            )?)
+        } else {
+            TokenMixer::Attention(Attention::load_gguf(cfg, layer_idx, gguf, device, dtype)?)
+        };
         // GGUF runtime: dense FFN only — MoE GGUF support is future work
         // (different tensor naming and per-expert quantization layout).
         if cfg.moe.is_some() {

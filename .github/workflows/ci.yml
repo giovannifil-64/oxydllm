@@ -78,9 +78,8 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      - name: Check (Metal)
-        run: cargo check --release
-
+      # No separate `cargo check`: clippy -D warnings performs the same full
+      # type-check pass, so an explicit check is a redundant metadata build.
       - name: Clippy (Metal)
         run: cargo clippy --release -- -D warnings
 
@@ -109,9 +108,6 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends pkg-config libssl-dev
-
-      - name: Check (CPU-only)
-        run: cargo check --release --no-default-features
 
       - name: Clippy (CPU-only)
         run: cargo clippy --release --no-default-features -- -D warnings
@@ -142,10 +138,22 @@ jobs:
           apt-get install -y --no-install-recommends \
             curl build-essential pkg-config libssl-dev git ca-certificates
 
+      # Toolchain cache: rustup installs ~200 MB per run otherwise; keyed on
+      # the pinned toolchain so a version bump naturally invalidates it.
+      - name: Cache Rust toolchain
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.rustup
+            ~/.cargo/bin
+          key: rustup-${{ runner.os }}-x86_64-${{ env.RUST_TOOLCHAIN }}
+
       - name: Install Rust stable
         run: |
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-            | sh -s -- -y --default-toolchain "$RUST_TOOLCHAIN" --profile minimal
+          if ! "$HOME/.cargo/bin/cargo" --version >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+              | sh -s -- -y --default-toolchain "$RUST_TOOLCHAIN" --profile minimal
+          fi
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
       - uses: Swatinem/rust-cache@v2
@@ -191,9 +199,6 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends pkg-config libssl-dev
 
-      - name: Check (CPU-only)
-        run: cargo check --release --no-default-features
-
       - name: Clippy (CPU-only)
         run: cargo clippy --release --no-default-features -- -D warnings
 
@@ -220,10 +225,20 @@ jobs:
           apt-get install -y --no-install-recommends \
             curl build-essential pkg-config libssl-dev git ca-certificates
 
+      - name: Cache Rust toolchain
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.rustup
+            ~/.cargo/bin
+          key: rustup-${{ runner.os }}-arm64-${{ env.RUST_TOOLCHAIN }}
+
       - name: Install Rust stable
         run: |
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-            | sh -s -- -y --default-toolchain "$RUST_TOOLCHAIN" --profile minimal
+          if ! "$HOME/.cargo/bin/cargo" --version >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+              | sh -s -- -y --default-toolchain "$RUST_TOOLCHAIN" --profile minimal
+          fi
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
       - uses: Swatinem/rust-cache@v2

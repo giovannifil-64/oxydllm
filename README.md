@@ -35,24 +35,21 @@ A rust-based inference engine for Large Language Models.
 > At the moment it only supports text input/output and a limited set of models.
 
 ## Features
-- OpenAI-compatible chat completions endpoint (`/v1/chat/completions`)
-- Function calling / tool use (function tools): `tools`, `tool_choice` (`auto`, `required`, `none`, forced function, and `allowed_tools`), and `parallel_tool_calls`; assistant tool calls are returned as proper `tool_calls` with `finish_reason: "tool_calls"`, and streaming emits incremental tool-call deltas
-- Structured output: `response_format` with `json_object` and `json_schema`; request-time schema validation includes strict-mode requirements plus recursive `$ref` / `$defs`, `anyOf`, enums, nested objects/arrays, and nullable unions
-- Metal acceleration on Apple Silicon with fused attention, RMSNorm, RoPE, and Softmax kernels
-- Paged KV cache with prefix caching for reduced redundant computation
-- Batched scheduler, where all active sequences share each GPU forward pass so throughput scales with concurrent users rather than collapsing to serial execution. At startup the scheduler computes `max_num_seqs` automatically as `total_kv_blocks / ceil(context_len / block_size)`, capped to 256; the value is logged and can be overridden with `--max-num-seqs`. Incoming requests are held in a bounded `tokio::sync::mpsc` channel of capacity `--max-queued-requests` (default 200); once full, new arrivals receive HTTP 429 immediately, bounding memory consumption under sustained load.
-- KV cache quantization (Lossless/Balanced/Aggressive) to reduce memory footprint by 2-4x
-- Multi-model server: load several models simultaneously with LRU eviction and configurable memory budgets
-- Thinking/reasoning model support with separated `reasoning_content` field: both `<think>`-style models (Qwen3, toggled with `enable_thinking`) and harmony channel models (gpt-oss, scaled with `reasoning_effort: low|medium|high`; reasoning cannot be disabled on that architecture)
-- GGUF quantized model support: bf16 Metal fast path for ten quant types (`Q4_0`, `Q4_1`, `Q5_0`, `Q5_1`, `Q8_0`, `Q2_K`, `Q3_K`, `Q4_K`, `Q5_K`, `Q6_K`); zero-copy mmap loader (Qwen3-4B-Q4_K_M loads in ~2.7 s); fused `mul_mm` for prefill so weights are never held twice. Sharded GGUF loading supported.
-- AWQ 4-bit and 8-bit quantization: fused W4A16 / W8A16 GEMV kernels keep packed weights resident on Metal (Qwen3-4B-AWQ goes from ~7.5 GB to ~2.5 GB resident); QKV and gate+up are fused at load; auto-detected per checkpoint with no flag.
-- GPTQ 4-bit and 8-bit quantization: `desc_act=false` checkpoints route through a dedicated Metal resident kernel family (Qwen3-0.6B-GPTQ-Int8 ~89 tok/s decode); CPU / non-bf16 paths still dequantize at load.
-- FP8 (E4M3) block-wise weight loading: `Qwen3-4B-Instruct-2507-FP8` and similar checkpoints; the load-time `weight × scale_inv` multiply is performed in F32 to preserve precision across deep block-wise rescaling.
-- MXFP4 (OCP microscaling FP4): GPT-OSS expert weights stay packed on Metal with fused dequant GEMV/GEMM kernels; `openai/gpt-oss-20b` (20.9B params) runs in ~13 GB resident on a 24 GB machine. `gpt-oss-120b` shares the same architecture and should load on machines with enough memory, but is untested.
-- Mixture-of-Experts: `Qwen3MoeForCausalLM`, `OlmoeForCausalLM`, and `GptOssForCausalLM` (interleaved clamped-swiglu experts, attention sinks via a dedicated fused decode kernel, alternating sliding/full attention layers) with top-k routing and a hybrid sparse/naive dispatch (decode-friendly + prefill-friendly). Tested on `allenai/OLMoE-1B-7B-0924-Instruct` and `openai/gpt-oss-20b`.
-- Hybrid linear-attention models (`Qwen3_5ForConditionalGeneration` and the GGUF `qwen35` arch, text-only): Gated DeltaNet layers run a chunked parallel scan for prefill and an O(1) recurrent step for decode, with per-sequence recurrent state managed alongside the paged KV cache; full-attention layers use gated attention (sigmoid output gate) with partial RoPE. Prefix caching and speculative decoding are automatically disabled for these models (recurrent state can neither skip tokens nor roll back). Vision tower and MTP weights are skipped at load. Supported checkpoint formats: BF16 safetensors, compressed-tensors pack-quantized INT4 (full or mixed BF16/INT4), and GGUF (llama.cpp `qwen35` tensor layout: tiled V-heads, pre-baked norm shift and `-exp(A_log)`).
-- compressed-tensors "pack-quantized" INT4 (llm-compressor output, symmetric, group strategy): converted to the AWQ layout at load (nibbles transfer verbatim — the format is already offset-binary; zero-points are constant 8) so the resident W4A16 Metal kernels apply unchanged. Works for both fully-quantized and mixed-precision (`ignore` list) checkpoints.
-- Streaming responses via Server-Sent Events
+- OpenAI-compatible chat completions endpoint (`/v1/chat/completions`) with streaming via Server-Sent Events
+- Function calling / tool use: `tools`, `tool_choice` (`auto`, `required`, `none`, forced function, `allowed_tools`), `parallel_tool_calls`, with incremental tool-call deltas in streaming
+- Structured output: `response_format` with `json_object` and `json_schema` (strict mode, recursive `$ref`/`$defs`, `anyOf`, enums, nested objects/arrays, nullable unions)
+- Thinking/reasoning models with a separated `reasoning_content` field: `<think>`-style (Qwen3/Qwen3.5, toggled with `enable_thinking`) and harmony channels (gpt-oss, scaled with `reasoning_effort`)
+- Metal acceleration on Apple Silicon with fused attention, RMSNorm, RoPE, and Softmax kernels; on macOS 26+ prefill matmuls use Metal 4 TensorOps (M5 neural accelerator) automatically
+- Continuous batching: all active sequences share each GPU forward pass; `max_num_seqs` is auto-computed at load and can be overridden with `--max-num-seqs`
+- Paged KV cache with prefix caching, plus optional KV cache quantization (Lossless/Balanced/Aggressive, 2-4× smaller)
+- Multi-model server with LRU eviction and configurable memory budgets
+- Quantized checkpoint support, auto-detected per checkpoint with no flags:
+  - **GGUF**: resident Metal fast path for ten quant types (`Q4_0`, `Q4_1`, `Q5_0`, `Q5_1`, `Q8_0`, `Q2_K`, `Q3_K`, `Q4_K`, `Q5_K`, `Q6_K`), zero-copy mmap loader, sharded files
+  - **AWQ** 4/8-bit and **GPTQ** 4/8-bit (`desc_act=false`): packed weights stay resident on Metal with fused GEMV kernels (batched across concurrent sequences for AWQ-layout checkpoints)
+  - **compressed-tensors** pack-quantized INT4 (llm-compressor): converted to the AWQ layout at load, fully-quantized or mixed-precision
+  - **FP8** (E4M3) block-wise and **MXFP4** (GPT-OSS experts, packed-resident)
+- Mixture-of-Experts: `Qwen3MoeForCausalLM`, `OlmoeForCausalLM`, `GptOssForCausalLM` (attention sinks, alternating sliding/full attention, harmony channels)
+- Hybrid linear-attention models (Qwen3.5 family, text-only): Gated DeltaNet + gated full attention, in BF16 safetensors, compressed-tensors INT4, and GGUF (`qwen35`) formats — see [docs/hybrid-linear-attention.md](docs/hybrid-linear-attention.md)
 - Model download directly from HuggingFace with interactive variant selection
 
 ## Architecture
@@ -62,57 +59,22 @@ KV cache quantization uses TurboQuant with MSE-based quantization during the dec
 
 > Note on `--kv-quant`: the quantization step currently runs on CPU, each KV write transfers the new K/V tensors from GPU to CPU and casts them to F32 before packing. On unified-memory Apple Silicon the transfer is cheap, but on discrete CUDA GPUs the per-step roundtrip can dominate. Enable `--kv-quant` for memory-constrained deployments; leave it `off` when throughput matters and KV memory is not the bottleneck. On-device kernels are on the roadmap.
 
-## Tested Models
-The following models all pass the deterministic coherence check in `scripts/stress_baseline.py` on the Apple Silicon reference machine (M5, 24 GB unified memory); the Qwen3.5 family is covered separately [below](#qwen35-hybrid-linear-attention) with its own adversarial battery. Decode `tok/s` is the steady-state median over five 150-token runs after one warm-up.
+## Supported Models
+The following architectures and checkpoints are covered by the regression suite. Other checkpoints in the same families (e.g. other Llama 3.2, Gemma 3, Qwen2.5 sizes) are likely to work but are not regularly tested. Measured throughput for every entry is in [Benchmarks](#benchmarks).
 
-| Model | Architecture | Format | Decode tok/s |
-|---|---|---|---|
-| `meta-llama/Llama-3.2-1B-Instruct` | LlamaForCausalLM | BF16 safetensors | 33.1 |
-| `Qwen/Qwen2.5-1.5B-Instruct` | Qwen2ForCausalLM | BF16 safetensors | 25.4 |
-| `Qwen/Qwen2.5-3B-Instruct` | Qwen2ForCausalLM | BF16 safetensors | 13.6 |
-| `Qwen/qwen2-1_5b-instruct-q4_0` | Qwen2 (GGUF) | Q4_0 | 67.3 |
-| `Qwen/Qwen2.5-1.5B-Instruct-Q2_K` | Qwen2 (GGUF) | Q2_K | 105.2 |
-| `Qwen/Qwen2.5-1.5B-Instruct-Q3_K_M` | Qwen2 (GGUF) | Q3_K_M | 85.1 |
-| `Qwen/Qwen2.5-1.5B-Instruct-Q4_0` | Qwen2 (GGUF) | Q4_0 | 85.4 |
-| `bartowski/Qwen2.5-1.5B-Instruct-Q4_0` | Qwen2 (GGUF) | Q4_0 | 64.6 |
-| `Qwen/Qwen2.5-1.5B-Instruct-Q4_K_M` | Qwen2 (GGUF) | Q4_K_M | 80.4 |
-| `Qwen/Qwen3-0.6B` | Qwen3ForCausalLM | BF16 safetensors | 52.7 |
-| `Qwen/Qwen3-0.6B-GPTQ-Int8` | Qwen3ForCausalLM | GPTQ Int8 (W8A16 resident) | 86.8 |
-| `Qwen/Qwen3-1.7B-Q8_0` | Qwen3 (GGUF) | Q8_0 | 38.0 |
-| `Qwen/Qwen3-1.7B-GPTQ-Int8` | Qwen3ForCausalLM | GPTQ Int8 (W8A16 resident) | 41.5 |
-| `Qwen/Qwen3-4B-Q4_K_M` | Qwen3 (GGUF) | Q4_K_M | 27.0 |
-| `Qwen/Qwen3-4B-Q5_0` | Qwen3 (GGUF) | Q5_0 | 26.4 |
-| `Qwen/Qwen3-4B-Q5_K_M` | Qwen3 (GGUF) | Q5_K_M | 25.5 |
-| `Qwen/Qwen3-4B-Q6_K` | Qwen3 (GGUF) | Q6_K | 22.8 |
-| `Qwen/Qwen3-4B-AWQ` | Qwen3ForCausalLM | AWQ 4-bit (W4A16 resident) | 38.5 |
-| `Qwen/Qwen3-4B-Instruct-2507-FP8` | Qwen3ForCausalLM | FP8 (E4M3, block-wise) | 10.0 |
-| `google/gemma-2b-it` | GemmaForCausalLM | BF16 safetensors | 16.6 |
-| `google/gemma-2-2b-it` | Gemma2ForCausalLM | BF16 safetensors | 15.5 |
-| `google/gemma-3-1b-it` | Gemma3ForCausalLM | BF16 safetensors | 36.1 |
-| `google/gemma-4-E2B-it` | Gemma4ForConditionalGeneration | BF16 safetensors | 15.4 |
-| `mistralai/Ministral-3-3B-Instruct-25` | Mistral3ForConditionalGeneration | BF16 safetensors | 12.1 |
-| `allenai/OLMoE-1B-7B-0924-Instruct` | OlmoeForCausalLM (MoE) | BF16 safetensors, 64 experts × top-k 8 | 13.6 |
-| `openai/gpt-oss-20b` | GptOssForCausalLM (MoE) | MXFP4 experts + BF16, 32 experts × top-k 4 | 14.3 |
+| Architecture | Tested checkpoints | Formats tested |
+|---|---|---|
+| LlamaForCausalLM | `meta-llama/Llama-3.2-1B-Instruct` | BF16 safetensors |
+| Qwen2ForCausalLM | `Qwen/Qwen2.5-1.5B-Instruct`, `Qwen/Qwen2.5-3B-Instruct` + GGUF variants | BF16, GGUF (`Q2_K`–`Q4_K_M`) |
+| Qwen3ForCausalLM | `Qwen/Qwen3-0.6B` / `1.7B` / `4B` variants | BF16, GGUF (`Q4_K_M`, `Q5_0`, `Q5_K_M`, `Q6_K`, `Q8_0`), AWQ 4-bit, GPTQ Int8, FP8 |
+| Qwen3.5 (hybrid linear attention) | `Qwen/Qwen3.5-4B`, `cyankiwi/Qwen3.5-4B-AWQ-4bit`, `cyankiwi/Qwen3.5-4B-AWQ-BF16-INT4`, `unsloth/Qwen3.5-4B-GGUF` | BF16, compressed-tensors INT4 (full + mixed), GGUF `qwen35` |
+| GemmaForCausalLM / Gemma2 / Gemma3 / Gemma4 | `gemma-2b-it`, `gemma-2-2b-it`, `gemma-3-1b-it`, `gemma-4-E2B-it` | BF16 safetensors |
+| Mistral3ForConditionalGeneration | `mistralai/Ministral-3-3B-Instruct-25` | BF16 safetensors |
+| OlmoeForCausalLM (MoE) | `allenai/OLMoE-1B-7B-0924-Instruct` | BF16 safetensors |
+| GptOssForCausalLM (MoE) | `openai/gpt-oss-20b` | MXFP4 experts + BF16 |
 
 > [!NOTE]
-> All Qwen3 models have been tested with and without thinking enabled. Other checkpoints in the same architecture families (e.g. other Llama 3.2, Gemma 3, Qwen2.5 sizes) are likely to work but are not in the regression suite.
-
-### Qwen3.5 (hybrid linear attention)
-
-Qwen3.5 runs on a dedicated hybrid runtime (Gated DeltaNet + gated full attention). Thinking mode works with `enable_thinking` on/off, with reasoning separated into `reasoning_content` in both streaming and non-streaming responses.
-
-| Model | Format | Resident | Decode tok/s* | Battery |
-|---|---|---|---|---|
-| `Qwen/Qwen3.5-4B` | BF16 safetensors | 8.7 GB | 8.9 | 13/13 |
-| `cyankiwi/Qwen3.5-4B-AWQ-4bit` | compressed-tensors INT4 (W4A16 resident) | 3.1 GB | 27.1 | 13/13 |
-| `cyankiwi/Qwen3.5-4B-AWQ-BF16-INT4` | mixed BF16 DeltaNet + INT4 attn/MLP | 4.4 GB | 14.7*** | 13/13 |
-| `unsloth/Qwen3.5-4B-GGUF` (Q4_K_M) | GGUF (`qwen35` arch) | 2.5 GB | 24.1 | 12/13** |
-
-\* Median of three 150-token completions, prefill included.
-
-\*\* Quality loss of the Q4_K_M quantization on one marginal reasoning prompt, not a runtime defect: the same weights answer correctly when prompted step-by-step, and batched-vs-single decode stays byte-identical.
-\*\*\* Measured before the tied lm_head RTN quantization landed; this checkpoint shares the fix and should now sit between its old number and the fully-quantized variant.
-
+> All Qwen3 and Qwen3.5 models have been tested with and without thinking enabled, with reasoning separated into `reasoning_content` in both streaming and non-streaming responses.
 
 ## Unsupported Model Families
 The following model families are not currently supported:
@@ -486,6 +448,64 @@ CUDA is currently a functional compatibility path, not a performance-tuned backe
 - `nightly` and `nightly-cuda` point to nightly `cuda-ada`.
 - Cross-generation SASS is **not** compatible: a Hopper binary will not run on Blackwell and vice versa. Pick the tag that matches your GPU.
 
+
+## Benchmarks
+
+All numbers were measured on the Apple Silicon reference machine (M5, 24 GB unified memory). Every model below passes the deterministic coherence check in the regression suite; decode `tok/s` is the steady-state median over five 150-token runs after one warm-up. Run-to-run variance is ~10%; treat the figures as indicative of relative cost, not as guarantees.
+
+| Model | Architecture | Format | Decode tok/s |
+|---|---|---|---|
+| `meta-llama/Llama-3.2-1B-Instruct` | LlamaForCausalLM | BF16 safetensors | 33.1 |
+| `Qwen/Qwen2.5-1.5B-Instruct` | Qwen2ForCausalLM | BF16 safetensors | 25.4 |
+| `Qwen/Qwen2.5-3B-Instruct` | Qwen2ForCausalLM | BF16 safetensors | 13.6 |
+| `Qwen/qwen2-1_5b-instruct-q4_0` | Qwen2 (GGUF) | Q4_0 | 67.3 |
+| `Qwen/Qwen2.5-1.5B-Instruct-Q2_K` | Qwen2 (GGUF) | Q2_K | 105.2 |
+| `Qwen/Qwen2.5-1.5B-Instruct-Q3_K_M` | Qwen2 (GGUF) | Q3_K_M | 85.1 |
+| `Qwen/Qwen2.5-1.5B-Instruct-Q4_0` | Qwen2 (GGUF) | Q4_0 | 85.4 |
+| `bartowski/Qwen2.5-1.5B-Instruct-Q4_0` | Qwen2 (GGUF) | Q4_0 | 64.6 |
+| `Qwen/Qwen2.5-1.5B-Instruct-Q4_K_M` | Qwen2 (GGUF) | Q4_K_M | 80.4 |
+| `Qwen/Qwen3-0.6B` | Qwen3ForCausalLM | BF16 safetensors | 52.7 |
+| `Qwen/Qwen3-0.6B-GPTQ-Int8` | Qwen3ForCausalLM | GPTQ Int8 (W8A16 resident) | 86.8 |
+| `Qwen/Qwen3-1.7B-Q8_0` | Qwen3 (GGUF) | Q8_0 | 38.0 |
+| `Qwen/Qwen3-1.7B-GPTQ-Int8` | Qwen3ForCausalLM | GPTQ Int8 (W8A16 resident) | 41.5 |
+| `Qwen/Qwen3-4B-Q4_K_M` | Qwen3 (GGUF) | Q4_K_M | 27.0 |
+| `Qwen/Qwen3-4B-Q5_0` | Qwen3 (GGUF) | Q5_0 | 26.4 |
+| `Qwen/Qwen3-4B-Q5_K_M` | Qwen3 (GGUF) | Q5_K_M | 25.5 |
+| `Qwen/Qwen3-4B-Q6_K` | Qwen3 (GGUF) | Q6_K | 22.8 |
+| `Qwen/Qwen3-4B-AWQ` | Qwen3ForCausalLM | AWQ 4-bit (W4A16 resident) | 38.5 |
+| `Qwen/Qwen3-4B-Instruct-2507-FP8` | Qwen3ForCausalLM | FP8 (E4M3, block-wise) | 10.0 |
+| `google/gemma-2b-it` | GemmaForCausalLM | BF16 safetensors | 16.6 |
+| `google/gemma-2-2b-it` | Gemma2ForCausalLM | BF16 safetensors | 15.5 |
+| `google/gemma-3-1b-it` | Gemma3ForCausalLM | BF16 safetensors | 36.1 |
+| `google/gemma-4-E2B-it` | Gemma4ForConditionalGeneration | BF16 safetensors | 15.4 |
+| `mistralai/Ministral-3-3B-Instruct-25` | Mistral3ForConditionalGeneration | BF16 safetensors | 12.1 |
+| `allenai/OLMoE-1B-7B-0924-Instruct` | OlmoeForCausalLM (MoE) | BF16 safetensors, 64 experts × top-k 8 | 13.6 |
+| `openai/gpt-oss-20b` | GptOssForCausalLM (MoE) | MXFP4 experts + BF16, 32 experts × top-k 4 | 14.3 |
+
+### Qwen3.5 (hybrid linear attention)
+
+The Qwen3.5 family additionally went through a 13-test adversarial battery per format: multi-needle recall over 2.6k tokens, adversarial repeated-token prompts, long-generation repetition detection, multi-turn state tracking, byte-identical batched-vs-single greedy decode, mixed prefill/decode concurrency, structured output, sampling health, streaming parity, logprobs, reasoning checks, and throughput.
+
+| Model | Format | Resident | Decode tok/s* | conc=4 aggregate | Battery |
+|---|---|---|---|---|---|
+| `Qwen/Qwen3.5-4B` | BF16 safetensors | 8.7 GB | 8.8 | 25.1 (2.7×) | 13/13 |
+| `cyankiwi/Qwen3.5-4B-AWQ-4bit` | compressed-tensors INT4 (W4A16 resident) | 3.1 GB | 24.6 | 36.1 (1.5×) | 13/13 |
+| `cyankiwi/Qwen3.5-4B-AWQ-BF16-INT4` | mixed BF16 DeltaNet + INT4 attn/MLP | 4.4 GB | 15.9 | 30.3 (1.9×) | 13/13 |
+| `unsloth/Qwen3.5-4B-GGUF` (Q4_K_M) | GGUF (`qwen35` arch) | 2.5 GB | 24.1 | — | 12/13** |
+
+\* Median of three 150-token completions, prefill included.
+
+\*\* Quality loss of the Q4_K_M quantization on one marginal reasoning prompt, not a runtime defect: the same weights answer correctly when prompted step-by-step, and batched-vs-single decode stays byte-identical.
+
+### Performance notes
+
+- Decode on Apple Silicon is weight-bandwidth-bound: quantized checkpoints scale roughly with bits-per-weight, and single-stream tok/s tracks resident model size.
+- Concurrent decode (2–8 sequences) shares one weight read per forward across the batch for GGUF and AWQ-layout checkpoints (batched GEMV kernels). Examples at concurrency 4 (aggregate): Qwen3-4B-AWQ 17.6 → 47.7 tok/s; GGUF Q4_K_M conc=8 reaches ~55 tok/s aggregate. GPTQ-layout checkpoints do not yet have the batched kernel and degrade under concurrency.
+- AWQ/GPTQ/INT4 weights stay packed on Metal: Qwen3-4B-AWQ runs in ~2.5 GB resident vs ~7.5 GB if dequantized.
+- GGUF loading is zero-copy mmap with parallel materialization (Qwen3-4B-Q4_K_M loads in ~2.7 s).
+- `openai/gpt-oss-20b` (20.9B params) runs in ~13 GB resident; `gpt-oss-120b` shares the architecture and should load given enough memory, but is untested.
+- Qwen3.5 prefill is GEMM-compute-bound (~230 tok/s on the BF16 4B); quantized checkpoints prefill faster.
+- On macOS 26 with an M5, prefill runs on Metal 4 TensorOps (neural accelerator): dense GEMMs, packed-quant GEMMs (tile-staged dequantization, no dense-weight materialization), and FlashAttention. TTFT on a ~1.3k-token prompt improves 25–61% vs the standard kernels (dense 0.6B −50%, AWQ 4B −61%, GPTQ-Int8 1.7B −37%, Qwen3.5 4B −25%); decode is unaffected (bandwidth-bound). Older macOS/hardware falls back to the standard kernels automatically.
 
 ## Contributing
 Contributions are welcome! If you want to contribute, please follow these steps:

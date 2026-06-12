@@ -20,7 +20,7 @@ use candle_core::{
 };
 use candle_metal_kernels::{
     SdpaDType,
-    metal::{ComputeCommandEncoder, ComputePipeline},
+    metal::{ComputeCommandEncoder, ComputePipeline, Library},
 };
 use objc2_metal::{MTLDevice, MTLGPUFamily};
 use objc2_metal::{MTLResourceUsage, MTLSize};
@@ -1167,6 +1167,14 @@ pub fn flash_attention_metal_prefill(
         candle_core::bail!("flash_attention_metal_prefill: q, k, v must all be on a Metal device");
     }
     let head_dim = q.dim(D::Minus1)?;
+    if q.dtype() == DType::BF16
+        && softcap.unwrap_or(0.0) == 0.0
+        && matches!(head_dim, 64 | 128 | 256)
+        && let candle_core::Device::Metal(md) = q.device()
+        && mpp_gemm_available(md.device())
+    {
+        return q.apply_op3_no_bwd(k, v, &MppFlashAttn { scale, prefix_len });
+    }
     let (br, bc) = fa_tile_sizes(head_dim);
     q.apply_op3_no_bwd(
         k,
@@ -1967,6 +1975,524 @@ pub fn dequantize_gptq_packed(
     })
 }
 
+// ---- TensorOps (Metal Performance Primitives) prefill GEMM ----
+//
+// Routes large-M BF16 matmuls onto mpp::tensor_ops matmul2d, which engages
+// the M5 neural accelerator (Metal 4, macOS 26+). The library compiles at
+// runtime once per device; on failure (older OS, no MPP) every entry point
+// reports unavailable and callers stay on the candle GEMM.
+
+const MPP_GEMM_SOURCE: &str = include_str!("mpp_gemm.metal");
+
+/// Minimum M routed onto the TensorOps GEMM. Below it the GEMV/batch kernels
+/// and candle GEMM win; from here up MPP wins on M5 (1.96x at M=64 rising to
+/// 3.6x at M=256 vs candle BF16 GEMM — see `mpp_gemm_perf_probe`).
+pub const MPP_GEMM_MIN_M: usize = 64;
+
+static MPP_LIBRARIES: OnceLock<Mutex<HashMap<u64, Option<Library>>>> = OnceLock::new();
+static MPP_PIPELINES: OnceLock<Mutex<HashMap<(u64, &'static str), ComputePipeline>>> =
+    OnceLock::new();
+
+fn mpp_library(device: &candle_metal_kernels::metal::Device) -> Option<Library> {
+    let cache = MPP_LIBRARIES.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = cache.lock().ok()?;
+    guard
+        .entry(device.registry_id())
+        .or_insert_with(|| {
+            if std::env::var("OXYDLLM_DISABLE_MPP").is_ok() {
+                tracing::info!("TensorOps GEMM disabled via OXYDLLM_DISABLE_MPP");
+                return None;
+            }
+            use objc2_foundation::NSString;
+            use objc2_metal::{MTLCompileOptions, MTLLanguageVersion};
+            let opts = MTLCompileOptions::new();
+            opts.setLanguageVersion(MTLLanguageVersion::Version4_0);
+            match device.as_ref().newLibraryWithSource_options_error(
+                &NSString::from_str(MPP_GEMM_SOURCE),
+                Some(&opts),
+            ) {
+                Ok(lib) => {
+                    tracing::info!(
+                        "TensorOps GEMM available: large-M matmuls use the Metal 4 tensor path"
+                    );
+                    Some(Library::new(lib))
+                }
+                Err(e) => {
+                    tracing::info!(
+                        "TensorOps GEMM unavailable, staying on candle GEMM: {}",
+                        e.localizedDescription()
+                    );
+                    None
+                }
+            }
+        })
+        .clone()
+}
+
+pub fn mpp_gemm_available(device: &candle_metal_kernels::metal::Device) -> bool {
+    mpp_library(device).is_some()
+}
+
+fn get_or_compile_mpp_pipeline(
+    device: &candle_metal_kernels::metal::Device,
+    kernel_name: &'static str,
+) -> Result<ComputePipeline> {
+    let cache = MPP_PIPELINES.get_or_init(|| Mutex::new(HashMap::new()));
+    let key = (device.registry_id(), kernel_name);
+    let mut guard = cache
+        .lock()
+        .map_err(|e| candle_core::Error::Msg(format!("mpp pipeline cache poisoned: {e}")))?;
+    if let Some(p) = guard.get(&key) {
+        return Ok(p.clone());
+    }
+    let lib = mpp_library(device)
+        .ok_or_else(|| candle_core::Error::Msg("mpp library unavailable".into()))?;
+    let func = lib
+        .get_function(kernel_name, None)
+        .map_err(|e| candle_core::Error::Msg(format!("mpp kernel '{kernel_name}': {e}")))?;
+    let pipeline = device
+        .new_compute_pipeline_state_with_function(&func)
+        .map_err(|e| candle_core::Error::Msg(format!("mpp pipeline: {e}")))?;
+    guard.insert(key, pipeline.clone());
+    Ok(pipeline)
+}
+
+#[repr(C)]
+struct MppGemmParams {
+    m: i32,
+    n: i32,
+    k: i32,
+}
+
+const MPP_GEMM_TILE: usize = 64;
+
+struct MppMatmul {
+    b: Tensor,
+}
+
+impl CustomOp1 for MppMatmul {
+    fn name(&self) -> &'static str {
+        "mpp-matmul"
+    }
+
+    fn cpu_fwd(&self, _s: &CpuStorage, _l: &Layout) -> Result<(CpuStorage, Shape)> {
+        candle_core::bail!("MppMatmul: Metal-only")
+    }
+
+    fn metal_fwd(&self, a: &MetalStorage, a_l: &Layout) -> Result<(MetalStorage, Shape)> {
+        if a.dtype() != DType::BF16 || self.b.dtype() != DType::BF16 {
+            candle_core::bail!("MppMatmul: BF16 only");
+        }
+        if !a_l.is_contiguous() {
+            candle_core::bail!("MppMatmul: x must be contiguous");
+        }
+        let a_dims = a_l.dims();
+        if a_dims.len() != 2 {
+            candle_core::bail!("MppMatmul: x must be 2-D, got {a_dims:?}");
+        }
+        let (m, k) = (a_dims[0], a_dims[1]);
+        let (kb, n) = self.b.dims2()?;
+        if kb != k {
+            candle_core::bail!("MppMatmul: x k {k} != b k {kb}");
+        }
+
+        let b_sl = self.b.storage_and_layout();
+        let b_l = &b_sl.1;
+        let kernel = if b_l.is_contiguous() {
+            "mpp_gemm_bf16_nn"
+        } else if b_l.stride() == [1, k] {
+            "mpp_gemm_bf16_nt"
+        } else {
+            candle_core::bail!(
+                "MppMatmul: unsupported b layout (stride {:?})",
+                b_l.stride()
+            );
+        };
+        let b_buf = match &*b_sl.0 {
+            candle_core::Storage::Metal(ms) => ms.buffer(),
+            _ => candle_core::bail!("MppMatmul: b must be Metal-resident"),
+        };
+
+        let device = a.device();
+        let out_elems = m * n;
+        let output = device.new_buffer(out_elems, DType::BF16, "mpp_matmul")?;
+        let params = MppGemmParams {
+            m: m as i32,
+            n: n as i32,
+            k: k as i32,
+        };
+
+        let pipeline = get_or_compile_mpp_pipeline(device.device(), kernel)?;
+        let encoder = device.command_encoder()?;
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(a.buffer()), a_l.start_offset() * 2);
+        encoder.set_buffer(1, Some(b_buf), b_l.start_offset() * 2);
+        encoder.set_buffer(2, Some(&*output), 0);
+        encoder.set_bytes(3, &params);
+        encoder.use_resource(a.buffer(), MTLResourceUsage::Read);
+        encoder.use_resource(b_buf, MTLResourceUsage::Read);
+        encoder.use_resource(&*output, MTLResourceUsage::Write);
+
+        encoder.dispatch_thread_groups(
+            MTLSize {
+                width: n.div_ceil(MPP_GEMM_TILE),
+                height: m.div_ceil(MPP_GEMM_TILE),
+                depth: 1,
+            },
+            MTLSize {
+                width: 128,
+                height: 1,
+                depth: 1,
+            },
+        );
+
+        Ok((
+            MetalStorage::new(output, device.clone(), out_elems, DType::BF16),
+            Shape::from_dims(&[m, n]),
+        ))
+    }
+}
+
+pub fn mpp_matmul(x: &Tensor, b: &Tensor) -> Result<Tensor> {
+    x.apply_op1_no_bwd(&MppMatmul { b: b.clone() })
+}
+
+pub fn maybe_mpp_matmul(x: &Tensor, b: &Tensor) -> Result<Option<Tensor>> {
+    if x.dtype() != DType::BF16 || b.dtype() != DType::BF16 {
+        return Ok(None);
+    }
+    let candle_core::Device::Metal(md) = x.device() else {
+        return Ok(None);
+    };
+    let dims = x.dims();
+    if dims.len() != 2 || dims[0] < MPP_GEMM_MIN_M || !x.is_contiguous() {
+        return Ok(None);
+    }
+    let k = dims[1];
+    let b_dims = b.dims();
+    if b_dims.len() != 2 || b_dims[0] != k {
+        return Ok(None);
+    }
+    if !(b.is_contiguous() || b.stride() == [1, k]) {
+        return Ok(None);
+    }
+    if !mpp_gemm_available(md.device()) {
+        return Ok(None);
+    }
+    mpp_matmul(x, b).map(Some)
+}
+
+#[repr(C)]
+struct MppQuantGemmParams {
+    m: i32,
+    n: i32,
+    k: i32,
+    group_shift: i32,
+}
+
+/// `x [m, k] @ dequant(qweight) [k, n]` on the TensorOps path, dequantizing
+/// B per-tile into threadgroup memory instead of materializing the dense
+/// weight. Supports the AWQ layout (`PackDim::Out`, arbitrary zero-points —
+/// covers AWQ, compressed-tensors INT4, W8A16) and the GPTQ layout
+/// (`PackDim::In`).
+struct MppQuantMatmul {
+    qweight: Tensor,
+    qzeros: Tensor,
+    scales: Tensor,
+    bits: u32,
+    pack_dim: crate::common::awq::PackDim,
+}
+
+impl CustomOp1 for MppQuantMatmul {
+    fn name(&self) -> &'static str {
+        "mpp-quant-matmul"
+    }
+
+    fn cpu_fwd(&self, _s: &CpuStorage, _l: &Layout) -> Result<(CpuStorage, Shape)> {
+        candle_core::bail!("MppQuantMatmul: Metal-only")
+    }
+
+    fn metal_fwd(&self, x: &MetalStorage, x_l: &Layout) -> Result<(MetalStorage, Shape)> {
+        use crate::common::awq::PackDim;
+
+        if x.dtype() != DType::BF16 || self.scales.dtype() != DType::BF16 {
+            candle_core::bail!("MppQuantMatmul: BF16 only");
+        }
+        if !x_l.is_contiguous() {
+            candle_core::bail!("MppQuantMatmul: x must be contiguous");
+        }
+        let x_dims = x_l.dims();
+        if x_dims.len() != 2 {
+            candle_core::bail!("MppQuantMatmul: x must be 2-D, got {x_dims:?}");
+        }
+        let (m, k) = (x_dims[0], x_dims[1]);
+        let (qw_d0, qw_d1) = self.qweight.dims2()?;
+        let (groups, n) = self.scales.dims2()?;
+
+        let (in_features, group_size, kernel) = match self.pack_dim {
+            PackDim::Out => {
+                let shape = AwqShape::new_bits(qw_d0, qw_d1, groups, n, self.bits)?;
+                if self.qzeros.dims() != [groups, shape.packed_out] {
+                    candle_core::bail!(
+                        "MppQuantMatmul: qzeros shape {:?} != [{groups}, {}]",
+                        self.qzeros.dims(),
+                        shape.packed_out
+                    );
+                }
+                let kernel = if self.bits == 8 {
+                    "mpp_gemm_w8_staged"
+                } else {
+                    "mpp_gemm_w4_staged"
+                };
+                (shape.in_features, shape.group_size, kernel)
+            }
+            PackDim::In => {
+                let shape = GptqShape::new_bits(qw_d0, n, groups, self.bits)?;
+                if qw_d1 != n {
+                    candle_core::bail!("MppQuantMatmul: gptq qweight dim1 {qw_d1} != n {n}");
+                }
+                let kernel = if self.bits == 8 {
+                    "mpp_gemm_gptq8_staged"
+                } else {
+                    "mpp_gemm_gptq4_staged"
+                };
+                (shape.in_features, shape.group_size, kernel)
+            }
+        };
+        if in_features != k {
+            candle_core::bail!("MppQuantMatmul: x k {k} != weight in_features {in_features}");
+        }
+        if !group_size.is_power_of_two() {
+            candle_core::bail!("MppQuantMatmul: group_size {group_size} must be a power of two");
+        }
+
+        let device = x.device();
+        let out_elems = m * n;
+        let output = device.new_buffer(out_elems, DType::BF16, "mpp_quant_matmul")?;
+        let params = MppQuantGemmParams {
+            m: m as i32,
+            n: n as i32,
+            k: k as i32,
+            group_shift: group_size.trailing_zeros() as i32,
+        };
+
+        let qw_sl = self.qweight.storage_and_layout();
+        let qz_sl = self.qzeros.storage_and_layout();
+        let sc_sl = self.scales.storage_and_layout();
+        let qw_buf = match &*qw_sl.0 {
+            candle_core::Storage::Metal(ms) => ms.buffer(),
+            _ => candle_core::bail!("MppQuantMatmul: qweight must be Metal-resident"),
+        };
+        let qz_buf = match &*qz_sl.0 {
+            candle_core::Storage::Metal(ms) => ms.buffer(),
+            _ => candle_core::bail!("MppQuantMatmul: qzeros must be Metal-resident"),
+        };
+        let sc_buf = match &*sc_sl.0 {
+            candle_core::Storage::Metal(ms) => ms.buffer(),
+            _ => candle_core::bail!("MppQuantMatmul: scales must be Metal-resident"),
+        };
+
+        let pipeline = get_or_compile_mpp_pipeline(device.device(), kernel)?;
+        let encoder = device.command_encoder()?;
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(x.buffer()), x_l.start_offset() * 2);
+        encoder.set_buffer(1, Some(qw_buf), qw_sl.1.start_offset() * 4);
+        encoder.set_buffer(2, Some(qz_buf), qz_sl.1.start_offset() * 4);
+        encoder.set_buffer(3, Some(sc_buf), sc_sl.1.start_offset() * 2);
+        encoder.set_buffer(4, Some(&*output), 0);
+        encoder.set_bytes(5, &params);
+        encoder.use_resource(x.buffer(), MTLResourceUsage::Read);
+        encoder.use_resource(qw_buf, MTLResourceUsage::Read);
+        encoder.use_resource(qz_buf, MTLResourceUsage::Read);
+        encoder.use_resource(sc_buf, MTLResourceUsage::Read);
+        encoder.use_resource(&*output, MTLResourceUsage::Write);
+
+        encoder.dispatch_thread_groups(
+            MTLSize {
+                width: n.div_ceil(MPP_GEMM_TILE),
+                height: m.div_ceil(MPP_GEMM_TILE),
+                depth: 1,
+            },
+            MTLSize {
+                width: 128,
+                height: 1,
+                depth: 1,
+            },
+        );
+
+        Ok((
+            MetalStorage::new(output, device.clone(), out_elems, DType::BF16),
+            Shape::from_dims(&[m, n]),
+        ))
+    }
+}
+
+pub fn mpp_quant_matmul(
+    x: &Tensor,
+    qweight: &Tensor,
+    qzeros: &Tensor,
+    scales: &Tensor,
+    bits: u32,
+    pack_dim: crate::common::awq::PackDim,
+) -> Result<Tensor> {
+    x.apply_op1_no_bwd(&MppQuantMatmul {
+        qweight: qweight.clone(),
+        qzeros: qzeros.clone(),
+        scales: scales.clone(),
+        bits,
+        pack_dim,
+    })
+}
+
+pub fn maybe_mpp_quant_matmul(
+    x: &Tensor,
+    qweight: &Tensor,
+    qzeros: &Tensor,
+    scales: &Tensor,
+    bits: u32,
+    pack_dim: crate::common::awq::PackDim,
+) -> Result<Option<Tensor>> {
+    if x.dtype() != DType::BF16 || scales.dtype() != DType::BF16 {
+        return Ok(None);
+    }
+    let candle_core::Device::Metal(md) = x.device() else {
+        return Ok(None);
+    };
+    let dims = x.dims();
+    if dims.len() != 2 || dims[0] < MPP_GEMM_MIN_M || !x.is_contiguous() {
+        return Ok(None);
+    }
+    if !mpp_gemm_available(md.device()) {
+        return Ok(None);
+    }
+    mpp_quant_matmul(x, qweight, qzeros, scales, bits, pack_dim).map(Some)
+}
+
+#[repr(C)]
+struct MppFaParams {
+    t_q: i32,
+    t_kv: i32,
+    h: i32,
+    h_kv: i32,
+    scale: f32,
+    prefix_len: i32,
+}
+
+struct MppFlashAttn {
+    scale: f32,
+    prefix_len: usize,
+}
+
+impl CustomOp3 for MppFlashAttn {
+    fn name(&self) -> &'static str {
+        "mpp-flash-attn-prefill"
+    }
+
+    fn cpu_fwd(
+        &self,
+        _s1: &CpuStorage,
+        _l1: &Layout,
+        _s2: &CpuStorage,
+        _l2: &Layout,
+        _s3: &CpuStorage,
+        _l3: &Layout,
+    ) -> Result<(CpuStorage, Shape)> {
+        candle_core::bail!("MppFlashAttn: Metal-only")
+    }
+
+    fn metal_fwd(
+        &self,
+        q: &MetalStorage,
+        q_l: &Layout,
+        k: &MetalStorage,
+        k_l: &Layout,
+        v: &MetalStorage,
+        v_l: &Layout,
+    ) -> Result<(MetalStorage, Shape)> {
+        if !q_l.is_contiguous() || !k_l.is_contiguous() || !v_l.is_contiguous() {
+            candle_core::bail!("MppFlashAttn: q, k, v must be contiguous");
+        }
+        if q.dtype() != DType::BF16 || k.dtype() != DType::BF16 || v.dtype() != DType::BF16 {
+            candle_core::bail!("MppFlashAttn: BF16 only");
+        }
+        let q_dims = q_l.dims();
+        let k_dims = k_l.dims();
+        let v_dims = v_l.dims();
+        if q_dims.len() != 4 || k_dims.len() != 4 || v_dims.len() != 4 {
+            candle_core::bail!("MppFlashAttn: q, k, v must be 4-D [B, H, T, D]");
+        }
+        let (b, h, t_q, d) = (q_dims[0], q_dims[1], q_dims[2], q_dims[3]);
+        let (h_kv, t_kv) = (k_dims[1], k_dims[2]);
+        if k_dims[0] != b
+            || v_dims[0] != b
+            || v_dims[1] != h_kv
+            || v_dims[2] != t_kv
+            || k_dims[3] != d
+            || v_dims[3] != d
+        {
+            candle_core::bail!("MppFlashAttn: k/v shape mismatch");
+        }
+        if h % h_kv != 0 {
+            candle_core::bail!("MppFlashAttn: n_heads must be divisible by n_kv_heads");
+        }
+        if self.prefix_len + t_q != t_kv {
+            candle_core::bail!(
+                "MppFlashAttn: prefix_len ({}) + T_q ({t_q}) != T_kv ({t_kv})",
+                self.prefix_len
+            );
+        }
+        let kernel = match d {
+            64 => "mpp_fa_bf16_d64",
+            128 => "mpp_fa_bf16_d128",
+            256 => "mpp_fa_bf16_d256",
+            other => candle_core::bail!("MppFlashAttn: unsupported head_dim {other}"),
+        };
+
+        let device = q.device();
+        let elem_count = b * h * t_q * d;
+        let output = device.new_buffer(elem_count, DType::BF16, "mpp_fa_out")?;
+        let params = MppFaParams {
+            t_q: t_q as i32,
+            t_kv: t_kv as i32,
+            h: h as i32,
+            h_kv: h_kv as i32,
+            scale: self.scale,
+            prefix_len: self.prefix_len as i32,
+        };
+
+        let pipeline = get_or_compile_mpp_pipeline(device.device(), kernel)?;
+        let encoder = device.command_encoder()?;
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(q.buffer()), q_l.start_offset() * 2);
+        encoder.set_buffer(1, Some(k.buffer()), k_l.start_offset() * 2);
+        encoder.set_buffer(2, Some(v.buffer()), v_l.start_offset() * 2);
+        encoder.set_buffer(3, Some(&*output), 0);
+        encoder.set_bytes(4, &params);
+        encoder.use_resource(q.buffer(), MTLResourceUsage::Read);
+        encoder.use_resource(k.buffer(), MTLResourceUsage::Read);
+        encoder.use_resource(v.buffer(), MTLResourceUsage::Read);
+        encoder.use_resource(&*output, MTLResourceUsage::Write);
+
+        encoder.dispatch_thread_groups(
+            MTLSize {
+                width: t_q.div_ceil(32),
+                height: b * h,
+                depth: 1,
+            },
+            MTLSize {
+                width: 32,
+                height: 1,
+                depth: 1,
+            },
+        );
+
+        Ok((
+            MetalStorage::new(output, device.clone(), elem_count, DType::BF16),
+            Shape::from_dims(&[b, h, t_q, d]),
+        ))
+    }
+}
+
 #[cfg(test)]
 mod fused_kernel_parity_tests {
     use super::*;
@@ -2442,6 +2968,28 @@ mod fused_kernel_parity_tests {
             None,
             0.05,
             "bf16/d128/no-prefix",
+        );
+    }
+
+    #[test]
+    fn flash_attn_bf16_d256_gqa_prefix_matches_naive() {
+        let Some(dev) = metal_device_or_skip() else {
+            return;
+        };
+        run_fa_parity(
+            &dev,
+            DType::BF16,
+            FaCase {
+                b: 1,
+                h: 16,
+                h_kv: 4,
+                t_q: 70,
+                t_kv: 90,
+                d: 256,
+            },
+            None,
+            0.05,
+            "bf16/d256/gqa/prefix",
         );
     }
 
@@ -3504,6 +4052,292 @@ mod fused_kernel_parity_tests {
                     gd1.min(gd2)
                 );
             }
+        }
+    }
+
+    // ---- TensorOps (MPP) GEMM tests ----
+
+    fn mpp_available(dev: &Device) -> bool {
+        match dev {
+            Device::Metal(md) => mpp_gemm_available(md.device()),
+            _ => false,
+        }
+    }
+
+    #[test]
+    fn mpp_gemm_nn_and_nt_match_candle() {
+        let Some(dev) = metal_device_or_skip() else {
+            return;
+        };
+        if !mpp_available(&dev) {
+            eprintln!("skipping: TensorOps GEMM unavailable on this machine");
+            return;
+        }
+        let mk = |rows: usize, cols: usize, seed: usize| -> Tensor {
+            let v: Vec<f32> = (0..rows * cols)
+                .map(|i| (((i + seed) % 17) as f32 - 8.0) * 0.03)
+                .collect();
+            Tensor::from_vec(v, (rows, cols), &dev)
+                .unwrap()
+                .to_dtype(DType::BF16)
+                .unwrap()
+        };
+        for (m, k, n) in [(128usize, 256usize, 192usize), (37, 192, 100), (64, 96, 64)] {
+            let a = mk(m, k, 1);
+            let w_nn = mk(k, n, 5); // [k, n] contiguous -> nn kernel
+            let w_nk = mk(n, k, 9); // [n, k] contiguous; its .t() view -> nt kernel
+            let w_nt = w_nk.t().unwrap();
+
+            for (label, w) in [("nn", &w_nn), ("nt", &w_nt)] {
+                let y = mpp_matmul(&a, w).unwrap();
+                let y_ref = a
+                    .to_dtype(DType::F32)
+                    .unwrap()
+                    .matmul(&w.to_dtype(DType::F32).unwrap().contiguous().unwrap())
+                    .unwrap();
+                let f = y
+                    .to_dtype(DType::F32)
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap();
+                let r = y_ref.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+                assert!(f.iter().all(|v| v.is_finite()), "{label}: non-finite");
+                let diff = max_abs_diff_f32(&f, &r);
+                let tol = parity_tol(&r);
+                assert!(
+                    diff < tol,
+                    "mpp {label} {m}x{k}x{n}: max_abs_diff {diff} (tol {tol})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn maybe_mpp_matmul_declines_unsupported_inputs() {
+        let Some(dev) = metal_device_or_skip() else {
+            return;
+        };
+        let small = Tensor::zeros((8, 64), DType::BF16, &dev).unwrap();
+        let w = Tensor::zeros((64, 32), DType::BF16, &dev).unwrap();
+        assert!(maybe_mpp_matmul(&small, &w).unwrap().is_none());
+        let f32x = Tensor::zeros((128, 64), DType::F32, &dev).unwrap();
+        let f32w = Tensor::zeros((64, 32), DType::F32, &dev).unwrap();
+        assert!(maybe_mpp_matmul(&f32x, &f32w).unwrap().is_none());
+        let x = Tensor::zeros((128, 48), DType::BF16, &dev).unwrap();
+        assert!(maybe_mpp_matmul(&x, &w).unwrap().is_none());
+    }
+
+    fn assert_quant_parity(y: &Tensor, x: &Tensor, w_ref: &Tensor, label: &str) {
+        let y_ref = x
+            .to_dtype(DType::F32)
+            .unwrap()
+            .matmul(&w_ref.t().unwrap().contiguous().unwrap())
+            .unwrap();
+        let f = y
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let r = y_ref.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        assert!(f.iter().all(|v| v.is_finite()), "{label}: non-finite");
+        let diff = max_abs_diff_f32(&f, &r);
+        let tol = parity_tol(&r);
+        assert!(diff < tol, "{label}: max_abs_diff {diff} (tol {tol})");
+    }
+
+    #[test]
+    fn mpp_quant_staged_matches_dequant_reference() {
+        use crate::common::awq::PackDim;
+        let Some(dev) = metal_device_or_skip() else {
+            return;
+        };
+        if !mpp_available(&dev) {
+            eprintln!("skipping: TensorOps GEMM unavailable on this machine");
+            return;
+        }
+        for (m, k, n, g) in [(70usize, 192usize, 104usize, 64usize), (70, 160, 104, 32)] {
+            let x = batch_x(&dev, DType::BF16, m, k);
+
+            let raw = build_awq_triplet(&dev, DType::BF16, k, n, g);
+            let w_ref = dequantize_awq(&raw, &dev, DType::F32).unwrap();
+            let y = mpp_quant_matmul(
+                &x,
+                &raw.qweight,
+                raw.qzeros.as_ref().unwrap(),
+                &raw.scales,
+                4,
+                PackDim::Out,
+            )
+            .unwrap();
+            assert_quant_parity(&y, &x, &w_ref, &format!("w4 staged {m}x{k}x{n} g{g}"));
+
+            let (qw, qz, sc, ref_w) = build_w8a16_triplet(&dev, DType::BF16, k, n, g);
+            let w_ref = Tensor::from_vec(ref_w, (n, k), &dev).unwrap();
+            let y = mpp_quant_matmul(&x, &qw, &qz, &sc, 8, PackDim::Out).unwrap();
+            assert_quant_parity(&y, &x, &w_ref, &format!("w8 staged {m}x{k}x{n} g{g}"));
+
+            for bits in [4u32, 8] {
+                let raw = build_gptq_triplet(&dev, DType::BF16, bits, k, n, g);
+                let w_ref = crate::common::awq::dequantize_gptq(&raw, &dev, DType::F32).unwrap();
+                let y = mpp_quant_matmul(
+                    &x,
+                    &raw.qweight,
+                    raw.qzeros.as_ref().unwrap(),
+                    &raw.scales,
+                    bits,
+                    PackDim::In,
+                )
+                .unwrap();
+                assert_quant_parity(
+                    &y,
+                    &x,
+                    &w_ref,
+                    &format!("gptq{bits} staged {m}x{k}x{n} g{g}"),
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "perf probe (requires macOS 26 / Metal 4)"]
+    fn mpp_quant_staged_perf_probe() {
+        use crate::common::awq::PackDim;
+        let Some(dev) = metal_device_or_skip() else {
+            return;
+        };
+        if !mpp_available(&dev) {
+            eprintln!("skipping: TensorOps GEMM unavailable on this machine");
+            return;
+        }
+        use std::time::Instant;
+        let (m, k, n, g) = (1024usize, 2560usize, 9728usize, 128usize);
+        let x = batch_x(&dev, DType::BF16, m, k);
+        let awq = build_awq_triplet(&dev, DType::BF16, k, n, g);
+        let awq_qz = awq.qzeros.as_ref().unwrap();
+        let gptq = build_gptq_triplet(&dev, DType::BF16, 4, k, n, g);
+        let gptq_qz = gptq.qzeros.as_ref().unwrap();
+
+        let iters = 20;
+        let time = |f: &dyn Fn() -> Tensor| -> f64 {
+            let t = Instant::now();
+            let mut sink = Vec::with_capacity(iters);
+            for _ in 0..iters {
+                sink.push(f());
+            }
+            sink.last().unwrap().to_device(&Device::Cpu).unwrap();
+            t.elapsed().as_secs_f64() / iters as f64
+        };
+        let staged_w4 =
+            || mpp_quant_matmul(&x, &awq.qweight, awq_qz, &awq.scales, 4, PackDim::Out).unwrap();
+        let dequant_w4 = || {
+            let w = dequantize_w4(&awq.qweight, awq_qz, &awq.scales).unwrap();
+            mpp_matmul(&x, &w).unwrap()
+        };
+        let staged_gptq =
+            || mpp_quant_matmul(&x, &gptq.qweight, gptq_qz, &gptq.scales, 4, PackDim::In).unwrap();
+        let dequant_gptq = || {
+            let w = dequantize_gptq_packed(&gptq.qweight, gptq_qz, &gptq.scales, 4).unwrap();
+            mpp_matmul(&x, &w).unwrap()
+        };
+        for _ in 0..3 {
+            staged_w4().to_device(&Device::Cpu).unwrap();
+            dequant_w4().to_device(&Device::Cpu).unwrap();
+            staged_gptq().to_device(&Device::Cpu).unwrap();
+            dequant_gptq().to_device(&Device::Cpu).unwrap();
+        }
+        let t_s4 = time(&staged_w4).min(time(&staged_w4));
+        let t_d4 = time(&dequant_w4).min(time(&dequant_w4));
+        let t_sg = time(&staged_gptq).min(time(&staged_gptq));
+        let t_dg = time(&dequant_gptq).min(time(&dequant_gptq));
+        let flops = 2.0 * m as f64 * n as f64 * k as f64;
+        let tf = |t: f64| flops / t / 1e12;
+        println!(
+            "[{m}x{k}x{n} g{g}] w4: staged {:8.1} us ({:5.2} TF) vs dequant+mpp {:8.1} us ({:5.2} TF, staged {:.2}x)",
+            t_s4 * 1e6,
+            tf(t_s4),
+            t_d4 * 1e6,
+            tf(t_d4),
+            t_d4 / t_s4
+        );
+        println!(
+            "[{m}x{k}x{n} g{g}] gptq4: staged {:8.1} us ({:5.2} TF) vs dequant+mpp {:8.1} us ({:5.2} TF, staged {:.2}x)",
+            t_sg * 1e6,
+            tf(t_sg),
+            t_dg * 1e6,
+            tf(t_dg),
+            t_dg / t_sg
+        );
+    }
+
+    #[test]
+    #[ignore = "perf probe (requires macOS 26 / Metal 4)"]
+    fn mpp_gemm_perf_probe() {
+        let Some(dev) = metal_device_or_skip() else {
+            return;
+        };
+        if !mpp_available(&dev) {
+            eprintln!("skipping: TensorOps GEMM unavailable on this machine");
+            return;
+        }
+        use std::time::Instant;
+        let mk = |rows: usize, cols: usize, seed: usize| -> Tensor {
+            let v: Vec<f32> = (0..rows * cols)
+                .map(|i| (((i + seed) % 17) as f32 - 8.0) * 0.03)
+                .collect();
+            Tensor::from_vec(v, (rows, cols), &dev)
+                .unwrap()
+                .to_dtype(DType::BF16)
+                .unwrap()
+        };
+        for (m, k, n) in [
+            (64usize, 2560usize, 9728usize),
+            (256, 2560, 9728),
+            (1024, 2560, 9728),
+            (1024, 2560, 2560),
+        ] {
+            let a = mk(m, k, 1);
+            let w_nn = mk(k, n, 5);
+            let w_nt = mk(n, k, 9);
+            let w_nt_view = w_nt.t().unwrap();
+
+            let iters = 20;
+            let time = |f: &dyn Fn() -> Tensor| -> f64 {
+                let t = Instant::now();
+                let mut sink = Vec::with_capacity(iters);
+                for _ in 0..iters {
+                    sink.push(f());
+                }
+                sink.last().unwrap().to_device(&Device::Cpu).unwrap();
+                t.elapsed().as_secs_f64() / iters as f64
+            };
+            let run_nn = || mpp_matmul(&a, &w_nn).unwrap();
+            let run_nt = || mpp_matmul(&a, &w_nt_view).unwrap();
+            let run_ref = || a.matmul(&w_nt_view).unwrap();
+            for _ in 0..3 {
+                run_nn().to_device(&Device::Cpu).unwrap();
+                run_nt().to_device(&Device::Cpu).unwrap();
+                run_ref().to_device(&Device::Cpu).unwrap();
+            }
+            let t_nn = time(&run_nn).min(time(&run_nn));
+            let t_nt = time(&run_nt).min(time(&run_nt));
+            let t_ref = time(&run_ref).min(time(&run_ref));
+            let flops = 2.0 * m as f64 * n as f64 * k as f64;
+            let tf = |t: f64| flops / t / 1e12;
+            println!(
+                "[{m}x{k}x{n}] candle {:8.1} us ({:5.2} TF)   mpp-nn {:8.1} us ({:5.2} TF, {:.2}x)   mpp-nt {:8.1} us ({:5.2} TF, {:.2}x)",
+                t_ref * 1e6,
+                tf(t_ref),
+                t_nn * 1e6,
+                tf(t_nn),
+                t_ref / t_nn,
+                t_nt * 1e6,
+                tf(t_nt),
+                t_ref / t_nt
+            );
         }
     }
 }

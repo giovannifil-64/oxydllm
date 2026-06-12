@@ -38,17 +38,27 @@ pub struct Linear {
 }
 
 fn matmul_with_bias(x: &Tensor, weight_t: &Tensor, bias: Option<&Tensor>) -> Result<Tensor> {
+    #[cfg(feature = "metal")]
+    let mm = |x2: &Tensor| -> Result<Tensor> {
+        match super::metal_ops::maybe_mpp_matmul(x2, weight_t)? {
+            Some(y) => Ok(y),
+            None => x2.matmul(weight_t),
+        }
+    };
+    #[cfg(not(feature = "metal"))]
+    let mm = |x2: &Tensor| x2.matmul(weight_t);
+
     let out = if x.rank() > 2 {
         let original_dims = x.dims().to_vec();
         let in_features = *original_dims.last().unwrap();
         let batch_flat: usize = original_dims[..original_dims.len() - 1].iter().product();
-        let o = x.reshape((batch_flat, in_features))?.matmul(weight_t)?;
+        let o = mm(&x.reshape((batch_flat, in_features))?)?;
         let out_features = o.dim(1)?;
         let mut new_dims = original_dims;
         *new_dims.last_mut().unwrap() = out_features;
         o.reshape(new_dims)?
     } else {
-        x.matmul(weight_t)?
+        mm(x)?
     };
 
     match bias {
@@ -465,6 +475,15 @@ impl PackedQuantLinear {
 
         let y_2d = if m <= self.gemv_max_m() {
             self.chunked_batch_gemv(&x_2d, m)?
+        } else if let Some(y) = super::metal_ops::maybe_mpp_quant_matmul(
+            &x_2d,
+            &self.qweight,
+            &self.qzeros,
+            &self.scales,
+            self.bits,
+            self.pack_dim,
+        )? {
+            y
         } else {
             let w = match (self.pack_dim, self.bits) {
                 (PackDim::Out, 8) => {
@@ -480,7 +499,10 @@ impl PackedQuantLinear {
                     bits,
                 )?,
             };
-            x_2d.matmul(&w)?
+            match super::metal_ops::maybe_mpp_matmul(&x_2d, &w)? {
+                Some(y) => y,
+                None => x_2d.matmul(&w)?,
+            }
         };
 
         let mut out_dims = dims;

@@ -432,10 +432,10 @@ impl PackedQuantLinear {
         let x_2d = x.reshape((m, in_features))?.contiguous()?;
 
         let y_2d = match (self.pack_dim, self.bits, m) {
-            (PackDim::Out, 8, 1) => {
+            (PackDim::Out, 8, 1..=8) => {
                 super::metal_ops::w8a16_matmul(&x_2d, &self.qweight, &self.qzeros, &self.scales)?
             }
-            (PackDim::Out, _, 1) => {
+            (PackDim::Out, _, 1..=8) => {
                 super::metal_ops::w4a16_matmul(&x_2d, &self.qweight, &self.qzeros, &self.scales)?
             }
             (PackDim::In, bits, 1) => super::metal_ops::gptq_matmul(

@@ -30,7 +30,10 @@ struct W4A16Params {
     uint group_shift;
     uint k_splits;
     uint chunk;
+    uint m;
 };
+
+constant uint AWQ_BATCH_MAX = 8u;
 
 constant uint AWQ_PACK_ORDER[8] = {0u, 2u, 4u, 6u, 1u, 3u, 5u, 7u};
 
@@ -106,6 +109,82 @@ inline void awq_gemv_impl(
     }
 }
 
+// Batched split-K AWQ GEMV for M = 2..8 decode rows: identical geometry to
+// awq_gemv_impl, but the weight word is unpacked ONCE and reused for all M
+// activation rows (the GGUF batch-kernel design — concurrent decode shares
+// one weight read instead of falling onto the dequant+GEMM prefill path).
+// `out` must be host-zeroed (atomic accumulation).
+template<typename T, uint BITS>
+inline void awq_gemv_batch_impl(
+    device const T*       x,        // [m, in_features]
+    device const uint*    qweight,
+    device const uint*    qzeros,
+    device const T*       scales,
+    device atomic_float*  out,      // [m, out_features]
+    constant W4A16Params& p,
+    uint2 gid)
+{
+    constexpr uint PACK_FACTOR = 32u / BITS;
+
+    uint j = gid.x;
+    if (j >= p.packed_out) {
+        return;
+    }
+    uint ks = gid.y;
+    if (ks >= p.k_splits) {
+        return;
+    }
+    uint m_rows = min(p.m, AWQ_BATCH_MAX);
+
+    uint i_start = ks * p.chunk;
+    uint i_end = min(i_start + p.chunk, p.in_features);
+    if (i_start >= i_end) {
+        return;
+    }
+
+    float acc[8][PACK_FACTOR];
+    for (uint m = 0; m < m_rows; ++m) {
+        for (uint k = 0; k < PACK_FACTOR; ++k) {
+            acc[m][k] = 0.0f;
+        }
+    }
+
+    float zero_slot[PACK_FACTOR];
+    float scale_v[PACK_FACTOR];
+    uint last_g = 0xFFFFFFFFu;
+
+    for (uint i = i_start; i < i_end; ++i) {
+        uint g = i >> p.group_shift;
+        if (g != last_g) {
+            uint zw = qzeros[g * p.packed_out + j];
+            for (uint k = 0; k < PACK_FACTOR; ++k) {
+                zero_slot[k] = float(unpack<BITS>(zw, k));
+                scale_v[k] = float(scales[g * p.out_features + j * PACK_FACTOR + pack_position<BITS>(k)]);
+            }
+            last_g = g;
+        }
+
+        uint ww = qweight[i * p.packed_out + j];
+        float w[PACK_FACTOR];
+        for (uint k = 0; k < PACK_FACTOR; ++k) {
+            w[k] = (float(unpack<BITS>(ww, k)) - zero_slot[k]) * scale_v[k];
+        }
+        for (uint m = 0; m < m_rows; ++m) {
+            float xv = float(x[m * p.in_features + i]);
+            for (uint k = 0; k < PACK_FACTOR; ++k) {
+                acc[m][k] += xv * w[k];
+            }
+        }
+    }
+
+    for (uint m = 0; m < m_rows; ++m) {
+        for (uint k = 0; k < PACK_FACTOR; ++k) {
+            uint o = j * PACK_FACTOR + pack_position<BITS>(k);
+            atomic_fetch_add_explicit(&out[m * p.out_features + o], acc[m][k], memory_order_relaxed);
+        }
+    }
+}
+
 template<typename T, uint BITS>
 inline void awq_dequantize_impl(
     device const uint*    qweight,
@@ -159,6 +238,30 @@ kernel void w4a16_gemv_bf16(
     awq_gemv_impl<bfloat, 4>(x, qweight, qzeros, scales, out, p, gid);
 }
 
+kernel void w4a16_gemv_batch_f16(
+    device const half*    x        [[buffer(0)]],
+    device const uint*    qweight  [[buffer(1)]],
+    device const uint*    qzeros   [[buffer(2)]],
+    device const half*    scales   [[buffer(3)]],
+    device atomic_float*  out      [[buffer(4)]],
+    constant W4A16Params& p        [[buffer(5)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    awq_gemv_batch_impl<half, 4>(x, qweight, qzeros, scales, out, p, gid);
+}
+
+kernel void w4a16_gemv_batch_bf16(
+    device const bfloat*  x        [[buffer(0)]],
+    device const uint*    qweight  [[buffer(1)]],
+    device const uint*    qzeros   [[buffer(2)]],
+    device const bfloat*  scales   [[buffer(3)]],
+    device atomic_float*  out      [[buffer(4)]],
+    constant W4A16Params& p        [[buffer(5)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    awq_gemv_batch_impl<bfloat, 4>(x, qweight, qzeros, scales, out, p, gid);
+}
+
 kernel void dequantize_w4_f16(
     device const uint*    qweight  [[buffer(0)]],
     device const uint*    qzeros   [[buffer(1)]],
@@ -203,6 +306,30 @@ kernel void w8a16_gemv_bf16(
     uint2 gid [[thread_position_in_grid]])
 {
     awq_gemv_impl<bfloat, 8>(x, qweight, qzeros, scales, out, p, gid);
+}
+
+kernel void w8a16_gemv_batch_f16(
+    device const half*    x        [[buffer(0)]],
+    device const uint*    qweight  [[buffer(1)]],
+    device const uint*    qzeros   [[buffer(2)]],
+    device const half*    scales   [[buffer(3)]],
+    device atomic_float*  out      [[buffer(4)]],
+    constant W4A16Params& p        [[buffer(5)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    awq_gemv_batch_impl<half, 8>(x, qweight, qzeros, scales, out, p, gid);
+}
+
+kernel void w8a16_gemv_batch_bf16(
+    device const bfloat*  x        [[buffer(0)]],
+    device const uint*    qweight  [[buffer(1)]],
+    device const uint*    qzeros   [[buffer(2)]],
+    device const bfloat*  scales   [[buffer(3)]],
+    device atomic_float*  out      [[buffer(4)]],
+    constant W4A16Params& p        [[buffer(5)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    awq_gemv_batch_impl<bfloat, 8>(x, qweight, qzeros, scales, out, p, gid);
 }
 
 kernel void dequantize_w8_f16(

@@ -1228,6 +1228,7 @@ struct W4A16Params {
     group_shift: u32,
     k_splits: u32,
     chunk: u32,
+    m: u32,
 }
 
 struct AwqShape {
@@ -1264,7 +1265,7 @@ impl AwqShape {
         })
     }
 
-    fn params(&self, group_shift: usize, k_splits: usize, chunk: usize) -> W4A16Params {
+    fn params(&self, group_shift: usize, k_splits: usize, chunk: usize, m: usize) -> W4A16Params {
         W4A16Params {
             in_features: self.in_features as u32,
             out_features: self.out_features as u32,
@@ -1273,6 +1274,7 @@ impl AwqShape {
             group_shift: group_shift as u32,
             k_splits: k_splits as u32,
             chunk: chunk as u32,
+            m: m as u32,
         }
     }
 }
@@ -1314,9 +1316,12 @@ impl InplaceOp1 for W4A16Matmul {
             candle_core::bail!("W4A16Matmul: x must be contiguous");
         }
         let x_dims = x_l.dims();
-        if x_dims.len() != 2 || x_dims[0] != 1 {
-            candle_core::bail!("W4A16Matmul: x must be [1, in] (M=1 decode path), got {x_dims:?}");
+        if x_dims.len() != 2 || !(1..=8).contains(&x_dims[0]) {
+            candle_core::bail!(
+                "W4A16Matmul: x must be [m, in] with m in 1..=8 (decode GEMV path), got {x_dims:?}"
+            );
         }
+        let m = x_dims[0];
         let in_features = x_dims[1];
 
         let (qw_in, packed_out) = self.qweight.dims2()?;
@@ -1335,9 +1340,9 @@ impl InplaceOp1 for W4A16Matmul {
                 shape.in_features
             );
         }
-        if out_l.dims() != [1, shape.out_features] {
+        if out_l.dims() != [m, shape.out_features] {
             candle_core::bail!(
-                "W{}A16Matmul: accumulator shape {:?} != [1, {}]",
+                "W{}A16Matmul: accumulator shape {:?} != [{m}, {}]",
                 self.bits,
                 out_l.dims(),
                 shape.out_features
@@ -1359,12 +1364,16 @@ impl InplaceOp1 for W4A16Matmul {
             );
         }
 
-        let kernel_name = match (self.bits, self.x.dtype()) {
-            (4, DType::F16) => "w4a16_gemv_f16",
-            (4, DType::BF16) => "w4a16_gemv_bf16",
-            (8, DType::F16) => "w8a16_gemv_f16",
-            (8, DType::BF16) => "w8a16_gemv_bf16",
-            (bits, other) => candle_core::bail!(
+        let kernel_name = match (self.bits, self.x.dtype(), m) {
+            (4, DType::F16, 1) => "w4a16_gemv_f16",
+            (4, DType::BF16, 1) => "w4a16_gemv_bf16",
+            (8, DType::F16, 1) => "w8a16_gemv_f16",
+            (8, DType::BF16, 1) => "w8a16_gemv_bf16",
+            (4, DType::F16, _) => "w4a16_gemv_batch_f16",
+            (4, DType::BF16, _) => "w4a16_gemv_batch_bf16",
+            (8, DType::F16, _) => "w8a16_gemv_batch_f16",
+            (8, DType::BF16, _) => "w8a16_gemv_batch_bf16",
+            (bits, other, _) => candle_core::bail!(
                 "W{bits}A16Matmul: unsupported (bits, dtype) combo ({bits}, {other:?})"
             ),
         };
@@ -1376,7 +1385,7 @@ impl InplaceOp1 for W4A16Matmul {
         let chunk = shape.in_features.div_ceil(k_splits);
         let k_splits = shape.in_features.div_ceil(chunk);
         let group_shift = shape.group_size.trailing_zeros() as usize;
-        let params = shape.params(group_shift, k_splits, chunk);
+        let params = shape.params(group_shift, k_splits, chunk, m);
 
         let dtype_bytes = self.x.dtype().size_in_bytes();
         let device = out.device();
@@ -1491,7 +1500,7 @@ impl CustomOp1 for DequantizeW4 {
         let out_elems = in_features * out_features;
         let device = qweight.device();
         let output = device.new_buffer(out_elems, out_dtype, "dequant_w4")?;
-        let params = shape.params(0, 0, 0);
+        let params = shape.params(0, 0, 0, 1);
 
         let qz_sl = self.qzeros.storage_and_layout();
         let sc_sl = self.scales.storage_and_layout();
@@ -1564,7 +1573,8 @@ fn wna16_matmul_inner(
     bits: u32,
 ) -> Result<Tensor> {
     let out_features = scales.dim(1)?;
-    let out = Tensor::zeros((1, out_features), DType::F32, x.device())?;
+    let m = x.dim(0)?;
+    let out = Tensor::zeros((m, out_features), DType::F32, x.device())?;
     out.inplace_op1(&W4A16Matmul {
         x: x.clone(),
         qweight: qweight.clone(),
@@ -2676,6 +2686,93 @@ mod fused_kernel_parity_tests {
         let diff = max_abs_diff_f32(&f, &r);
         let tol = parity_tol(&r);
         assert!(diff < tol, "{label}: max_abs_diff = {diff} (tol {tol})");
+    }
+
+    fn batch_x(dev: &Device, dtype: DType, m: usize, in_features: usize) -> Tensor {
+        let x_data: Vec<f32> = (0..m * in_features)
+            .map(|i| ((i % 17) as f32 - 8.0) * 0.03)
+            .collect();
+        Tensor::from_vec(x_data, (m, in_features), dev)
+            .unwrap()
+            .to_dtype(dtype)
+            .unwrap()
+    }
+
+    fn assert_batch_parity(y_kernel: &Tensor, y_ref: &Tensor, m: usize, out: usize, label: &str) {
+        assert_eq!(y_kernel.dims2().unwrap(), (m, out), "{label}: shape");
+        let f = y_kernel
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let r = y_ref.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        assert!(f.iter().all(|v| v.is_finite()), "{label}: non-finite");
+        let diff = max_abs_diff_f32(&f, &r);
+        let tol = parity_tol(&r);
+        assert!(diff < tol, "{label}: max_abs_diff = {diff} (tol {tol})");
+    }
+
+    fn run_w4a16_gemv_batch_parity(dev: &Device, dtype: DType, m: usize, label: &str) {
+        let (in_features, out_features, group_size) = (256usize, 128usize, 64usize);
+        let raw = build_awq_triplet(dev, dtype, in_features, out_features, group_size);
+        let x = batch_x(dev, dtype, m, in_features);
+
+        let y_kernel = w4a16_matmul(
+            &x,
+            &raw.qweight,
+            raw.qzeros.as_ref().expect("AWQ qzeros"),
+            &raw.scales,
+        )
+        .expect("batched w4a16 kernel must not error");
+
+        let w_ref = dequantize_awq(&raw, dev, DType::F32).unwrap();
+        let y_ref = x
+            .to_dtype(DType::F32)
+            .unwrap()
+            .matmul(&w_ref.t().unwrap().contiguous().unwrap())
+            .unwrap();
+        assert_batch_parity(&y_kernel, &y_ref, m, out_features, label);
+    }
+
+    #[test]
+    fn w4a16_gemv_batch_bf16_matches_reference() {
+        let Some(dev) = metal_device_or_skip() else {
+            return;
+        };
+        for m in [2usize, 4, 8] {
+            run_w4a16_gemv_batch_parity(&dev, DType::BF16, m, "w4 batch bf16");
+        }
+    }
+
+    #[test]
+    fn w4a16_gemv_batch_f16_matches_reference() {
+        let Some(dev) = metal_device_or_skip() else {
+            return;
+        };
+        run_w4a16_gemv_batch_parity(&dev, DType::F16, 3, "w4 batch f16");
+    }
+
+    #[test]
+    fn w8a16_gemv_batch_bf16_matches_reference() {
+        let Some(dev) = metal_device_or_skip() else {
+            return;
+        };
+        let (in_features, out_features, group_size) = (256usize, 128usize, 64usize);
+        let (qw, qz, sc, ref_w) =
+            build_w8a16_triplet(&dev, DType::BF16, in_features, out_features, group_size);
+        for m in [2usize, 5, 8] {
+            let x = batch_x(&dev, DType::BF16, m, in_features);
+            let y_kernel = w8a16_matmul(&x, &qw, &qz, &sc).expect("w8a16 batch must not error");
+            let w_ref = Tensor::from_vec(ref_w.clone(), (out_features, in_features), &dev).unwrap();
+            let y_ref = x
+                .to_dtype(DType::F32)
+                .unwrap()
+                .matmul(&w_ref.t().unwrap().contiguous().unwrap())
+                .unwrap();
+            assert_batch_parity(&y_kernel, &y_ref, m, out_features, "w8 batch bf16");
+        }
     }
 
     fn run_dequant_w4_parity(

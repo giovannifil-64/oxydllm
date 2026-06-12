@@ -73,11 +73,15 @@ fn chunk_size() -> usize {
     })
 }
 
+enum BaProjection {
+    Fused(AnyLinear),
+    Separate { b: AnyLinear, a: AnyLinear },
+}
+
 pub struct GatedDeltaNet {
     in_proj_qkv: AnyLinear,
     in_proj_z: AnyLinear,
-    in_proj_b: AnyLinear,
-    in_proj_a: AnyLinear,
+    in_proj_ba: BaProjection,
     out_proj: AnyLinear,
     /// Depthwise conv weight, stored [kernel, conv_dim] in model dtype.
     conv_w: Tensor,
@@ -321,14 +325,22 @@ fn chunk_gated_delta_rule(
     debug_probe("chunk.v_t", &v_t);
     debug_probe("chunk.k_cumdecay", &k_cumdecay);
 
-    // Sequential cross-chunk scan, shapes [h, c, d] per chunk.
-    let chunked = |x: &Tensor, d: usize| x.reshape((h, n, c, d));
-    let q_n = chunked(&q_c, dk)?;
-    let k_n = chunked(&k_c, dk)?;
-    let v_n = chunked(&v_t, dv)?;
-    let kcd_n = chunked(&k_cumdecay, dk)?;
-    let g_n = g_c.reshape((h, n, c))?;
-    let decay_n = decay.reshape((h, n, c, c))?;
+    let g_exp = g_c.exp()?.unsqueeze(D::Minus1)?; // (hn, c, 1)
+    let attn_all = (q_c.matmul(&k_c.transpose(D::Minus2, D::Minus1)?)? * decay)?; // (hn, c, c)
+    let qg_all = q_c.broadcast_mul(&g_exp)?; // (hn, c, dk)
+    let g_last = g_c.narrow(1, c - 1, 1)?; // (hn, 1)
+    let eg_last = g_last.exp()?.reshape((h, n))?; // (h, n)
+    let carry_t = k_c
+        .broadcast_mul(&g_last.broadcast_sub(&g_c)?.exp()?.unsqueeze(D::Minus1)?)?
+        .transpose(D::Minus2, D::Minus1)?
+        .contiguous()?;
+
+    let chunked = |x: &Tensor, a: usize, b: usize| x.reshape((h, n, a, b));
+    let v_n = chunked(&v_t, c, dv)?;
+    let kcd_n = chunked(&k_cumdecay, c, dk)?;
+    let qg_n = chunked(&qg_all, c, dk)?;
+    let attn_n = chunked(&attn_all, c, c)?;
+    let carry_n = chunked(&carry_t, dk, c)?;
 
     let mut s = match initial_state {
         Some(st) => st.clone(),
@@ -337,27 +349,10 @@ fn chunk_gated_delta_rule(
     let mut outs: Vec<Tensor> = Vec::with_capacity(n);
     for i in 0..n {
         let take = |x: &Tensor| -> Result<Tensor> { x.narrow(1, i, 1)?.squeeze(1)?.contiguous() };
-        let q_i = take(&q_n)?;
-        let k_i = take(&k_n)?;
-        let v_i = take(&v_n)?;
-        let kcd_i = take(&kcd_n)?;
-        let g_i = g_n.narrow(1, i, 1)?.squeeze(1)?.contiguous()?; // [h, c]
-        let decay_i = decay_n.narrow(1, i, 1)?.squeeze(1)?.contiguous()?;
-
-        let attn = (q_i.matmul(&k_i.transpose(D::Minus2, D::Minus1)?)? * decay_i)?;
-        let v_new = (v_i - kcd_i.matmul(&s)?)?;
-        let attn_inter = q_i
-            .broadcast_mul(&g_i.exp()?.unsqueeze(D::Minus1)?)?
-            .matmul(&s)?;
-        outs.push((attn_inter + attn.matmul(&v_new)?)?);
-
-        let g_last = g_i.narrow(1, c - 1, 1)?; // [h, 1]
-        let carry_decay = g_last.broadcast_sub(&g_i)?.exp()?.unsqueeze(D::Minus1)?; // [h, c, 1]
-        s = (s.broadcast_mul(&g_last.exp()?.unsqueeze(D::Minus1)?)?
-            + k_i
-                .broadcast_mul(&carry_decay)?
-                .transpose(D::Minus2, D::Minus1)?
-                .matmul(&v_new)?)?;
+        let v_new = (take(&v_n)? - take(&kcd_n)?.matmul(&s)?)?;
+        outs.push((take(&qg_n)?.matmul(&s)? + take(&attn_n)?.matmul(&v_new)?)?);
+        let eg_i = eg_last.narrow(1, i, 1)?.unsqueeze(D::Minus1)?; // (h, 1, 1)
+        s = (s.broadcast_mul(&eg_i)? + take(&carry_n)?.matmul(&v_new)?)?;
     }
 
     let out = Tensor::cat(&outs, 1)?.narrow(1, 0, t)?;
@@ -414,9 +409,35 @@ impl GatedDeltaNet {
 
         let in_proj_qkv = proj("in_proj_qkv", Some(conv_dim))?;
         let in_proj_z = proj("in_proj_z", Some(value_dim))?;
-        let in_proj_b = proj("in_proj_b", Some(la.num_v_heads))?;
-        let in_proj_a = proj("in_proj_a", Some(la.num_v_heads))?;
         let out_proj = proj("out_proj", None)?;
+
+        let b_dense = weights.try_get_quant(&format!("{p}.in_proj_b")).is_none()
+            && weights
+                .try_get(&format!("{p}.in_proj_b.weight"))
+                .is_some_and(|w| w.dtype() != DType::F8E4M3);
+        let a_dense = weights.try_get_quant(&format!("{p}.in_proj_a")).is_none()
+            && weights
+                .try_get(&format!("{p}.in_proj_a.weight"))
+                .is_some_and(|w| w.dtype() != DType::F8E4M3);
+        let in_proj_ba = if b_dense && a_dense {
+            let b_w = weights.get(&format!("{p}.in_proj_b.weight"))?;
+            let a_w = weights.get(&format!("{p}.in_proj_a.weight"))?;
+            if b_w.dim(0)? != la.num_v_heads || a_w.dim(0)? != la.num_v_heads {
+                candle_core::bail!(
+                    "{p}.in_proj_b/a: expected out_features {}, got {}/{}",
+                    la.num_v_heads,
+                    b_w.dim(0)?,
+                    a_w.dim(0)?
+                );
+            }
+            let ba_w = Tensor::cat(&[b_w, a_w], 0)?;
+            BaProjection::Fused(AnyLinear::from_weight_with_scale_inv(ba_w, None, None)?)
+        } else {
+            BaProjection::Separate {
+                b: proj("in_proj_b", Some(la.num_v_heads))?,
+                a: proj("in_proj_a", Some(la.num_v_heads))?,
+            }
+        };
 
         let conv_raw = weights.get(&format!("{p}.conv1d.weight"))?; // [conv_dim, 1, k]
         if conv_raw.dims() != [conv_dim, 1, la.conv_kernel] {
@@ -445,8 +466,7 @@ impl GatedDeltaNet {
         Ok(Self {
             in_proj_qkv,
             in_proj_z,
-            in_proj_b,
-            in_proj_a,
+            in_proj_ba,
             out_proj,
             conv_w,
             neg_exp_a_log,
@@ -458,10 +478,6 @@ impl GatedDeltaNet {
         })
     }
 
-    /// Load from a GGUF checkpoint (llama.cpp arch "qwen35" naming):
-    /// `attn_qkv` = in_proj_qkv, `attn_gate` = in_proj_z, `ssm_alpha`/`ssm_beta`
-    /// = in_proj_a/b, `ssm_out` = out_proj, `ssm_a` = A_log, `ssm_dt.bias` =
-    /// dt_bias, `ssm_conv1d`/`ssm_norm` = conv/gated-norm weights.
     pub fn load_gguf(
         cfg: &BlockConfig,
         layer_idx: usize,
@@ -491,8 +507,10 @@ impl GatedDeltaNet {
         };
         let in_proj_qkv = qproj("attn_qkv", conv_dim)?;
         let in_proj_z = qproj("attn_gate", value_dim)?;
-        let in_proj_a = qproj("ssm_alpha", la.num_v_heads)?;
-        let in_proj_b = qproj("ssm_beta", la.num_v_heads)?;
+        let in_proj_ba = BaProjection::Separate {
+            b: qproj("ssm_beta", la.num_v_heads)?,
+            a: qproj("ssm_alpha", la.num_v_heads)?,
+        };
         let out_proj = {
             let qt = gguf.get(&format!("{prefix}.ssm_out.weight"))?;
             AnyLinear::Quantized(QLinear::from_arc(qt, dtype)?)
@@ -533,8 +551,7 @@ impl GatedDeltaNet {
         Ok(Self {
             in_proj_qkv,
             in_proj_z,
-            in_proj_b,
-            in_proj_a,
+            in_proj_ba,
             out_proj,
             conv_w,
             neg_exp_a_log,
@@ -580,16 +597,39 @@ impl GatedDeltaNet {
         Ok((silu(&acc.expect("conv_kernel >= 1"))?, new_window))
     }
 
-    /// Forward for one sequence segment. `x`: [1, t, hidden]. The recurrent
-    /// state slot is read (decode continuation) and overwritten.
-    pub fn forward_segment(
+    fn project(&self, x: &Tensor) -> Result<(Tensor, Tensor, Tensor, Tensor)> {
+        let nv = self.cfg.num_v_heads;
+        let qkv = self.in_proj_qkv.forward(x)?;
+        let z = self.in_proj_z.forward(x)?;
+
+        let to_h_t = |x: &Tensor| -> Result<Tensor> {
+            x.squeeze(0)?
+                .transpose(0, 1)?
+                .to_dtype(DType::F32)?
+                .contiguous()
+        };
+        let (b_t, a_t) = match &self.in_proj_ba {
+            BaProjection::Fused(p) => {
+                let ba = to_h_t(&p.forward(x)?)?; // [2·nv, T]
+                (ba.narrow(0, 0, nv)?, ba.narrow(0, nv, nv)?)
+            }
+            BaProjection::Separate { b, a } => (to_h_t(&b.forward(x)?)?, to_h_t(&a.forward(x)?)?),
+        };
+        let beta = sigmoid(&b_t)?;
+        let g = softplus(&a_t.broadcast_add(&self.dt_bias.unsqueeze(1)?)?)?
+            .broadcast_mul(&self.neg_exp_a_log.unsqueeze(1)?)?;
+        Ok((qkv, z, beta, g))
+    }
+
+    fn mix_segment(
         &self,
-        x: &Tensor,
+        qkv: &Tensor,
+        beta: &Tensor,
+        g: &Tensor,
         state: &mut Option<RecurrentState>,
     ) -> Result<Tensor> {
         let la = &self.cfg;
-        let (_, t, _) = x.dims3()?;
-        let in_dtype = x.dtype();
+        let t = qkv.dim(1)?;
         let key_dim = la.num_k_heads * la.head_k_dim;
         let value_dim = la.num_v_heads * la.head_v_dim;
         let rep = la.num_v_heads / la.num_k_heads;
@@ -600,42 +640,32 @@ impl GatedDeltaNet {
             candle_core::bail!("GatedDeltaNet: multi-token continuation is not supported");
         }
 
-        let qkv = self.in_proj_qkv.forward(x)?; // [1, t, conv_dim]
-        let z = self.in_proj_z.forward(x)?; // [1, t, value_dim]
-        let b_proj = self.in_proj_b.forward(x)?; // [1, t, nv]
-        let a_proj = self.in_proj_a.forward(x)?; // [1, t, nv]
-
         let prev = state.as_ref().map(|s| &s.conv);
-        let (qkv_act, new_conv) = self.conv_forward(&qkv, prev)?;
+        let (qkv_act, new_conv) = self.conv_forward(qkv, prev)?;
+        let qkv_f32 = qkv_act.to_dtype(DType::F32)?;
 
-        // [h, t, d] F32 scan layout.
         let to_heads = |x: &Tensor, n_heads: usize, hd: usize| -> Result<Tensor> {
             x.reshape((1, t, n_heads, hd))?
                 .squeeze(0)?
                 .transpose(0, 1)?
-                .to_dtype(DType::F32)?
                 .contiguous()
         };
         let q = to_heads(
-            &qkv_act.narrow(2, 0, key_dim)?,
+            &qkv_f32.narrow(2, 0, key_dim)?,
             la.num_k_heads,
             la.head_k_dim,
         )?;
         let k = to_heads(
-            &qkv_act.narrow(2, key_dim, key_dim)?,
+            &qkv_f32.narrow(2, key_dim, key_dim)?,
             la.num_k_heads,
             la.head_k_dim,
         )?;
         let v = to_heads(
-            &qkv_act.narrow(2, 2 * key_dim, value_dim)?,
+            &qkv_f32.narrow(2, 2 * key_dim, value_dim)?,
             la.num_v_heads,
             la.head_v_dim,
         )?;
 
-        // GVA: expand q,k across the value heads, matching the checkpoint's
-        // V-head order — grouped (HF: k-head i → v-heads i·r..i·r+r, i.e.
-        // repeat_interleave) or tiled (GGUF: k-head i → v-heads i, i+nk, …,
-        // i.e. whole-block repetition).
         let expand_heads = |x: &Tensor| -> Result<Tensor> {
             if rep == 1 {
                 return Ok(x.clone());
@@ -654,23 +684,12 @@ impl GatedDeltaNet {
         let q = expand_heads(&q)?;
         let k = expand_heads(&k)?;
 
-        // β = σ(b); g = −exp(A_log)·softplus(a + dt_bias); [h, t] F32.
-        let to_h_t = |x: &Tensor| -> Result<Tensor> {
-            x.squeeze(0)?
-                .transpose(0, 1)?
-                .to_dtype(DType::F32)?
-                .contiguous()
-        };
-        let beta = sigmoid(&to_h_t(&b_proj)?)?;
-        let g = softplus(&to_h_t(&a_proj)?.broadcast_add(&self.dt_bias.unsqueeze(1)?)?)?
-            .broadcast_mul(&self.neg_exp_a_log.unsqueeze(1)?)?;
-
         debug_probe("fwd.qkv_act", &qkv_act);
-        debug_probe("fwd.g", &g);
+        debug_probe("fwd.g", g);
         debug_probe("fwd.v", &v);
         let (core, new_s) = match state.as_ref() {
-            Some(st) if t == 1 => recurrent_delta_step(&q, &k, &v, &g, &beta, &st.s)?,
-            _ => chunk_gated_delta_rule(&q, &k, &v, &g, &beta, None, chunk_size())?,
+            Some(st) if t == 1 => recurrent_delta_step(&q, &k, &v, g, beta, &st.s)?,
+            _ => chunk_gated_delta_rule(&q, &k, &v, g, beta, None, chunk_size())?,
         };
         debug_probe("fwd.core", &core);
         *state = Some(RecurrentState {
@@ -678,21 +697,82 @@ impl GatedDeltaNet {
             s: new_s,
         });
 
-        // Gated RMSNorm (norm before gate, plain weight), per value head, F32.
-        let core = core
-            .transpose(0, 1)?
-            .reshape((1, t, la.num_v_heads, la.head_v_dim))?;
-        let var = core.sqr()?.mean_keepdim(D::Minus1)?;
-        let normed = core
-            .broadcast_div(&(var + self.rms_norm_eps)?.sqrt()?)?
-            .broadcast_mul(&self.norm_w)?;
+        core.transpose(0, 1)?
+            .reshape((1, t, la.num_v_heads, la.head_v_dim))
+    }
+
+    fn finish(&self, core: &Tensor, z: &Tensor, in_dtype: DType) -> Result<Tensor> {
+        let la = &self.cfg;
+        let t = core.dim(1)?;
+        let value_dim = la.num_v_heads * la.head_v_dim;
         let z_f32 = z
             .reshape((1, t, la.num_v_heads, la.head_v_dim))?
             .to_dtype(DType::F32)?;
-        let gated = (normed * silu(&z_f32)?)?;
+
+        #[cfg(feature = "metal")]
+        let gated = if core.device().is_metal() {
+            let normed = super::metal_ops::rms_norm_fused(
+                &core.contiguous()?,
+                &self.norm_w,
+                self.rms_norm_eps as f32,
+            )?;
+            super::metal_ops::silu_mul_fused(&z_f32.contiguous()?, &normed)?
+        } else {
+            Self::gated_norm_fallback(core, &z_f32, &self.norm_w, self.rms_norm_eps)?
+        };
+        #[cfg(not(feature = "metal"))]
+        let gated = Self::gated_norm_fallback(core, &z_f32, &self.norm_w, self.rms_norm_eps)?;
 
         let out = gated.reshape((1, t, value_dim))?.to_dtype(in_dtype)?;
         self.out_proj.forward(&out)
+    }
+
+    fn gated_norm_fallback(
+        core: &Tensor,
+        z_f32: &Tensor,
+        norm_w: &Tensor,
+        eps: f64,
+    ) -> Result<Tensor> {
+        let var = core.sqr()?.mean_keepdim(D::Minus1)?;
+        let normed = core
+            .broadcast_div(&(var + eps)?.sqrt()?)?
+            .broadcast_mul(norm_w)?;
+        normed * silu(z_f32)?
+    }
+
+    pub fn forward_segment(
+        &self,
+        x: &Tensor,
+        state: &mut Option<RecurrentState>,
+    ) -> Result<Tensor> {
+        let (qkv, z, beta, g) = self.project(x)?;
+        let core = self.mix_segment(&qkv, &beta, &g, state)?;
+        self.finish(&core, &z, x.dtype())
+    }
+
+    pub fn forward_batch(
+        &self,
+        x: &Tensor,
+        token_counts: &[usize],
+        states: &mut [&mut Option<RecurrentState>],
+    ) -> Result<Tensor> {
+        debug_assert_eq!(token_counts.len(), states.len());
+        if states.len() == 1 {
+            return self.forward_segment(x, states[0]);
+        }
+
+        let (qkv, z, beta, g) = self.project(x)?;
+        let mut cores = Vec::with_capacity(states.len());
+        let mut offset = 0usize;
+        for (state, &t) in states.iter_mut().zip(token_counts) {
+            let qkv_seg = qkv.narrow(1, offset, t)?.contiguous()?;
+            let beta_seg = beta.narrow(1, offset, t)?.contiguous()?;
+            let g_seg = g.narrow(1, offset, t)?.contiguous()?;
+            cores.push(self.mix_segment(&qkv_seg, &beta_seg, &g_seg, state)?);
+            offset += t;
+        }
+        let core = Tensor::cat(&cores, 1)?;
+        self.finish(&core, &z, x.dtype())
     }
 }
 
@@ -998,9 +1078,38 @@ mod tests {
         assert!(state_v.iter().all(|x| x.is_finite()));
     }
 
-    /// Perf probe (Metal): decompose the cost of one decode step at real
-    /// Qwen3.5-9B dimensions. Not a contract test — run explicitly with
-    /// `cargo test --features metal --release gdn_decode_step_cost -- --ignored --nocapture`.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn fused_gated_norm_matches_fallback_on_metal() {
+        let Ok(dev) = Device::new_metal(0) else {
+            return; // no Metal device available (CI)
+        };
+        let (t, nv, dv) = (5usize, 4usize, 8usize);
+        let core = Tensor::randn(0f32, 2f32, (1, t, nv, dv), &dev).unwrap();
+        let z = Tensor::randn(0f32, 2f32, (1, t, nv, dv), &dev).unwrap();
+        let w = Tensor::randn(0f32, 1f32, (dv,), &dev).unwrap();
+        let eps = 1e-6f64;
+
+        let fallback = GatedDeltaNet::gated_norm_fallback(&core, &z, &w, eps).unwrap();
+        let fused = {
+            let normed = crate::common::metal_ops::rms_norm_fused(
+                &core.contiguous().unwrap(),
+                &w,
+                eps as f32,
+            )
+            .unwrap();
+            crate::common::metal_ops::silu_mul_fused(&z.contiguous().unwrap(), &normed).unwrap()
+        };
+        let a: Vec<f32> = fallback.flatten_all().unwrap().to_vec1().unwrap();
+        let b: Vec<f32> = fused.flatten_all().unwrap().to_vec1().unwrap();
+        let max_diff = a
+            .iter()
+            .zip(b.iter())
+            .map(|(x, y)| (x - y).abs())
+            .fold(0f32, f32::max);
+        assert!(max_diff < 1e-5, "fused vs fallback max diff {max_diff}");
+    }
+
     #[cfg(feature = "metal")]
     #[test]
     #[ignore]
@@ -1103,15 +1212,11 @@ mod tests {
         }
         sync("decode step (full)", t0, N);
 
-        // Sub-part: the four input projections + out_proj only.
         let t0 = Instant::now();
         for _ in 0..N {
-            let _ = layer.in_proj_qkv.forward(&x1).unwrap();
-            let _ = layer.in_proj_z.forward(&x1).unwrap();
-            let _ = layer.in_proj_b.forward(&x1).unwrap();
-            let _ = layer.in_proj_a.forward(&x1).unwrap();
+            let _ = layer.project(&x1).unwrap();
         }
-        sync("projections only", t0, N);
+        sync("projections+βg only", t0, N);
 
         // Sub-part: recurrent delta step on F32 tensors.
         let q = Tensor::randn(0f32, 1f32, (nv, 1, dk), &dev).unwrap();

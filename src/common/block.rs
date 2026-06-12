@@ -53,20 +53,12 @@ impl TokenMixer {
         match self {
             Self::Attention(attn) => attn.forward_batch(normed, rope, position_ids, mask, segments),
             Self::Gdn(gdn) => {
-                // Each sequence carries its own recurrent state; process the
-                // batch segment by segment.
-                let mut outs = Vec::with_capacity(segments.len());
-                let mut offset = 0usize;
-                for seg in segments.iter_mut() {
-                    let x_seg = normed.narrow(1, offset, seg.num_tokens)?.contiguous()?;
-                    outs.push(gdn.forward_segment(&x_seg, seg.cache.recurrent_mut())?);
-                    offset += seg.num_tokens;
-                }
-                if outs.len() == 1 {
-                    Ok(outs.pop().expect("one segment"))
-                } else {
-                    Tensor::cat(&outs, 1)
-                }
+                let token_counts: Vec<usize> = segments.iter().map(|s| s.num_tokens).collect();
+                let mut states: Vec<&mut Option<crate::common::paged::RecurrentState>> = segments
+                    .iter_mut()
+                    .map(|s| s.cache.recurrent_mut())
+                    .collect();
+                gdn.forward_batch(normed, &token_counts, &mut states)
             }
         }
     }

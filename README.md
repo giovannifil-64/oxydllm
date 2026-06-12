@@ -104,13 +104,14 @@ Qwen3.5 runs on a dedicated hybrid runtime (Gated DeltaNet + gated full attentio
 | Model | Format | Resident | Decode tok/s* | Battery |
 |---|---|---|---|---|
 | `Qwen/Qwen3.5-4B` | BF16 safetensors | 8.7 GB | 8.9 | 13/13 |
-| `cyankiwi/Qwen3.5-4B-AWQ-4bit` | compressed-tensors INT4 (W4A16 resident) | 3.1 GB | 19.5 | 13/13 |
-| `cyankiwi/Qwen3.5-4B-AWQ-BF16-INT4` | mixed BF16 DeltaNet + INT4 attn/MLP | 4.4 GB | 14.7 | 13/13 |
+| `cyankiwi/Qwen3.5-4B-AWQ-4bit` | compressed-tensors INT4 (W4A16 resident) | 3.1 GB | 27.1 | 13/13 |
+| `cyankiwi/Qwen3.5-4B-AWQ-BF16-INT4` | mixed BF16 DeltaNet + INT4 attn/MLP | 4.4 GB | 14.7*** | 13/13 |
 | `unsloth/Qwen3.5-4B-GGUF` (Q4_K_M) | GGUF (`qwen35` arch) | 2.5 GB | 24.1 | 12/13** |
 
 \* Median of three 150-token completions, prefill included.
 
 \*\* Quality loss of the Q4_K_M quantization on one marginal reasoning prompt, not a runtime defect: the same weights answer correctly when prompted step-by-step, and batched-vs-single decode stays byte-identical.
+\*\*\* Measured before the tied lm_head RTN quantization landed; this checkpoint shares the fix and should now sit between its old number and the fully-quantized variant.
 
 
 ## Unsupported Model Families

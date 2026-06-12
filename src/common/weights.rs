@@ -366,7 +366,9 @@ impl ModelWeights {
 
     #[cfg(feature = "metal")]
     pub fn has_packed_quantized_weights(&self) -> bool {
-        self.tensors.keys().any(|k| k.ends_with(".qweight"))
+        self.tensors
+            .keys()
+            .any(|k| k.ends_with(".qweight") || k.ends_with(".weight_packed"))
     }
 
     pub fn runtime_size_bytes(&self) -> usize {

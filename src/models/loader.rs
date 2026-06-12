@@ -771,8 +771,12 @@ fn load_standard_safetensors(
                 );
             }
 
-            // 4-bit tied lm_head (via RTN) only applies to AWQ-4bit; 8-bit AWQ
-            // takes the plain-tied path.
+            // 4-bit tied lm_head (via RTN) applies to the 4-bit packed schemes
+            // (AWQ-4bit and compressed-tensors INT4, which runs on the same
+            // resident W4A16 path); 8-bit AWQ takes the plain-tied path. On a
+            // 4-bit model a BF16 tied lm_head would otherwise dominate decode:
+            // the 248k-vocab Qwen3.5 reads 1.27 GB/token through it (~25% of
+            // the per-token budget measured on the INT4 checkpoint).
             #[cfg(feature = "metal")]
             if has_packed_quantized_weights
                 && device.is_metal()
@@ -780,6 +784,7 @@ fn load_standard_safetensors(
                 && matches!(
                     weights.quant_scheme(),
                     Some(crate::common::weights::QuantScheme::Awq { bits: 4 })
+                        | Some(crate::common::weights::QuantScheme::CompressedTensors4)
                 )
             {
                 let raw = crate::common::awq::rtn_quantize_awq(&embed_weight, 128)?;

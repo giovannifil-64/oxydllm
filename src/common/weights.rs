@@ -1,22 +1,37 @@
+//! Unified weight access over safetensors checkpoints.
+//!
+//! [`ModelWeights`] memory-maps safetensors files, casts each tensor to the
+//! runtime dtype (handling FP8 and block-wise scales), and serves tensors by
+//! name to the loaders. Name resolution is alias-aware, so the same keys work
+//! across plain and multimodal-nested checkpoints. [`QuantScheme`] records which
+//! packed-int format a checkpoint uses so [`ModelWeights::try_get_quant`]
+//! returns the right [`QuantWeight`].
+
 use crate::common::awq::{AwqRawTensors, QuantWeight};
 use anyhow::{Context, Result};
 use candle_core::{DType, Device, Tensor, safetensors::MmapedSafetensors};
 use rustc_hash::FxHashMap;
 
+/// The packed-int quantization format of a checkpoint.
+///
+/// `Awq` and `Gptq` carry the bit width (GPTQ also its symmetric flag).
+/// `CompressedTensors4` is llm-compressor's pack-quantized symmetric INT4, which
+/// is converted to the AWQ layout at load and runs on the resident W4A16 path.
+/// A `None` scheme on [`ModelWeights`] means dense / non-packed weights.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum QuantScheme {
-    Awq {
-        bits: u32,
-    },
-    Gptq {
-        bits: u32,
-        sym: bool,
-    },
-    /// compressed-tensors "pack-quantized" int4 symmetric (llm-compressor).
-    /// Converted to the AWQ layout at load; runs on the resident W4A16 path.
+    Awq { bits: u32 },
+    Gptq { bits: u32, sym: bool },
     CompressedTensors4,
 }
 
+/// All tensors of a model, loaded and ready to serve to the layer constructors.
+///
+/// Built by [`load`](Self::load) from safetensors files; tensors are looked up
+/// by canonical name via [`get`](Self::get) / [`try_get`](Self::try_get), with
+/// alias fallbacks for multimodal-nested layouts. When a packed-int
+/// [`QuantScheme`] is attached, [`try_get_quant`](Self::try_get_quant) assembles
+/// the matching [`QuantWeight`] from the per-projection packed tensors.
 pub struct ModelWeights {
     tensors: FxHashMap<String, Tensor>,
     quant_scheme: Option<QuantScheme>,
@@ -30,6 +45,17 @@ fn keeps_file_dtype(name: &str) -> bool {
         || name.ends_with(".linear_attn.norm.weight")
 }
 
+/// Loads one tensor from the mmap and casts it to the runtime dtype.
+///
+/// Integer tensors and the F32-pinned GatedDeltaNet scalars
+/// ([`keeps_file_dtype`]) are returned as stored. FP8 weights stay packed when
+/// `preserve_fp8_weight` is set and the device can dequantize them, but on Metal
+/// (no FP8 kernels) they are dequantized to F32 on CPU and moved back.
+/// `force_f32` overrides the target dtype (used for scale tensors). A failed
+/// device-side cast retries via CPU.
+///
+/// ## Errors
+/// Propagates load, cast, or device-transfer failures.
 fn load_tensor_with_dtype(
     mmap: &MmapedSafetensors,
     name: &str,
@@ -60,8 +86,6 @@ fn load_tensor_with_dtype(
     }
 
     if t.dtype() == DType::F8E4M3 {
-        // Metal has no F8E4M3 compute kernels, so Fp8Linear's on-the-fly dequant
-        // is unavailable there; dequantize at load on CPU and move to device.
         let use_cpu_path = matches!(device, Device::Metal(_));
 
         if preserve_fp8_weight && !use_cpu_path {
@@ -152,6 +176,16 @@ pub(crate) fn apply_scale_inv(weight: &Tensor, scale_inv: &Tensor) -> candle_cor
         .mul(weight)
 }
 
+/// Folds every `*.weight_scale_inv` factor into its `*.weight` in place,
+/// dequantizing block-wise FP8 weights that were not kept packed.
+///
+/// The multiply is done in F32 even for BF16 weights: BF16's 7-bit mantissa
+/// accumulates perceptible error across the dozens of layers of block-wise
+/// rescaling (coherent vs gibberish output). FP8-typed weights are skipped; they
+/// dequantize later on their own path.
+///
+/// ## Errors
+/// Propagates promotion, scale-application, or cast failures.
 fn apply_weight_scale_inv(tensors: &mut FxHashMap<String, Tensor>) -> Result<()> {
     let weight_names: Vec<String> = tensors
         .keys()
@@ -172,8 +206,6 @@ fn apply_weight_scale_inv(tensors: &mut FxHashMap<String, Tensor>) -> Result<()>
             continue;
         }
 
-        // Multiply in F32: BF16's 7-bit mantissa accumulates perceptible error
-        // across 36+ layers of block-wise rescaling (gibberish vs coherent).
         let weight_dtype = weight.dtype();
         let weight_f32 = weight.to_dtype(DType::F32).with_context(|| {
             format!("Failed to promote '{weight_name}' to F32 for scale_inv multiply")
@@ -201,6 +233,17 @@ fn apply_weight_scale_inv(tensors: &mut FxHashMap<String, Tensor>) -> Result<()>
 }
 
 impl ModelWeights {
+    /// Loads and memory-maps the safetensors files at `paths`, casting tensors to
+    /// `dtype` on `device`.
+    ///
+    /// Vision-tower (`model.visual.*`) and multi-token-prediction (`mtp.*`)
+    /// tensors are skipped (text-only runtime), saving the gigabytes they would
+    /// cost on Qwen3.5-class checkpoints. After loading, every
+    /// `*.weight_scale_inv` factor is folded into its weight.
+    ///
+    /// ## Errors
+    /// Fails if the files cannot be mapped, or any tensor cannot be loaded, cast,
+    /// or scaled.
     pub fn load(paths: &[&str], device: &Device, dtype: DType) -> Result<Self> {
         // SAFETY: the server owns models_dir exclusively; no external process
         // will truncate or replace these files while the mmap is live.
@@ -208,9 +251,6 @@ impl ModelWeights {
             MmapedSafetensors::multi(paths).context("Failed to memory-map weight files")?
         };
 
-        // Text-only runtime: the vision tower and MTP (multi-token prediction)
-        // head of Qwen3.5-class checkpoints are never read — don't spend ~2 GB
-        // materializing them.
         let names: Vec<String> = mmap
             .tensors()
             .into_iter()
@@ -255,22 +295,29 @@ impl ModelWeights {
         })
     }
 
+    /// Attaches (or clears) the packed-int [`QuantScheme`] and returns `self`.
     pub fn with_quant_scheme(mut self, scheme: Option<QuantScheme>) -> Self {
         self.quant_scheme = scheme;
         self
     }
 
+    /// The attached [`QuantScheme`], if any.
     #[cfg(feature = "metal")]
     pub fn quant_scheme(&self) -> Option<QuantScheme> {
         self.quant_scheme
     }
 
+    /// Resolves a canonical tensor name, trying multimodal aliases when the
+    /// direct lookup misses.
+    ///
+    /// Multimodal checkpoints nest the text model under `model.language_model.*`
+    /// (and similar) and place `lm_head` outside `model.`; this maps the
+    /// canonical names the loaders use onto those layouts.
     fn resolve_name<'a>(&'a self, name: &str) -> Option<&'a Tensor> {
         if let Some(t) = self.tensors.get(name) {
             return Some(t);
         }
 
-        // Multimodal checkpoints nest the text model under `model.language_model.*`.
         if let Some(rest) = name.strip_prefix("model.") {
             for alias in [
                 format!("model.language_model.{rest}"),
@@ -316,19 +363,27 @@ impl ModelWeights {
         None
     }
 
+    /// Returns the tensor for canonical `name` (with multimodal alias fallback).
+    ///
+    /// ## Errors
+    /// Fails if no tensor resolves to that name.
     pub fn get(&self, name: &str) -> candle_core::Result<&Tensor> {
         self.resolve_name(name)
             .ok_or_else(|| candle_core::Error::Msg(format!("Tensor not found: {}", name)))
     }
 
+    /// Returns the tensor for canonical `name`, or `None` if absent.
     pub fn try_get(&self, name: &str) -> Option<&Tensor> {
         self.resolve_name(name)
     }
 
+    /// Returns the `{weight_name}_scale_inv` companion tensor, if present.
     pub fn try_get_scale_inv(&self, weight_name: &str) -> Option<&Tensor> {
         self.try_get(&format!("{}_scale_inv", weight_name))
     }
 
+    /// Assembles the AWQ packed tensors at `prefix` (`qweight` + `qzeros` +
+    /// `scales`), or `None` if any is missing.
     pub fn try_get_awq(&self, prefix: &str, bits: u32) -> Option<AwqRawTensors> {
         let qweight = self.try_get(&format!("{prefix}.qweight"))?.clone();
         let qzeros = self.try_get(&format!("{prefix}.qzeros"))?.clone();
@@ -336,6 +391,8 @@ impl ModelWeights {
         Some(QuantWeight::new_awq(bits, qweight, qzeros, scales))
     }
 
+    /// Assembles a GPTQ [`QuantWeight`] at `prefix` (`qweight` + `scales`, with
+    /// optional `qzeros`), or `None` if a required tensor is missing.
     pub fn try_get_gptq(&self, prefix: &str, bits: u32, sym: bool) -> Option<QuantWeight> {
         let qweight = self.try_get(&format!("{prefix}.qweight"))?.clone();
         let scales = self.try_get(&format!("{prefix}.scales"))?.clone();
@@ -343,6 +400,9 @@ impl ModelWeights {
         Some(QuantWeight::new_gptq(bits, sym, qweight, qzeros, scales))
     }
 
+    /// Assembles a [`QuantWeight`] from compressed-tensors `weight_packed` +
+    /// `weight_scale` at `prefix`, converting to the AWQ layout. Returns `None`
+    /// if the tensors are missing or the conversion fails (logged).
     pub fn try_get_compressed(&self, prefix: &str) -> Option<QuantWeight> {
         let packed = self.try_get(&format!("{prefix}.weight_packed"))?;
         let scale = self.try_get(&format!("{prefix}.weight_scale"))?;
@@ -355,6 +415,9 @@ impl ModelWeights {
         }
     }
 
+    /// Assembles the packed [`QuantWeight`] at `prefix` using the attached
+    /// [`QuantScheme`] (AWQ / GPTQ / compressed-tensors). Returns `None` when no
+    /// scheme is set or a tensor is missing.
     pub fn try_get_quant(&self, prefix: &str) -> Option<QuantWeight> {
         match self.quant_scheme {
             Some(QuantScheme::Awq { bits }) => self.try_get_awq(prefix, bits),
@@ -364,6 +427,7 @@ impl ModelWeights {
         }
     }
 
+    /// Whether any tensor is packed-quantized (`*.qweight` or `*.weight_packed`).
     #[cfg(feature = "metal")]
     pub fn has_packed_quantized_weights(&self) -> bool {
         self.tensors
@@ -371,6 +435,8 @@ impl ModelWeights {
             .any(|k| k.ends_with(".qweight") || k.ends_with(".weight_packed"))
     }
 
+    /// Total resident size of all tensors in bytes (packed tensors counted at
+    /// their on-device size, not the dequantized size).
     pub fn runtime_size_bytes(&self) -> usize {
         self.tensors
             .values()

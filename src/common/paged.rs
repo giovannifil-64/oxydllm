@@ -588,7 +588,7 @@ fn contig_buf_capacity(total_needed: usize) -> usize {
     cap.max(64)
 }
 
-/// Deferred block-pool write — avoids GPU→CPU sync during the forward pass.
+/// Deferred block-pool write that avoids GPU-to-CPU sync during the forward pass.
 struct PendingWrite {
     block_id: usize,
     offset: usize,
@@ -613,9 +613,16 @@ pub struct RecurrentState {
     pub s: Tensor,
 }
 
+/// Per-sequence, per-layer KV cache backed by a shared paged block pool.
+///
+/// Keys and values live in fixed-size blocks allocated on demand from the shared
+/// [`SharedBlockAllocator`], optionally KV-quantized (`quantizer`, cached at
+/// construction so the hot path never relocks the allocator). Writes are staged
+/// in `pending_writes` and flushed before reads. On the linear-attention layers
+/// of hybrid models the layer instead keeps a [`RecurrentState`] in `recurrent`
+/// and never touches the paged pool.
 pub struct PagedKvCache {
     allocator: SharedBlockAllocator,
-    // Cached at construction so the hot path never relocks the allocator.
     quantizer: Option<Arc<KvQuantizer>>,
     table: BlockTable,
     block_size: usize,
@@ -627,8 +634,6 @@ pub struct PagedKvCache {
     contig_v: Option<Tensor>,
     contig_len: usize,
     pending_writes: Vec<PendingWrite>,
-    /// `Some` only on linear-attention layers of hybrid models; such layers
-    /// never touch the paged pool.
     recurrent: Option<RecurrentState>,
 }
 
@@ -822,7 +827,7 @@ impl PagedKvCache {
             return Ok(());
         }
 
-        // Batch all pending K/V chunks into one GPU→CPU transfer each.
+        // Batch all pending K/V chunks into one GPU-to-CPU transfer each.
         let pending_writes = std::mem::take(&mut self.pending_writes);
 
         let token_counts: Vec<usize> = pending_writes

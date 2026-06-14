@@ -1,4 +1,4 @@
-// TensorOps (Metal Performance Primitives) GEMM — prefill fast path using the
+// TensorOps (Metal Performance Primitives) GEMM, prefill fast path using the
 // M5 neural accelerator. Requires Metal 4 (macOS 26+); compiled at runtime
 // with MTLLanguageVersion 4.0 and gated behind a compile-once availability
 // check (older OS / non-M5 falls back to the candle GEMM).
@@ -12,7 +12,7 @@
 //   B [N, K]  -> transpose_right descriptor                  (nt kernel)
 //   D [M, N]  -> tensor extents {N, M},  strides {1, ldd}
 //
-// NB: no `const` on a/b — the TensorOps dispatch matches value types without
+// NB: no `const` on a/b, the TensorOps dispatch matches value types without
 // stripping cv-qualifiers, so `const bfloat` falls through to a static_assert.
 
 #include <metal_stdlib>

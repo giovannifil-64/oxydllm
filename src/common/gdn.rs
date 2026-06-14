@@ -1,11 +1,11 @@
 // ─────────────────────────────────────────────────────────────────────────────
-// gdn.rs — Gated DeltaNet linear attention (Qwen3.5 / Qwen3-Next family)
+// gdn.rs, Gated DeltaNet linear attention (Qwen3.5 / Qwen3-Next family)
 //
 // Math follows transformers/models/qwen3_5/modeling_qwen3_5.py:
 //   • causal depthwise conv1d (no bias) + SiLU over the packed q|k|v stream
 //   • q,k L2-normalized (eps on the *sum* of squares), q scaled by dk^-0.5
 //   • β = σ(b·x);  g = -exp(A_log)·softplus(a·x + dt_bias)   (all F32)
-//   • recurrence  S_t = S_{t-1}·exp(g_t) + k_t ⊗ ((v_t − S_{t-1}ᵀk_t)·β_t)
+//   • recurrence  S_t = S_{t-1}·exp(g_t) + k_t ⊗ ((v_t - S_{t-1}ᵀk_t)·β_t)
 //     with output o_t = S_tᵀ q_t
 //   • gated RMSNorm (norm before gate, plain weight): rms(o)·w·silu(z)
 //
@@ -13,7 +13,7 @@
 // per-chunk unit-lower-triangular system with a sequential row loop; that is
 // O(C) kernel launches per chunk and unusable on Metal, so we use a blocked
 // inversion (see `invert_unit_lower`): doubling product on 16×16 diagonal
-// blocks + pairwise block combination — O(log C) batched matmuls with bounded
+// blocks + pairwise block combination, O(log C) batched matmuls with bounded
 // intermediates. Decode uses the O(1) recurrent step. Per-sequence state
 // (conv window + S) lives in PagedKvCache::recurrent_mut().
 // ─────────────────────────────────────────────────────────────────────────────
@@ -28,12 +28,12 @@ use candle_core::{D, DType, Result, Tensor};
 /// Prefill chunk size (matches the transformers reference). Override with
 /// `OXYDLLM_GDN_CHUNK` for experiments.
 const CHUNK_SIZE: usize = 64;
-/// Base size for the blocked triangular inversion — see `invert_unit_lower`.
+/// Base size for the blocked triangular inversion, see `invert_unit_lower`.
 const INVERT_BLOCK: usize = 16;
 const L2_NORM_EPS: f64 = 1e-6;
 
 /// Debug probe (env `OXYDLLM_GDN_DEBUG=1`): logs NaN/Inf count and max |x|
-/// per stage. Syncs the device — debugging only.
+/// per stage. Syncs the device, debugging only.
 fn debug_probe(label: &str, t: &Tensor) {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
@@ -78,36 +78,48 @@ enum BaProjection {
     Separate { b: AnyLinear, a: AnyLinear },
 }
 
+/// Gated DeltaNet: the linear-attention token mixer of hybrid models (Qwen3.5).
+///
+/// Replaces softmax attention on the linear layers with a gated delta-rule
+/// recurrence: a short causal depthwise convolution over the q/k/v projections,
+/// then a per-head state update gated by a learned decay. The state is a
+/// fixed-size matrix carried across decode steps (in the paged cache) instead of
+/// a growing KV cache. The head geometry comes from
+/// [`super::config::LinearAttnConfig`].
+///
+/// Besides the projections (`in_proj_*`, `out_proj`), the parameters are:
+/// `conv_w`, the depthwise conv weight (`[kernel, conv_dim]`); `neg_exp_a_log`
+/// and `dt_bias`, the decay `-exp(A_log)` and timestep bias of the recurrence
+/// (both F32 `[num_v_heads]`, kept in F32 because the recurrence is
+/// precision-sensitive); and `norm_w`, the gated RMSNorm weight (F32
+/// `[head_v_dim]`).
+///
+/// `v_heads_tiled` records the checkpoint's V-head ordering. HuggingFace groups
+/// V heads by K head (the k-head of v-head `h` is `h / r`, so q/k expand by
+/// `repeat_interleave`), while the llama.cpp GGUF converter reorders them to
+/// tiled order (k-head `h % nk`, so q/k expand by whole-block tiling). Both are
+/// consistent permutations of the same computation.
 pub struct GatedDeltaNet {
     in_proj_qkv: AnyLinear,
     in_proj_z: AnyLinear,
     in_proj_ba: BaProjection,
     out_proj: AnyLinear,
-    /// Depthwise conv weight, stored [kernel, conv_dim] in model dtype.
     conv_w: Tensor,
-    /// −exp(A_log), F32 [num_v_heads].
     neg_exp_a_log: Tensor,
-    /// F32 [num_v_heads].
     dt_bias: Tensor,
-    /// Gated-norm weight, F32 [head_v_dim].
     norm_w: Tensor,
     cfg: LinearAttnConfig,
     rms_norm_eps: f64,
-    /// V-head layout of the checkpoint. HF stores V heads grouped by K head
-    /// (k-head of v-head h = h / r ⇒ q/k expand by repeat_interleave); the
-    /// llama.cpp GGUF converter reorders them to tiled order (k-head = h % nk
-    /// ⇒ q/k expand by whole-block tiling). Both are consistent permutations
-    /// of the same computation.
     v_heads_tiled: bool,
 }
 
-/// Numerically stable ln(1+eˣ) = relu(x) + ln(1 + e^(−|x|)).
+/// Numerically stable ln(1+eˣ) = relu(x) + ln(1 + e^(-|x|)).
 fn softplus(x: &Tensor) -> Result<Tensor> {
     let ln1p = ((x.abs()?.neg()?.exp()? + 1.0)?).log()?;
     x.relu()? + ln1p
 }
 
-/// x · rsqrt(Σx² + eps) over the last dim — FLA's l2norm (eps inside the sum).
+/// x · rsqrt(Σx² + eps) over the last dim, FLA's l2norm (eps inside the sum).
 fn l2norm(x: &Tensor) -> Result<Tensor> {
     let sq = x.sqr()?.sum_keepdim(D::Minus1)?;
     x.broadcast_div(&(sq + L2_NORM_EPS)?.sqrt()?)
@@ -133,8 +145,8 @@ fn tril_mask(n: usize, strict: bool, device: &candle_core::Device) -> Result<Ten
     Tensor::from_vec(v, (1, n, n), device)
 }
 
-/// (I − A)⁻¹ for strictly-lower-triangular A [b, n, n] via the doubling
-/// product ∏ (I + A^(2^j)) — exact because A is nilpotent (Aⁿ = 0).
+/// (I - A)⁻¹ for strictly-lower-triangular A [b, n, n] via the doubling
+/// product ∏ (I + A^(2^j)), exact because A is nilpotent (Aⁿ = 0).
 ///
 /// Only safe for small n: the explicit powers A^(2^j) grow combinatorially
 /// (path counts) even when the true inverse is small, and the result relies
@@ -154,12 +166,12 @@ fn invert_unit_lower_base(a: &Tensor, n: usize) -> Result<Tensor> {
     Ok(inv)
 }
 
-/// Stable (I − A)⁻¹ for strictly-lower-triangular A [b, n, n]: invert the
+/// Stable (I - A)⁻¹ for strictly-lower-triangular A [b, n, n]: invert the
 /// 16×16 diagonal blocks with the doubling product, then combine pairs
 /// level by level with the block identity
 ///   [[N₁₁, 0], [N₂₁, N₂₂]]⁻¹ = [[M₁₁, 0], [M₂₂·A₂₁·M₁₁, M₂₂]]
-/// (N = I − A, M = N⁻¹). Every intermediate is a product of true-inverse
-/// blocks and A sub-blocks — all bounded — unlike the explicit large powers
+/// (N = I - A, M = N⁻¹). Every intermediate is a product of true-inverse
+/// blocks and A sub-blocks, all bounded, unlike the explicit large powers
 /// of the plain doubling form. This mirrors the delta-rule's own stability
 /// (β < 1 keeps N well conditioned), matching the torch reference's
 /// sequential forward substitution at ~log₂(n) batched-matmul cost.
@@ -169,7 +181,7 @@ fn invert_unit_lower(a: &Tensor, n: usize) -> Result<Tensor> {
         return invert_unit_lower_base(a, n);
     }
 
-    // Diagonal blocks → (b·nb, B, B), inverted batched.
+    // Diagonal blocks, shaped (b·nb, B, B), inverted batched.
     let nb = n / INVERT_BLOCK;
     let mut diag = Vec::with_capacity(nb);
     for i in 0..nb {
@@ -219,8 +231,8 @@ fn invert_unit_lower(a: &Tensor, n: usize) -> Result<Tensor> {
     m.reshape((b, n, n))
 }
 
-/// Inclusive prefix sum over the last dim of [b, n] via mask matmul
-/// (out[i] = Σ_{j≤i} x[j]).
+/// Inclusive prefix sum over the last dim of `[b, n]` via mask matmul
+/// (`out[i]` = Σ_{j≤i} `x[j]`).
 fn cumsum_last(x: &Tensor, n: usize) -> Result<Tensor> {
     let mut v = vec![0f32; n * n];
     for j in 0..n {
@@ -302,7 +314,7 @@ fn chunk_gated_delta_rule(
     let tril = tril_mask(c, false, &device)?;
     let strict = tril_mask(c, true, &device)?;
 
-    // decay[i][j] = exp(g_i − g_j) on the lower triangle (incl. diagonal).
+    // decay[i][j] = exp(g_i - g_j) on the lower triangle (incl. diagonal).
     let decay = g_c
         .unsqueeze(D::Minus1)?
         .broadcast_sub(&g_c.unsqueeze(D::Minus2)?)?
@@ -543,7 +555,7 @@ impl GatedDeltaNet {
             t.to_dtype(DType::F32)
         };
         // llama.cpp's converter bakes the transform: GGUF `ssm_a` already
-        // holds −exp(A_log) — use it verbatim.
+        // holds -exp(A_log), use it verbatim.
         let neg_exp_a_log = f32_vec("ssm_a", la.num_v_heads)?;
         let dt_bias = f32_vec("ssm_dt.bias", la.num_v_heads)?;
         let norm_w = f32_vec("ssm_norm.weight", la.head_v_dim)?;
@@ -564,7 +576,7 @@ impl GatedDeltaNet {
     }
 
     /// Causal depthwise conv + SiLU on the packed stream [1, t, conv_dim].
-    /// Returns (activated stream, new conv window [1, k−1, conv_dim]).
+    /// Returns (activated stream, new conv window [1, k-1, conv_dim]).
     fn conv_forward(&self, qkv: &Tensor, prev_window: Option<&Tensor>) -> Result<(Tensor, Tensor)> {
         let (_, t, conv_dim) = qkv.dims3()?;
         let k = self.cfg.conv_kernel;
@@ -580,9 +592,9 @@ impl GatedDeltaNet {
             return Ok((silu(&out)?, new_window));
         }
 
-        // Fresh prefill: left-pad k−1 zeros, sum k shifted broadcast products.
+        // Fresh prefill: left-pad k-1 zeros, sum k shifted broadcast products.
         let zeros = Tensor::zeros((1, k - 1, conv_dim), qkv.dtype(), qkv.device())?;
-        let padded = Tensor::cat(&[&zeros, qkv], 1)?; // [1, t+k−1, c]
+        let padded = Tensor::cat(&[&zeros, qkv], 1)?; // [1, t+k-1, c]
         let mut acc: Option<Tensor> = None;
         for j in 0..k {
             let term = padded
@@ -801,7 +813,7 @@ mod tests {
             .collect()
     }
 
-    /// [B=1, T, H, D] (torch layout) → [H, T, D].
+    /// [B=1, T, H, D] (torch layout) to [H, T, D].
     fn to_htd(data: Vec<f32>, t: usize, h: usize, d: usize) -> Tensor {
         Tensor::from_vec(data, (1, t, h, d), &Device::Cpu)
             .unwrap()
@@ -813,7 +825,7 @@ mod tests {
             .unwrap()
     }
 
-    /// [B=1, T, H] → [H, T].
+    /// [B=1, T, H] to [H, T].
     fn to_ht(data: Vec<f32>, t: usize, h: usize) -> Tensor {
         Tensor::from_vec(data, (1, t, h), &Device::Cpu)
             .unwrap()
@@ -855,7 +867,7 @@ mod tests {
         let g = to_ht(vecf(&f["g"]), t, h);
         let beta = to_ht(vecf(&f["beta"]), t, h);
 
-        // chunk_size 4 exercises multiple chunks + padding (t=10 → 3 chunks).
+        // chunk_size 4 exercises multiple chunks + padding (t=10 to 3 chunks).
         let (out, state) = chunk_gated_delta_rule(&q, &k, &v, &g, &beta, None, 4).unwrap();
         let out_bthd = out.transpose(0, 1).unwrap().contiguous().unwrap(); // [T,H,DV]
         assert_close(&out_bthd, &vecf(&f["out"]), 1e-4, "chunk out");
@@ -870,7 +882,7 @@ mod tests {
 
     /// Contract: the recurrent decode step matches the reference both
     /// token-by-token over a fresh sequence and as a continuation from a
-    /// chunked-prefill state (the prefill→decode handoff).
+    /// chunked-prefill state (the prefill-to-decode handoff).
     #[test]
     fn recurrent_step_matches_reference_and_chunked_prefill() {
         let fx: Value = serde_json::from_str(FIXTURES).unwrap();
@@ -990,8 +1002,8 @@ mod tests {
         (GatedDeltaNet::load(&cfg, 0, &weights).unwrap(), hidden, t)
     }
 
-    /// Contract: the full layer (projections → causal conv → delta rule →
-    /// gated norm → out_proj) matches the transformers reference on a fresh
+    /// Contract: the full layer (projections, causal conv, delta rule, gated
+    /// norm, out_proj) matches the transformers reference on a fresh
     /// prefill AND on the subsequent cached decode step, including the conv
     /// window handoff between the two.
     #[test]
@@ -1031,7 +1043,7 @@ mod tests {
         let (h, t, dk, dv) = (2usize, 128usize, 16usize, 16usize);
 
         // Identical key vector at every position (the worst case), strong β,
-        // weak decay — mirrors a long run of one repeated token.
+        // weak decay, mirrors a long run of one repeated token.
         let k_one: Vec<f32> = (0..dk).map(|i| (i as f32 * 0.37).sin() + 0.1).collect();
         let k_data: Vec<f32> = (0..h * t).flat_map(|_| k_one.clone()).collect();
         let k = Tensor::from_vec(k_data, (h, t, dk), &dev).unwrap();

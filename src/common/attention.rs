@@ -27,8 +27,8 @@ fn log_sdpa_fallback_once(head_dim: usize, dtype: candle_core::DType) {
     });
 }
 
-/// Below this the materialised QKᵀ fits in cache and the fallback (matmul →
-/// softmax → matmul) beats FA's IO-aware tiling.
+/// Below this the materialised QKᵀ fits in cache and the fallback (matmul, then
+/// softmax, then matmul) beats FA's IO-aware tiling.
 #[cfg(feature = "metal")]
 const METAL_FA_MIN_KV: usize = 1024;
 
@@ -47,25 +47,36 @@ enum QkvProjection {
     },
 }
 
-/// Auto-detected from weight element count. `PerHead` ([head_dim], applied to
-/// [B,H,T,head_dim]) is Qwen3/Gemma3; `Flat` ([hidden] or [n_kv*head_dim],
-/// applied to [B,T,*_dim] **before reshape**) is OLMoE.
+/// Auto-detected from weight element count. `PerHead` (`[head_dim]`, applied to
+/// `[B,H,T,head_dim]`) is Qwen3/Gemma3; `Flat` (`[hidden]` or `[n_kv*head_dim]`,
+/// applied to `[B,T,*_dim]` **before reshape**) is OLMoE.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum QkNormLayout {
     PerHead,
     Flat,
 }
 
+/// Multi-head softmax attention for one layer.
+///
+/// Supports grouped-query attention (`n_kv_heads < n_heads`), optional query/key
+/// RMSNorm (`q_norm` / `k_norm`, with the [`QkNormLayout`] auto-detected from the
+/// weight shape), value RMSNorm, attention-logit soft-capping, and a sliding
+/// window. On Metal the hot path uses fused SDPA / FlashAttention.
+///
+/// Three optional features are model-specific. `sinks` are GPT-OSS attention
+/// sinks: a per-head learned logit folded into the softmax denominator (stored
+/// `[1, n_heads, 1, 1]`); decode uses a dedicated sink-aware SDPA kernel while
+/// prefill falls back, since FlashAttention / stock SDPA cannot inject the extra
+/// softmax column. `output_gate` is Qwen3.5 gated attention: q_proj emits
+/// per-head `[query | gate]` and the sigmoid gate scales the output before
+/// `o_proj`. `rotary_dim` enables partial RoPE (only the first `rotary_dim` dims
+/// of each head rotate). `out_buf` is a reused output scratch buffer.
 pub struct Attention {
     qkv: QkvProjection,
     o_proj: AnyLinear,
     q_norm: Option<RMSNorm>,
     k_norm: Option<RMSNorm>,
     qk_norm_layout: QkNormLayout,
-    /// GPT-OSS attention sinks: per-head learned logit folded into the softmax
-    /// denominator (stored [1, n_heads, 1, 1]). Decode uses the dedicated
-    /// sink-aware SDPA kernel; prefill takes the fallback path (FA/stock SDPA
-    /// can't inject the extra softmax column).
     sinks: Option<Tensor>,
     n_heads: usize,
     n_kv_heads: usize,
@@ -77,10 +88,7 @@ pub struct Attention {
     sliding_window: Option<usize>,
     v_norm: bool,
     rms_norm_eps: f64,
-    /// Qwen3.5 gated attention: q_proj emits per-head [query | gate]; the
-    /// sigmoid gate multiplies the attention output before o_proj.
     output_gate: bool,
-    /// Partial RoPE: only the first `rotary_dim` dims of each head rotate.
     rotary_dim: Option<usize>,
     out_buf: std::cell::RefCell<Option<Tensor>>,
 }
@@ -140,7 +148,6 @@ impl Attention {
             .transpose()?;
         let p = format!("model.layers.{}.self_attn", layer_idx);
         let hd = cfg.head_dim;
-        // Gated attention doubles the q projection: per-head [query | gate].
         let q_dim = cfg.n_heads * hd * if cfg.attn_output_gate { 2 } else { 1 };
         let kv_dim = cfg.n_kv_heads * hd;
         let q_prefix = format!("{}.q_proj", p);
@@ -297,9 +304,6 @@ impl Attention {
         layer_idx: usize,
     ) -> Result<Self> {
         let hd = cfg.head_dim;
-        // Gated attention doubles the q projection (per-head [query | gate]);
-        // the split happens on the projected activations, so the packed-quant
-        // matmul itself is unaffected.
         let q_dim = cfg.n_heads * hd * if cfg.attn_output_gate { 2 } else { 1 };
         let kv_dim = cfg.n_kv_heads * hd;
 
@@ -351,7 +355,6 @@ impl Attention {
             (Some(_), Some(_), Some(_)) | (None, None, None)
         );
         let dims_fusable = q_dim.is_multiple_of(8) && kv_dim.is_multiple_of(8);
-        // GPTQ packs along in_features → out-dim concat doesn't apply, use Separate.
         let is_awq = q_raw.pack_dim == PackDim::Out;
         let qkv_fused = bias_fusable && dims_fusable && is_awq;
         let group_size = q_raw
@@ -450,7 +453,7 @@ impl Attention {
         let qkv = if let Some(qkv_qt) = gguf.try_get(&format!("{prefix}.attn_qkv.weight")) {
             // Known gated GGUF archs (qwen35) ship separate q/k/v on full
             // layers; a fused-qkv gated checkpoint would need its own q split
-            // and would mis-validate below — fail loudly instead.
+            // and would mis-validate below, fail loudly instead.
             if cfg.attn_output_gate {
                 candle_core::bail!(
                     "gated attention with fused GGUF attn_qkv is not supported at {prefix}"
@@ -529,7 +532,6 @@ impl Attention {
             None
         };
 
-        // Gated attention (qwen35): q projection is per-head [query | gate].
         let q_dim = cfg.n_heads * hd * if cfg.attn_output_gate { 2 } else { 1 };
         let kv_dim = cfg.n_kv_heads * hd;
 
@@ -639,8 +641,6 @@ impl Attention {
             QkNormLayout::PerHead => (q_raw, k_raw),
         };
 
-        // Gated attention: q projection is per-head [query(hd) | gate(hd)];
-        // the gate multiplies (sigmoid) the attention output before o_proj.
         let (q_raw, out_gate) = if self.output_gate {
             let q_full = q_raw.reshape((b, total_seq, self.n_heads, 2 * hd))?;
             let q = q_full.narrow(D::Minus1, 0, hd)?.contiguous()?;
@@ -748,7 +748,7 @@ impl Attention {
         };
         let mut q_offset = 0usize;
 
-        // Routing priority: Metal FA (prefill) → Metal SDPA vector (decode) → fallback.
+        // Routing priority: Metal FA (prefill), then Metal SDPA vector (decode), then fallback.
         // SDPA "full" mode (q_seq > 1) corrupts outputs past ~16 tokens, so it
         // stays disabled for prefill regardless of FA availability.
         #[cfg(feature = "metal")]
@@ -809,8 +809,6 @@ impl Attention {
             #[cfg(not(feature = "metal"))]
             let use_sink_sdpa = false;
 
-            // Tensor::contiguous() short-circuits to a cheap clone when the
-            // tensor is already contiguous, so no borrow-or-own dance is needed.
             if use_metal_fa {
                 #[cfg(feature = "metal")]
                 {
@@ -828,7 +826,6 @@ impl Attention {
             } else if use_seg_sdpa {
                 #[cfg(feature = "metal")]
                 {
-                    // SDPA handles GQA natively.
                     let seg_out = super::metal_ops::sdpa(
                         &q_seg.contiguous()?,
                         &k_seg.contiguous()?,

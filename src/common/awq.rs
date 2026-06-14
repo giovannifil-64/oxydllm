@@ -141,16 +141,16 @@ impl QuantWeight {
             qweight: self
                 .qweight
                 .to_device(device)
-                .context("quant qweight → device")?,
+                .context("quant qweight to device")?,
             qzeros: self
                 .qzeros
                 .as_ref()
-                .map(|t| t.to_device(device).context("quant qzeros → device"))
+                .map(|t| t.to_device(device).context("quant qzeros to device"))
                 .transpose()?,
             scales: self
                 .scales
                 .to_device(device)
-                .context("quant scales → device")?,
+                .context("quant scales to device")?,
         })
     }
 }
@@ -158,7 +158,7 @@ impl QuantWeight {
 fn read_packed_to_u32(t: &Tensor) -> Result<Vec<u32>> {
     let cpu = t
         .to_device(&Device::Cpu)
-        .context("AWQ packed tensor → CPU")?;
+        .context("AWQ packed tensor to CPU")?;
     let flat = cpu.flatten_all().context("flatten AWQ packed tensor")?;
     match flat.dtype() {
         DType::I32 => {
@@ -182,7 +182,7 @@ fn read_packed_to_u32(t: &Tensor) -> Result<Vec<u32>> {
 /// (llm-compressor output: `weight_packed` [out, in/8] i32 with sequential
 /// LSB-first nibbles already offset-binary q+8, `weight_scale` [out, in/g])
 /// into the canonical AWQ layout so the resident W4A16 Metal kernel and all
-/// downstream paths apply unchanged. Symmetric ⇒ qzeros are constant 8
+/// downstream paths apply unchanged. Symmetric means qzeros are constant 8
 /// (0x88888888 words); nibble values transfer verbatim.
 pub fn compressed_to_awq(weight_packed: &Tensor, weight_scale: &Tensor) -> Result<QuantWeight> {
     let (out_f, packed_in) = weight_packed
@@ -241,7 +241,7 @@ pub fn compressed_to_awq(weight_packed: &Tensor, weight_scale: &Tensor) -> Resul
         }
     }
 
-    // Materialise on the checkpoint's device — downstream loaders derive the
+    // Materialise on the checkpoint's device, downstream loaders derive the
     // compute device from these tensors.
     let device = weight_packed.device();
     let qweight = Tensor::from_vec(qweight, (in_f, packed_out), &Device::Cpu)?.to_device(device)?;
@@ -303,7 +303,7 @@ pub fn concat_awq_along_out(parts: &[AwqRawTensors]) -> Result<AwqRawTensors> {
         .iter()
         .map(|p| match &p.qzeros {
             Some(t) => to_cpu(t, "qzeros"),
-            None => anyhow::bail!("AWQ fuse: qzeros missing on a part — not an AWQ tensor"),
+            None => anyhow::bail!("AWQ fuse: qzeros missing on a part, not an AWQ tensor"),
         })
         .collect::<Result<_>>()?;
     let scales_cpu: Vec<Tensor> = parts
@@ -436,7 +436,7 @@ pub fn dequantize_awq(raw: &AwqRawTensors, device: &Device, out_dtype: DType) ->
 
     weight_cpu
         .to_device(device)
-        .context("AWQ dequantized weight → device")
+        .context("AWQ dequantized weight to device")
 }
 
 pub fn dequantize_gptq(raw: &QuantWeight, device: &Device, out_dtype: DType) -> Result<Tensor> {
@@ -541,7 +541,7 @@ pub fn dequantize_gptq(raw: &QuantWeight, device: &Device, out_dtype: DType) -> 
 
     weight_cpu
         .to_device(device)
-        .context("GPTQ dequantized weight → device")
+        .context("GPTQ dequantized weight to device")
 }
 
 struct GptqDequantPlan<'a> {
@@ -655,7 +655,7 @@ pub fn rtn_quantize_awq(weight: &Tensor, group_size: usize) -> Result<AwqRawTens
 
     let w: Vec<f32> = weight
         .to_device(&Device::Cpu)
-        .context("rtn_quantize_awq: weight → CPU")?
+        .context("rtn_quantize_awq: weight to CPU")?
         .to_dtype(DType::F32)
         .context("rtn_quantize_awq: cast weight to F32")?
         .flatten_all()?
@@ -829,17 +829,17 @@ mod tests {
         let rel = (sq_err / sq).sqrt();
         assert!(
             rel < 0.05,
-            "RTN 4-bit relative error {rel} — packing likely wrong"
+            "RTN 4-bit relative error {rel}; packing likely wrong"
         );
         Ok(())
     }
 
     #[test]
-    #[ignore = "A quality measurement — needs the Qwen3-4B-AWQ model on disk"]
+    #[ignore = "A quality measurement; needs the Qwen3-4B-AWQ model on disk"]
     fn rtn_lm_head_quality_measurement() {
         let dir = std::path::Path::new("/Users/giovanni/.oxydllm/models/Qwen/Qwen3-4B-AWQ");
         if !dir.exists() {
-            eprintln!("[rtn-measure] model dir not found — skipping");
+            eprintln!("[rtn-measure] model dir not found, skipping");
             return;
         }
         let device = Device::Cpu;

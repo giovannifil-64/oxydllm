@@ -161,8 +161,13 @@ pub fn softmax_last_dim(x: &Tensor) -> Result<Tensor> {
     exp_x.broadcast_div(&sum)
 }
 
+/// A quantized linear layer over GGUF `QTensor` weights.
+///
+/// Holds either candle's `QMatMul` (`inner`) or, on Metal, the resident
+/// fast-path stream (`gguf_fast`). `inner` is `None` when `gguf_fast` owns the
+/// packed weights, so they are never held in memory twice. An optional `bias` is
+/// added and the output is produced in `out_dtype`.
 pub struct QLinear {
-    /// `None` when `gguf_fast` owns the packed weight stream (avoids 2× residency).
     inner: Option<QMatMul>,
     #[cfg(feature = "metal")]
     gguf_fast: Option<GgufFastPath>,
@@ -379,6 +384,12 @@ impl QLinear {
     }
 }
 
+/// A resident packed-int linear layer (AWQ / GPTQ) for Metal.
+///
+/// Runs the W4A16 / W8A16 fused kernels directly on the packed `qweight` +
+/// `qzeros` + `scales`, with bit width `bits` (4 or 8). `pack_dim` records the
+/// layout: AWQ packs along out-features (`PackDim::Out`), GPTQ along in-features
+/// (`PackDim::In`).
 #[cfg(feature = "metal")]
 pub struct PackedQuantLinear {
     qweight: Tensor,
@@ -387,9 +398,7 @@ pub struct PackedQuantLinear {
     bias: Option<Tensor>,
     in_features: usize,
     out_features: usize,
-    /// 4 or 8.
     bits: u32,
-    /// AWQ (`Out`) vs GPTQ (`In`) layout.
     pack_dim: PackDim,
 }
 
@@ -551,7 +560,7 @@ impl AnyLinear {
         if device.is_metal() && matches!(dtype, DType::F16 | DType::BF16) {
             let resident = raw
                 .to_device(device)
-                .map_err(|e| candle_core::Error::Msg(format!("AWQ → Metal failed: {e:#}")))?;
+                .map_err(|e| candle_core::Error::Msg(format!("AWQ to Metal failed: {e:#}")))?;
             return Ok(Self::PackedQuant(PackedQuantLinear::new(
                 resident, bias, dtype,
             )?));
@@ -570,7 +579,7 @@ impl AnyLinear {
         #[cfg(feature = "metal")]
         if device.is_metal() && matches!(dtype, DType::F16 | DType::BF16) {
             let resident = raw.to_device(device).map_err(|e| {
-                candle_core::Error::Msg(format!("packed-quant → Metal failed: {e:#}"))
+                candle_core::Error::Msg(format!("packed-quant to Metal failed: {e:#}"))
             })?;
             return Ok(Self::PackedQuant(PackedQuantLinear::new(
                 resident, bias, dtype,

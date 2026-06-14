@@ -1,9 +1,9 @@
 //! Mixture-of-Experts (MoE) feed-forward layer.
 //!
 //! Drops in as a sibling of [`super::ffn::FeedForward`] for architectures with
-//! sparse expert routing (Qwen3-MoE, OLMoE, Mixtral-style). The block-level
-//! integration is in [`super::ffn::FeedForwardLayer`] which the transformer
-//! block dispatches via the same `forward` signature.
+//! sparse expert routing (Qwen3-MoE, OLMoE, GPT-OSS). The transformer block
+//! ([`super::block::TransformerBlock`]) dispatches it through the same `forward`
+//! signature as the dense FFN.
 //!
 //! ## Routing
 //!
@@ -26,8 +26,8 @@
 //! * **Sparse** (`n_tokens > top_k`, prefill): group token indices per expert
 //!   on the CPU, then for each expert `index_select` its rows, run the FFN on
 //!   the subset, and `index_add` the weighted result back. Per-expert compute
-//!   drops from `n_tokens` to `~n_tokens × top_k / num_experts` — up to ~8×
-//!   on OLMoE-1B-7B (64 × top_k=8) for long prefill.
+//!   drops from `n_tokens` to `~n_tokens × top_k / num_experts` (up to ~8× on
+//!   OLMoE-1B-7B with 64 experts and top_k=8 for long prefill).
 //!
 //! Empirically on OLMoE-1B-7B (Metal, M5 base): the hybrid gives decode
 //! ≈ 10 tok/s and TTFT ≈ 7.3 s on a 256-word prompt. Pure-naive matches
@@ -50,17 +50,20 @@ use super::mxfp4::Mxfp4Linear;
 use super::weights::ModelWeights;
 use candle_core::{D, DType, Result, Tensor};
 
+/// A single MoE expert, in one of two formats.
+///
+/// `Standard` is an ordinary SwiGLU FFN with separate gate/up/down projections
+/// (Qwen3-MoE, OLMoE). `GptOss` is the GPT-OSS expert: MXFP4 weights with gate
+/// and up interleaved in one projection (even columns gate, odd up) and a
+/// clamped SwiGLU with alpha = 1.702 and a `+1` on the up branch, i.e.
+/// `glu = min(gate, limit) * sigmoid(1.702 * min(gate, limit))` then
+/// `out = down((clamp(up, ±limit) + 1) * glu)`.
 enum MoeExpert {
     Standard {
         gate_proj: AnyLinear,
         up_proj: AnyLinear,
         down_proj: AnyLinear,
     },
-    /// GPT-OSS expert: MXFP4 weights, gate/up INTERLEAVED in one projection
-    /// (even columns gate, odd columns up), clamped swiglu with alpha = 1.702
-    /// and a `+1` on the up branch:
-    ///   glu = min(gate, limit) * sigmoid(1.702 * min(gate, limit))
-    ///   out = down((clamp(up, ±limit) + 1) * glu)
     GptOss {
         gate_up: Mxfp4Linear,
         down: Mxfp4Linear,
@@ -71,6 +74,8 @@ enum MoeExpert {
 const GPT_OSS_SWIGLU_ALPHA: f64 = 1.702;
 
 impl MoeExpert {
+    /// Runs this expert on `x`: gated SwiGLU for `Standard`, the clamped
+    /// interleaved SwiGLU for `GptOss`.
     fn forward(&self, x: &Tensor, activation: Activation) -> Result<Tensor> {
         match self {
             Self::Standard {
@@ -113,6 +118,13 @@ impl MoeExpert {
     }
 }
 
+/// A sparse Mixture-of-Experts feed-forward layer.
+///
+/// A linear `router` scores the experts per token; the top `top_k` are run and
+/// their outputs combined (renormalised when `norm_topk`). See the module docs
+/// for the routing math and the naive/sparse dispatch. Load it with
+/// [`load`](Self::load) (standard experts) or
+/// [`load_gpt_oss`](Self::load_gpt_oss) (MXFP4 GPT-OSS experts).
 pub struct MoeFeedForward {
     router: AnyLinear,
     experts: Vec<MoeExpert>,
@@ -122,6 +134,15 @@ pub struct MoeFeedForward {
 }
 
 impl MoeFeedForward {
+    /// Loads a standard MoE layer for `layer_idx` (Qwen3-MoE / OLMoE).
+    ///
+    /// Reads the router (`mlp.gate.weight` or `mlp.router.weight`) and the
+    /// `num_experts` per-expert gate/up/down projections; `norm_topk` controls
+    /// whether the top-k gate weights are renormalised to sum to 1.
+    ///
+    /// ## Errors
+    /// Fails if `top_k` is not in `(0, num_experts]`, or a required tensor is
+    /// missing.
     pub fn load(
         layer_idx: usize,
         weights: &ModelWeights,
@@ -172,6 +193,10 @@ impl MoeFeedForward {
     /// (`mlp.experts.{gate_up,down}_proj_{blocks,scales,bias}`, expert dim 0)
     /// and a router with bias. Routing is softmax-over-top-k, which equals the
     /// standard path with `norm_topk = true`.
+    ///
+    /// ## Errors
+    /// Fails if `top_k` is not in `(0, num_experts]`, a required tensor is
+    /// missing, or a blocks tensor is not shaped `[E, out, K/32, 16]`.
     pub fn load_gpt_oss(
         layer_idx: usize,
         weights: &ModelWeights,
@@ -198,7 +223,6 @@ impl MoeFeedForward {
         let dn_scales = weights.get(&format!("{p}.experts.down_proj_scales"))?;
         let dn_bias = weights.get(&format!("{p}.experts.down_proj_bias"))?;
 
-        // [E, out, K/32, 16] blocks: derive (out, in) from the stacked shapes.
         let dims_of = |t: &Tensor, what: &str| -> Result<(usize, usize)> {
             let d = t.dims();
             if d.len() != 4 || d[3] != 16 {
@@ -243,6 +267,12 @@ impl MoeFeedForward {
         })
     }
 
+    /// Routes `x` through the MoE: softmax router scores, top-k selection
+    /// (optionally renormalised), then the naive or sparse dispatch. The output
+    /// has the same shape as `x`.
+    ///
+    /// ## Errors
+    /// Propagates router, routing, or expert tensor-op failures.
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let original_shape = x.dims().to_vec();
         let hidden = *original_shape.last().unwrap();
@@ -264,8 +294,6 @@ impl MoeFeedForward {
             top_vals
         };
 
-        // Per-expert `index_select` / `index_add` overhead beats the FFN saving
-        // when `n_tokens ≤ top_k` (decode); cross over to the sparse path above.
         let out = if n_tokens > self.top_k {
             self.dispatch_sparse(&x_flat, &top_idx, &top_vals, n_tokens, hidden)?
         } else {
@@ -274,6 +302,15 @@ impl MoeFeedForward {
         out.reshape(original_shape)
     }
 
+    /// Decode-path dispatch (`n_tokens <= top_k`): runs only the chosen experts
+    /// on the full input and accumulates their gate-weighted outputs.
+    ///
+    /// Per-expert token weights are built on the CPU to avoid a dense
+    /// `[n_tokens, num_experts]` gate tensor; at M=1 only `top_k` experts have
+    /// non-zero mass, so there are no wasted FFN calls.
+    ///
+    /// ## Errors
+    /// Propagates tensor-op failures.
     fn dispatch_naive(
         &self,
         x_flat: &Tensor,
@@ -285,9 +322,6 @@ impl MoeFeedForward {
         let num_experts = self.experts.len();
         let device = x_flat.device();
 
-        // Decode-sized batches: read the (tiny) routing decision once and run
-        // only the chosen experts — no dense gate tensor or full-vocab-of-experts
-        // mass readback on the serialized decode path.
         let top_idx_cpu: Vec<u32> = top_idx.flatten_all()?.to_vec1::<u32>()?;
         let top_vals_cpu: Vec<f32> = top_vals.flatten_all()?.to_vec1::<f32>()?;
         let mut per_expert_w: Vec<Option<Vec<f32>>> = vec![None; num_experts];
@@ -320,6 +354,15 @@ impl MoeFeedForward {
         })
     }
 
+    /// Prefill-path dispatch (`n_tokens > top_k`): groups tokens by expert, runs
+    /// each expert on only its routed rows (`index_select`), and scatters the
+    /// gate-weighted results back (`index_add`).
+    ///
+    /// Per-expert compute drops from `n_tokens` to roughly
+    /// `n_tokens * top_k / num_experts`.
+    ///
+    /// ## Errors
+    /// Propagates tensor-op failures.
     fn dispatch_sparse(
         &self,
         x_flat: &Tensor,
@@ -459,9 +502,9 @@ mod tests {
         Ok(())
     }
 
-    // Contract: the GPT-OSS expert math — interleaved gate/up split, clamping
-    // at swiglu_limit, alpha=1.702 sigmoid gate, and the (up + 1) branch —
-    // matches a scalar reference computed independently in f32.
+    // Contract: the GPT-OSS expert math (interleaved gate/up split, clamping at
+    // swiglu_limit, alpha=1.702 sigmoid gate, and the (up + 1) branch) matches a
+    // scalar reference computed independently in f32.
     #[test]
     fn gpt_oss_expert_matches_scalar_reference() -> Result<()> {
         use crate::common::mxfp4::Mxfp4Linear;

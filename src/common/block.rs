@@ -29,7 +29,7 @@ use candle_core::DType;
 use candle_core::Result;
 use candle_core::Tensor;
 
-/// Dense or MoE FFN sub-layer. Both variants share the same `forward(x) → x`
+/// Dense or MoE FFN sub-layer. Both variants share the same `forward(x) -> x`
 /// signature so the block can dispatch uniformly. `Moe` is only constructed
 /// when [`BlockConfig::moe`] is `Some`.
 enum FeedForwardLayer {

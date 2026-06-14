@@ -83,6 +83,7 @@ These architecture classes are covered by the regression suite, each with at lea
 - `Qwen3_5ForConditionalGeneration` (hybrid linear attention, text-only): Gated DeltaNet plus gated full attention
 - `GemmaForCausalLM`, `Gemma2ForCausalLM`, `Gemma3ForCausalLM`, `Gemma4ForConditionalGeneration`
 - `Mistral3ForConditionalGeneration`
+- `Phi3ForCausalLM` (Phi-3 / Phi-3.5)
 - `OlmoeForCausalLM` and `GptOssForCausalLM` (Mixture-of-Experts)
 
 Formats span BF16 safetensors, GGUF, AWQ/GPTQ, compressed-tensors INT4, FP8, and MXFP4, auto-detected per checkpoint. Other checkpoints in the same families and sizes (e.g. other Llama 3.2, Gemma 3, or Qwen2.5 variants) are likely to work but are not regularly tested.

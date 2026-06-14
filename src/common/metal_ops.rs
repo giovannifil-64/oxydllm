@@ -1,17 +1,17 @@
 // ─────────────────────────────────────────────────────────────────────────────
-// metal_ops.rs  — Metal-accelerated kernels for oxydLLM
+// metal_ops.rs, Metal-accelerated kernels for oxydLLM
 // ─────────────────────────────────────────────────────────────────────────────
 //
 // All ops wrap candle-metal-kernels (already a project dependency) via
 // candle's `CustomOp` traits, matching the same pattern used for SDPA.
 //
 // Kernels provided:
-//   • SDPA        — fused Flash-Attention (vector + full paths, GQA-native)
-//   • RMSNorm     — single-pass fused normalisation + scale
-//   • Softmax     — fused softmax over last dimension
-//   • RoPE        — fused rotary embedding (standard non-interleaved layout)
-//   • GatedSiLU   — fused silu(gate)*up from a single interleaved [*, 2N] tensor
-//   • SiLU-Mul    — fused silu(gate)*up from two separate contiguous tensors
+//   • SDPA, fused Flash-Attention (vector + full paths, GQA-native)
+//   • RMSNorm, single-pass fused normalisation + scale
+//   • Softmax, fused softmax over last dimension
+//   • RoPE, fused rotary embedding (standard non-interleaved layout)
+//   • GatedSiLU, fused silu(gate)*up from a single interleaved [*, 2N] tensor
+//   • SiLU-Mul, fused silu(gate)*up from two separate contiguous tensors
 // ─────────────────────────────────────────────────────────────────────────────
 
 use candle_core::{
@@ -48,7 +48,7 @@ impl CustomOp3 for Sdpa {
         _s3: &CpuStorage,
         _l3: &Layout,
     ) -> Result<(CpuStorage, Shape)> {
-        candle_core::bail!("SDPA: Metal-only — use standard attention path on CPU")
+        candle_core::bail!("SDPA: Metal-only; use standard attention path on CPU")
     }
 
     fn metal_fwd(
@@ -957,7 +957,7 @@ impl CustomOp3 for FlashAttnPrefill {
         _s3: &CpuStorage,
         _l3: &Layout,
     ) -> Result<(CpuStorage, Shape)> {
-        candle_core::bail!("FlashAttnPrefill: Metal-only — use standard attention path on CPU")
+        candle_core::bail!("FlashAttnPrefill: Metal-only; use standard attention path on CPU")
     }
 
     fn metal_fwd(
@@ -1309,7 +1309,7 @@ impl InplaceOp1 for W4A16Matmul {
 
     fn cpu_fwd(&self, _s: &mut CpuStorage, _l: &Layout) -> Result<()> {
         candle_core::bail!(
-            "W{}A16Matmul: Metal-only — use the CPU dequantize_awq path",
+            "W{}A16Matmul: Metal-only; use the CPU dequantize_awq path",
             self.bits
         )
     }
@@ -1471,7 +1471,7 @@ impl CustomOp1 for DequantizeW4 {
 
     fn cpu_fwd(&self, _s: &CpuStorage, _l: &Layout) -> Result<(CpuStorage, Shape)> {
         candle_core::bail!(
-            "DequantizeW{}: Metal-only — use the CPU dequantize_awq path",
+            "DequantizeW{}: Metal-only; use the CPU dequantize_awq path",
             self.bits
         )
     }
@@ -1684,7 +1684,7 @@ impl InplaceOp1 for GptqMatmul {
 
     fn cpu_fwd(&self, _s: &mut CpuStorage, _l: &Layout) -> Result<()> {
         candle_core::bail!(
-            "GptqMatmul (bits={}): Metal-only — use the CPU dequantize_gptq path",
+            "GptqMatmul (bits={}): Metal-only; use the CPU dequantize_gptq path",
             self.bits
         )
     }
@@ -1849,7 +1849,7 @@ impl CustomOp1 for DequantizeGptqPacked {
 
     fn cpu_fwd(&self, _s: &CpuStorage, _l: &Layout) -> Result<(CpuStorage, Shape)> {
         candle_core::bail!(
-            "DequantizeGptq{}: Metal-only — use the CPU dequantize_gptq path",
+            "DequantizeGptq{}: Metal-only; use the CPU dequantize_gptq path",
             self.bits
         )
     }
@@ -1990,7 +1990,7 @@ const MPP_GEMM_SOURCE: &str = include_str!("mpp_gemm.metal");
 
 /// Minimum M routed onto the TensorOps GEMM. Below it the GEMV/batch kernels
 /// and candle GEMM win; from here up MPP wins on M5 (1.96x at M=64 rising to
-/// 3.6x at M=256 vs candle BF16 GEMM — see `mpp_gemm_perf_probe`).
+/// 3.6x at M=256 vs candle BF16 GEMM, see `mpp_gemm_perf_probe`).
 pub const MPP_GEMM_MIN_M: usize = 64;
 
 static MPP_LIBRARIES: OnceLock<Mutex<HashMap<u64, Option<Library>>>> = OnceLock::new();
@@ -2233,7 +2233,7 @@ struct MppQuantGemmParams {
 
 /// `x [m, k] @ dequant(qweight) [k, n]` on the TensorOps path, dequantizing
 /// B per-tile into threadgroup memory instead of materializing the dense
-/// weight. Supports the AWQ layout (`PackDim::Out`, arbitrary zero-points —
+/// weight. Supports the AWQ layout (`PackDim::Out`, arbitrary zero-points ,
 /// covers AWQ, compressed-tensors INT4, W8A16) and the GPTQ layout
 /// (`PackDim::In`).
 struct MppQuantMatmul {
@@ -2576,7 +2576,7 @@ mod fused_kernel_parity_tests {
             return;
         };
 
-        // [batch=1, seq=4, 2*N=16] → output [1, 4, 8]
+        // [batch=1, seq=4, 2*N=16] to output [1, 4, 8]
         let n = 8usize;
         let data: Vec<f32> = (0..1 * 4 * 2 * n)
             .map(|i| (i as f32 - 32.0) * 0.05)
@@ -2629,7 +2629,7 @@ mod fused_kernel_parity_tests {
             .to_vec1::<f32>()
             .unwrap();
         let diff = max_abs_diff_f32(&f, &s);
-        // BF16 precision: ~7 bits of mantissa → ~1e-2 absolute for activations near unity.
+        // BF16 precision: ~7 bits of mantissa give ~1e-2 absolute for activations near unity.
         assert!(diff < 0.05, "max_abs_diff (bf16) = {diff}");
     }
 
@@ -2660,7 +2660,7 @@ mod fused_kernel_parity_tests {
             return;
         };
         let x = Tensor::zeros((1, 2, 7), DType::F32, &dev).unwrap();
-        // intermediate_size=4 → expects last dim = 8, but we have 7.
+        // intermediate_size=4 means it expects last dim = 8, but we have 7.
         let res = gated_silu_fused(&x, 4);
         assert!(res.is_err());
     }
@@ -3086,7 +3086,7 @@ mod fused_kernel_parity_tests {
 
     #[test]
     fn flash_attn_bf16_d64_with_prefix_cache_matches_naive() {
-        // prefix_len = 24, t_q = 8 → t_kv = 32 (simulates 24-token KV cache hit)
+        // prefix_len = 24, t_q = 8 gives t_kv = 32 (simulates 24-token KV cache hit)
         let Some(dev) = metal_device_or_skip() else {
             return;
         };
@@ -4498,7 +4498,7 @@ impl GgufFastQuant {
         }
     }
 
-    // (threads_per_TG, rows_per_TG) per quant — must match the kernel's geometry.
+    // (threads_per_TG, rows_per_TG) per quant, must match the kernel's geometry.
     fn dispatch_geometry(self) -> (usize, usize) {
         const SIMDWIDTH: usize = 32;
         match self {
@@ -4957,7 +4957,7 @@ impl InplaceOp1 for Mxfp4Matmul {
         encoder.use_resource(s_buf, MTLResourceUsage::Read);
         encoder.use_resource(out.buffer(), MTLResourceUsage::Write);
 
-        // 2 simdgroups x GGUF_N_DST(4) rows per TG — must match the kernel.
+        // 2 simdgroups x GGUF_N_DST(4) rows per TG, must match the kernel.
         encoder.dispatch_thread_groups(
             MTLSize {
                 width: self.n.div_ceil(8),
@@ -5371,8 +5371,8 @@ mod decode_batch_scaling_tests {
         }
     }
 
-    // Contract: sdpa_vector_sink equals the scalar reference — softmax over
-    // [scores, sink] with the sink column dropped — including GQA head mapping
+    // Contract: sdpa_vector_sink equals the scalar reference, softmax over
+    // [scores, sink] with the sink column dropped, including GQA head mapping
     // and kv lengths not aligned to the 32-thread stride.
     #[test]
     fn sdpa_vector_sink_matches_reference() {

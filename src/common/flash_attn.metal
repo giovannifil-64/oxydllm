@@ -266,7 +266,7 @@ inline void flash_attention_prefill_impl(
 }
 
 // MMA variant: hardware simdgroup_matrix on Apple GPU family 8+ (M3+).
-// Host MUST gate on `supportsFamily(MTLGPUFamily.apple8)` — on M1/M2 the path
+// Host MUST gate on `supportsFamily(MTLGPUFamily.apple8)`, on M1/M2 the path
 // is emulated and slower than the scalar kernel above.
 template<typename T>
 inline void flash_attention_prefill_mma_impl(
@@ -404,7 +404,7 @@ inline void flash_attention_prefill_mma_impl(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // Fused softmax → P-as-T conversion (writes p_tile directly, saving 2 barriers).
+        // Fused softmax to P-as-T conversion (writes p_tile directly, saving 2 barriers).
         for (uint i = tid; i < br_act; i += tg_size) {
             float row_max = -INFINITY;
             for (uint j = 0; j < bc_act; j++) {

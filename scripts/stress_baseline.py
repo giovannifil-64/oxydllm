@@ -82,7 +82,7 @@ CORE_MODELS = [
     "google/gemma-3-1b-it",
     "google/gemma-4-E2B-it",
     # Mistral family.
-    "mistralai/Ministral-3-3B-Instruct-25",
+    "mistralai/Ministral-3-3B-Instruct-2512",
     # MoE.
     "allenai/OLMoE-1B-7B-0924-Instruct",
     # FP8.

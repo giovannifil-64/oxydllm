@@ -71,7 +71,7 @@ pub struct LinearAttnConfig {
 /// - `n_kv_heads < n_heads` selects grouped-query attention (GQA).
 /// - `qk_norm` applies RMSNorm to per-head queries and keys before RoPE (Qwen3,
 ///   Gemma3); `v_norm` does the same for values.
-/// - `attention_scale` overrides the softmax scale; `None` ⇒ `1/sqrt(head_dim)`.
+/// - `attention_scale` overrides the softmax scale; `None` defaults to `1/sqrt(head_dim)`.
 /// - `attn_softcap` tanh-caps the attention logits (Gemma2: 50.0).
 /// - `sliding_window` restricts attention to the last `n` tokens; `None` is full
 ///   causal.
@@ -79,8 +79,8 @@ pub struct LinearAttnConfig {
 ///   sub-layer.
 ///
 /// Three fields select the layer's *shape* rather than tune it, and are set per
-/// layer by the loader: `moe` (`Some` ⇒ Mixture-of-Experts FFN), `linear_attn`
-/// (`Some` ⇒ the token mixer is a [`super::gdn::GatedDeltaNet`], not attention),
+/// layer by the loader: `moe` (`Some` means a Mixture-of-Experts FFN), `linear_attn`
+/// (`Some` means the token mixer is a [`super::gdn::GatedDeltaNet`], not attention),
 /// and `attn_output_gate` / `rotary_dim` (Qwen3.5 gated attention, where q_proj
 /// emits per-head `[query | gate]`, and partial RoPE over the first `rotary_dim`
 /// dims of each head).

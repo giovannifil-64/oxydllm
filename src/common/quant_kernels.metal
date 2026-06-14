@@ -111,7 +111,7 @@ inline void awq_gemv_impl(
 
 // Batched split-K AWQ GEMV for M = 2..8 decode rows: identical geometry to
 // awq_gemv_impl, but the weight word is unpacked ONCE and reused for all M
-// activation rows (the GGUF batch-kernel design — concurrent decode shares
+// activation rows (the GGUF batch-kernel design, concurrent decode shares
 // one weight read instead of falling onto the dequant+GEMM prefill path).
 // `out` must be host-zeroed (atomic accumulation).
 template<typename T, uint BITS>
@@ -2250,7 +2250,7 @@ kernel void gguf_q3k_gemv_batch_bf16(
             scales32 = ((scales32 >> s_shift1) & 0x0f0f0f0fu) | aux32;
 
             // Dequantize ONCE into registers. True per-element value:
-            // d*(sc-32)*(q2bit - (hbit ? 0 : 4)) — extracting the 2-bit values
+            // d*(sc-32)*(q2bit - (hbit ? 0 : 4)), extracting the 2-bit values
             // directly cancels the template's in-place <<shift, /256 odd-byte and
             // 0.25*sumf2 normalizations, so no final rescale is needed.
             const float dsA = d_all * (float)(scales[0] - 32);
@@ -3101,7 +3101,7 @@ kernel void gguf_q3k_mul_mm_bf16(
     }
 }
 
-// ── MXFP4 (OCP microscaling FP4 — GPT-OSS experts) ─────────────────────────
+// ── MXFP4 (OCP microscaling FP4, GPT-OSS experts) ─────────────────────────
 // 32-element blocks: 16 bytes of FP4 (E2M1, low nibble first) + one E8M0
 // scale byte per block (value = 2^(s-127)). Weights stay packed; both kernels
 // dequantize inline.
@@ -3242,7 +3242,7 @@ kernel void mxfp4_mul_mm_bf16(
 // ── Decode SDPA with attention sinks (GPT-OSS) ──────────────────────────────
 // One simdgroup per (q-head): online softmax over the kv positions with the
 // per-head sink logit folded into the denominator (the sink contributes no
-// value vector). Reads K/V per kv-head directly — GQA without repeat_kv.
+// value vector). Reads K/V per kv-head directly, GQA without repeat_kv.
 // q: [H, D] (q_len = 1), k/v: [KVH, L, D], sinks: [H], out: [H, D]. BF16 I/O,
 // F32 accumulation. D <= SDPA_SINK_MAX_D.
 

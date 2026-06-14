@@ -1,5 +1,29 @@
+//! Rotary position embeddings (RoPE) and the long-context scaling schemes.
+//!
+//! [`RotaryEmbedding`] precomputes the cos/sin tables for a model and applies
+//! them to per-head queries and keys. [`RopeScaling`] selects how the base
+//! frequencies are stretched for context lengths beyond the model's training
+//! window (Llama3, YaRN, LongRoPE, or plain linear interpolation).
+
 use candle_core::{D, DType, Device, Result, Tensor};
 
+/// How RoPE base frequencies are rescaled to extend the usable context length.
+///
+/// With `None` the frequencies are `theta^(-2i/head_dim)` as trained. The other
+/// variants stretch the low-frequency (long-wavelength) end so positions past
+/// the training window stay in distribution:
+///
+/// - `Linear` divides every frequency by `factor` (uniform interpolation).
+/// - `Llama3` interpolates only the low-frequency band, with a smooth ramp
+///   between `low_freq_factor` and `high_freq_factor` (Llama 3.1 / 3.2).
+/// - `Yarn` is NTK-aware: it blends original and interpolated frequencies per
+///   dimension across the `beta_fast` / `beta_slow` correction range, and is a
+///   no-op when `max_seq_len <= original_max_pos`.
+/// - `LongRope` applies an explicit per-dimension factor (Phi-3.5): `long_factor`
+///   once the sequence exceeds `original_max_pos`, otherwise `short_factor`.
+///
+/// Parsed from a model's `config.json`; see
+/// [`super::config::StandardTransformerConfig`].
 #[derive(Debug, Clone)]
 pub enum RopeScaling {
     None,
@@ -25,12 +49,25 @@ pub enum RopeScaling {
     },
 }
 
+/// Precomputed RoPE cos/sin tables for one model, ready to apply to q and k.
+///
+/// Construction runs the frequency math once for every position up to
+/// `max_seq_len` and caches the `[max_seq_len, head_dim/2]` cos and sin tables;
+/// applying RoPE is then a gather by position followed by an elementwise
+/// half-split rotation. Build one with [`new`](Self::new) for the unscaled
+/// schedule, or [`new_with_scaling`](Self::new_with_scaling) to pass a
+/// [`RopeScaling`]. On Metal the rotation runs as a single fused kernel.
 pub struct RotaryEmbedding {
     cos: Tensor,
     sin: Tensor,
 }
 
 impl RotaryEmbedding {
+    /// Builds an unscaled rotary embedding: shorthand for
+    /// [`new_with_scaling`](Self::new_with_scaling) with [`RopeScaling::None`].
+    ///
+    /// ## Errors
+    /// Propagates tensor allocation failures from building the cos/sin tables.
     pub fn new(
         head_dim: usize,
         max_seq_len: usize,
@@ -48,6 +85,15 @@ impl RotaryEmbedding {
         )
     }
 
+    /// Builds the cos/sin tables for `head_dim` over `max_seq_len` positions,
+    /// applying `scaling` to the base frequencies derived from `rope_theta`.
+    ///
+    /// The frequency math runs in F32 and the tables are cast to `dtype`. The
+    /// `Yarn` and `LongRope` schemes only diverge from the base schedule once
+    /// `max_seq_len` exceeds the scheme's `original_max_pos`.
+    ///
+    /// ## Errors
+    /// Propagates tensor allocation or dtype-cast failures.
     pub fn new_with_scaling(
         head_dim: usize,
         max_seq_len: usize,
@@ -160,6 +206,15 @@ impl RotaryEmbedding {
         Ok(Self { cos, sin })
     }
 
+    /// Rotates `x` (shape `[batch, heads, seq, head_dim]`) by the positions in
+    /// `position_ids`, returning a tensor of the same shape.
+    ///
+    /// The cos/sin rows are gathered by `position_ids`, then a half-split
+    /// (NeoX-style) rotation is applied. On Metal this is a single fused kernel;
+    /// elsewhere it is plain candle ops.
+    ///
+    /// ## Errors
+    /// Propagates shape or tensor-op failures (for example if `x` is not rank-4).
     pub fn apply_with_positions(&self, x: &Tensor, position_ids: &Tensor) -> Result<Tensor> {
         let (_b, _h, _seq, d) = x.dims4()?;
 
@@ -186,6 +241,15 @@ impl RotaryEmbedding {
         Tensor::cat(&[&out1, &out2], D::Minus1)
     }
 
+    /// Applies RoPE to queries and keys at once, returning the rotated `(q, k)`.
+    ///
+    /// On Metal, when `q` and `k` share batch, sequence length, dtype and device,
+    /// they are concatenated along the head axis and rotated in one fused kernel
+    /// launch; otherwise each is rotated separately via
+    /// [`apply_with_positions`](Self::apply_with_positions).
+    ///
+    /// ## Errors
+    /// Fails if `q` and `k` have different head dimensions.
     pub fn apply_qk_with_positions(
         &self,
         q: &Tensor,

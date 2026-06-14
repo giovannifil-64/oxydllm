@@ -1,9 +1,9 @@
-//! MXFP4 (OCP Microscaling FP4) weights — GPT-OSS expert format.
+//! MXFP4 (OCP Microscaling FP4) weights, GPT-OSS expert format.
 //!
 //! On-disk layout (per weight matrix, row-major over output rows):
-//! - `blocks`: u8 `[rows, K/32, 16]` — 32 FP4 (E2M1) values per block, two per
+//! - `blocks`: u8 `[rows, K/32, 16]`, 32 FP4 (E2M1) values per block, two per
 //!   byte, low nibble first.
-//! - `scales`: u8 `[rows, K/32]` — one E8M0 exponent per block: `2^(s - 127)`.
+//! - `scales`: u8 `[rows, K/32]`, one E8M0 exponent per block: `2^(s - 127)`.
 //!
 //! Weights stay MXFP4-resident on Metal (dequantizing GPT-OSS-20B's experts to
 //! BF16 would need ~38 GB); matmuls run fused dequant kernels.
@@ -115,7 +115,7 @@ impl Mxfp4Linear {
         })
     }
 
-    /// `x`: `[..., in_features]` BF16 → `[..., out_features]` BF16.
+    /// `x`: `[..., in_features]` BF16 to `[..., out_features]` BF16.
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let original_dims = x.dims().to_vec();
         let in_features = *original_dims.last().unwrap();

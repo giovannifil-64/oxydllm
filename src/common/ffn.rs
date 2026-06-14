@@ -1,3 +1,11 @@
+//! Dense gated feed-forward (MLP) sub-layer.
+//!
+//! [`FeedForward`] is the standard transformer MLP: `down(act(gate(x)) * up(x))`
+//! with SiLU or GeLU-tanh activation. It hides the many ways checkpoints store
+//! the gate/up projection (separate, pre-fused, packed, or ungated) behind one
+//! [`forward`](FeedForward::forward), across dense, FP8, AWQ/GPTQ, and GGUF
+//! weights. The Mixture-of-Experts variant lives in [`super::moe`].
+
 use super::awq::{AwqRawTensors, PackDim, concat_awq_along_out};
 use super::config::Activation;
 use super::gguf_weights::GgufWeights;
@@ -6,6 +14,17 @@ use super::weights::ModelWeights;
 use candle_core::DType;
 use candle_core::{D, Result, Tensor};
 
+/// How a checkpoint stores the gate and up projections of the MLP.
+///
+/// A SwiGLU-style FFN needs both a `gate` and an `up` projection; checkpoints
+/// ship them in different shapes, and the loader picks one variant:
+///
+/// - `Fused`: gate and up in one matrix (concatenated at load, or shipped
+///   pre-fused), sliced apart after the matmul.
+/// - `Separate`: two independent projections (GGUF, and GPTQ whose packed
+///   layout cannot be concatenated).
+/// - `Packed`: a single GGUF `ffn_up` tensor already holding gate+up (Phi-3).
+/// - `Simple`: an ungated MLP with only an up projection.
 enum GateUpProjection {
     Fused(AnyLinear),
     Separate { gate: AnyLinear, up: AnyLinear },
@@ -13,6 +32,13 @@ enum GateUpProjection {
     Simple(AnyLinear),
 }
 
+/// The dense gated MLP of one transformer layer.
+///
+/// Computes `down(act(gate(x)) * up(x))`, where `act` is [`Activation::SiLU`] or
+/// [`Activation::GeLUTanh`] and the gate/up projection is held in one of the
+/// [`GateUpProjection`] shapes. Load it with [`load`](Self::load) (safetensors,
+/// including FP8 and AWQ/GPTQ) or [`load_gguf`](Self::load_gguf); on Metal the
+/// activation and elementwise multiply run as one fused kernel.
 pub struct FeedForward {
     gate_up: GateUpProjection,
     down_proj: AnyLinear,
@@ -21,6 +47,18 @@ pub struct FeedForward {
 }
 
 impl FeedForward {
+    /// Loads the MLP for `layer_idx` from safetensors weights
+    /// (`model.layers.{i}.mlp.*`).
+    ///
+    /// AWQ/GPTQ checkpoints are detected and routed to the packed-quant path.
+    /// Otherwise the gate/up layout is chosen from the tensors present: separate
+    /// `gate_proj` + `up_proj` (fused into one matrix at load), a pre-fused
+    /// `gate_up_proj`, or an ungated `up_proj`. FP8 weights are paired with their
+    /// `*_scale_inv` tensors.
+    ///
+    /// ## Errors
+    /// Fails on a missing required tensor, an FP8 weight without its
+    /// `*_scale_inv`, or a gate/up/down shape mismatch.
     pub fn load(layer_idx: usize, weights: &ModelWeights, activation: Activation) -> Result<Self> {
         let p = format!("model.layers.{}.mlp", layer_idx);
 
@@ -59,7 +97,6 @@ impl FeedForward {
                     up_out
                 );
             }
-            // Fuse gate+up into one matrix; individual weight tensors are not retained.
             let gate_up_w = Tensor::cat(&[&gate_w, &up_w], 0)?;
             let gate_is_fp8 = gate_w.dtype() == DType::F8E4M3;
             let up_is_fp8 = up_w.dtype() == DType::F8E4M3;
@@ -152,6 +189,17 @@ impl FeedForward {
         })
     }
 
+    /// Builds the MLP from packed-int (AWQ / GPTQ) weights, given the already
+    /// fetched `down_proj` tensors.
+    ///
+    /// AWQ packs along out_features, so gate and up can be concatenated into one
+    /// fused projection when the intermediate size is divisible by 8. GPTQ packs
+    /// along in_features, which cannot be concatenated, so it stays `Separate`
+    /// (the dequant-at-load cost dominates either way).
+    ///
+    /// ## Errors
+    /// Fails on a gate/up shape mismatch, or if `down_proj` is packed but no
+    /// gate/up tensors are (a partially-quantized checkpoint).
     fn load_awq(
         p: &str,
         down_raw: AwqRawTensors,
@@ -163,7 +211,6 @@ impl FeedForward {
         let dtype = down_raw.scales.dtype();
         let is_awq = down_raw.pack_dim == PackDim::Out;
 
-        // down_proj: out_features = hidden, in_features = intermediate.
         let intermediate_size = down_raw.in_features().map_err(|e| {
             candle_core::Error::Msg(format!("packed-quant down_proj in_features: {e}"))
         })?;
@@ -185,8 +232,6 @@ impl FeedForward {
                 );
             }
 
-            // GPTQ packs along in_features ⇒ out-dim concat (`concat_awq_along_out`)
-            // doesn't apply. Take Separate; the dequant-at-load dominates anyway.
             let gate_up_fused = is_awq && intermediate_size.is_multiple_of(8);
             if layer_idx == 0 {
                 tracing::info!(
@@ -250,6 +295,15 @@ impl FeedForward {
         })
     }
 
+    /// Loads the MLP for `layer_idx` from GGUF weights (`blk.{i}.ffn_*`), keeping
+    /// the weights quantized.
+    ///
+    /// The gate/up layout follows the tensors present: `Separate` when an
+    /// `ffn_gate` exists, `Packed` when `ffn_up` already holds gate+up (some
+    /// variants such as Phi-3), or `Simple` (ungated) otherwise.
+    ///
+    /// ## Errors
+    /// Fails on a missing tensor or a gate/up/down shape mismatch.
     pub fn load_gguf(
         layer_idx: usize,
         gguf: &GgufWeights,
@@ -296,7 +350,6 @@ impl FeedForward {
                 up: AnyLinear::Quantized(up),
             }
         } else if up_out == 2 * intermediate_size {
-            // Some GGUF variants (e.g. Phi-3) pack gate+up into ffn_up.
             let packed = QLinear::from_arc(up_qt, dtype)?;
             GateUpProjection::Packed(AnyLinear::Quantized(packed))
         } else if up_out == intermediate_size {
@@ -320,13 +373,19 @@ impl FeedForward {
         })
     }
 
+    /// Runs the MLP: `down(act(gate(x)) * up(x))`, with `act` being SiLU or
+    /// GeLU-tanh per the layer's [`Activation`].
+    ///
+    /// On Metal the activation and the gate-times-up multiply run as a single
+    /// fused kernel for each [`GateUpProjection`] layout, avoiding an extra
+    /// intermediate buffer; elsewhere they are separate candle ops.
+    ///
+    /// ## Errors
+    /// Propagates tensor-op failures from the projections or activation.
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let gated = match &self.gate_up {
             GateUpProjection::Fused(gu) => {
                 let out = gu.forward(x)?;
-                // On Metal: fuse the activation+multiply into one kernel, avoiding two
-                // separate encoder creations and an intermediate buffer. Both SiLU
-                // (Llama/Qwen/Mistral) and GeLU-tanh (Gemma family) have fused kernels.
                 #[cfg(feature = "metal")]
                 if out.device().is_metal() {
                     match self.activation {

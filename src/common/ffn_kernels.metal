@@ -16,7 +16,7 @@ METAL_FUNC float gelu_tanh_f32(float x) {
     return 0.5f * x * (1.0f + precise::tanh(inner));
 }
 
-// ── GatedSiLU: [*, 2*N] → [*, N]  (gate in first half, up in second) ─────────
+// ── GatedSiLU: [*, 2*N] to [*, N]  (gate in first half, up in second) ─────────
 // For output index gid: row = gid/half_n, col = gid%half_n
 //   gate = x[row*2*half_n + col],  up = x[row*2*half_n + half_n + col]
 
@@ -109,7 +109,7 @@ kernel void silu_mul_bf16(
 }
 #endif
 
-// ── GatedGeLU-Tanh: [*, 2*N] → [*, N]  (gate in first half, up in second) ────
+// ── GatedGeLU-Tanh: [*, 2*N] to [*, N]  (gate in first half, up in second) ────
 // Tanh-approximation GeLU; used by Gemma / Gemma-2 / Gemma-3 / Gemma-4 FFNs.
 
 kernel void gated_gelu_tanh_f32(

@@ -1,3 +1,11 @@
+//! Zero-copy loader and accessor for GGUF weight files.
+//!
+//! [`GgufWeights`] memory-maps one or more GGUF files, parses the header, and
+//! builds an `Arc<QTensor>` per tensor whose data points directly into the
+//! mapped pages (the mmaps are kept alive for the struct's lifetime). Tensor
+//! materialisation is parallelised with rayon. Besides tensor access it exposes
+//! typed getters over the GGUF `metadata` map.
+
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::sync::Arc;
@@ -10,6 +18,8 @@ use memmap2::Mmap;
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 
+/// A loaded GGUF model: quantized tensors by name, the raw metadata map, and the
+/// backing memory maps held alive so the tensor data stays valid.
 pub struct GgufWeights {
     tensors: FxHashMap<String, Arc<QTensor>>,
     pub metadata: HashMap<String, gguf_file::Value>,
@@ -17,6 +27,12 @@ pub struct GgufWeights {
 }
 
 impl GgufWeights {
+    /// Loads a single GGUF file: mmaps it, parses the header, and materialises
+    /// every tensor onto `device`.
+    ///
+    /// ## Errors
+    /// Fails if the file cannot be opened or mapped, the GGUF header is invalid,
+    /// or a tensor cannot be built.
     pub fn load(path: &str, device: &Device) -> anyhow::Result<Self> {
         let file = std::fs::File::open(path)
             .with_context(|| format!("Failed to open GGUF file: {}", path))?;
@@ -48,6 +64,10 @@ impl GgufWeights {
         })
     }
 
+    /// Returns the tensor named `name`.
+    ///
+    /// ## Errors
+    /// Fails if no tensor with that name exists.
     pub fn get(&self, name: &str) -> candle_core::Result<Arc<QTensor>> {
         self.tensors
             .get(name)
@@ -55,10 +75,12 @@ impl GgufWeights {
             .ok_or_else(|| candle_core::Error::Msg(format!("GGUF tensor not found: {}", name)))
     }
 
+    /// Returns the tensor named `name`, or `None` if it is absent.
     pub fn try_get(&self, name: &str) -> Option<Arc<QTensor>> {
         self.tensors.get(name).cloned()
     }
 
+    /// Total on-device size of all loaded tensors, in bytes.
     pub fn total_size_bytes(&self) -> usize {
         self.tensors
             .values()
@@ -66,6 +88,10 @@ impl GgufWeights {
             .sum()
     }
 
+    /// Reads metadata `key` as a `u32`.
+    ///
+    /// ## Errors
+    /// Fails if the key is missing or not a `u32`.
     pub fn metadata_u32(&self, key: &str) -> anyhow::Result<u32> {
         self.metadata
             .get(key)
@@ -76,6 +102,10 @@ impl GgufWeights {
             })
     }
 
+    /// Reads metadata `key` as an `f32`.
+    ///
+    /// ## Errors
+    /// Fails if the key is missing or not an `f32`.
     pub fn metadata_f32(&self, key: &str) -> anyhow::Result<f32> {
         self.metadata
             .get(key)
@@ -86,6 +116,10 @@ impl GgufWeights {
             })
     }
 
+    /// Reads metadata `key` as a `String`.
+    ///
+    /// ## Errors
+    /// Fails if the key is missing or not a string.
     pub fn metadata_string(&self, key: &str) -> anyhow::Result<String> {
         self.metadata
             .get(key)
@@ -97,14 +131,24 @@ impl GgufWeights {
             })
     }
 
+    /// Reads metadata `key` as a `u32`, falling back to `default` if missing or
+    /// the wrong type.
     pub fn metadata_u32_or(&self, key: &str, default: u32) -> u32 {
         self.metadata_u32(key).unwrap_or(default)
     }
 
+    /// Reads metadata `key` as an `f32`, falling back to `default` if missing or
+    /// the wrong type.
     pub fn metadata_f32_or(&self, key: &str, default: f32) -> f32 {
         self.metadata_f32(key).unwrap_or(default)
     }
 
+    /// Loads a sharded GGUF model, merging the tensors of every shard into one
+    /// [`GgufWeights`]; metadata is taken from the first shard.
+    ///
+    /// ## Errors
+    /// Fails if `paths` is empty, or if any shard cannot be opened, mapped,
+    /// parsed, or loaded.
     pub fn load_shards(paths: &[&str], device: &Device) -> anyhow::Result<Self> {
         anyhow::ensure!(!paths.is_empty(), "load_shards: paths must be non-empty");
         if paths.len() == 1 {
@@ -163,10 +207,17 @@ impl GgufWeights {
         })
     }
 
+    /// Returns the `general.architecture` metadata string (e.g. `llama`,
+    /// `qwen2`, `qwen35`).
+    ///
+    /// ## Errors
+    /// Fails if the key is absent.
     pub fn architecture(&self) -> anyhow::Result<String> {
         self.metadata_string("general.architecture")
     }
 
+    /// Collects the end-of-sequence token ids from metadata: the single
+    /// `eos_token_id` plus any in the `eos_token_ids` array, de-duplicated.
     pub fn eos_token_ids(&self) -> Vec<u32> {
         let mut ids = Vec::new();
         if let Ok(eos) = self.metadata_u32("tokenizer.ggml.eos_token_id") {
@@ -187,6 +238,7 @@ impl GgufWeights {
     }
 }
 
+/// Builds every tensor from the mmap in parallel (rayon), keyed by name.
 fn parallelise_tensor_load(
     mmap: &Mmap,
     data_offset: u64,
@@ -208,6 +260,8 @@ fn parallelise_tensor_load(
     Ok(tensors)
 }
 
+/// Builds one `QTensor` from its slice of the memory map, validating the element
+/// count against the block size and that the slice lies within bounds.
 fn build_qtensor_from_mmap(
     mmap: &Mmap,
     data_offset: u64,

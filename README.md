@@ -34,6 +34,22 @@ A rust-based inference engine for Large Language Models.
 >
 > At the moment it only supports text input/output and a limited set of models.
 
+## Contents
+- [Features](#features)
+- [Architecture](#architecture)
+- [Supported Models](#supported-models)
+- [Unsupported Model Families](#unsupported-model-families)
+- [Installation](#installation)
+- [Usage](#usage)
+- [Server Options](#server-options)
+- [Security](#security)
+- [Run Options](#run-options)
+- [Known Limitations and Work in Progress](#known-limitations-and-work-in-progress)
+- [CUDA Status](#cuda-status)
+- [Benchmarks](#benchmarks)
+- [Contributing](#contributing)
+- [License](#license)
+
 ## Features
 - OpenAI-compatible chat completions endpoint (`/v1/chat/completions`) with streaming via Server-Sent Events
 - Function calling / tool use: `tools`, `tool_choice` (`auto`, `required`, `none`, forced function, `allowed_tools`), `parallel_tool_calls`, with incremental tool-call deltas in streaming
@@ -49,7 +65,7 @@ A rust-based inference engine for Large Language Models.
   - **compressed-tensors** pack-quantized INT4 (llm-compressor): converted to the AWQ layout at load, fully-quantized or mixed-precision
   - **FP8** (E4M3) block-wise and **MXFP4** (GPT-OSS experts, packed-resident)
 - Mixture-of-Experts: `Qwen3MoeForCausalLM`, `OlmoeForCausalLM`, `GptOssForCausalLM` (attention sinks, alternating sliding/full attention, harmony channels)
-- Hybrid linear-attention models (Qwen3.5 family, text-only): Gated DeltaNet + gated full attention, in BF16 safetensors, compressed-tensors INT4, and GGUF (`qwen35`) formats — see [docs/hybrid-linear-attention.md](docs/hybrid-linear-attention.md)
+- Hybrid linear-attention models (Qwen3.5 family, text-only): Gated DeltaNet + gated full attention, in BF16 safetensors, compressed-tensors INT4, and GGUF (`qwen35`) formats
 - Model download directly from HuggingFace with interactive variant selection
 
 ## Architecture
@@ -60,18 +76,16 @@ KV cache quantization uses TurboQuant with MSE-based quantization during the dec
 > Note on `--kv-quant`: the quantization step currently runs on CPU, each KV write transfers the new K/V tensors from GPU to CPU and casts them to F32 before packing. On unified-memory Apple Silicon the transfer is cheap, but on discrete CUDA GPUs the per-step roundtrip can dominate. Enable `--kv-quant` for memory-constrained deployments; leave it `off` when throughput matters and KV memory is not the bottleneck. On-device kernels are on the roadmap.
 
 ## Supported Models
-The following architectures and checkpoints are covered by the regression suite. Other checkpoints in the same families (e.g. other Llama 3.2, Gemma 3, Qwen2.5 sizes) are likely to work but are not regularly tested. Measured throughput for every entry is in [Benchmarks](#benchmarks).
+These architecture classes are covered by the regression suite, each with at least one tested checkpoint. See [Benchmarks](#benchmarks) for the exact checkpoints, formats, and measured throughput.
 
-| Architecture | Tested checkpoints | Formats tested |
-|---|---|---|
-| LlamaForCausalLM | `meta-llama/Llama-3.2-1B-Instruct` | BF16 safetensors |
-| Qwen2ForCausalLM | `Qwen/Qwen2.5-1.5B-Instruct`, `Qwen/Qwen2.5-3B-Instruct` + GGUF variants | BF16, GGUF (`Q2_K`–`Q4_K_M`) |
-| Qwen3ForCausalLM | `Qwen/Qwen3-0.6B` / `1.7B` / `4B` variants | BF16, GGUF (`Q4_K_M`, `Q5_0`, `Q5_K_M`, `Q6_K`, `Q8_0`), AWQ 4-bit, GPTQ Int8, FP8 |
-| Qwen3.5 (hybrid linear attention) | `Qwen/Qwen3.5-4B`, `cyankiwi/Qwen3.5-4B-AWQ-4bit`, `cyankiwi/Qwen3.5-4B-AWQ-BF16-INT4`, `unsloth/Qwen3.5-4B-GGUF` | BF16, compressed-tensors INT4 (full + mixed), GGUF `qwen35` |
-| GemmaForCausalLM / Gemma2 / Gemma3 / Gemma4 | `gemma-2b-it`, `gemma-2-2b-it`, `gemma-3-1b-it`, `gemma-4-E2B-it` | BF16 safetensors |
-| Mistral3ForConditionalGeneration | `mistralai/Ministral-3-3B-Instruct-25` | BF16 safetensors |
-| OlmoeForCausalLM (MoE) | `allenai/OLMoE-1B-7B-0924-Instruct` | BF16 safetensors |
-| GptOssForCausalLM (MoE) | `openai/gpt-oss-20b` | MXFP4 experts + BF16 |
+- `LlamaForCausalLM`
+- `Qwen2ForCausalLM`, `Qwen3ForCausalLM`
+- `Qwen3_5ForConditionalGeneration` (hybrid linear attention, text-only): Gated DeltaNet plus gated full attention
+- `GemmaForCausalLM`, `Gemma2ForCausalLM`, `Gemma3ForCausalLM`, `Gemma4ForConditionalGeneration`
+- `Mistral3ForConditionalGeneration`
+- `OlmoeForCausalLM` and `GptOssForCausalLM` (Mixture-of-Experts)
+
+Formats span BF16 safetensors, GGUF, AWQ/GPTQ, compressed-tensors INT4, FP8, and MXFP4, auto-detected per checkpoint. Other checkpoints in the same families and sizes (e.g. other Llama 3.2, Gemma 3, or Qwen2.5 variants) are likely to work but are not regularly tested.
 
 > [!NOTE]
 > All Qwen3 and Qwen3.5 models have been tested with and without thinking enabled, with reasoning separated into `reasoning_content` in both streaming and non-streaming responses.
@@ -85,7 +99,7 @@ The following model families are not currently supported:
 - Encoder-only models (BERT, etc.)
 
 ## Installation
-For using oxydLLM, you can either build from source or use the provided installers.
+To use oxydLLM, build from source or use the provided installers.
 
 ### Building from source
 Clone the repository and install the [Rust toolchain](https://rust-lang.org/tools/install/):
@@ -127,7 +141,7 @@ Run the server
 cargo run --release -- start
 ```
 
-Run `cargo run --release -- help` for see all the options.
+Run `cargo run --release -- help` to see all the options.
 
 ### Installers
 Platform-specific installers are made available with pre-built binaries for supported configurations. The installers bundle the server executable and its dependencies, but **not** the models.
@@ -154,24 +168,26 @@ If you prefer to manually download the installer, you can find the latest releas
 
 #### macOS (Apple Silicon)
 > [!IMPORTANT]
-> Intel-based Macs are not supported. Requires macOS 14 (Sonoma) or newer; supported releases are macOS 14, 15, and 26 (Tahoe). The installer refuses older versions because the Metal kernels need bfloat support (Metal 3.1, macOS 14+).
+> Apple Silicon only. Intel Macs are not supported. Same macOS 14+ requirement as building from source.
 - `oxydllm-macos-arm64`
 
 #### Linux (CUDA)
 
-##### x86_64
-- `oxydllm-linux-x86_64-cuda-ada.tar.gz` for Ada Lovelace (sm_89: RTX 40xx, L4, L40/L40S)
-- `oxydllm-linux-x86_64-cuda-hopper.tar.gz` for Hopper (sm_90: H100, H200)
-- `oxydllm-linux-x86_64-cuda-blackwell.tar.gz` for Blackwell datacenter (sm_100: B100, B200, GB200)
-- `oxydllm-linux-x86_64-cuda-blackwell-ultra.tar.gz` for Blackwell Ultra (sm_103: B300, GB300)
-- `oxydllm-linux-x86_64-cuda-blackwell-desktop.tar.gz` for Blackwell Desktop (sm_120: RTX 50xx, RTX PRO)
+Pick by architecture (the compute-capability table above maps each one to its GPUs):
 
-##### arm64 (GH200 / GB300 / Jetson / DGX Spark)
-- `oxydllm-linux-arm64-cuda-hopper.tar.gz` for Hopper (sm_90: GH200)
-- `oxydllm-linux-arm64-cuda-blackwell.tar.gz` for Blackwell datacenter (sm_100: B200, GB200)
-- `oxydllm-linux-arm64-cuda-blackwell-ultra.tar.gz` for Blackwell Ultra (sm_103: GB300)
-- `oxydllm-linux-arm64-cuda-thor.tar.gz` for Jetson GB (sm_110: T4000, T5000)
-- `oxydllm-linux-arm64-cuda-blackwell-desktop.tar.gz` for Blackwell Desktop (sm_121: DGX Spark / GB10)
+##### x86_64
+- `oxydllm-linux-x86_64-cuda-ada.tar.gz`: Ada Lovelace (sm_89)
+- `oxydllm-linux-x86_64-cuda-hopper.tar.gz`: Hopper (sm_90)
+- `oxydllm-linux-x86_64-cuda-blackwell.tar.gz`: Blackwell datacenter (sm_100)
+- `oxydllm-linux-x86_64-cuda-blackwell-ultra.tar.gz`: Blackwell Ultra (sm_103)
+- `oxydllm-linux-x86_64-cuda-blackwell-desktop.tar.gz`: Blackwell Desktop (sm_120)
+
+##### arm64
+- `oxydllm-linux-arm64-cuda-hopper.tar.gz`: Hopper (sm_90)
+- `oxydllm-linux-arm64-cuda-blackwell.tar.gz`: Blackwell datacenter (sm_100)
+- `oxydllm-linux-arm64-cuda-blackwell-ultra.tar.gz`: Blackwell Ultra (sm_103)
+- `oxydllm-linux-arm64-cuda-thor.tar.gz`: Jetson Thor (sm_110)
+- `oxydllm-linux-arm64-cuda-blackwell-desktop.tar.gz`: Blackwell Desktop (sm_121)
 
 ## Usage
 Download a model from HuggingFace using the `user/model` repo ID. For GGUF repos, an interactive prompt lists available quantizations and lets you pick one; variants already on disk are shown with a check mark and excluded from the numbered choices. Use `--variant Q4_K_M` to skip the prompt, `--token` for gated models, and `--name` to save under a custom local name instead of the default `user/model` path.
@@ -205,14 +221,14 @@ oxydllm rm Qwen/Qwen3-0.6B
 > [!IMPORTANT]
 > Models are loaded on demand when the first request for that model arrives.
 
-Update oxydllm to a newer release. Without flags the command queries the GitHub releases API for the latest stable non-pre-release build and compares the remote version tag against the installed binary. Pass `--pre` to target the most recent pre-release instead, or `--nightly` to compare the rolling nightly build against the compile-time Unix timestamp baked into the binary at build time. When the installed version is already current the command reports that and exits without making any changes. `update` is only available in binaries installed via `install.sh`; source builds receive an informational error and exit.
+Update oxydllm to a newer release. Without flags it targets the latest stable release; `--pre` targets the most recent pre-release, `--nightly` the rolling nightly build. It is a no-op when already current, and is only available in binaries installed via `install.sh` (source builds receive an informational error).
 ```bash
 oxydllm update
 oxydllm update --pre
 oxydllm update --nightly
 ```
 
-Remove oxydllm from the system. The command stops and removes the OS service (launchd agent on macOS, systemd unit on Linux), deletes the binary via self-removal, and then exits cleanly. A confirmation prompt is always shown before any changes are made. Pass `--purge` to also remove `~/.oxydllm/` and all downloaded models; this operation cannot be undone. `uninstall` is only available in binaries installed via `install.sh`.
+Remove oxydllm from the system: it stops and removes the OS service (launchd on macOS, systemd on Linux) and self-deletes the binary, after a confirmation prompt. `--purge` also removes `~/.oxydllm/` and all downloaded models (irreversible). Only available in binaries installed via `install.sh`.
 ```bash
 oxydllm uninstall
 oxydllm uninstall --purge
@@ -285,7 +301,7 @@ curl http://localhost:11313/metrics
 
 Example Prometheus queries:
 ```promql
-# Average TTFT over the last 5 minutes
+# 95th-percentile TTFT over the last 5 minutes
 histogram_quantile(0.95, rate(oxydllm_ttft_milliseconds_bucket[5m]))
 
 # Prefix cache hit ratio
@@ -338,10 +354,10 @@ Every option can be set via a CLI flag or an environment variable. CLI flags tak
 | `--shutdown-timeout <SECS>` | `OXYDLLM_SHUTDOWN_TIMEOUT` | `30` | Grace period for in-flight requests on shutdown |
 | `--qjl-quantization` | - | disabled | Enable Stage-2 QJL key residual quantization |
 | `--allow-cpu` | `OXYDLLM_ALLOW_CPU` | disabled | Permit CPU fallback when no GPU is available. By default startup fails fast on a GPU-less host. |
-| `--api-key <KEY>` | `OXYDLLM_API_KEY` | disabled | When set, every `/v1/*` and `/metrics` request must present the key via `Authorization: Bearer <KEY>` (or `X-API-Key: <KEY>`). `/health` remains unauthenticated for liveness probes. |
+| `--api-key <KEY>` | `OXYDLLM_API_KEY` | disabled | Require an API key on `/v1/*` and `/metrics` (see [Security](#security)). |
 | `--request-timeout <SECS>` | `OXYDLLM_REQUEST_TIMEOUT` | `300` | Wall-clock timeout per `/v1/chat/completions` request. Non-streaming responses are returned as `408 Request Timeout`; streaming responses emit a final `request_timeout` error chunk followed by `[DONE]`. Set to `0` to disable. |
 
-To produce machine-parseable JSON log output (useful with Loki, Datadog, or `jq`), set `LOG_FORMAT=json`. The variable is read at startup and applies to all commands. See the [Observability](#observability) section for details and examples.
+Set `LOG_FORMAT=json` for machine-parseable logs; see [Observability](#observability) for details.
 
 ### Configuration examples
 
@@ -383,7 +399,7 @@ The HTTP API has **no authentication by default**. Without `--api-key` set, any 
 
 Request-side hardening already enforced by the server (no configuration needed):
 
-- Per-request wall-clock timeout (`--request-timeout`, default 300s) bounds the time a single chat-completion request can hold a slot. On expiry the engine sequence is aborted, the client receives `408` (non-streaming) or an error chunk + `[DONE]` (streaming).
+- Per-request wall-clock timeout (`--request-timeout`, default 300s) bounds how long one request can hold a slot; on expiry the sequence is aborted (see Server Options for the client-facing behavior).
 - Sampling parameter ranges are validated up-front (`temperature ∈ [0, 2]`, `top_p ∈ [0, 1]`, `frequency_penalty`/`presence_penalty ∈ [-2, 2]`, `top_logprobs ∈ [0, 20]`, `repetition_penalty > 0`, `n ∈ [1, 128]`, `max_tokens ≥ 1`, `reasoning_effort ∈ {low, medium, high}`). Out-of-range values return `400 invalid_request_error` rather than silently degrading the sampler.
 
 ## Run Options
@@ -401,7 +417,7 @@ The following options are shared between `start` and `run`:
 `--models-dir`, `--devices`, `--max-context-len`, `--kv-quant`, `--qjl-quantization`, `--allow-cpu`.
 
 ## Known Limitations and Work in Progress
-- GGUF compatibility: the bf16 Metal fast path covers ten quant types (`Q4_0/1`, `Q5_0/1`, `Q8_0`, `Q2_K`, `Q3_K`, `Q4_K`, `Q5_K`, `Q6_K`); i-quants (`IQ*`) and ternary (`TQ*`) types fall back to candle's F32 path. MoE GGUFs are not yet wired.
+- GGUF compatibility: i-quants (`IQ*`) and ternary (`TQ*`) types fall back to candle's F32 path instead of the resident Metal fast path (see Features for the supported quants); MoE GGUFs are not yet wired.
 - Thinking mode is template-dependent: `enable_thinking` is applied only when the tokenizer chat template supports it.
 - Byte-level tokenizers: Streaming decode uses incremental buffering; occasional model-specific Unicode artifacts can still appear.
 - Tool / schema adherence is model-dependent: the OpenAI-compatible request fields, response shapes, and streaming semantics are implemented server-side, but local models can still ignore tool instructions or emit invalid JSON / tool arguments.
@@ -410,7 +426,6 @@ The following options are shared between `start` and `run`:
 - Metal softcap SDPA policy: The Metal SDPA path with attention softcap is currently hard-disabled in runtime (no experimental toggle) and falls back to the standard attention path.
 - Attention-sink models (gpt-oss): decode runs a dedicated fused sink-aware SDPA kernel; prefill falls back to the standard attention path, so long-prompt TTFT is higher than on comparable non-sink models.
 - Metal SDPA head-dim coverage: The fused Metal SDPA kernel supports head dimensions `32, 64, 72, 80, 96, 128, 256`. Models with other head dimensions remain functionally correct but fall back to the non-fused attention path with a measurable throughput cost.
-- CUDA optimization: Support exists but is not optimized for production use.
 - GPTQ act-order (`desc_act=true`) not supported: load fails fast; only sequential `desc_act=false` checkpoints are accepted. `g_idx` is loaded but ignored on the supported path.
 - FP8 on Apple Silicon doubles resident memory: Metal has no FP8 compute kernels, so all FP8 checkpoints are dequanted to BF16 at load time. A 4B-FP8 model needs ~8 GB resident instead of the ~4 GB on-disk footprint. CUDA / CPU retain the Level-2 resident FP8 path.
 - MoE perf is dispatch-bound: the hybrid sparse/naive path is correct and decode-competitive, but per-expert Metal command-buffer overhead caps prefill throughput. A custom fused MoE kernel would unlock the next ~2-3× speedup on long prompts.
@@ -429,20 +444,20 @@ CUDA is currently a functional compatibility path, not a performance-tuned backe
 ### Official CUDA Docker tags
 
 > [!IMPORTANT]
-> Every tag below is unvalidated, the images compile and pass CPU tests in CI, but no inference run has been verified on physical NVIDIA hardware. Treat the table as a build matrix, not a compatibility guarantee.
+> These tags are unvalidated on physical NVIDIA hardware (see the warning above). Treat the table as a build matrix, not a compatibility guarantee.
 
-| Tag | Compute capability | Platform | Target |
+| Tag | Compute capability | Platform | Architecture |
 |---|---:|---|---|
-| `cuda-ada` | 89 | amd64 | Ada Lovelace (RTX 40xx, L4, L40/L40S) |
-| `cuda-hopper` | 90 | amd64 | Hopper (H100, H200) |
-| `cuda-blackwell` | 100 | amd64 | Blackwell datacenter (B100, B200, GB200) |
-| `cuda-blackwell-ultra` | 103 | amd64 | Blackwell Ultra (B300, GB300) |
-| `cuda-blackwell-desktop` | 120 | amd64 | Blackwell Desktop (RTX 50xx, RTX PRO) |
-| `cuda-hopper-arm64` | 90 | arm64 | Hopper (GH200 Grace Hopper) |
-| `cuda-blackwell-arm64` | 100 | arm64 | Blackwell datacenter (B200, GB200) |
-| `cuda-blackwell-ultra-arm64` | 103 | arm64 | Blackwell Ultra (GB300 NVL72) |
-| `cuda-thor-arm64` | 110 | arm64 | Jetson GB (T4000, T5000) |
-| `cuda-blackwell-desktop-arm64` | 121 | arm64 | Blackwell Desktop (DGX Spark / GB10) |
+| `cuda-ada` | 89 | amd64 | Ada Lovelace |
+| `cuda-hopper` | 90 | amd64 | Hopper |
+| `cuda-blackwell` | 100 | amd64 | Blackwell datacenter |
+| `cuda-blackwell-ultra` | 103 | amd64 | Blackwell Ultra |
+| `cuda-blackwell-desktop` | 120 | amd64 | Blackwell Desktop |
+| `cuda-hopper-arm64` | 90 | arm64 | Hopper |
+| `cuda-blackwell-arm64` | 100 | arm64 | Blackwell datacenter |
+| `cuda-blackwell-ultra-arm64` | 103 | arm64 | Blackwell Ultra |
+| `cuda-thor-arm64` | 110 | arm64 | Jetson Thor |
+| `cuda-blackwell-desktop-arm64` | 121 | arm64 | Blackwell Desktop |
 
 - `latest` and `cuda` point to `cuda-ada` (stable default, widest x86_64 compatibility).
 - `nightly` and `nightly-cuda` point to nightly `cuda-ada`.
@@ -478,7 +493,7 @@ All numbers were measured on the Apple Silicon reference machine (M5, 24 GB unif
 | `google/gemma-2-2b-it` | Gemma2ForCausalLM | BF16 safetensors | 15.5 |
 | `google/gemma-3-1b-it` | Gemma3ForCausalLM | BF16 safetensors | 36.1 |
 | `google/gemma-4-E2B-it` | Gemma4ForConditionalGeneration | BF16 safetensors | 15.4 |
-| `mistralai/Ministral-3-3B-Instruct-25` | Mistral3ForConditionalGeneration | BF16 safetensors | 12.1 |
+| `mistralai/Ministral-3-3B-Instruct-2512` | Mistral3ForConditionalGeneration | BF16 safetensors | 12.1 |
 | `allenai/OLMoE-1B-7B-0924-Instruct` | OlmoeForCausalLM (MoE) | BF16 safetensors, 64 experts × top-k 8 | 13.6 |
 | `openai/gpt-oss-20b` | GptOssForCausalLM (MoE) | MXFP4 experts + BF16, 32 experts × top-k 4 | 14.3 |
 
@@ -491,7 +506,7 @@ The Qwen3.5 family additionally went through a 13-test adversarial battery per f
 | `Qwen/Qwen3.5-4B` | BF16 safetensors | 8.7 GB | 8.8 | 25.1 (2.7×) | 13/13 |
 | `cyankiwi/Qwen3.5-4B-AWQ-4bit` | compressed-tensors INT4 (W4A16 resident) | 3.1 GB | 24.6 | 36.1 (1.5×) | 13/13 |
 | `cyankiwi/Qwen3.5-4B-AWQ-BF16-INT4` | mixed BF16 DeltaNet + INT4 attn/MLP | 4.4 GB | 15.9 | 30.3 (1.9×) | 13/13 |
-| `unsloth/Qwen3.5-4B-GGUF` (Q4_K_M) | GGUF (`qwen35` arch) | 2.5 GB | 24.1 | — | 12/13** |
+| `unsloth/Qwen3.5-4B-GGUF` (Q4_K_M) | GGUF (`qwen35` arch) | 2.5 GB | 24.1 | n/a | 12/13** |
 
 \* Median of three 150-token completions, prefill included.
 
@@ -500,12 +515,12 @@ The Qwen3.5 family additionally went through a 13-test adversarial battery per f
 ### Performance notes
 
 - Decode on Apple Silicon is weight-bandwidth-bound: quantized checkpoints scale roughly with bits-per-weight, and single-stream tok/s tracks resident model size.
-- Concurrent decode (2–8 sequences) shares one weight read per forward across the batch for GGUF and AWQ-layout checkpoints (batched GEMV kernels). Examples at concurrency 4 (aggregate): Qwen3-4B-AWQ 17.6 → 47.7 tok/s; GGUF Q4_K_M conc=8 reaches ~55 tok/s aggregate. GPTQ-layout checkpoints do not yet have the batched kernel and degrade under concurrency.
+- Concurrent decode (2-8 sequences) shares one weight read per forward across the batch for GGUF and AWQ-layout checkpoints (batched GEMV kernels). Examples at concurrency 4 (aggregate): Qwen3-4B-AWQ 17.6 to 47.7 tok/s; GGUF Q4_K_M conc=8 reaches ~55 tok/s aggregate. GPTQ-layout checkpoints do not yet have the batched kernel and degrade under concurrency.
 - AWQ/GPTQ/INT4 weights stay packed on Metal: Qwen3-4B-AWQ runs in ~2.5 GB resident vs ~7.5 GB if dequantized.
 - GGUF loading is zero-copy mmap with parallel materialization (Qwen3-4B-Q4_K_M loads in ~2.7 s).
 - `openai/gpt-oss-20b` (20.9B params) runs in ~13 GB resident; `gpt-oss-120b` shares the architecture and should load given enough memory, but is untested.
 - Qwen3.5 prefill is GEMM-compute-bound (~230 tok/s on the BF16 4B); quantized checkpoints prefill faster.
-- On macOS 26 with an M5, prefill runs on Metal 4 TensorOps (neural accelerator): dense GEMMs, packed-quant GEMMs (tile-staged dequantization, no dense-weight materialization), and FlashAttention. TTFT on a ~1.3k-token prompt improves 25–61% vs the standard kernels (dense 0.6B −50%, AWQ 4B −61%, GPTQ-Int8 1.7B −37%, Qwen3.5 4B −25%); decode is unaffected (bandwidth-bound). Older macOS/hardware falls back to the standard kernels automatically.
+- On macOS 26 with an M5, prefill runs on Metal 4 TensorOps (neural accelerator): dense GEMMs, packed-quant GEMMs (tile-staged dequantization, no dense-weight materialization), and FlashAttention. TTFT on a ~1.3k-token prompt improves 25-61% vs the standard kernels (dense 0.6B -50%, AWQ 4B -61%, GPTQ-Int8 1.7B -37%, Qwen3.5 4B -25%); decode is unaffected (bandwidth-bound). Older macOS/hardware falls back to the standard kernels automatically.
 
 ## Contributing
 Contributions are welcome! If you want to contribute, please follow these steps:

@@ -65,9 +65,7 @@ pub fn dequantize_mxfp4_f32(
 
 /// MXFP4-resident linear layer: `y = x @ W^T + bias` with W kept packed.
 pub struct Mxfp4Linear {
-    /// Flattened `[out_features × in_features/2]` u8 (16 bytes per block).
     blocks: Tensor,
-    /// Flattened `[out_features × in_features/32]` u8 (E8M0).
     scales: Tensor,
     bias: Option<Tensor>,
     in_features: usize,

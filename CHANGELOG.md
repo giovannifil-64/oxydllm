@@ -51,6 +51,7 @@ Before the fix, concurrency 2 to 4 on these checkpoints ran below single-stream 
 
 Qwen3.5-4B decode, single stream: BF16 9.2 tok/s, compressed-tensors INT4 27.1 tok/s (20.4 before the tied lm_head quantization), mixed BF16/INT4 14.7 tok/s, GGUF Q4_K_M 24.1 tok/s. BF16 concurrency 4 aggregate scales 2.7x.
 
+**Full Changelog**: https://github.com/giovannifil-64/oxydllm/compare/0.0.0-alpha.12.1...0.0.0-alpha.12.2
 
 ## 0.0.0-alpha.12.1
 

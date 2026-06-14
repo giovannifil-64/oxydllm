@@ -1,3 +1,16 @@
+//! The transformer layer and the top-level batched forward pass.
+//!
+//! A [`TransformerBlock`] is one pre-norm decoder layer: a token mixer
+//! (attention or Gated DeltaNet) and a feed-forward sub-layer (dense or MoE),
+//! each wrapped in RMSNorm and a residual connection. The same struct covers
+//! every supported architecture; which optional sub-components exist is decided
+//! by the [`BlockConfig`] at load time.
+//!
+//! [`run_transformer_layers_batch`] is the architecture-agnostic forward pass:
+//! given the static [`TransformerComponents`] and a batch of tokens, it runs
+//! embeddings, every block in turn, the final norm and the lm-head, and returns
+//! logits. It is the function the GGUF and safetensors runtimes both call.
+
 use super::decode_profile;
 use super::{
     attention::{Attention, SegmentInfo},
@@ -64,6 +77,29 @@ impl TokenMixer {
     }
 }
 
+/// One pre-norm transformer decoder layer.
+///
+/// The fixed backbone is two residual sub-layers:
+///
+/// 1. `x = x + mix(input_norm(x))`: the token mixer ([`TokenMixer`]:
+///    attention or Gated DeltaNet).
+/// 2. `x = x + ffn(ffn_norm(x))`: the feed-forward sub-layer
+///    ([`FeedForwardLayer`]: dense or MoE).
+///
+/// Everything else is optional and driven by the [`BlockConfig`]:
+///
+/// - **Gemma "sandwich" norms** ([`BlockConfig::has_ffn_norms`]): when present,
+///   `pre_ffn_norm` and `post_ffn_norm` wrap the FFN, and `ffn_norm` is reused
+///   as a *post-attention* norm applied to the mixer output before the residual
+///   add. So the same `ffn_norm` field sits in different places depending on
+///   this flag: see [`forward_batch`](Self::forward_batch).
+/// - **Per-layer input** (Gemma 3n): `per_layer_input_gate`,
+///   `per_layer_projection` and `post_per_layer_input_norm`, when all present,
+///   add a third gated residual that mixes in this layer's per-layer embedding.
+/// - **`layer_scalar`**: a final scalar multiply on the block output.
+///
+/// Build one with [`load`](Self::load) (safetensors) or
+/// [`load_gguf`](Self::load_gguf).
 pub struct TransformerBlock {
     input_norm: RMSNorm,
     attention: TokenMixer,
@@ -97,6 +133,17 @@ fn tensor_to_scalar_f64(t: &Tensor) -> Result<f64> {
 }
 
 impl TransformerBlock {
+    /// Loads layer `layer_idx` from safetensors weights (`model.layers.{i}.*`).
+    ///
+    /// The token mixer is a Gated DeltaNet when [`BlockConfig::linear_attn`] is
+    /// set, otherwise attention; the FFN is MoE when [`BlockConfig::moe`] is set
+    /// (with a GPT-OSS variant), otherwise dense. The optional sandwich norms
+    /// and per-layer-input projections are loaded only when their tensors are
+    /// present in `weights`.
+    ///
+    /// ## Errors
+    /// Fails if a required tensor is missing, or if an FP8 weight is present
+    /// without its companion `*_scale_inv`.
     pub fn load(cfg: &BlockConfig, layer_idx: usize, weights: &ModelWeights) -> Result<Self> {
         let p = format!("model.layers.{}", layer_idx);
         let input_norm = RMSNorm::load(
@@ -220,6 +267,18 @@ impl TransformerBlock {
         })
     }
 
+    /// Loads layer `layer_idx` from GGUF weights (`blk.{i}.*`), dequantizing the
+    /// norm tensors to `dtype` on `device`.
+    ///
+    /// The GGUF runtime is the dense, single-stream path: only attention/GDN
+    /// mixers and a dense FFN are built here. The pre-FFN norm is read from
+    /// either `ffn_norm` (standard archs) or `post_attention_norm` (Qwen3.5),
+    /// matching llama.cpp's naming.
+    ///
+    /// ## Errors
+    /// Fails if a required tensor is missing, or if `cfg.moe` is set: GGUF MoE
+    /// models are not yet supported (different tensor naming and per-expert
+    /// quantization layout).
     pub fn load_gguf(
         cfg: &BlockConfig,
         layer_idx: usize,
@@ -239,8 +298,6 @@ impl TransformerBlock {
             cfg.norm_type,
         )?;
 
-        // llama.cpp names the pre-FFN norm `ffn_norm` on standard archs and
-        // `post_attention_norm` on qwen35.
         let ffn_norm_qt = match gguf.try_get(&format!("{prefix}.ffn_norm.weight")) {
             Some(qt) => qt,
             None => gguf.get(&format!("{prefix}.post_attention_norm.weight"))?,
@@ -255,8 +312,6 @@ impl TransformerBlock {
         } else {
             TokenMixer::Attention(Attention::load_gguf(cfg, layer_idx, gguf, device, dtype)?)
         };
-        // GGUF runtime: dense FFN only — MoE GGUF support is future work
-        // (different tensor naming and per-expert quantization layout).
         if cfg.moe.is_some() {
             candle_core::bail!(
                 "GGUF MoE models are not yet supported (layer {layer_idx} has cfg.moe = Some)"
@@ -286,6 +341,21 @@ impl TransformerBlock {
         })
     }
 
+    /// Runs the layer over a packed batch of tokens, returning the new hidden
+    /// state (same shape as `x`).
+    ///
+    /// `segments` carries one [`SegmentInfo`] per sequence in the batch: its
+    /// token count and its KV cache (or recurrent state) for this layer, so a
+    /// single call advances several sequences at once. `per_layer_input` is the
+    /// Gemma-3n per-layer embedding for this layer, or `None`.
+    ///
+    /// The norm placement follows the [`TransformerBlock`] type docs: with
+    /// sandwich norms, `ffn_norm` is applied to the attention output before the
+    /// residual add and `pre_ffn_norm` feeds the FFN; without them, `ffn_norm`
+    /// feeds the FFN directly.
+    ///
+    /// ## Errors
+    /// Propagates any tensor-op failure from the sub-layers.
     pub fn forward_batch(
         &self,
         x: &Tensor,
@@ -350,7 +420,14 @@ impl TransformerBlock {
     }
 }
 
-/// Static model components shared by standard transformer architectures (Llama, Qwen3, …).
+/// A borrowed bundle of the static parts of a model, passed by value into
+/// [`run_transformer_layers_batch`].
+///
+/// Everything here is owned by the model struct and lives for the duration of
+/// the forward pass. `ropes` holds one [`RotaryEmbedding`] per layer (models
+/// can use a different `rope_theta` per layer); the `per_layer_*` and softcap
+/// fields are the optional features described on
+/// [`super::config::StandardTransformerConfig`].
 pub struct TransformerComponents<'a> {
     pub embed_tokens: &'a Embedding,
     pub blocks: &'a [TransformerBlock],
@@ -368,7 +445,31 @@ pub struct TransformerComponents<'a> {
     pub kv_shared_layer_map: Option<&'a [Option<usize>]>,
 }
 
-/// Shared batched forward pass for standard transformer models.
+/// The architecture-agnostic forward pass: tokens in, logits out.
+///
+/// Several sequences are packed into one batch. `token_ids` is their tokens
+/// concatenated end to end, and `token_counts[i]` is how many of those belong to
+/// sequence `i` (typically many during prefill, exactly `1` during decode).
+/// `seq_caches[i]` is that sequence's KV cache, one [`PagedKvCache`] per layer.
+/// The result has one logit row per input token.
+///
+/// The pass runs embeddings (plus the optional per-layer-input embedding),
+/// every [`TransformerBlock`] in order, the final norm, the lm-head, and the
+/// optional logit soft-cap. Per-layer it assembles the [`SegmentInfo`] slice
+/// each block needs, honouring [`TransformerComponents::kv_shared_layer_map`]
+/// so layers that share a KV cache read the same one.
+///
+/// ## Panics
+/// In debug builds, asserts the batch is internally consistent:
+/// `token_counts.len() == seq_caches.len()`, `sum(token_counts)` equals the
+/// `token_ids` sequence length, every `seq_caches[i]` has one entry per block,
+/// and `token_ids`/`position_ids` live on the same device: a cross-device
+/// mismatch would otherwise be silently miscomputed by downstream ops rather
+/// than caught here. These are `debug_assert!`s, compiled out of release builds.
+///
+/// ## Errors
+/// Propagates tensor-op failures, and fails if a per-layer-input embedding
+/// dimension is not divisible by the layer count.
 pub fn run_transformer_layers_batch(
     c: TransformerComponents<'_>,
     token_ids: &Tensor,
@@ -393,9 +494,6 @@ pub fn run_transformer_layers_batch(
             "seq_caches[{i}].len() must equal number of transformer blocks"
         );
     }
-    // Cross-device tensors would be silently miscomputed by candle ops further
-    // down; surface the misroute here so the panic names the offending input.
-    // Single-device deployments are unaffected — the check is debug-only.
     debug_assert_eq!(
         token_ids.device().location(),
         position_ids.device().location(),
@@ -507,6 +605,13 @@ pub fn run_transformer_layers_batch(
     out
 }
 
+/// Commits any buffered writes in every per-sequence, per-layer KV cache.
+///
+/// [`PagedKvCache`] may stage appends; call this after a batch to make them
+/// visible before the caches are read again.
+///
+/// ## Errors
+/// Propagates a flush failure from any underlying cache.
 pub fn flush_caches(seq_caches: &mut [&mut [PagedKvCache]]) -> Result<()> {
     for seq_cache in seq_caches.iter_mut() {
         for cache in seq_cache.iter_mut() {

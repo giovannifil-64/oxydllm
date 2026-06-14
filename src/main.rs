@@ -964,36 +964,40 @@ fn run_list(models_dir: &std::path::Path) {
         return;
     }
 
-    const COL_NAME: usize = 36;
-    const COL_ARCH: usize = 34;
+    let name_w = models
+        .iter()
+        .map(|m| m.id.chars().count())
+        .chain(std::iter::once("NAME".len()))
+        .max()
+        .unwrap_or(4);
+    let arch_w = models
+        .iter()
+        .map(|m| m.architecture.chars().count())
+        .chain(std::iter::once("ARCHITECTURE".len()))
+        .max()
+        .unwrap_or(12);
 
     println!();
     println!(
-        "  {:<COL_NAME$} {:<COL_ARCH$} {:>9}",
+        "  {:<name_w$} {:<arch_w$} {:>9}",
         "NAME", "ARCHITECTURE", "SIZE"
     );
-    println!("  {}", "─".repeat(COL_NAME + 1 + COL_ARCH + 1 + 9));
+    println!("  {}", "─".repeat(name_w + 1 + arch_w + 1 + 9));
 
     for m in &models {
         let size_str = if m.size_bytes > 0 {
             fmt_size(m.size_bytes)
         } else {
-            "—".to_string()
+            "-".to_string()
         };
         println!(
-            "  {:<COL_NAME$} {:<COL_ARCH$} {:>9}",
-            truncate(&m.id, COL_NAME),
-            truncate(&m.architecture, COL_ARCH),
-            size_str,
+            "  {:<name_w$} {:<arch_w$} {:>9}",
+            m.id, m.architecture, size_str,
         );
     }
     println!();
-    println!("  {} model(s)  —  {}", models.len(), models_dir.display());
+    println!("  {} model(s) in {}", models.len(), models_dir.display());
     println!();
-}
-
-fn truncate(s: &str, max: usize) -> &str {
-    if s.len() <= max { s } else { &s[..max] }
 }
 
 fn fmt_size(bytes: usize) -> String {

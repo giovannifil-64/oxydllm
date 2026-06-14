@@ -445,6 +445,7 @@ pub fn engine_loop(
     tokenizer: Arc<Tokenizer>,
     mut request_rx: tokio_mpsc::Receiver<IncomingRequest>,
     shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    model_id: String,
 ) {
     let gpu_lock = crate::gpu_lock::gpu_lock_for(engine.device());
     let mut trackers: HashMap<SequenceId, SeqTracker> = HashMap::new();
@@ -732,16 +733,11 @@ pub fn engine_loop(
                     }
 
                     if step.prefix_cache_hits + step.prefix_cache_misses > 0 {
-                        let model_label = trackers
-                            .values()
-                            .next()
-                            .map(|t| t.model_id.clone())
-                            .unwrap_or_default();
                         metrics::PREFIX_CACHE_REQUESTS
-                            .with_label_values(&[model_label.as_str(), "hit"])
+                            .with_label_values(&[model_id.as_str(), "hit"])
                             .inc_by(step.prefix_cache_hits as f64);
                         metrics::PREFIX_CACHE_REQUESTS
-                            .with_label_values(&[model_label.as_str(), "miss"])
+                            .with_label_values(&[model_id.as_str(), "miss"])
                             .inc_by(step.prefix_cache_misses as f64);
                     }
                 }
@@ -762,6 +758,9 @@ pub fn engine_loop(
                         let aborted_ids = engine.abort_all();
                         for id in aborted_ids {
                             if let Some(tracker) = trackers.remove(&id) {
+                                metrics::REQUESTS_TOTAL
+                                    .with_label_values(&[tracker.model_id.as_str(), "error"])
+                                    .inc();
                                 let _ = tracker.tx.send(EngineEvent::Error(e.to_string()));
                                 let _ = tracker.tx.send(EngineEvent::StreamEnd);
                             }
@@ -770,6 +769,9 @@ pub fn engine_loop(
                         let aborted_ids = engine.abort_running();
                         for id in aborted_ids {
                             if let Some(tracker) = trackers.remove(&id) {
+                                metrics::REQUESTS_TOTAL
+                                    .with_label_values(&[tracker.model_id.as_str(), "error"])
+                                    .inc();
                                 let _ = tracker.tx.send(EngineEvent::Error(e.to_string()));
                                 let _ = tracker.tx.send(EngineEvent::StreamEnd);
                             }
@@ -783,9 +785,232 @@ pub fn engine_loop(
     }
 
     for (_, tracker) in trackers.drain() {
+        metrics::REQUESTS_TOTAL
+            .with_label_values(&[tracker.model_id.as_str(), "error"])
+            .inc();
         let _ = tracker
             .tx
             .send(EngineEvent::Error("Model unloaded".to_string()));
         let _ = tracker.tx.send(EngineEvent::StreamEnd);
+    }
+}
+
+#[cfg(test)]
+mod metrics_loop_tests {
+    use super::*;
+    use crate::common::paged::{
+        BlockAllocator, DEFAULT_BLOCK_SIZE, PagedKvCache, SharedBlockAllocator,
+    };
+    use crate::models::traits::BatchModel;
+    use crate::sampling::SamplingParams;
+    use crate::scheduler::SchedulerConfig;
+    use candle_core::{DType, Device, Tensor};
+    use std::sync::Mutex;
+    use std::sync::atomic::AtomicBool;
+    use tempfile::TempDir;
+    use tokenizers::models::wordlevel::WordLevel;
+    use tokenizers::pre_tokenizers::whitespace::Whitespace;
+
+    // Minimal model that drives the real `engine_loop`: either fails on forward
+    // (to exercise the error path) or forces `forced` as the argmax token so a
+    // request completes (to exercise the success + prefix-cache path).
+    struct StubModel {
+        device: Device,
+        allocators: Vec<SharedBlockAllocator>,
+        forced: u32,
+        fail: bool,
+    }
+
+    impl StubModel {
+        fn new(forced: u32, fail: bool) -> Self {
+            let alloc =
+                BlockAllocator::new(64, DEFAULT_BLOCK_SIZE, 1, 8, DType::F32, &Device::Cpu, None)
+                    .expect("alloc");
+            Self {
+                device: Device::Cpu,
+                allocators: vec![Arc::new(Mutex::new(alloc))],
+                forced,
+                fail,
+            }
+        }
+        fn failing() -> Self {
+            Self::new(0, true)
+        }
+        fn completing(forced: u32) -> Self {
+            Self::new(forced, false)
+        }
+    }
+
+    impl BatchModel for StubModel {
+        fn forward_batch(
+            &self,
+            token_ids: &Tensor,
+            _position_ids: &Tensor,
+            _seq_caches: &mut [&mut [PagedKvCache]],
+            _token_counts: &[usize],
+        ) -> candle_core::Result<Tensor> {
+            if self.fail {
+                return Err(candle_core::Error::Msg(
+                    "stub model forced failure".to_string(),
+                ));
+            }
+            let (_, total_tokens) = token_ids.dims2()?;
+            let vocab = self.vocab_size();
+            let forced = (self.forced as usize).min(vocab - 1);
+            let mut logits = vec![0f32; total_tokens * vocab];
+            for i in 0..total_tokens {
+                logits[i * vocab + forced] = 1.0;
+            }
+            Tensor::from_vec(logits, (1, total_tokens, vocab), &self.device)
+        }
+        fn vocab_size(&self) -> usize {
+            32
+        }
+        fn stop_token_ids(&self) -> &[u32] {
+            &[]
+        }
+        fn max_seq_len(&self) -> usize {
+            1024
+        }
+        fn device(&self) -> &Device {
+            &self.device
+        }
+        fn num_layers(&self) -> usize {
+            self.allocators.len()
+        }
+        fn allocators(&self) -> &[SharedBlockAllocator] {
+            &self.allocators
+        }
+    }
+
+    fn make_tokenizer() -> (Arc<Tokenizer>, TempDir) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let model = WordLevel::builder()
+            .vocab(
+                [("[UNK]".to_string(), 0u32), ("a".to_string(), 1u32)]
+                    .into_iter()
+                    .collect(),
+            )
+            .unk_token("[UNK]".to_string())
+            .build()
+            .unwrap_or_else(|e| panic!("build wordlevel: {e}"));
+        let mut inner = tokenizers::Tokenizer::new(model);
+        inner.with_pre_tokenizer(Some(Whitespace {}));
+        inner
+            .save(tmp.path().join("tokenizer.json"), false)
+            .unwrap_or_else(|e| panic!("save tokenizer: {e}"));
+        let tok =
+            Tokenizer::from_dir(tmp.path().to_str().expect("utf-8 path")).expect("load tokenizer");
+        (Arc::new(tok), tmp)
+    }
+
+    // Run a single request through the real engine_loop to completion (or failure)
+    // and join the loop thread, so metrics are fully recorded before assertions.
+    fn drive_one_request(
+        stub: StubModel,
+        engine_model_id: &str,
+        request_model_id: &str,
+        max_tokens: usize,
+    ) {
+        let engine = Engine::new_with_stop_controls(
+            Box::new(stub),
+            SchedulerConfig {
+                max_num_sequences: 4,
+                max_tokens_per_step: 1024,
+            },
+            &[],
+            &[],
+        );
+        let (tok, _tmp) = make_tokenizer();
+        let (req_tx, req_rx) = tokio_mpsc::channel::<IncomingRequest>(8);
+        let (resp_tx, resp_rx) = tokio_mpsc::unbounded_channel::<EngineEvent>();
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        let req = IncomingRequest {
+            request_id: "req-test".to_string(),
+            prompt_tokens: vec![1, 1, 1],
+            sampling_params: SamplingParams::default(),
+            max_tokens,
+            response_tx: resp_tx,
+            model_id: request_model_id.to_string(),
+            enqueued_at: std::time::Instant::now(),
+            enable_thinking: false,
+            extra_stop_token_ids: vec![],
+        };
+        req_tx.try_send(req).expect("enqueue request");
+        // Drop the sender before running the loop: blocking_recv first returns the
+        // buffered request, and once all work has drained it returns None so the
+        // loop exits. Engine holds a non-Send Box<dyn BatchModel>, so we run the
+        // loop on this thread rather than spawning (as production builds it inside
+        // its own thread). resp_rx stays alive so the request isn't aborted as a
+        // closed channel.
+        drop(req_tx);
+        engine_loop(engine, tok, req_rx, shutdown, engine_model_id.to_string());
+        drop(resp_rx);
+    }
+
+    fn counter_value(name: &str, labels: &[(&str, &str)]) -> Option<f64> {
+        prometheus::gather()
+            .into_iter()
+            .find(|mf| mf.name() == name)
+            .and_then(|mf| {
+                mf.metric.iter().find_map(|m| {
+                    let matches = labels
+                        .iter()
+                        .all(|(k, v)| m.label.iter().any(|l| l.name() == *k && l.value() == *v));
+                    matches.then(|| m.counter.value())
+                })
+            })
+    }
+
+    // Contract (#2): a request killed by an engine step failure is counted once
+    // under status="error". Before the fix only status="ok" was ever recorded.
+    #[test]
+    fn failed_request_is_counted_as_error_status() {
+        let model = "metricstest-error-status-model";
+        drive_one_request(StubModel::failing(), model, model, 4);
+        assert_eq!(
+            counter_value(
+                "oxydllm_requests_total",
+                &[("model", model), ("status", "error")]
+            ),
+            Some(1.0),
+            "an engine step failure must record exactly one error-status request"
+        );
+    }
+
+    // Contract (#3): prefix-cache counters are labeled with the engine's model id,
+    // never an empty string, even when the only in-flight request completes in the
+    // same step it prefilled (which drains `trackers` before the cache is recorded).
+    #[test]
+    fn prefix_cache_uses_engine_model_label_not_empty() {
+        let engine_label = "metricstest-engine-label";
+        let request_label = "metricstest-request-label";
+        drive_one_request(StubModel::completing(5), engine_label, request_label, 1);
+
+        let misses = counter_value(
+            "oxydllm_prefix_cache_requests_total",
+            &[("model", engine_label), ("result", "miss")],
+        );
+        assert!(
+            misses.map(|v| v >= 1.0).unwrap_or(false),
+            "cold prefill misses must be labeled with the engine model id, got {misses:?}"
+        );
+        assert_eq!(
+            counter_value(
+                "oxydllm_prefix_cache_requests_total",
+                &[("model", ""), ("result", "miss")]
+            ),
+            None,
+            "prefix-cache must never record under an empty model label"
+        );
+        assert_eq!(
+            counter_value(
+                "oxydllm_requests_total",
+                &[("model", request_label), ("status", "ok")]
+            ),
+            Some(1.0),
+            "the successful completion is still counted under the request's model id"
+        );
     }
 }

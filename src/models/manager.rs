@@ -1014,7 +1014,7 @@ fn spawn_load(params: SpawnLoadParams) {
         if let Some(d) = draft {
             engine = engine.with_draft_model(d);
         }
-        engine_loop(engine, tokenizer, request_rx, shutdown);
+        engine_loop(engine, tokenizer, request_rx, shutdown, model_id_thread);
     });
 
     tokio::spawn(async move {

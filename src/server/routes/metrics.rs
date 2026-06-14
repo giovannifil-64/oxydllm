@@ -1,4 +1,4 @@
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use axum::extract::State;
 use axum::http::header;
@@ -94,6 +94,24 @@ pub static VRAM_USED_BYTES: LazyLock<Gauge> = LazyLock::new(|| {
     .expect("failed to register oxydllm_vram_used_bytes")
 });
 
+static MEMORY_GAUGE_LOCK: Mutex<()> = Mutex::new(());
+
+fn refresh_memory_gauges<'a>(models: impl Iterator<Item = (&'a str, u64, u64)>) {
+    MODEL_WEIGHTS_BYTES.reset();
+    KV_CACHE_ALLOCATED_BYTES.reset();
+    let mut total_bytes: u64 = 0;
+    for (id, weights_bytes, kv_bytes) in models {
+        MODEL_WEIGHTS_BYTES
+            .with_label_values(&[id])
+            .set(weights_bytes as f64);
+        KV_CACHE_ALLOCATED_BYTES
+            .with_label_values(&[id])
+            .set(kv_bytes as f64);
+        total_bytes += weights_bytes + kv_bytes;
+    }
+    VRAM_USED_BYTES.set(total_bytes as f64);
+}
+
 pub(super) async fn serve_metrics(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     // Touch all statics so they appear in output even before any request comes in.
     let _ = &*TTFT_HISTOGRAM;
@@ -106,23 +124,25 @@ pub(super) async fn serve_metrics(State(state): State<Arc<AppState>>) -> impl In
     let _ = &*VRAM_USED_BYTES;
 
     let running = state.manager.lock().await.list_running();
-    let mut total_bytes: u64 = 0;
-    for info in &running {
-        MODEL_WEIGHTS_BYTES
-            .with_label_values(&[&info.id])
-            .set(info.weights_size_bytes as f64);
-        KV_CACHE_ALLOCATED_BYTES
-            .with_label_values(&[&info.id])
-            .set(info.kv_cache_bytes as f64);
-        total_bytes += (info.weights_size_bytes + info.kv_cache_bytes) as u64;
-    }
-    VRAM_USED_BYTES.set(total_bytes as f64);
 
-    let encoder = TextEncoder::new();
-    let mut buf = Vec::new();
-    if let Err(e) = encoder.encode(&prometheus::gather(), &mut buf) {
-        tracing::warn!(error = %e, "failed to encode prometheus metrics");
-    }
+    let buf = {
+        let _guard = MEMORY_GAUGE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        refresh_memory_gauges(running.iter().map(|info| {
+            (
+                info.id.as_str(),
+                info.weights_size_bytes as u64,
+                info.kv_cache_bytes as u64,
+            )
+        }));
+        let encoder = TextEncoder::new();
+        let mut buf = Vec::new();
+        if let Err(e) = encoder.encode(&prometheus::gather(), &mut buf) {
+            tracing::warn!(error = %e, "failed to encode prometheus metrics");
+        }
+        buf
+    };
     (
         [(
             header::CONTENT_TYPE,
@@ -130,4 +150,55 @@ pub(super) async fn serve_metrics(State(state): State<Arc<AppState>>) -> impl In
         )],
         buf,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn gauge_value(metric_name: &str, model: &str) -> Option<f64> {
+        prometheus::gather()
+            .into_iter()
+            .find(|mf| mf.name() == metric_name)
+            .and_then(|mf| {
+                mf.metric.iter().find_map(|m| {
+                    let matches = m
+                        .label
+                        .iter()
+                        .any(|l| l.name() == "model" && l.value() == model);
+                    matches.then(|| m.gauge.value())
+                })
+            })
+    }
+
+    #[test]
+    fn unloaded_model_gauge_series_is_dropped() {
+        let model = "stale-series-contract-model";
+        let _guard = MEMORY_GAUGE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        refresh_memory_gauges([(model, 4096u64, 1024u64)].into_iter());
+        assert_eq!(
+            gauge_value("oxydllm_model_weights_bytes", model),
+            Some(4096.0),
+            "series must be exported while the model is loaded"
+        );
+        assert_eq!(
+            gauge_value("oxydllm_kv_cache_allocated_bytes", model),
+            Some(1024.0),
+        );
+
+        refresh_memory_gauges(std::iter::empty());
+        assert_eq!(
+            gauge_value("oxydllm_model_weights_bytes", model),
+            None,
+            "stale weights series must be removed after the model is unloaded"
+        );
+        assert_eq!(
+            gauge_value("oxydllm_kv_cache_allocated_bytes", model),
+            None,
+            "stale kv-cache series must be removed after the model is unloaded"
+        );
+    }
 }

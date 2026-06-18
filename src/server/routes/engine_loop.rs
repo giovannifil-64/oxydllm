@@ -194,6 +194,10 @@ struct SeqTracker {
     think_stable_text: String,
     harmony_state: HarmonyState,
     harmony_header_ids: Vec<u32>,
+    // Per-request OpenTelemetry span (whole lifecycle) and the child `decode`
+    // span (first token to completion). Closed when this tracker is dropped.
+    span: tracing::Span,
+    decode_span: Option<tracing::Span>,
 }
 
 fn abort_sequences(
@@ -232,6 +236,8 @@ fn enqueue_request(
     let request_id = req.request_id.clone();
     let model_id = req.model_id.clone();
     let enqueued_at = req.enqueued_at;
+    let prompt_len = req.prompt_tokens.len();
+    let max_tokens = req.max_tokens;
     let seq_id = engine.add_request_with_stop(
         req.prompt_tokens,
         req.sampling_params,
@@ -243,6 +249,23 @@ fn enqueue_request(
         model_id = %model_id,
         seq_id,
         "request enqueued"
+    );
+    // Lifecycle span for this request, nested under the HTTP-handler span so the
+    // trace spans the HTTP boundary. The Empty fields are filled in via `record`
+    // as the request reaches first token and completion.
+    let span = tracing::info_span!(
+        parent: &req.parent_span,
+        "inference.request",
+        request_id = %request_id,
+        model_id = %model_id,
+        seq_id,
+        prompt_tokens = prompt_len,
+        max_tokens,
+        ttft_ms = tracing::field::Empty,
+        completion_tokens = tracing::field::Empty,
+        tokens_per_second = tracing::field::Empty,
+        finish_reason = tracing::field::Empty,
+        outcome = tracing::field::Empty,
     );
     trackers.insert(
         seq_id,
@@ -265,6 +288,8 @@ fn enqueue_request(
             think_stable_text: String::new(),
             harmony_state: HarmonyState::Markers,
             harmony_header_ids: Vec::new(),
+            span,
+            decode_span: None,
         },
     );
 }
@@ -521,7 +546,9 @@ pub fn engine_loop(
                             if tracker.first_token_at.is_none() {
                                 let ttft_ms = tracker.enqueued_at.elapsed().as_secs_f64() * 1000.0;
                                 let ttft_ms = (ttft_ms * 10.0).round() / 10.0;
+                                tracker.span.record("ttft_ms", ttft_ms);
                                 tracing::info!(
+                                    parent: &tracker.span,
                                     request_id = %tracker.request_id,
                                     model_id = %tracker.model_id,
                                     seq_id = tok.seq_id,
@@ -531,6 +558,10 @@ pub fn engine_loop(
                                 metrics::TTFT_HISTOGRAM
                                     .with_label_values(&[&tracker.model_id])
                                     .observe(ttft_ms);
+                                // Child span covering the decode phase (first token to completion);
+                                // its start offset from the parent visualises the TTFT.
+                                tracker.decode_span =
+                                    Some(tracing::info_span!(parent: &tracker.span, "decode"));
                                 tracker.first_token_at = Some(std::time::Instant::now());
                             }
                             tracker.token_count += 1;
@@ -704,7 +735,19 @@ pub fn engine_loop(
                             let total_ms = (total_ms * 10.0).round() / 10.0;
                             let decode_ms = ((decode_s * 1000.0) * 10.0).round() / 10.0;
                             let tps = (tps * 100.0).round() / 100.0;
+                            let finish_reason =
+                                completed.finish_reason.as_deref().unwrap_or("stop");
+                            // Close the decode child span at completion, then fill in the
+                            // request span's outcome fields before it closes on drop.
+                            tracker.decode_span = None;
+                            tracker
+                                .span
+                                .record("completion_tokens", tracker.token_count);
+                            tracker.span.record("tokens_per_second", tps);
+                            tracker.span.record("finish_reason", finish_reason);
+                            tracker.span.record("outcome", "ok");
                             tracing::info!(
+                                parent: &tracker.span,
                                 request_id = %tracker.request_id,
                                 model_id = %tracker.model_id,
                                 seq_id = completed.id,
@@ -761,6 +804,8 @@ pub fn engine_loop(
                                 metrics::REQUESTS_TOTAL
                                     .with_label_values(&[tracker.model_id.as_str(), "error"])
                                     .inc();
+                                tracker.span.record("outcome", "error");
+                                tracing::warn!(parent: &tracker.span, error = %e, "request failed");
                                 let _ = tracker.tx.send(EngineEvent::Error(e.to_string()));
                                 let _ = tracker.tx.send(EngineEvent::StreamEnd);
                             }
@@ -772,6 +817,8 @@ pub fn engine_loop(
                                 metrics::REQUESTS_TOTAL
                                     .with_label_values(&[tracker.model_id.as_str(), "error"])
                                     .inc();
+                                tracker.span.record("outcome", "error");
+                                tracing::warn!(parent: &tracker.span, error = %e, "request failed");
                                 let _ = tracker.tx.send(EngineEvent::Error(e.to_string()));
                                 let _ = tracker.tx.send(EngineEvent::StreamEnd);
                             }
@@ -788,6 +835,7 @@ pub fn engine_loop(
         metrics::REQUESTS_TOTAL
             .with_label_values(&[tracker.model_id.as_str(), "error"])
             .inc();
+        tracker.span.record("outcome", "unloaded");
         let _ = tracker
             .tx
             .send(EngineEvent::Error("Model unloaded".to_string()));
@@ -936,6 +984,7 @@ mod metrics_loop_tests {
             enqueued_at: std::time::Instant::now(),
             enable_thinking: false,
             extra_stop_token_ids: vec![],
+            parent_span: tracing::Span::none(),
         };
         req_tx.try_send(req).expect("enqueue request");
         // Drop the sender before running the loop: blocking_recv first returns the

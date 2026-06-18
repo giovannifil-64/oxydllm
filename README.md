@@ -279,6 +279,9 @@ curl http://localhost:11313/v1/chat/completions \
 
 ### Observability
 
+> [!NOTE]
+> Metrics and distributed tracing are server capabilities, exposed only by the `start` command. The interactive `oxydllm run` command has no HTTP endpoint and runs its own uninstrumented decode loop, so it emits neither Prometheus metrics nor OpenTelemetry traces. Structured logs (below) apply to both.
+
 #### Prometheus metrics (`GET /metrics`)
 
 Metrics are exposed in Prometheus text format at `GET /metrics`. Scrape this endpoint with Prometheus or any compatible agent (Vector, OpenTelemetry Collector, etc.).
@@ -338,6 +341,24 @@ Query a single request's lifecycle with Loki: `{app="oxydllm"} | json | request_
 oxydllm start 2>&1 | jq 'select(.fields.request_id=="abc-123")'
 ```
 
+#### Distributed tracing (OpenTelemetry)
+
+For per-request visibility that aggregate metrics cannot give (the queue/prefill vs decode breakdown of a single request, the slowest individual requests, correlation by `request_id`), oxydLLM can export OpenTelemetry traces over OTLP/HTTP. This is additive: the Prometheus endpoint above is unchanged, and tracing stays off unless an endpoint is configured.
+
+Point it at any OTLP/HTTP collector (Grafana Alloy, the OpenTelemetry Collector, Jaeger, Grafana Tempo):
+
+```bash
+oxydllm start --otel-endpoint http://localhost:4318
+# or, equivalently, via environment:
+OXYDLLM_OTEL_ENDPOINT=http://localhost:4318 oxydllm start
+```
+
+The value is treated as the OTLP base, so traces are sent to `<endpoint>/v1/traces` (matching the `OTEL_EXPORTER_OTLP_ENDPOINT` convention, which is also honored). Spans are batched in the background and flushed on shutdown.
+
+Each request produces a trace tree `http.request -> inference.request -> decode`: the gap before `decode` starts is the time-to-first-token. Span attributes include `request_id`, `model_id`, `prompt_tokens`, `max_tokens`, `ttft_ms`, `completion_tokens`, `tokens_per_second`, `finish_reason`, and `outcome` (`ok` / `error` / `unloaded`), and the `first token emitted` and `request completed` events are attached to the span. A W3C `traceparent` header on the incoming request is honored, so the spans join the caller's distributed trace (e.g. through an upstream gateway); without it, a fresh trace is started. Loading a model emits a separate `model.load` span (weight/KV bytes, layer count, warm-up time). In Grafana Tempo, search `service.name = oxydllm` and filter by any of those attributes.
+
+When running as a service (installed via `install.sh`), set `OXYDLLM_OTEL_ENDPOINT` in `/etc/default/oxydllm` (systemd) or the launchd plist `EnvironmentVariables` (macOS) instead of passing the flag.
+
 ## Server Options
 Every option can be set via a CLI flag or an environment variable. CLI flags take priority when both are set. When running as a system service (launchd on macOS, systemd on Linux) you typically configure via env vars without touching the service unit file itself.
 
@@ -357,6 +378,7 @@ Every option can be set via a CLI flag or an environment variable. CLI flags tak
 | `--allow-cpu` | `OXYDLLM_ALLOW_CPU` | disabled | Permit CPU fallback when no GPU is available. By default startup fails fast on a GPU-less host. |
 | `--api-key <KEY>` | `OXYDLLM_API_KEY` | disabled | Require an API key on `/v1/*` and `/metrics` (see [Security](#security)). |
 | `--request-timeout <SECS>` | `OXYDLLM_REQUEST_TIMEOUT` | `300` | Wall-clock timeout per `/v1/chat/completions` request. Non-streaming responses are returned as `408 Request Timeout`; streaming responses emit a final `request_timeout` error chunk followed by `[DONE]`. Set to `0` to disable. |
+| `--otel-endpoint <URL>` | `OXYDLLM_OTEL_ENDPOINT` | disabled | Export per-request traces over OTLP/HTTP to this collector (e.g. `http://localhost:4318`); also honors the standard `OTEL_EXPORTER_OTLP_ENDPOINT`. See [Observability](#observability). |
 
 Set `LOG_FORMAT=json` for machine-parseable logs; see [Observability](#observability) for details.
 
@@ -367,6 +389,7 @@ Set `LOG_FORMAT=json` for machine-parseable logs; see [Observability](#observabi
 OXYDLLM_MAX_CONTEXT_LEN=8192
 OXYDLLM_MAX_NUM_SEQS=16
 OXYDLLM_KV_QUANT=balanced
+OXYDLLM_OTEL_ENDPOINT=http://localhost:4318
 LOG_FORMAT=json
 ```
 
@@ -374,6 +397,7 @@ LOG_FORMAT=json
 ```xml
 <key>OXYDLLM_MAX_CONTEXT_LEN</key><string>8192</string>
 <key>OXYDLLM_MAX_NUM_SEQS</key><string>16</string>
+<key>OXYDLLM_OTEL_ENDPOINT</key><string>http://localhost:4318</string>
 <key>LOG_FORMAT</key><string>json</string>
 ```
 

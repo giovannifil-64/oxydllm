@@ -9,6 +9,7 @@ use axum::response::{IntoResponse, Json};
 use serde::Serialize;
 use tokio::sync::mpsc as tokio_mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use super::AppState;
 use super::error_response;
@@ -1288,6 +1289,7 @@ async fn collect_one_completion_inner(
 
 pub(super) async fn chat_completions(
     State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
     Json(body): Json<ChatCompletionRequest>,
 ) -> Result<axum::response::Response, (StatusCode, Json<serde_json::Value>)> {
     if body.messages.is_empty() {
@@ -1372,6 +1374,17 @@ pub(super) async fn chat_completions(
 
     let request_id = uuid::Uuid::new_v4().to_string();
     let t_request = std::time::Instant::now();
+
+    // HTTP-boundary span. Parented to any upstream `traceparent` so the request's
+    // engine spans join the caller's distributed trace; cloned into each
+    // IncomingRequest below so the engine's per-request span nests under it.
+    let http_span = tracing::info_span!(
+        "http.request",
+        request_id = %request_id,
+        model_id = %model_id,
+        stream = body.stream.unwrap_or(false),
+    );
+    let _ = http_span.set_parent(crate::telemetry::extract_context(&headers));
 
     let get_result = {
         let mut mgr = state.manager.lock().await;
@@ -1593,6 +1606,7 @@ pub(super) async fn chat_completions(
                 enqueued_at: std::time::Instant::now(),
                 enable_thinking,
                 extra_stop_token_ids: extra_stop_token_ids.clone(),
+                parent_span: http_span.clone(),
             })
             .map_err(|e| match e {
                 tokio::sync::mpsc::error::TrySendError::Full(_) => error_response(

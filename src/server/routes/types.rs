@@ -164,6 +164,11 @@ pub struct IncomingRequest {
     pub enqueued_at: std::time::Instant,
     pub enable_thinking: bool,
     pub extra_stop_token_ids: Vec<u32>,
+    /// HTTP-handler span this request belongs to. The engine's per-request span
+    /// is created as its child, so the trace tree spans the HTTP boundary and
+    /// links to any upstream caller. Cloning keeps the parent alive until the
+    /// engine picks the request up.
+    pub parent_span: tracing::Span,
 }
 
 pub enum EngineEvent {

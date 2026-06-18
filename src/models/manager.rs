@@ -812,6 +812,18 @@ fn spawn_load(params: SpawnLoadParams) {
     std::thread::spawn(move || {
         let model_dir = model_path_thread.to_string_lossy().to_string();
 
+        // Standalone span covering load + warmup of this model (a root trace, since
+        // the load runs on its own thread, decoupled from the triggering request).
+        let load_span = tracing::info_span!(
+            "model.load",
+            model_id = %model_id_thread,
+            weights_gb = tracing::field::Empty,
+            kv_cache_gb = tracing::field::Empty,
+            num_layers = tracing::field::Empty,
+            warmup_s = tracing::field::Empty,
+        );
+        let load_guard = load_span.enter();
+
         let tokenizer = match Tokenizer::from_dir(&model_dir) {
             Ok(t) => Arc::new(t),
             Err(e) => {
@@ -896,15 +908,18 @@ fn spawn_load(params: SpawnLoadParams) {
             },
             "model loaded"
         );
+        load_span.record("weights_gb", round_2(gb(weights_size_bytes)));
+        load_span.record("kv_cache_gb", round_2(gb(kv_cache_bytes)));
+        load_span.record("num_layers", num_layers);
 
         tracing::info!(model_id = %model_id_thread, "warming up model");
         let t_warmup = std::time::Instant::now();
         warm_up_model(batch_model.as_ref());
-        tracing::info!(
-            model_id = %model_id_thread,
-            warmup_s = round_1(t_warmup.elapsed().as_secs_f64()),
-            "model ready"
-        );
+        let warmup_s = round_1(t_warmup.elapsed().as_secs_f64());
+        tracing::info!(model_id = %model_id_thread, warmup_s, "model ready");
+        load_span.record("warmup_s", warmup_s);
+        drop(load_guard);
+        drop(load_span);
 
         let block_size = if batch_model.allocators().is_empty() {
             crate::common::paged::DEFAULT_BLOCK_SIZE

@@ -6,6 +6,7 @@ mod models;
 mod sampling;
 mod scheduler;
 mod server;
+mod telemetry;
 mod tokenizer;
 
 use std::path::PathBuf;
@@ -14,7 +15,6 @@ use std::time::Duration;
 use sampling::SamplingParams;
 use server::ChatMessage;
 use tokenizer::Tokenizer;
-use tracing_subscriber::EnvFilter;
 
 struct EstimateArgs {
     model: String,
@@ -125,27 +125,6 @@ fn resolve_devices(explicit: Option<Vec<usize>>) -> Vec<usize> {
     vec![]
 }
 
-fn init_tracing() {
-    let env_filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("oxydllm=info,hyper=warn,tower=warn"));
-
-    // LOG_FORMAT=json emits one JSON object per line — machine-parseable by
-    // Loki, Datadog, CloudWatch, or `jq`. Omit for human-readable compact format.
-    if std::env::var("LOG_FORMAT").as_deref() == Ok("json") {
-        let _ = tracing_subscriber::fmt()
-            .json()
-            .with_env_filter(env_filter)
-            .with_target(false)
-            .try_init();
-    } else {
-        let _ = tracing_subscriber::fmt()
-            .with_env_filter(env_filter)
-            .with_target(false)
-            .compact()
-            .try_init();
-    }
-}
-
 fn print_usage() {
     eprintln!(
         "\
@@ -190,6 +169,8 @@ Server options (start):
   --api-key <KEY>            Require `Authorization: Bearer <KEY>` (or `X-API-Key`) on /v1/* and /metrics (default: disabled, env: OXYDLLM_API_KEY)
   --request-timeout <SECS>   Wall-clock timeout per chat completion request; 0 disables (default: 300, env: OXYDLLM_REQUEST_TIMEOUT)
   --draft-model <NAME>       Enable greedy speculative decoding with this draft model (env: OXYDLLM_DRAFT_MODEL)
+  --otel-endpoint <URL>      Export per-request traces over OTLP/HTTP to this endpoint, e.g. http://localhost:4318
+                             (env: OXYDLLM_OTEL_ENDPOINT or OTEL_EXPORTER_OTLP_ENDPOINT; default: disabled)
 
 Chat options (run):
   --models-dir <DIR>         Models directory (default: ~/.oxydllm/models/)
@@ -809,6 +790,11 @@ fn parse_start_args(args: &[String]) -> Result<StartArgs, String> {
             "--draft-model" => {
                 draft_model = Some(next_arg(args, &mut i, "--draft-model")?.to_string());
             }
+            "--otel-endpoint" => {
+                // Consumed at subscriber-init time (before arg parsing); accept it
+                // here so it is not rejected as an unknown option.
+                let _ = next_arg(args, &mut i, "--otel-endpoint")?;
+            }
             other => return Err(format!("Unknown option: {}", other)),
         }
         i += 1;
@@ -1300,9 +1286,17 @@ fn main() -> anyhow::Result<()> {
         std::env::set_var("CANDLE_METAL_COMMAND_POOL_SIZE", "1");
     }
 
-    init_tracing();
-
     let args: Vec<String> = std::env::args().collect();
+
+    // OTLP trace export is only meaningful for the long-running server; resolve
+    // the endpoint before installing the subscriber so the OpenTelemetry layer
+    // can be attached at init time (it cannot be added afterwards).
+    let otel_endpoint = if args.get(1).map(String::as_str) == Some("start") {
+        telemetry::resolve_endpoint(&args[2..])
+    } else {
+        None
+    };
+    let mut otel_provider = telemetry::init(otel_endpoint.as_deref());
 
     if args.len() < 2 {
         print_usage();
@@ -1324,7 +1318,7 @@ fn main() -> anyhow::Result<()> {
                 print_usage();
                 std::process::exit(1);
             });
-            server::start_server(server::StartServerArgs {
+            let result = server::start_server(server::StartServerArgs {
                 models_dir: start_args.models_dir,
                 port: start_args.port,
                 keep_alive: start_args.keep_alive,
@@ -1340,7 +1334,12 @@ fn main() -> anyhow::Result<()> {
                 api_key: start_args.api_key,
                 request_timeout: start_args.request_timeout,
                 draft_model: start_args.draft_model,
-            })?
+            });
+            // Flush buffered spans before exit, on both clean shutdown and error.
+            if let Some(provider) = otel_provider.take() {
+                telemetry::shutdown(provider);
+            }
+            result?
         }
         "run" => {
             let run_args = parse_run_args(&args[2..]).unwrap_or_else(|e| {

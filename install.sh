@@ -190,6 +190,7 @@ install_systemd_service() {
 # OXYDLLM_MAX_NUM_SEQS=
 # OXYDLLM_MAX_QUEUED_REQUESTS=200
 # OXYDLLM_DEVICES=
+# OXYDLLM_OTEL_ENDPOINT=http://localhost:4318   # export per-request traces over OTLP/HTTP
 # RUST_LOG=warn
 # LOG_FORMAT=
 ENVEOF
@@ -297,6 +298,7 @@ install_launchd_agent() {
         <key>OXYDLLM_MAX_NUM_SEQS</key><string></string>
         <key>OXYDLLM_MAX_QUEUED_REQUESTS</key><string>200</string>
         <key>OXYDLLM_DEVICES</key><string></string>
+        <key>OXYDLLM_OTEL_ENDPOINT</key><string>http://localhost:4318</string>
         <key>LOG_FORMAT</key><string></string>
         -->
     </dict>

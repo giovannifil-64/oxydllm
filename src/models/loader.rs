@@ -1121,7 +1121,9 @@ fn compute_kv_blocks(
         kv_budget.release(granted_bytes);
         anyhow::bail!(
             "KV cache budget exhausted: requested {} blocks ({:.2} GB minimum) \
-             but only {} blocks ({:.2} GB) available",
+             but only {} blocks ({:.2} GB) available. Unload other models, or \
+             start the server with --memory-budget <MB> to size the global KV \
+             pool independently of the free memory at startup.",
             min_blocks,
             min_blocks as f64 * per_block_bytes as f64 / 1_073_741_824.0,
             granted_blocks,

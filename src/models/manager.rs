@@ -229,6 +229,17 @@ impl ModelManager {
             kv_cache_budget_gb = round_2(gb(kv_total)),
             "global KV cache budget configured"
         );
+        // Without --memory-budget the budget derives from the memory that is
+        // free RIGHT NOW; under system memory pressure it can start near zero
+        // and every model load then fails with "KV cache budget exhausted".
+        if memory_budget_bytes.is_none() && kv_total < 1024 * 1024 * 1024 {
+            tracing::warn!(
+                kv_cache_budget_gb = round_2(gb(kv_total)),
+                "KV cache budget is very low because system free memory was low at \
+                 startup; model loads will likely fail. Pass --memory-budget <MB> \
+                 to size the budget deterministically."
+            );
+        }
         let kv_budget = Arc::new(GlobalKvBudget::new(kv_total));
         if kv_quant != KvQuantMode::Off {
             tracing::info!(mode = %kv_quant.label(), "KV cache quantization enabled");

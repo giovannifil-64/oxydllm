@@ -621,14 +621,18 @@ fn tool_exists(tools: &[ToolDefinition], name: &str) -> bool {
     tools.iter().any(|tool| tool.function.name == name)
 }
 
-/// Parse the XML-ish tool-call format emitted by Qwen3.5-class templates:
-/// `<tool_call>\n<function=NAME>\n<parameter=KEY>\nVALUE\n</parameter>…
-/// </function>\n</tool_call>`, possibly preceded by free-form reasoning text
-/// and possibly repeated for parallel calls. Parameter values are typed
-/// best-effort: anything that parses as JSON (numbers, booleans, null,
-/// objects, arrays, quoted strings) is kept as that value, bare text stays a
-/// string.
-fn parse_function_xml_tool_calls(raw: &str) -> Option<Vec<ToolCall>> {
+/// Parse the tool calls wrapped in `<tool_call>…</tool_call>` blocks,
+/// possibly preceded by free-form reasoning text and possibly repeated for
+/// parallel calls. Two block payloads exist in the wild:
+///
+/// - Qwen3.5-class XML: `<function=NAME>\n<parameter=KEY>\nVALUE\n
+///   </parameter>…</function>`. Parameter values are typed best-effort:
+///   anything that parses as JSON (numbers, booleans, null, objects, arrays,
+///   quoted strings) is kept as that value, bare text stays a string.
+/// - Qwen2.5/Qwen3-class JSON: a single `{"name": …, "arguments": …}` object
+///   (canonical template output), or a `{"tool_calls": […]}` object when the
+///   model echoes the injected system-prompt instruction inside the tags.
+fn parse_tool_call_tag_blocks(raw: &str) -> Option<Vec<ToolCall>> {
     let mut calls = Vec::new();
     let mut rest = raw;
     while let Some(start) = rest.find("<tool_call>") {
@@ -640,6 +644,16 @@ fn parse_function_xml_tool_calls(raw: &str) -> Option<Vec<ToolCall>> {
         rest = &after[end + "</tool_call>".len()..];
 
         let Some(fstart) = block.find("<function=") else {
+            // JSON payload block.
+            if let Ok(value) =
+                serde_json::from_str::<serde_json::Value>(strip_json_fences(block.trim()))
+            {
+                if let Some(nested) = value.get("tool_calls").and_then(|v| v.as_array()) {
+                    calls.extend(nested.iter().filter_map(parse_tool_call_entry));
+                } else if let Some(single) = parse_tool_call_entry(&value) {
+                    calls.push(single);
+                }
+            }
             continue;
         };
         let fname_rest = &block[fstart + "<function=".len()..];
@@ -684,7 +698,7 @@ fn parse_function_xml_tool_calls(raw: &str) -> Option<Vec<ToolCall>> {
 }
 
 fn try_parse_tool_calls(raw: &str, config: &ToolConfig) -> Option<Vec<ToolCall>> {
-    if let Some(mut result) = parse_function_xml_tool_calls(raw) {
+    if let Some(mut result) = parse_tool_call_tag_blocks(raw) {
         result.retain(|call| tool_exists(&config.tools, &call.function.name));
         if !result.is_empty() {
             if !config.parallel_tool_calls && result.len() > 1 {
@@ -2587,6 +2601,50 @@ mod tests {
         let parsed2 = try_parse_tool_calls(raw2, &config).expect("should parse");
         assert_eq!(parsed2.len(), 1, "unknown function must be filtered");
         assert_eq!(parsed2[0].function.name, "get_weather");
+    }
+
+    /// Contract: the JSON payloads that Qwen2.5/Qwen3-class templates wrap in
+    /// `<tool_call>` tags parse into proper tool calls — both the canonical
+    /// single `{"name": …, "arguments": …}` object and the
+    /// `{"tool_calls": […]}` shape models produce when echoing the injected
+    /// system-prompt instruction. Parallel blocks supported, unknown
+    /// functions filtered, reasoning text before the block tolerated.
+    #[test]
+    fn try_parse_tool_calls_accepts_json_inside_tool_call_tags() {
+        let config = ToolConfig {
+            tools: sample_tools(),
+            choice_mode: ToolChoiceMode::Auto,
+            parallel_tool_calls: true,
+        };
+
+        // Canonical Qwen: single {"name", "arguments"} object per block.
+        let raw = "Let me check.\n<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"location\": \"Paris\"}}\n</tool_call>";
+        let parsed = try_parse_tool_calls(raw, &config).expect("canonical block should parse");
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].function.name, "get_weather");
+        let args: serde_json::Value = serde_json::from_str(&parsed[0].function.arguments).unwrap();
+        assert_eq!(args["location"], "Paris");
+
+        // Instruction-echo shape observed E2E on Qwen2.5-1.5B.
+        let raw2 = "<tool_call>\n{\"tool_calls\": [{\"name\": \"get_weather\", \"arguments\": {\"location\": \"Rome\"}}]}\n</tool_call>";
+        let parsed2 = try_parse_tool_calls(raw2, &config).expect("echo shape should parse");
+        assert_eq!(parsed2.len(), 1);
+        assert_eq!(parsed2[0].function.name, "get_weather");
+
+        // Two blocks → parallel calls; unknown function filtered.
+        let raw3 = "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"location\": \"Paris\"}}\n</tool_call>\n<tool_call>\n{\"name\": \"not_a_real_tool\", \"arguments\": {}}\n</tool_call>";
+        let parsed3 = try_parse_tool_calls(raw3, &config).expect("should parse");
+        assert_eq!(parsed3.len(), 1, "unknown function must be filtered");
+
+        // parallel_tool_calls=false truncates to the first call.
+        let config_serial = ToolConfig {
+            tools: sample_tools(),
+            choice_mode: ToolChoiceMode::Auto,
+            parallel_tool_calls: false,
+        };
+        let raw4 = "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"location\": \"Paris\"}}\n</tool_call>\n<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"location\": \"Rome\"}}\n</tool_call>";
+        let parsed4 = try_parse_tool_calls(raw4, &config_serial).expect("should parse");
+        assert_eq!(parsed4.len(), 1, "serial mode must truncate to one call");
     }
 
     #[test]

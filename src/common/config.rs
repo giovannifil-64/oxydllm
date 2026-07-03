@@ -73,6 +73,8 @@ pub struct LinearAttnConfig {
 ///   Gemma3); `v_norm` does the same for values.
 /// - `attention_scale` overrides the softmax scale; `None` defaults to `1/sqrt(head_dim)`.
 /// - `attn_softcap` tanh-caps the attention logits (Gemma2: 50.0).
+/// - `residual_multiplier` scales each sub-layer output before its residual add
+///   (Granite: 0.22); `None` is the standard unscaled residual.
 /// - `sliding_window` restricts attention to the last `n` tokens; `None` is full
 ///   causal.
 /// - `has_ffn_norms` adds Gemma's "sandwich" norms around the feed-forward
@@ -83,7 +85,9 @@ pub struct LinearAttnConfig {
 /// (`Some` means the token mixer is a [`super::gdn::GatedDeltaNet`], not attention),
 /// and `attn_output_gate` / `rotary_dim` (Qwen3.5 gated attention, where q_proj
 /// emits per-head `[query | gate]`, and partial RoPE over the first `rotary_dim`
-/// dims of each head).
+/// dims of each head). `gguf_qk_permuted` marks Llama-family GGUFs whose q/k
+/// rows are interleaved by the converter and must be restored at load; it is
+/// always `false` on the safetensors path.
 pub struct BlockConfig {
     pub n_heads: usize,
     pub n_kv_heads: usize,
@@ -94,6 +98,7 @@ pub struct BlockConfig {
     pub activation: Activation,
     pub norm_type: NormType,
     pub attn_softcap: Option<f64>,
+    pub residual_multiplier: Option<f64>,
     pub v_norm: bool,
     pub has_ffn_norms: bool,
     pub sliding_window: Option<usize>,
@@ -101,6 +106,7 @@ pub struct BlockConfig {
     pub linear_attn: Option<LinearAttnConfig>,
     pub attn_output_gate: bool,
     pub rotary_dim: Option<usize>,
+    pub gguf_qk_permuted: bool,
 }
 
 /// Mixture-of-Experts routing parameters for one layer.
@@ -130,7 +136,10 @@ pub struct MoeConfig {
 ///   `head_dim`, `rope_theta`, `rope_scaling`.
 /// - **Behaviour flags**: `qk_norm`, `attention_scale`, `attn_softcap` /
 ///   `logit_softcap`, `norm_type`, `activation`, `embed_scale`,
-///   `sliding_window`, `tie_word_embeddings`.
+///   `sliding_window`, `tie_word_embeddings`. `residual_multiplier` and
+///   `logits_scaling` are Granite's depth-scaled training multipliers: the
+///   former scales every sub-layer output before its residual add, the latter
+///   divides the final logits.
 /// - **Per-layer overrides** (`per_layer_*`, `kv_shared_layer_map`): `Some`
 ///   only when layers differ from one another; `None` means every layer uses
 ///   the scalar field above. `kv_shared_layer_map[i] = Some(j)` makes layer `i`
@@ -165,6 +174,8 @@ pub struct StandardTransformerConfig {
     pub embed_scale: Option<f64>,
     pub attn_softcap: Option<f64>,
     pub logit_softcap: Option<f64>,
+    pub residual_multiplier: Option<f64>,
+    pub logits_scaling: Option<f64>,
     pub v_norm: bool,
     pub has_ffn_norms: bool,
     pub sliding_window: Option<usize>,
@@ -224,6 +235,7 @@ impl StandardTransformerConfig {
             activation: self.activation,
             norm_type: self.norm_type,
             attn_softcap: self.attn_softcap,
+            residual_multiplier: self.residual_multiplier,
             v_norm: self.v_norm,
             has_ffn_norms: self.has_ffn_norms,
             sliding_window: self.sliding_window,
@@ -231,6 +243,8 @@ impl StandardTransformerConfig {
             linear_attn: None,
             attn_output_gate: self.attn_output_gate,
             rotary_dim: self.rotary_dim,
+            // Safetensors checkpoints always keep the HF q/k row layout.
+            gguf_qk_permuted: false,
         }
     }
 }

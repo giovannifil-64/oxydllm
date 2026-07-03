@@ -96,6 +96,8 @@ impl TokenMixer {
 /// - **Per-layer input** (Gemma 3n): `per_layer_input_gate`,
 ///   `per_layer_projection` and `post_per_layer_input_norm`, when all present,
 ///   add a third gated residual that mixes in this layer's per-layer embedding.
+/// - **`residual_multiplier`** (Granite): scales each sub-layer output before
+///   its residual add, so the update is `x + f(norm(x)) * m`.
 /// - **`layer_scalar`**: a final scalar multiply on the block output.
 ///
 /// Build one with [`load`](Self::load) (safetensors) or
@@ -110,6 +112,7 @@ pub struct TransformerBlock {
     per_layer_input_gate: Option<AnyLinear>,
     per_layer_projection: Option<AnyLinear>,
     post_per_layer_input_norm: Option<RMSNorm>,
+    residual_multiplier: Option<f64>,
     layer_scalar: Option<f64>,
     activation: Activation,
 }
@@ -262,6 +265,7 @@ impl TransformerBlock {
             per_layer_input_gate,
             per_layer_projection,
             post_per_layer_input_norm,
+            residual_multiplier: cfg.residual_multiplier,
             layer_scalar,
             activation: cfg.activation,
         })
@@ -336,6 +340,7 @@ impl TransformerBlock {
             per_layer_input_gate: None,
             per_layer_projection: None,
             post_per_layer_input_norm: None,
+            residual_multiplier: cfg.residual_multiplier,
             layer_scalar: None,
             activation: cfg.activation,
         })
@@ -376,6 +381,9 @@ impl TransformerBlock {
         if self.pre_ffn_norm.is_some() {
             attn_out = self.ffn_norm.forward(&attn_out)?;
         }
+        if let Some(m) = self.residual_multiplier {
+            attn_out = (attn_out * m)?;
+        }
 
         let mut x = (residual + attn_out)?;
         let residual = x.clone();
@@ -390,6 +398,9 @@ impl TransformerBlock {
         })?;
         if let Some(post_norm) = &self.post_ffn_norm {
             ffn_out = post_norm.forward(&ffn_out)?;
+        }
+        if let Some(m) = self.residual_multiplier {
+            ffn_out = (ffn_out * m)?;
         }
 
         x = (residual + ffn_out)?;
@@ -436,6 +447,7 @@ pub struct TransformerComponents<'a> {
     pub ropes: &'a [RotaryEmbedding],
     pub embed_scale: Option<f64>,
     pub logit_softcap: Option<f64>,
+    pub logits_scaling: Option<f64>,
     pub per_layer_input_embed: Option<&'a Embedding>,
     pub per_layer_input_embed_scale: Option<f64>,
     pub per_layer_model_projection: Option<&'a AnyLinear>,
@@ -454,10 +466,11 @@ pub struct TransformerComponents<'a> {
 /// The result has one logit row per input token.
 ///
 /// The pass runs embeddings (plus the optional per-layer-input embedding),
-/// every [`TransformerBlock`] in order, the final norm, the lm-head, and the
-/// optional logit soft-cap. Per-layer it assembles the [`SegmentInfo`] slice
-/// each block needs, honouring [`TransformerComponents::kv_shared_layer_map`]
-/// so layers that share a KV cache read the same one.
+/// every [`TransformerBlock`] in order, the final norm, the lm-head, the
+/// optional Granite logits division, and the optional logit soft-cap.
+/// Per-layer it assembles the [`SegmentInfo`] slice each block needs,
+/// honouring [`TransformerComponents::kv_shared_layer_map`] so layers that
+/// share a KV cache read the same one.
 ///
 /// ## Panics
 /// In debug builds, asserts the batch is internally consistent:
@@ -582,7 +595,12 @@ pub fn run_transformer_layers_batch(
     }
 
     let x = decode_profile::phase(&dev, "final_norm", || c.norm.forward(&x))?;
-    let logits = decode_profile::phase(&dev, "lm_head", || c.lm_head.forward(&x))?;
+    let mut logits = decode_profile::phase(&dev, "lm_head", || c.lm_head.forward(&x))?;
+
+    // Granite calibrates sampling by dividing the logits (HF `logits_scaling`).
+    if let Some(s) = c.logits_scaling {
+        logits = (logits / s)?;
+    }
 
     let out = if let Some(cap) = c.logit_softcap {
         #[cfg(feature = "metal")]

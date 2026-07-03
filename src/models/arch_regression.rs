@@ -53,6 +53,8 @@ mod tests {
         logit_softcap: Option<f64>,
         sliding_window: Option<usize>,
         attention_scale: Option<f64>,
+        residual_multiplier: Option<f64>,
+        logits_scaling: Option<f64>,
         tie_weights: bool,
         rope_theta: f64,
     }
@@ -71,6 +73,8 @@ mod tests {
                 logit_softcap: None,
                 sliding_window: None,
                 attention_scale: None,
+                residual_multiplier: None,
+                logits_scaling: None,
                 tie_weights: false,
                 rope_theta: 10_000.0,
             }
@@ -184,6 +188,7 @@ mod tests {
             activation: spec.activation,
             norm_type: spec.norm_type,
             attn_softcap: spec.attn_softcap,
+            residual_multiplier: spec.residual_multiplier,
             v_norm: spec.v_norm,
             has_ffn_norms: spec.has_ffn_norms,
             sliding_window: spec.sliding_window,
@@ -191,6 +196,7 @@ mod tests {
             linear_attn: None,
             attn_output_gate: false,
             rotary_dim: None,
+            gguf_qk_permuted: false,
         };
 
         let blocks = (0..LAYERS)
@@ -237,6 +243,7 @@ mod tests {
             max_seq_len: MAX_SEQ,
             embed_scale: spec.embed_scale,
             logit_softcap: spec.logit_softcap,
+            logits_scaling: spec.logits_scaling,
             per_layer_input_embed: None,
             per_layer_input_embed_scale: None,
             per_layer_model_projection: None,
@@ -434,6 +441,62 @@ mod tests {
     }
 
     #[test]
+    fn arch_granite() {
+        run_arch_test(ArchSpec {
+            name: "Granite",
+            activation: Activation::SiLU,
+            embed_scale: Some(12.0),
+            attention_scale: Some(1.0 / HEAD_DIM as f64),
+            residual_multiplier: Some(0.22),
+            logits_scaling: Some(8.0),
+            tie_weights: true,
+            rope_theta: 10_000_000.0,
+            ..Default::default()
+        });
+    }
+
+    /// Contract: `logits_scaling = s` divides the final logits by exactly `s`
+    /// (Granite semantics), leaving everything else untouched.
+    #[test]
+    fn granite_logits_scaling_divides() {
+        let spec_off = ArchSpec {
+            name: "logits_scaling_off",
+            ..Default::default()
+        };
+        let dev = Device::Cpu;
+        let tensors = build_weights(&spec_off, &dev);
+        let tensors2: rustc_hash::FxHashMap<String, Tensor> = tensors
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+
+        let model_off = build_model_from_tensors(&spec_off, tensors, None).unwrap();
+        let spec_on = ArchSpec {
+            name: "logits_scaling_on",
+            logits_scaling: Some(8.0),
+            ..Default::default()
+        };
+        let model_on = build_model_from_tensors(&spec_on, tensors2, None).unwrap();
+
+        let mut caches_off = make_caches(&model_off);
+        let mut caches_on = make_caches(&model_on);
+        let logits_off = run_prefill(&model_off, &mut caches_off, 8).unwrap();
+        let logits_on = run_prefill(&model_on, &mut caches_on, 8).unwrap();
+
+        let off: Vec<f32> = logits_off.flatten_all().unwrap().to_vec1().unwrap();
+        let on: Vec<f32> = logits_on.flatten_all().unwrap().to_vec1().unwrap();
+        let max_diff = off
+            .iter()
+            .zip(on.iter())
+            .map(|(a, b)| (a / 8.0 - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_diff < 1e-6,
+            "logits_scaling must divide logits by exactly 8: max_abs_diff = {max_diff:.8}"
+        );
+    }
+
+    #[test]
     fn arch_phi3() {
         run_arch_test(ArchSpec {
             name: "Phi3",
@@ -470,6 +533,8 @@ mod tests {
             logit_softcap: Some(20.0),
             sliding_window: Some(8),
             attention_scale: Some(0.5),
+            residual_multiplier: Some(0.5),
+            logits_scaling: Some(2.0),
             tie_weights: true,
             rope_theta: 500_000.0,
         });

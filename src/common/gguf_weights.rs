@@ -238,6 +238,57 @@ impl GgufWeights {
     }
 }
 
+/// Undoes the per-head row interleave that `convert_hf_to_gguf.py` applies to
+/// the q/k projections of Llama-family architectures (llama, mistral, granite).
+///
+/// llama.cpp rotates consecutive dimension pairs in RoPE, so its converter
+/// reorders each head's output rows from the HF layout `[first_half |
+/// second_half]` to the interleaved `[0, h/2, 1, h/2+1, ...]`. Our
+/// [`super::rope::RotaryEmbedding`] is NeoX/HF split-half and needs the
+/// original layout, so those tensors must be de-interleaved at load. Each row
+/// is quantized independently (blocks run along the input dimension), which
+/// makes this a pure row-wise byte shuffle valid for every GGML dtype.
+///
+/// ## Errors
+/// Fails if the tensor is not 2-D, its row count is not `n_heads * head_dim`
+/// with an even `head_dim`, or the rebuilt tensor cannot be constructed.
+pub fn depermute_qk_rows(
+    qt: &QTensor,
+    n_heads: usize,
+    head_dim: usize,
+    device: &Device,
+) -> candle_core::Result<QTensor> {
+    let dims = qt.shape().dims().to_vec();
+    if dims.len() != 2 || dims[0] != n_heads * head_dim || !head_dim.is_multiple_of(2) {
+        candle_core::bail!(
+            "depermute_qk_rows: shape {dims:?} incompatible with {n_heads} heads x {head_dim} dims"
+        );
+    }
+    let k = dims[1];
+    let dtype = qt.dtype();
+    if !k.is_multiple_of(dtype.block_size()) {
+        candle_core::bail!(
+            "depermute_qk_rows: row length {k} not divisible by {:?} block size {}",
+            dtype,
+            dtype.block_size()
+        );
+    }
+    let row_bytes = k / dtype.block_size() * dtype.type_size();
+    let data = qt.data()?;
+    let mut out = vec![0u8; data.len()];
+    let half = head_dim / 2;
+    for h in 0..n_heads {
+        for r in 0..head_dim {
+            // HF row `r` of this head sits at interleaved row `2*(r%half) + r/half`.
+            let src = h * head_dim + 2 * (r % half) + r / half;
+            let dst = h * head_dim + r;
+            out[dst * row_bytes..(dst + 1) * row_bytes]
+                .copy_from_slice(&data[src * row_bytes..(src + 1) * row_bytes]);
+        }
+    }
+    candle_core::quantized::ggml_file::qtensor_from_ggml(dtype, &out, dims, device)
+}
+
 /// Builds every tensor from the mmap in parallel (rayon), keyed by name.
 fn parallelise_tensor_load(
     mmap: &Mmap,
@@ -258,6 +309,55 @@ fn parallelise_tensor_load(
     let mut tensors = FxHashMap::with_capacity_and_hasher(pairs.len(), Default::default());
     tensors.extend(pairs);
     Ok(tensors)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle_core::Tensor;
+    use candle_core::quantized::GgmlDType;
+
+    /// Contract: `depermute_qk_rows` is the exact inverse of the
+    /// `convert_hf_to_gguf.py` Llama-family permute
+    /// (`reshape(n_head, 2, hd/2, k).swapaxes(1, 2)`), so a GGUF q/k tensor
+    /// comes back in the HF row layout our split-half RoPE expects.
+    #[test]
+    fn depermute_qk_rows_inverts_converter_permute() {
+        let dev = Device::Cpu;
+        let (n_heads, head_dim, k) = (2usize, 8usize, 32usize);
+        let n = n_heads * head_dim;
+
+        let hf: Vec<f32> = (0..n * k).map(|i| i as f32).collect();
+        let hf_t = Tensor::from_vec(hf.clone(), (n, k), &dev).unwrap();
+
+        // Apply the converter's permute in HF row space.
+        let half = head_dim / 2;
+        let mut permuted = vec![0f32; n * k];
+        for h in 0..n_heads {
+            for j in 0..head_dim {
+                let src = h * head_dim + (j % 2) * half + j / 2;
+                let dst = h * head_dim + j;
+                permuted[dst * k..(dst + 1) * k].copy_from_slice(&hf[src * k..(src + 1) * k]);
+            }
+        }
+        let permuted_t = Tensor::from_vec(permuted, (n, k), &dev).unwrap();
+        let qt = QTensor::quantize(&permuted_t, GgmlDType::F32).unwrap();
+
+        let restored = depermute_qk_rows(&qt, n_heads, head_dim, &dev).unwrap();
+        let restored_t = restored.dequantize(&dev).unwrap();
+
+        let a = restored_t.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let b = hf_t.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        assert_eq!(a, b, "depermute must restore the HF row layout exactly");
+    }
+
+    #[test]
+    fn depermute_qk_rows_rejects_bad_geometry() {
+        let dev = Device::Cpu;
+        let t = Tensor::zeros((16, 32), candle_core::DType::F32, &dev).unwrap();
+        let qt = QTensor::quantize(&t, GgmlDType::F32).unwrap();
+        assert!(depermute_qk_rows(&qt, 3, 8, &dev).is_err());
+    }
 }
 
 /// Builds one `QTensor` from its slice of the memory map, validating the element

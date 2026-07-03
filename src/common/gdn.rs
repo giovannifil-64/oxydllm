@@ -985,6 +985,7 @@ mod tests {
             activation: super::super::config::Activation::SiLU,
             norm_type: super::super::config::NormType::Standard,
             attn_softcap: None,
+            residual_multiplier: None,
             v_norm: false,
             has_ffn_norms: false,
             sliding_window: None,
@@ -998,6 +999,7 @@ mod tests {
             }),
             attn_output_gate: false,
             rotary_dim: None,
+            gguf_qk_permuted: false,
         };
         (GatedDeltaNet::load(&cfg, 0, &weights).unwrap(), hidden, t)
     }
@@ -1170,6 +1172,7 @@ mod tests {
             activation: super::super::config::Activation::SiLU,
             norm_type: super::super::config::NormType::Standard,
             attn_softcap: None,
+            residual_multiplier: None,
             v_norm: false,
             has_ffn_norms: false,
             sliding_window: None,
@@ -1183,6 +1186,7 @@ mod tests {
             }),
             attn_output_gate: false,
             rotary_dim: None,
+            gguf_qk_permuted: false,
         };
         let layer = GatedDeltaNet::load(&cfg, 0, &weights).unwrap();
 

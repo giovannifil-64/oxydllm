@@ -466,7 +466,20 @@ pub fn find_gguf_files(dir: &Path) -> Option<Vec<std::path::PathBuf>> {
             return Some(files);
         }
     }
-    find_gguf_file(dir).map(|p| vec![p])
+    // All .gguf files in the directory, so multi-variant dirs (e.g. Q4_K_M +
+    // f16 side by side) resolve by stem instead of whichever file lists first.
+    let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("gguf"))
+        .collect();
+    if files.is_empty() {
+        None
+    } else {
+        files.sort();
+        Some(files)
+    }
 }
 
 pub fn find_gguf_file(dir: &Path) -> Option<std::path::PathBuf> {
@@ -955,6 +968,7 @@ fn load_standard_safetensors(
                 max_seq_len: ctx,
                 embed_scale: cfg.embed_scale,
                 logit_softcap: cfg.logit_softcap,
+                logits_scaling: cfg.logits_scaling,
                 per_layer_input_embed,
                 per_layer_input_embed_scale: cfg.per_layer_input_embed_scale,
                 per_layer_model_projection,

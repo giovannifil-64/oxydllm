@@ -479,16 +479,26 @@ impl Attention {
             let q_bias = load_bias(&format!("{prefix}.attn_q.bias"))?;
             let k_bias = load_bias(&format!("{prefix}.attn_k.bias"))?;
             let v_bias = load_bias(&format!("{prefix}.attn_v.bias"))?;
-            let q_proj = QLinear::from_arc_with_bias(
-                gguf.get(&format!("{prefix}.attn_q.weight"))?,
-                q_bias,
-                dtype,
-            )?;
-            let k_proj = QLinear::from_arc_with_bias(
+            // Llama-family GGUFs store q/k rows interleaved for llama.cpp's
+            // paired RoPE; restore the HF layout our split-half RoPE expects.
+            let restore = |qt: std::sync::Arc<candle_core::quantized::QTensor>,
+                           heads: usize|
+             -> Result<std::sync::Arc<candle_core::quantized::QTensor>> {
+                if cfg.gguf_qk_permuted {
+                    Ok(std::sync::Arc::new(
+                        crate::common::gguf_weights::depermute_qk_rows(&qt, heads, hd, device)?,
+                    ))
+                } else {
+                    Ok(qt)
+                }
+            };
+            let q_qt = restore(gguf.get(&format!("{prefix}.attn_q.weight"))?, cfg.n_heads)?;
+            let k_qt = restore(
                 gguf.get(&format!("{prefix}.attn_k.weight"))?,
-                k_bias,
-                dtype,
+                cfg.n_kv_heads,
             )?;
+            let q_proj = QLinear::from_arc_with_bias(q_qt, q_bias, dtype)?;
+            let k_proj = QLinear::from_arc_with_bias(k_qt, k_bias, dtype)?;
             let v_proj = QLinear::from_arc_with_bias(
                 gguf.get(&format!("{prefix}.attn_v.weight"))?,
                 v_bias,
@@ -991,6 +1001,7 @@ mod tests {
             activation: Activation::SiLU,
             norm_type,
             attn_softcap: None,
+            residual_multiplier: None,
             v_norm: false,
             has_ffn_norms: false,
             sliding_window,
@@ -998,6 +1009,7 @@ mod tests {
             linear_attn: None,
             attn_output_gate: false,
             rotary_dim: None,
+            gguf_qk_permuted: false,
         }
     }
 

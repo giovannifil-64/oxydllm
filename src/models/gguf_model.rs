@@ -42,6 +42,7 @@ pub struct StandardTransformer {
     pub(crate) max_seq_len: usize,
     pub(crate) embed_scale: Option<f64>,
     pub(crate) logit_softcap: Option<f64>,
+    pub(crate) logits_scaling: Option<f64>,
     pub(crate) per_layer_input_embed: Option<Embedding>,
     pub(crate) per_layer_input_embed_scale: Option<f64>,
     pub(crate) per_layer_model_projection: Option<AnyLinear>,
@@ -73,6 +74,13 @@ impl GgufTopology {
             None => false,
         }
     }
+}
+
+/// Reads a float metadata key, treating absence and non-positive values as
+/// "not published" (llama.cpp writes 0.0 for unset scales).
+fn positive_f64(gguf: &GgufWeights, key: &str) -> Option<f64> {
+    let v = gguf.metadata_f32_or(key, 0.0) as f64;
+    (v > 0.0).then_some(v)
 }
 
 pub(crate) fn parse_gguf_topology(gguf: &GgufWeights) -> anyhow::Result<GgufTopology> {
@@ -131,6 +139,7 @@ impl StandardTransformer {
             ropes: &self.ropes,
             embed_scale: self.embed_scale,
             logit_softcap: self.logit_softcap,
+            logits_scaling: self.logits_scaling,
             per_layer_input_embed: self.per_layer_input_embed.as_ref(),
             per_layer_input_embed_scale: self.per_layer_input_embed_scale,
             per_layer_model_projection: self.per_layer_model_projection.as_ref(),
@@ -209,6 +218,14 @@ impl StandardTransformer {
         if arch_def.embed_scale_from_hidden {
             embed_scale = Some((hidden_size as f64).sqrt());
         }
+        // Granite scale metadata (llama.cpp key names). `logit_scale` uses
+        // Granite semantics: the logits are divided by it.
+        if let Some(s) = positive_f64(gguf, &format!("{prefix}.embedding_scale")) {
+            embed_scale = Some(s);
+        }
+        let residual_multiplier = positive_f64(gguf, &format!("{prefix}.residual_scale"));
+        let logits_scaling =
+            positive_f64(gguf, &format!("{prefix}.logit_scale")).filter(|&s| s != 1.0);
 
         let rms_norm_eps = gguf
             .metadata_f32_or(&format!("{prefix}.attention.layer_norm_rms_epsilon"), 1e-5)
@@ -240,7 +257,8 @@ impl StandardTransformer {
             }
         };
 
-        // Gemma2 27B uses query_pre_attn_scalar=224, not head_dim.
+        // Gemma2 27B uses query_pre_attn_scalar=224, not head_dim. Granite
+        // publishes `attention.scale`, which is the softmax scale itself.
         let attention_scale = {
             let scalar = gguf
                 .metadata_f32_or(&format!("{prefix}.attention.query_pre_attn_scalar"), 0.0)
@@ -248,7 +266,7 @@ impl StandardTransformer {
             if scalar > 0.0 {
                 Some(1.0 / scalar.sqrt())
             } else {
-                None
+                positive_f64(gguf, &format!("{prefix}.attention.scale"))
             }
         };
 
@@ -289,6 +307,7 @@ impl StandardTransformer {
                     activation,
                     norm_type,
                     attn_softcap,
+                    residual_multiplier,
                     v_norm: has_v_norm,
                     has_ffn_norms,
                     sliding_window: arch_def.resolve_sliding_window_for_layer(sliding_window, i),
@@ -301,6 +320,7 @@ impl StandardTransformer {
                     },
                     attn_output_gate: arch_def.attn_output_gate,
                     rotary_dim,
+                    gguf_qk_permuted: arch_def.gguf_qk_permuted,
                 };
                 TransformerBlock::load_gguf(&block_cfg, i, gguf, device, dtype, intermediate_size)
             })
@@ -370,6 +390,7 @@ impl StandardTransformer {
             max_seq_len: max_position_embeddings,
             embed_scale,
             logit_softcap,
+            logits_scaling,
             per_layer_input_embed: None,
             per_layer_input_embed_scale: None,
             per_layer_model_projection: None,

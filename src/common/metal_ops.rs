@@ -5238,6 +5238,162 @@ mod decode_batch_scaling_tests {
     use candle_core::quantized::{GgmlDType, QTensor};
     use std::time::Instant;
 
+    // Contract: the prefill mul_mm kernel equals candle's dequant+matmul for
+    // M > GGUF_BATCH_MAX across the Granite layer shapes (q/o [2048,2048],
+    // kv [512,2048], ffn up [8192,2048], ffn down [2048,8192]). This is the
+    // kernel every K-quant GGUF prompt runs through; it previously had no
+    // correctness coverage (only the MXFP4 variant did).
+    #[test]
+    fn gguf_mul_mm_prefill_matches_reference() {
+        let Ok(dev) = Device::new_metal(0) else {
+            return;
+        };
+        for (ggml, fast, tag) in [
+            (GgmlDType::Q4K, GgufFastQuant::Q4K, "Q4K"),
+            (GgmlDType::Q6K, GgufFastQuant::Q6K, "Q6K"),
+        ] {
+            for (n, k) in [
+                (2048usize, 2048usize),
+                (512, 2048),
+                (8192, 2048),
+                (2048, 8192),
+            ] {
+                let w_data: Vec<f32> = (0..n * k)
+                    .map(|i| ((i % 23) as f32 - 11.0) * 0.04)
+                    .collect();
+                let w_src = Tensor::from_vec(w_data, (n, k), &Device::Cpu).unwrap();
+                let qt = QTensor::quantize(&w_src, ggml).unwrap();
+                let bytes = qt.data().unwrap().into_owned();
+                let blen = bytes.len();
+                let wb = Tensor::from_vec(bytes, (blen,), &dev).unwrap();
+                let w_ref_t = qt
+                    .dequantize(&Device::Cpu)
+                    .unwrap()
+                    .to_dtype(DType::F32)
+                    .unwrap()
+                    .t()
+                    .unwrap()
+                    .contiguous()
+                    .unwrap();
+
+                for m in [9usize, 33, 70] {
+                    let x_data: Vec<f32> =
+                        (0..m * k).map(|i| ((i % 13) as f32 - 6.0) * 0.03).collect();
+                    let x = Tensor::from_vec(x_data.clone(), (m, k), &dev)
+                        .unwrap()
+                        .to_dtype(DType::BF16)
+                        .unwrap();
+                    let y_kernel = gguf_quant_mul_mm(&x, &wb, k, n, fast).unwrap();
+                    let x_cpu = Tensor::from_vec(x_data, (m, k), &Device::Cpu).unwrap();
+                    let y_ref = x_cpu.matmul(&w_ref_t).unwrap();
+
+                    let f = y_kernel
+                        .to_dtype(DType::F32)
+                        .unwrap()
+                        .flatten_all()
+                        .unwrap()
+                        .to_vec1::<f32>()
+                        .unwrap();
+                    let r = y_ref.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+                    assert!(
+                        f.iter().all(|v| v.is_finite()),
+                        "{tag} mul_mm M={m} n={n} k={k}: non-finite"
+                    );
+                    let max_abs = r.iter().fold(0f32, |a, &v| a.max(v.abs()));
+                    let tol = 0.06 * max_abs + 1e-2;
+                    let mut worst = (0f32, 0usize);
+                    for (i, (a, b)) in f.iter().zip(r.iter()).enumerate() {
+                        let d = (a - b).abs();
+                        if d > worst.0 {
+                            worst = (d, i);
+                        }
+                    }
+                    assert!(
+                        worst.0 <= tol,
+                        "{tag} mul_mm M={m} n={n} k={k}: max diff {} at idx {} \
+                         (kernel={} ref={}), tol {tol}",
+                        worst.0,
+                        worst.1,
+                        f[worst.1],
+                        r[worst.1]
+                    );
+                }
+            }
+        }
+    }
+
+    // Contract: the M=1 gemv path equals candle's dequant+matmul for odd and
+    // non-power-of-two N (Granite ties its lm_head to a [49159, 2048]
+    // embedding; every other tested model has power-of-two-ish N, so the gemv
+    // row-bound tail was never exercised at M=1).
+    #[test]
+    fn gguf_gemv_m1_odd_n_matches_reference() {
+        let Ok(dev) = Device::new_metal(0) else {
+            return;
+        };
+        for (ggml, fast, tag) in [
+            (GgmlDType::Q4K, GgufFastQuant::Q4K, "Q4K"),
+            (GgmlDType::Q6K, GgufFastQuant::Q6K, "Q6K"),
+        ] {
+            for (n, k) in [(1001usize, 2048usize), (49159, 2048), (2048, 2048)] {
+                let w_data: Vec<f32> = (0..n * k).map(|i| ((i % 17) as f32 - 8.0) * 0.05).collect();
+                let w_src = Tensor::from_vec(w_data, (n, k), &Device::Cpu).unwrap();
+                let qt = QTensor::quantize(&w_src, ggml).unwrap();
+                let bytes = qt.data().unwrap().into_owned();
+                let blen = bytes.len();
+                let wb = Tensor::from_vec(bytes, (blen,), &dev).unwrap();
+                let w_ref_t = qt
+                    .dequantize(&Device::Cpu)
+                    .unwrap()
+                    .to_dtype(DType::F32)
+                    .unwrap()
+                    .t()
+                    .unwrap()
+                    .contiguous()
+                    .unwrap();
+
+                let x_data: Vec<f32> = (0..k).map(|i| ((i % 13) as f32 - 6.0) * 0.03).collect();
+                let x = Tensor::from_vec(x_data.clone(), (1, k), &dev)
+                    .unwrap()
+                    .to_dtype(DType::BF16)
+                    .unwrap();
+                let y_kernel = gguf_quant_matmul(&x, &wb, k, n, fast).unwrap();
+                let x_cpu = Tensor::from_vec(x_data, (1, k), &Device::Cpu).unwrap();
+                let y_ref = x_cpu.matmul(&w_ref_t).unwrap();
+
+                let f = y_kernel
+                    .to_dtype(DType::F32)
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap();
+                let r = y_ref.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+                assert!(
+                    f.iter().all(|v| v.is_finite()),
+                    "{tag} M=1 n={n} k={k}: non-finite"
+                );
+                let max_abs = r.iter().fold(0f32, |a, &v| a.max(v.abs()));
+                let tol = 0.06 * max_abs + 1e-2;
+                let mut worst = (0f32, 0usize);
+                for (i, (a, b)) in f.iter().zip(r.iter()).enumerate() {
+                    let d = (a - b).abs();
+                    if d > worst.0 {
+                        worst = (d, i);
+                    }
+                }
+                assert!(
+                    worst.0 <= tol,
+                    "{tag} M=1 n={n} k={k}: max diff {} at row {} (kernel={} ref={}), tol {tol}",
+                    worst.0,
+                    worst.1,
+                    f[worst.1],
+                    r[worst.1]
+                );
+            }
+        }
+    }
+
     // Contract: every batched decode gemv equals candle's dequant+matmul across
     // M=2,4,8 and shapes incl. N not a multiple of the geometry's rows-per-TG
     // (exercises the row-bound) and varying nb. Fails if the M-loop or dequant is

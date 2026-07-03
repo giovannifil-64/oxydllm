@@ -64,11 +64,15 @@ pub fn parse(config_path: &str) -> Result<StandardTransformerConfig> {
         eos_token_ids = vec![2];
     }
 
-    let embed_scale = if arch_def.embed_scale_from_hidden {
+    let mut embed_scale = if arch_def.embed_scale_from_hidden {
         Some((hidden_size as f64).sqrt())
     } else {
         None
     };
+    // Granite: `embedding_multiplier` is an explicit embedding scale.
+    if let Some(m) = v["embedding_multiplier"].as_f64().filter(|&m| m != 1.0) {
+        embed_scale = Some(m);
+    }
 
     let mut attn_softcap = arch_def.attn_softcap;
     let mut logit_softcap = arch_def.logit_softcap;
@@ -83,6 +87,15 @@ pub fn parse(config_path: &str) -> Result<StandardTransformerConfig> {
     if let Some(scalar) = v["query_pre_attn_scalar"].as_f64() {
         attention_scale = Some(1.0 / scalar.sqrt());
     }
+    // Granite: `attention_multiplier` is the softmax scale itself, not a
+    // divisor to be inverted.
+    if let Some(m) = v["attention_multiplier"].as_f64() {
+        attention_scale = Some(m);
+    }
+    let residual_multiplier = v["residual_multiplier"].as_f64().filter(|&m| m != 1.0);
+    let logits_scaling = v["logits_scaling"]
+        .as_f64()
+        .filter(|&s| s > 0.0 && s != 1.0);
     if attention_scale.is_none()
         && (arch == "gemma4"
             || arch == "gemma-4"
@@ -302,6 +315,8 @@ pub fn parse(config_path: &str) -> Result<StandardTransformerConfig> {
         embed_scale,
         attn_softcap,
         logit_softcap,
+        residual_multiplier,
+        logits_scaling,
         v_norm: arch_def.v_norm,
         has_ffn_norms: arch_def.has_ffn_norms,
         sliding_window,
@@ -805,6 +820,83 @@ mod tests {
 
         let cfg = parse(config_path.to_string_lossy().as_ref()).unwrap();
         assert!(!cfg.tie_word_embeddings);
+    }
+
+    #[test]
+    fn granite_multipliers_are_parsed() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("config.json");
+
+        let config = json!({
+            "architectures": ["GraniteForCausalLM"],
+            "hidden_size": 2048,
+            "num_hidden_layers": 40,
+            "num_attention_heads": 32,
+            "num_key_value_heads": 8,
+            "vocab_size": 49159,
+            "attention_multiplier": 0.015625,
+            "embedding_multiplier": 12.0,
+            "residual_multiplier": 0.22,
+            "logits_scaling": 8.0,
+            "rope_theta": 10000000.0,
+            "tie_word_embeddings": true
+        });
+        fs::write(&config_path, config.to_string()).unwrap();
+
+        let cfg = parse(config_path.to_str().unwrap()).unwrap();
+        // attention_multiplier is the softmax scale itself, not inverted.
+        assert_eq!(cfg.attention_scale, Some(0.015625));
+        assert_eq!(cfg.embed_scale, Some(12.0));
+        assert_eq!(cfg.residual_multiplier, Some(0.22));
+        assert_eq!(cfg.logits_scaling, Some(8.0));
+        assert!(cfg.tie_word_embeddings);
+        assert_eq!(cfg.rope_theta, 10_000_000.0);
+    }
+
+    #[test]
+    fn non_granite_configs_leave_multipliers_unset() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("config.json");
+
+        let config = json!({
+            "architectures": ["LlamaForCausalLM"],
+            "hidden_size": 2048,
+            "num_hidden_layers": 4,
+            "num_attention_heads": 16,
+            "vocab_size": 32000
+        });
+        fs::write(&config_path, config.to_string()).unwrap();
+
+        let cfg = parse(config_path.to_str().unwrap()).unwrap();
+        assert_eq!(cfg.attention_scale, None);
+        assert_eq!(cfg.embed_scale, None);
+        assert_eq!(cfg.residual_multiplier, None);
+        assert_eq!(cfg.logits_scaling, None);
+    }
+
+    #[test]
+    fn granite_moe_variants_are_rejected_with_reason() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("config.json");
+
+        for arch in ["GraniteMoeForCausalLM", "GraniteMoeHybridForCausalLM"] {
+            let config = json!({
+                "architectures": [arch],
+                "hidden_size": 1024,
+                "num_hidden_layers": 24,
+                "num_attention_heads": 16,
+                "vocab_size": 49155
+            });
+            fs::write(&config_path, config.to_string()).unwrap();
+            let err = match parse(config_path.to_str().unwrap()) {
+                Ok(_) => panic!("expected {arch} to be rejected"),
+                Err(e) => e,
+            };
+            assert!(
+                err.to_string().contains("not supported"),
+                "expected a clean unsupported error for {arch}, got: {err}"
+            );
+        }
     }
 
     #[test]

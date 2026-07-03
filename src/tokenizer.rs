@@ -222,16 +222,74 @@ impl Tokenizer {
         })
     }
 
+    /// Repairs the pre-tokenizer that candle built for a GGUF, for the
+    /// `tokenizer.ggml.pre` kinds candle mishandles.
+    ///
+    /// candle maps unknown pre kinds to `ByteLevel::default()`, whose
+    /// `add_prefix_space = true` injects a spurious `Ġ` at the start of every
+    /// text segment that follows a special token, so chat markup like
+    /// `<|start_of_role|>user` encodes the role name as `Ġuser` instead of
+    /// `user`. Two families need repair:
+    ///
+    /// - `refact` / `starcoder` (bigcode: Granite 3.x, granite-code) and plain
+    ///   `gpt-2`: the reference pipeline is GPT-2 ByteLevel with
+    ///   `add_prefix_space = false`.
+    /// - `llama-bpe` (Llama 3 family): llama.cpp writes `llama-bpe` but candle
+    ///   only matches `llama3`, so these fall through to the broken default;
+    ///   the reference pipeline splits with the Llama 3 regex (digit runs
+    ///   capped at 3) and then byte-encodes without a prefix space.
+    fn fix_gguf_pre_tokenizer(inner: &mut tokenizers::Tokenizer, pre: &str) -> Result<()> {
+        use tokenizers::pre_tokenizers::byte_level::ByteLevel;
+        use tokenizers::pre_tokenizers::sequence::Sequence;
+        use tokenizers::pre_tokenizers::split::{Split, SplitPattern};
+        use tokenizers::tokenizer::SplitDelimiterBehavior;
+
+        const REGEX_LLAMA3: &str = r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+
+        match pre {
+            "refact" | "starcoder" | "gpt-2" => {
+                inner.with_pre_tokenizer(Some(ByteLevel::new(false, true, true)));
+            }
+            "llama-bpe" => {
+                let split = Split::new(
+                    SplitPattern::Regex(REGEX_LLAMA3.to_string()),
+                    SplitDelimiterBehavior::Isolated,
+                    false,
+                )
+                .map_err(|e| anyhow::anyhow!("llama-bpe split regex: {e}"))?;
+                inner.with_pre_tokenizer(Some(Sequence::new(vec![
+                    split.into(),
+                    ByteLevel::new(false, true, false).into(),
+                ])));
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
     pub fn from_gguf_file(gguf_path: &str) -> Result<Self> {
-        use candle_core::quantized::{gguf_file, tokenizer::TokenizerFromGguf};
+        use candle_core::quantized::gguf_file;
 
         let mut file = std::fs::File::open(gguf_path)
             .with_context(|| format!("Failed to open GGUF file: {}", gguf_path))?;
         let content = gguf_file::Content::read(&mut file)
             .map_err(|e| anyhow::anyhow!("Failed to parse GGUF: {}", e))?;
+        Self::from_gguf_content(&content)
+    }
 
-        let inner = tokenizers::Tokenizer::from_gguf(&content)
+    fn from_gguf_content(content: &candle_core::quantized::gguf_file::Content) -> Result<Self> {
+        use candle_core::quantized::tokenizer::TokenizerFromGguf;
+
+        let mut inner = tokenizers::Tokenizer::from_gguf(content)
             .map_err(|e| anyhow::anyhow!("Failed to build tokenizer from GGUF: {}", e))?;
+
+        let pre_kind = content
+            .metadata
+            .get("tokenizer.ggml.pre")
+            .and_then(|v| v.to_string().ok())
+            .cloned()
+            .unwrap_or_default();
+        Self::fix_gguf_pre_tokenizer(&mut inner, &pre_kind)?;
 
         let chat_template = content
             .metadata
@@ -514,6 +572,65 @@ mod tests {
             tok.eos_token_id(),
             Some(3),
             "<eos> is at index 3 in the test vocab"
+        );
+    }
+
+    /// Contract: with the GGUF pre-tokenizer kinds candle mishandles
+    /// (`refact`/`starcoder`/`gpt-2` and `llama-bpe`), text after a special
+    /// token must NOT receive a spurious leading space: `<|x|>user` encodes
+    /// the role name as `user`, never `Ġuser`. Guards the override of
+    /// candle's `ByteLevel::default()` fallback, whose
+    /// `add_prefix_space = true` corrupts chat markup.
+    #[test]
+    fn gguf_repaired_pre_tokenizers_have_no_prefix_space() {
+        for pre in ["refact", "starcoder", "gpt-2", "llama-bpe"] {
+            run_gguf_pre_tokenizer_case(pre);
+        }
+    }
+
+    fn run_gguf_pre_tokenizer_case(pre: &str) {
+        use candle_core::quantized::gguf_file::{Content, Value, VersionedMagic};
+        use std::collections::HashMap;
+
+        let tokens = [
+            "<|x|>", "Ġ", "u", "s", "e", "r", "us", "er", "user", "Ġuser",
+        ];
+        // Types per llama_token_type: 3 = control (special), 1 = normal.
+        let token_types = [3u32, 1, 1, 1, 1, 1, 1, 1, 1, 1];
+        let merges = ["u s", "e r", "us er", "Ġ user"];
+
+        let mut metadata: HashMap<String, Value> = HashMap::new();
+        metadata.insert("tokenizer.ggml.model".into(), Value::String("gpt2".into()));
+        metadata.insert("tokenizer.ggml.pre".into(), Value::String(pre.into()));
+        metadata.insert(
+            "tokenizer.ggml.tokens".into(),
+            Value::Array(tokens.iter().map(|t| Value::String((*t).into())).collect()),
+        );
+        metadata.insert(
+            "tokenizer.ggml.token_type".into(),
+            Value::Array(token_types.iter().map(|&t| Value::U32(t)).collect()),
+        );
+        metadata.insert(
+            "tokenizer.ggml.merges".into(),
+            Value::Array(merges.iter().map(|m| Value::String((*m).into())).collect()),
+        );
+
+        let content = Content {
+            magic: VersionedMagic::GgufV3,
+            metadata,
+            tensor_infos: HashMap::new(),
+            tensor_data_offset: 0,
+        };
+
+        let tok = Tokenizer::from_gguf_content(&content).unwrap();
+        let ids = tok.encode("<|x|>user").unwrap();
+        let user_id = 8u32;
+        let prefixed_user_id = 9u32;
+        assert_eq!(
+            ids,
+            vec![0, user_id],
+            "[{pre}] expected [<|x|>, user], got ids {ids:?}: a {prefixed_user_id} here means \
+             the pre-tokenizer injected a spurious leading space"
         );
     }
 

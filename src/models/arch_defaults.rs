@@ -20,6 +20,10 @@ pub struct ArchDefaults {
     /// consulted by the GGUF loader; safetensors reads `attn_output_gate`
     /// from config.json.
     pub attn_output_gate: bool,
+    /// GGUF q/k projections are stored with llama.cpp's per-head row
+    /// interleave (Llama-family converter) and must be de-interleaved at load
+    /// to match our NeoX/HF RoPE. Only consulted by the GGUF loader.
+    pub gguf_qk_permuted: bool,
 }
 
 impl ArchDefaults {
@@ -68,6 +72,7 @@ impl Default for ArchDefaults {
             gpt_oss_moe: false,
             alternating_sliding_window: false,
             attn_output_gate: false,
+            gguf_qk_permuted: false,
         }
     }
 }
@@ -88,6 +93,7 @@ pub fn llama_defaults() -> ArchDefaults {
         alternating_sliding_window: false,
         gpt_oss_moe: false,
         attn_output_gate: false,
+        gguf_qk_permuted: false,
     }
 }
 
@@ -100,13 +106,28 @@ pub fn known_unsupported_reason(arch: &str) -> Option<&'static str> {
         "MixtralForCausalLM" | "DeepseekV2ForCausalLM" | "DeepseekV3ForCausalLM" => {
             Some("This MoE variant (Mixtral / DeepSeek) uses a tensor naming we don't load yet")
         }
+        // GraniteMoe stores experts as fused 3D tensors
+        // (`block_sparse_moe.input_linear.weight`, shape [n_experts, 2*ffn, hidden])
+        // that our per-expert `mlp.experts.{e}.*` loader cannot consume yet;
+        // the Hybrid variant additionally interleaves Mamba2 layers.
+        "GraniteMoeForCausalLM" | "GraniteMoeSharedForCausalLM" => Some(
+            "GraniteMoe uses fused 3D expert tensors (block_sparse_moe.input_linear) we don't load yet",
+        ),
+        "GraniteMoeHybridForCausalLM" => {
+            Some("Granite 4.0 hybrid interleaves Mamba2 layers, which have no runtime yet")
+        }
         _ => None,
     }
 }
 
 pub fn arch_defaults(arch: &str) -> Option<ArchDefaults> {
     match arch {
-        "llama" | "LlamaForCausalLM" => Some(llama_defaults()),
+        // GGUF "llama" files (Llama, Mistral, ...) come from the converter's
+        // LlamaModel, which interleaves q/k rows for llama.cpp's paired RoPE.
+        "llama" | "LlamaForCausalLM" => Some(ArchDefaults {
+            gguf_qk_permuted: true,
+            ..llama_defaults()
+        }),
 
         "mistral" | "MistralForCausalLM" | "Mistral3ForConditionalGeneration" => {
             Some(ArchDefaults {
@@ -114,6 +135,16 @@ pub fn arch_defaults(arch: &str) -> Option<ArchDefaults> {
                 ..Default::default()
             })
         }
+        // Granite 3.x dense: Llama-shaped blocks plus four scalar multipliers
+        // (embedding / attention / residual / logits), all read from the
+        // config or GGUF metadata rather than defaulted here. Granite GGUFs
+        // are converted through the Llama-family path, so q/k are interleaved.
+        "granite" | "GraniteForCausalLM" => Some(ArchDefaults {
+            default_rope_theta: 10_000_000.0,
+            extra_eos_ids: &[],
+            gguf_qk_permuted: true,
+            ..llama_defaults()
+        }),
         "phi3" | "Phi3ForCausalLM" => Some(ArchDefaults {
             default_rope_theta: 10_000.0,
             extra_eos_ids: &[],

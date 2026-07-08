@@ -1199,6 +1199,30 @@ pub fn flash_attention_metal_available(head_dim: usize) -> bool {
 
 const QUANT_METAL_SOURCE: &str = include_str!("quant_kernels.metal");
 
+/// Benchmark-only toggle: selects the retired atomic split-K epilogue in the
+/// AWQ/GPTQ GEMV kernels so `quant_gemv_bench` can measure the deterministic
+/// replacement against it in the same process (paired samples cancel the
+/// machine's GPU timing drift). Production never sets this: the atomic
+/// epilogue's scheduling-dependent float addition order made temp-0 decode
+/// flip borderline tokens run to run.
+#[doc(hidden)]
+pub static QUANT_GEMV_ATOMIC: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn quant_gemv_atomic() -> bool {
+    QUANT_GEMV_ATOMIC.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Threadgroup geometry shared by the deterministic GEMV kernels; must match
+/// the `QDET_*` constants in `quant_kernels.metal`.
+const QDET_TGW: usize = 32;
+const QDET_S: usize = 16;
+const QDET_S_BATCH: usize = 16;
+const QDET_A_TGW: usize = 32;
+const QDET_A_S: usize = 32;
+const QDET_AB_TGW: usize = 16;
+const QDET_AB_S: usize = 32;
+
 static QUANT_PIPELINES: OnceLock<Mutex<HashMap<(u64, &'static str), ComputePipeline>>> =
     OnceLock::new();
 
@@ -1376,26 +1400,81 @@ impl InplaceOp1 for W4A16Matmul {
             );
         }
 
-        let kernel_name = match (self.bits, self.x.dtype(), m) {
-            (4, DType::F16, 1) => "w4a16_gemv_f16",
-            (4, DType::BF16, 1) => "w4a16_gemv_bf16",
-            (8, DType::F16, 1) => "w8a16_gemv_f16",
-            (8, DType::BF16, 1) => "w8a16_gemv_bf16",
-            (4, DType::F16, _) => "w4a16_gemv_batch_f16",
-            (4, DType::BF16, _) => "w4a16_gemv_batch_bf16",
-            (8, DType::F16, _) => "w8a16_gemv_batch_f16",
-            (8, DType::BF16, _) => "w8a16_gemv_batch_bf16",
-            (bits, other, _) => candle_core::bail!(
-                "W{bits}A16Matmul: unsupported (bits, dtype) combo ({bits}, {other:?})"
-            ),
+        let atomic = quant_gemv_atomic();
+        let kernel_name = if atomic {
+            match (self.bits, self.x.dtype(), m) {
+                (4, DType::F16, 1) => "w4a16_gemv_f16_atomic",
+                (4, DType::BF16, 1) => "w4a16_gemv_bf16_atomic",
+                (8, DType::F16, 1) => "w8a16_gemv_f16_atomic",
+                (8, DType::BF16, 1) => "w8a16_gemv_bf16_atomic",
+                (4, DType::F16, _) => "w4a16_gemv_batch_f16_atomic",
+                (4, DType::BF16, _) => "w4a16_gemv_batch_bf16_atomic",
+                (8, DType::F16, _) => "w8a16_gemv_batch_f16_atomic",
+                (8, DType::BF16, _) => "w8a16_gemv_batch_bf16_atomic",
+                (bits, other, _) => candle_core::bail!(
+                    "W{bits}A16Matmul: unsupported (bits, dtype) combo ({bits}, {other:?})"
+                ),
+            }
+        } else {
+            // M=1 geometry class by output width: narrow outputs need a deep
+            // split to keep the GPU busy, mid ones a narrow tile for
+            // threadgroup balance, wide ones are fine at S=16.
+            let class = if m > 1 {
+                2
+            } else if shape.packed_out < 512 {
+                0
+            } else if shape.packed_out < 1024 {
+                1
+            } else {
+                3
+            };
+            match (self.bits, self.x.dtype(), class) {
+                (4, DType::F16, 0) => "w4a16_gemv_f16",
+                (4, DType::BF16, 0) => "w4a16_gemv_bf16",
+                (8, DType::F16, 0) => "w8a16_gemv_f16",
+                (8, DType::BF16, 0) => "w8a16_gemv_bf16",
+                (4, DType::F16, 1) => "w4a16_gemv_t16_f16",
+                (4, DType::BF16, 1) => "w4a16_gemv_t16_bf16",
+                (8, DType::F16, 1) => "w8a16_gemv_t16_f16",
+                (8, DType::BF16, 1) => "w8a16_gemv_t16_bf16",
+                (4, DType::F16, 3) => "w4a16_gemv_s16_f16",
+                (4, DType::BF16, 3) => "w4a16_gemv_s16_bf16",
+                (8, DType::F16, 3) => "w8a16_gemv_s16_f16",
+                (8, DType::BF16, 3) => "w8a16_gemv_s16_bf16",
+                (4, DType::F16, _) => "w4a16_gemv_batch_f16",
+                (4, DType::BF16, _) => "w4a16_gemv_batch_bf16",
+                (8, DType::F16, _) => "w8a16_gemv_batch_f16",
+                (8, DType::BF16, _) => "w8a16_gemv_batch_bf16",
+                (bits, other, _) => candle_core::bail!(
+                    "W{bits}A16Matmul: unsupported (bits, dtype) combo ({bits}, {other:?})"
+                ),
+            }
         };
 
-        const TARGET_THREADS: usize = 32768;
-        let k_splits = (TARGET_THREADS / shape.packed_out.max(1))
-            .clamp(1, 256)
-            .min(shape.in_features.max(1));
-        let chunk = shape.in_features.div_ceil(k_splits);
-        let k_splits = shape.in_features.div_ceil(chunk);
+        // Deterministic kernels reduce their k-splits inside one threadgroup,
+        // so the split count is the kernel's threadgroup height; the atomic
+        // kernels size the grid for occupancy instead. Geometry must mirror
+        // the kernel-name classes above.
+        let (det_tgw, s_rows) = if m > 1 {
+            (QDET_AB_TGW, QDET_AB_S)
+        } else if shape.packed_out < 512 {
+            (QDET_A_TGW, QDET_A_S)
+        } else if shape.packed_out < 1024 {
+            (QDET_AB_TGW, QDET_A_S)
+        } else {
+            (QDET_A_TGW, QDET_S)
+        };
+        let (k_splits, chunk) = if atomic {
+            const TARGET_THREADS: usize = 32768;
+            let k_splits = (TARGET_THREADS / shape.packed_out.max(1))
+                .clamp(1, 256)
+                .min(shape.in_features.max(1));
+            let chunk = shape.in_features.div_ceil(k_splits);
+            (shape.in_features.div_ceil(chunk), chunk)
+        } else {
+            let chunk = shape.in_features.div_ceil(s_rows);
+            (shape.in_features.div_ceil(chunk), chunk)
+        };
         let group_shift = shape.group_size.trailing_zeros() as usize;
         let params = shape.params(group_shift, k_splits, chunk, m);
 
@@ -1437,19 +1516,34 @@ impl InplaceOp1 for W4A16Matmul {
         encoder.use_resource(scales_buf, MTLResourceUsage::Read);
         encoder.use_resource(out.buffer(), MTLResourceUsage::Write);
 
-        const TG_WIDTH: usize = 64;
-        encoder.dispatch_thread_groups(
-            MTLSize {
-                width: shape.packed_out.div_ceil(TG_WIDTH),
-                height: k_splits,
-                depth: 1,
-            },
-            MTLSize {
-                width: TG_WIDTH,
-                height: 1,
-                depth: 1,
-            },
-        );
+        if atomic {
+            const TG_WIDTH: usize = 64;
+            encoder.dispatch_thread_groups(
+                MTLSize {
+                    width: shape.packed_out.div_ceil(TG_WIDTH),
+                    height: k_splits,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: TG_WIDTH,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+        } else {
+            encoder.dispatch_thread_groups(
+                MTLSize {
+                    width: shape.packed_out.div_ceil(det_tgw),
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: det_tgw,
+                    height: s_rows,
+                    depth: 1,
+                },
+            );
+        }
 
         Ok(())
     }
@@ -1752,28 +1846,55 @@ impl InplaceOp1 for GptqMatmul {
             );
         }
 
-        let kernel_name = match (self.bits, self.x.dtype(), m) {
-            (4, DType::F16, 1) => "gptq4_gemv_f16",
-            (4, DType::BF16, 1) => "gptq4_gemv_bf16",
-            (8, DType::F16, 1) => "gptq8_gemv_f16",
-            (8, DType::BF16, 1) => "gptq8_gemv_bf16",
-            (4, DType::F16, _) => "gptq4_gemv_batch_f16",
-            (4, DType::BF16, _) => "gptq4_gemv_batch_bf16",
-            (8, DType::F16, _) => "gptq8_gemv_batch_f16",
-            (8, DType::BF16, _) => "gptq8_gemv_batch_bf16",
-            (bits, other, _) => candle_core::bail!(
-                "GptqMatmul: unsupported (bits, dtype) combo ({bits}, {other:?})"
-            ),
+        let atomic = quant_gemv_atomic();
+        let kernel_name = if atomic {
+            match (self.bits, self.x.dtype(), m) {
+                (4, DType::F16, 1) => "gptq4_gemv_f16_atomic",
+                (4, DType::BF16, 1) => "gptq4_gemv_bf16_atomic",
+                (8, DType::F16, 1) => "gptq8_gemv_f16_atomic",
+                (8, DType::BF16, 1) => "gptq8_gemv_bf16_atomic",
+                (4, DType::F16, _) => "gptq4_gemv_batch_f16_atomic",
+                (4, DType::BF16, _) => "gptq4_gemv_batch_bf16_atomic",
+                (8, DType::F16, _) => "gptq8_gemv_batch_f16_atomic",
+                (8, DType::BF16, _) => "gptq8_gemv_batch_bf16_atomic",
+                (bits, other, _) => candle_core::bail!(
+                    "GptqMatmul: unsupported (bits, dtype) combo ({bits}, {other:?})"
+                ),
+            }
+        } else {
+            match (self.bits, self.x.dtype(), m) {
+                (4, DType::F16, 1) => "gptq4_gemv_f16",
+                (4, DType::BF16, 1) => "gptq4_gemv_bf16",
+                (8, DType::F16, 1) => "gptq8_gemv_f16",
+                (8, DType::BF16, 1) => "gptq8_gemv_bf16",
+                (4, DType::F16, _) => "gptq4_gemv_batch_f16",
+                (4, DType::BF16, _) => "gptq4_gemv_batch_bf16",
+                (8, DType::F16, _) => "gptq8_gemv_batch_f16",
+                (8, DType::BF16, _) => "gptq8_gemv_batch_bf16",
+                (bits, other, _) => candle_core::bail!(
+                    "GptqMatmul: unsupported (bits, dtype) combo ({bits}, {other:?})"
+                ),
+            }
         };
 
-        // `chunk` must be a multiple of pack_factor (kernel iterates whole words).
-        const TARGET_THREADS: usize = 32768;
-        let k_splits = (TARGET_THREADS / shape.out_features.max(1))
-            .clamp(1, 256)
-            .min(shape.in_features.max(1));
-        let raw_chunk = shape.in_features.div_ceil(k_splits);
-        let chunk = raw_chunk.div_ceil(pack_factor) * pack_factor;
-        let k_splits = shape.in_features.div_ceil(chunk);
+        // `chunk` must be a multiple of pack_factor (kernel iterates whole
+        // words). Deterministic kernels reduce their k-splits inside one
+        // threadgroup, so the split count is the kernel's threadgroup height;
+        // the atomic kernels size the grid for occupancy instead.
+        let s_rows = if m == 1 { QDET_S } else { QDET_S_BATCH };
+        let (k_splits, chunk) = if atomic {
+            const TARGET_THREADS: usize = 32768;
+            let k_splits = (TARGET_THREADS / shape.out_features.max(1))
+                .clamp(1, 256)
+                .min(shape.in_features.max(1));
+            let raw_chunk = shape.in_features.div_ceil(k_splits);
+            let chunk = raw_chunk.div_ceil(pack_factor) * pack_factor;
+            (shape.in_features.div_ceil(chunk), chunk)
+        } else {
+            let raw_chunk = shape.in_features.div_ceil(s_rows);
+            let chunk = raw_chunk.div_ceil(pack_factor) * pack_factor;
+            (shape.in_features.div_ceil(chunk), chunk)
+        };
         let group_shift = shape.group_size.trailing_zeros() as usize;
         let params = shape.params(group_shift, k_splits, chunk, m);
 
@@ -1815,19 +1936,34 @@ impl InplaceOp1 for GptqMatmul {
         encoder.use_resource(scales_buf, MTLResourceUsage::Read);
         encoder.use_resource(out.buffer(), MTLResourceUsage::Write);
 
-        const TG_WIDTH: usize = 64;
-        encoder.dispatch_thread_groups(
-            MTLSize {
-                width: shape.out_features.div_ceil(TG_WIDTH),
-                height: k_splits,
-                depth: 1,
-            },
-            MTLSize {
-                width: TG_WIDTH,
-                height: 1,
-                depth: 1,
-            },
-        );
+        if atomic {
+            const TG_WIDTH: usize = 64;
+            encoder.dispatch_thread_groups(
+                MTLSize {
+                    width: shape.out_features.div_ceil(TG_WIDTH),
+                    height: k_splits,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: TG_WIDTH,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+        } else {
+            encoder.dispatch_thread_groups(
+                MTLSize {
+                    width: shape.out_features.div_ceil(QDET_TGW),
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: QDET_TGW,
+                    height: s_rows,
+                    depth: 1,
+                },
+            );
+        }
 
         Ok(())
     }
@@ -3828,6 +3964,183 @@ mod fused_kernel_parity_tests {
             return;
         };
         run_gptq_dequant_parity(&dev, DType::BF16, 8, 256, 128, 128, "gptq8/bf16/g128");
+    }
+
+    /// Micro-benchmark for the quantized GEMV kernels on the layer shapes of
+    /// the locally tested models (Qwen3-4B-AWQ, Qwen3-0.6B-GPTQ-Int8).
+    /// Ignored by default; run explicitly when touching these kernels:
+    /// `cargo test quant_gemv_bench -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn quant_gemv_bench() {
+        // Match the runtime configuration (main() forces the pool to 1);
+        // with the default pool of 5 the flush boundaries vary run to run
+        // and the timings are unusable.
+        unsafe { std::env::set_var("CANDLE_METAL_COMMAND_POOL_SIZE", "1") };
+        let Some(dev) = metal_device_or_skip() else {
+            return;
+        };
+        // 64 back-to-back launches per sample with a single readback (so the
+        // per-call sync overhead does not mask kernel-time differences), and
+        // det/atomic samples interleaved so slow thermal/scheduler drift
+        // cancels in the per-pair ratio.
+        const LAUNCHES: usize = 64;
+        use std::sync::atomic::Ordering;
+        let sample_us = |f: &dyn Fn() -> Tensor| -> f64 {
+            let t0 = std::time::Instant::now();
+            let mut last = None;
+            for _ in 0..LAUNCHES {
+                last = Some(f());
+            }
+            let _ = last
+                .unwrap()
+                .to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            t0.elapsed().as_secs_f64() * 1e6 / LAUNCHES as f64
+        };
+        let med = |v: &mut Vec<f64>| -> f64 {
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            v[v.len() / 2]
+        };
+        let paired = |f: &dyn Fn() -> Tensor| -> (f64, f64, f64) {
+            QUANT_GEMV_ATOMIC.store(false, Ordering::Relaxed);
+            let _ = sample_us(f);
+            QUANT_GEMV_ATOMIC.store(true, Ordering::Relaxed);
+            let _ = sample_us(f);
+            let mut det = Vec::new();
+            let mut atomic = Vec::new();
+            let mut ratios = Vec::new();
+            for _ in 0..12 {
+                QUANT_GEMV_ATOMIC.store(false, Ordering::Relaxed);
+                let d = sample_us(f);
+                QUANT_GEMV_ATOMIC.store(true, Ordering::Relaxed);
+                let a = sample_us(f);
+                det.push(d);
+                atomic.push(a);
+                ratios.push(d / a);
+            }
+            QUANT_GEMV_ATOMIC.store(false, Ordering::Relaxed);
+            (med(&mut det), med(&mut atomic), med(&mut ratios))
+        };
+
+        // Qwen3-4B-AWQ layer shapes (hidden 2560, q 4096, ffn 9728).
+        for (out, k) in [
+            (4096usize, 2560usize),
+            (2560, 4096),
+            (9728, 2560),
+            (2560, 9728),
+        ] {
+            let raw = build_awq_triplet(&dev, DType::BF16, k, out, 128);
+            for m in [1usize, 4] {
+                let x = batch_x(&dev, DType::BF16, m, k);
+                let (det, atomic, ratio) = paired(&|| {
+                    w4a16_matmul(&x, &raw.qweight, raw.qzeros.as_ref().unwrap(), &raw.scales)
+                        .unwrap()
+                });
+                println!(
+                    "awq4  out={out:<5} k={k:<5} m={m}: det {det:7.1} us | atomic {atomic:7.1} us | paired ratio {ratio:.2}"
+                );
+            }
+        }
+        // Qwen3-0.6B-GPTQ-Int8 layer shapes (hidden 1024, q 2048, ffn 3072).
+        for (out, k) in [
+            (2048usize, 1024usize),
+            (1024, 2048),
+            (3072, 1024),
+            (1024, 3072),
+        ] {
+            let raw = build_gptq_triplet(&dev, DType::BF16, 8, k, out, 128);
+            for m in [1usize, 4] {
+                let x = batch_x(&dev, DType::BF16, m, k);
+                let (det, atomic, ratio) = paired(&|| {
+                    gptq_matmul(
+                        &x,
+                        &raw.qweight,
+                        raw.qzeros.as_ref().unwrap(),
+                        &raw.scales,
+                        8,
+                    )
+                    .unwrap()
+                });
+                println!(
+                    "gptq8 out={out:<5} k={k:<5} m={m}: det {det:7.1} us | atomic {atomic:7.1} us | paired ratio {ratio:.2}"
+                );
+            }
+        }
+    }
+
+    /// Contract: the quantized GEMV kernels are bitwise deterministic; the
+    /// same inputs must produce the same output on every invocation. Guards
+    /// the fixed-order split-K reduction: the previous epilogue accumulated
+    /// partial sums with `atomic_fetch_add` on floats, whose scheduling-
+    /// dependent order made temp-0 decode flip borderline tokens run to run.
+    #[test]
+    fn quant_gemv_kernels_are_bitwise_deterministic() {
+        let Some(dev) = metal_device_or_skip() else {
+            return;
+        };
+        // Small out + large in maximizes k_splits, the worst case for
+        // reduction-order variance in the old atomic epilogue.
+        let (in_features, out_features, group_size) = (3072usize, 128usize, 64usize);
+
+        let awq = build_awq_triplet(&dev, DType::BF16, in_features, out_features, group_size);
+        let gptq = build_gptq_triplet(&dev, DType::BF16, 8, in_features, out_features, group_size);
+
+        let bits_of = |t: &Tensor| -> Vec<u32> {
+            t.to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+                .iter()
+                .map(|v| v.to_bits())
+                .collect()
+        };
+
+        for m in [1usize, 4] {
+            let x = batch_x(&dev, DType::BF16, m, in_features);
+
+            let awq_runs: std::collections::HashSet<Vec<u32>> = (0..48)
+                .map(|_| {
+                    bits_of(
+                        &w4a16_matmul(&x, &awq.qweight, awq.qzeros.as_ref().unwrap(), &awq.scales)
+                            .unwrap(),
+                    )
+                })
+                .collect();
+            assert_eq!(
+                awq_runs.len(),
+                1,
+                "w4a16 M={m}: {} distinct outputs in 48 runs",
+                awq_runs.len()
+            );
+
+            let gptq_runs: std::collections::HashSet<Vec<u32>> = (0..48)
+                .map(|_| {
+                    bits_of(
+                        &gptq_matmul(
+                            &x,
+                            &gptq.qweight,
+                            gptq.qzeros.as_ref().unwrap(),
+                            &gptq.scales,
+                            8,
+                        )
+                        .unwrap(),
+                    )
+                })
+                .collect();
+            assert_eq!(
+                gptq_runs.len(),
+                1,
+                "gptq8 M={m}: {} distinct outputs in 48 runs",
+                gptq_runs.len()
+            );
+        }
     }
 
     fn run_gptq_gemv_batch_parity(dev: &Device, dtype: DType, bits: u32, m: usize, label: &str) {

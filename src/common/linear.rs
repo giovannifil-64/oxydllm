@@ -94,6 +94,15 @@ impl Fp8Linear {
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        // candle 0.11 ships no Metal cast kernels for F8E4M3; widen through
+        // the dedicated kernel there, and candle's native cast on CPU.
+        #[cfg(feature = "metal")]
+        let mut weight_f32 = if self.weight.device().is_metal() {
+            super::metal_ops::cast_f8e4m3_to_f32(&self.weight)?
+        } else {
+            self.weight.to_dtype(DType::F32)?
+        };
+        #[cfg(not(feature = "metal"))]
         let mut weight_f32 = self.weight.to_dtype(DType::F32)?;
 
         if let Some(scale_inv) = &self.scale_inv {

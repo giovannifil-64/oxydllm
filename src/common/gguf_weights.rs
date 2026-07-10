@@ -391,6 +391,12 @@ fn build_qtensor_from_mmap(
         );
     }
     let slice = &mmap[start..end];
+    // Serialize Metal storage creation across the rayon workers: candle
+    // 0.11's residency-set registration is not thread-safe (see
+    // `weights::metal_alloc_lock`).
+    let _guard = device
+        .is_metal()
+        .then(|| crate::common::weights::metal_alloc_lock().lock().unwrap());
     candle_core::quantized::ggml_file::qtensor_from_ggml(
         info.ggml_dtype,
         slice,

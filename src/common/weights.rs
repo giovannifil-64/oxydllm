@@ -45,14 +45,46 @@ fn keeps_file_dtype(name: &str) -> bool {
         || name.ends_with(".linear_attn.norm.weight")
 }
 
-/// Loads one tensor from the mmap and casts it to the runtime dtype.
+/// Serializes Metal tensor creation across the rayon loader threads.
+///
+/// candle 0.11's Metal device registers every allocation in an
+/// `MTLResidencySet`, which Apple documents as not supporting concurrent
+/// mutation; candle mutates it without a lock, so parallel `to_device` /
+/// tensor creation races and leaves buffers non-resident (the GPU then reads
+/// zeros from them). Guard every device-touching call in the parallel load
+/// paths with this lock; the CPU-side work (mmap reads, dequant casts) stays
+/// parallel.
+pub(crate) fn metal_alloc_lock() -> &'static std::sync::Mutex<()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    &LOCK
+}
+
+/// Drains the queued Metal work after a device transfer during loading.
+///
+/// candle 0.11 queues even host-to-device copies as GPU commands and reclaims
+/// staging/dropped buffers only at sync points; loading a whole checkpoint
+/// without syncing accumulates every staging copy until the Metal working-set
+/// limit is hit and command buffers fail with
+/// kIOGPUCommandBufferCallbackErrorOutOfMemory (the weights then read as
+/// zeros).
+fn drain_metal(device: &Device, what: &str) -> Result<()> {
+    if device.is_metal() {
+        device
+            .synchronize()
+            .map_err(|e| anyhow::anyhow!("synchronize after {what}: {e:#}"))?;
+    }
+    Ok(())
+}
+
+/// Loads one tensor from the mmap and casts it to the runtime dtype, on the
+/// CPU for the load phase (the device transfer happens afterwards, see
+/// [`ModelWeights::load`]).
 ///
 /// Integer tensors and the F32-pinned GatedDeltaNet scalars
-/// ([`keeps_file_dtype`]) are returned as stored. FP8 weights stay packed when
-/// `preserve_fp8_weight` is set and the device can dequantize them, but on Metal
-/// (no FP8 kernels) they are dequantized to F32 on CPU and moved back.
-/// `force_f32` overrides the target dtype (used for scale tensors). A failed
-/// device-side cast retries via CPU.
+/// ([`keeps_file_dtype`]) are returned as stored. FP8 weights are dequantized
+/// on CPU unless `preserve_fp8_weight` is set (non-Metal devices that can
+/// consume F8 directly). `force_f32` overrides the target dtype (used for
+/// scale tensors). A failed device-side cast retries via CPU.
 ///
 /// ## Errors
 /// Propagates load, cast, or device-transfer failures.
@@ -63,16 +95,55 @@ fn load_tensor_with_dtype(
     dtype: DType,
     preserve_fp8_weight: bool,
     force_f32: bool,
+    file_is_f8: bool,
 ) -> Result<Tensor> {
-    let t = mmap
-        .load(name, device)
-        .with_context(|| format!("Failed to load tensor {}", name))?;
+    let target_dtype = if force_f32 { DType::F32 } else { dtype };
+
+    // FP8 on Metal: dequantize entirely on CPU and transfer the final tensor
+    // once. The file dtype comes from the safetensors metadata, so the F8
+    // original is never materialized on the device: candle 0.11 reclaims
+    // dropped Metal buffers only at sync points, and staging every F8 tensor
+    // on the GPU pushed the load peak past the Metal working-set limit
+    // (command buffers then fail with kIOGPUCommandBufferCallbackError-
+    // OutOfMemory and the model loads as zeros).
+    if file_is_f8 && device.is_metal() && !keeps_file_dtype(name) {
+        let t_cpu = mmap
+            .load(name, &Device::Cpu)
+            .with_context(|| format!("Failed to load FP8 tensor {} on CPU", name))?
+            .to_dtype(DType::F32)
+            .with_context(|| format!("Failed to convert FP8 tensor {} to F32 on CPU", name))?
+            .to_dtype(target_dtype)
+            .with_context(|| {
+                format!(
+                    "Failed to cast FP8 tensor {} to {:?} on CPU",
+                    name, target_dtype
+                )
+            })?;
+        let _guard = metal_alloc_lock().lock().unwrap();
+        let t_dev = t_cpu.to_device(device).with_context(|| {
+            format!(
+                "Failed to move tensor {} to device after CPU conversion",
+                name
+            )
+        })?;
+        drain_metal(device, name)?;
+        return Ok(t_dev);
+    }
+
+    let t = {
+        let _guard = device
+            .is_metal()
+            .then(|| metal_alloc_lock().lock().unwrap());
+        let t = mmap
+            .load(name, device)
+            .with_context(|| format!("Failed to load tensor {}", name))?;
+        drain_metal(device, name)?;
+        t
+    };
 
     if keeps_file_dtype(name) {
         return Ok(t);
     }
-
-    let target_dtype = if force_f32 { DType::F32 } else { dtype };
 
     if matches!(
         t.dtype(),
@@ -86,28 +157,12 @@ fn load_tensor_with_dtype(
     }
 
     if t.dtype() == DType::F8E4M3 {
-        let use_cpu_path = matches!(device, Device::Metal(_));
-
-        if preserve_fp8_weight && !use_cpu_path {
+        if preserve_fp8_weight {
             return Ok(t);
         }
-
-        let t_f32 = if use_cpu_path {
-            mmap.load(name, &Device::Cpu)
-                .with_context(|| format!("Failed to reload FP8 tensor {} on CPU", name))?
-                .to_dtype(DType::F32)
-                .with_context(|| format!("Failed to convert FP8 tensor {} to F32 on CPU", name))?
-                .to_device(device)
-                .with_context(|| {
-                    format!(
-                        "Failed to move tensor {} to device after CPU conversion",
-                        name
-                    )
-                })?
-        } else {
-            t.to_dtype(DType::F32)
-                .with_context(|| format!("Failed to cast FP8 tensor {} to F32", name))?
-        };
+        let t_f32 = t
+            .to_dtype(DType::F32)
+            .with_context(|| format!("Failed to cast FP8 tensor {} to F32", name))?;
         return t_f32.to_dtype(target_dtype).with_context(|| {
             format!(
                 "Failed to cast FP8 tensor {} from F32 to {:?}",
@@ -116,7 +171,20 @@ fn load_tensor_with_dtype(
         });
     }
 
-    match t.to_dtype(target_dtype) {
+    let cast_result = {
+        let _guard = device
+            .is_metal()
+            .then(|| metal_alloc_lock().lock().unwrap());
+        let r = t.to_dtype(target_dtype);
+        // The queued GPU cast still reads `t` when this function returns and
+        // drops it; candle 0.11's pool would recycle the buffer under the
+        // pending command (see the module comment on metal_alloc_lock).
+        if r.is_ok() {
+            drain_metal(device, name)?;
+        }
+        r
+    };
+    match cast_result {
         Ok(t) => Ok(t),
         Err(device_cast_err) => {
             let t_cpu = mmap
@@ -129,18 +197,23 @@ fn load_tensor_with_dtype(
                     .to_dtype(DType::F32)
                     .with_context(|| format!("Failed to cast tensor {} to F32 on CPU", name))?
             };
-            let t_on_device = t_cpu_f32.to_device(device).with_context(|| {
+            let t_cpu_target = t_cpu_f32.to_dtype(target_dtype).with_context(|| {
+                format!(
+                    "Failed to cast tensor {} to {:?} on CPU (device cast error: {})",
+                    name, target_dtype, device_cast_err
+                )
+            })?;
+            let _guard = device
+                .is_metal()
+                .then(|| metal_alloc_lock().lock().unwrap());
+            let t_dev = t_cpu_target.to_device(device).with_context(|| {
                 format!(
                     "Failed to move tensor {} back to target device after CPU fallback",
                     name
                 )
             })?;
-            t_on_device.to_dtype(target_dtype).with_context(|| {
-                format!(
-                    "Failed to cast tensor {} to {:?} after CPU fallback (original error: {})",
-                    name, target_dtype, device_cast_err
-                )
-            })
+            drain_metal(device, name)?;
+            Ok(t_dev)
         }
     }
 }
@@ -226,6 +299,10 @@ fn apply_weight_scale_inv(tensors: &mut FxHashMap<String, Tensor>) -> Result<()>
         let scaled = scaled_f32.to_dtype(weight_dtype).with_context(|| {
             format!("Failed to cast scaled '{weight_name}' back to {weight_dtype:?}")
         })?;
+        // Drain per weight: the queue otherwise accumulates an F32 copy of
+        // every scaled weight before anything is reclaimed, which blows the
+        // Metal working-set limit on multi-GB checkpoints.
+        drain_metal(scaled.device(), &weight_name)?;
         tensors.insert(weight_name, scaled);
     }
 
@@ -263,6 +340,28 @@ impl ModelWeights {
             .cloned()
             .collect();
 
+        // File dtypes from the safetensors metadata, so FP8 tensors never get
+        // staged on the device just to discover their dtype.
+        let f8_names: std::collections::HashSet<String> = mmap
+            .tensors()
+            .into_iter()
+            .filter(|(_, view)| format!("{:?}", view.dtype()) == "F8_E4M3")
+            .map(|(n, _)| n)
+            .collect();
+
+        // Two-phase load. Phase 1 (parallel, CPU only): read, cast to the
+        // runtime dtype and fold the FP8 scale factors, all in host memory.
+        // Phase 2 (sequential): transfer to the device with periodic drains.
+        //
+        // candle 0.11's Metal device tolerates neither concurrent tensor
+        // creation (unsynchronized MTLResidencySet mutation), nor a load's
+        // worth of queued transfers (staging buffers are only reclaimed at
+        // sync points, so the peak blows past the working-set limit and
+        // command buffers fail with kIOGPUCommandBufferCallbackError-
+        // OutOfMemory), nor synchronizing from one thread while another
+        // encodes. Keeping the device work sequential and drained sidesteps
+        // all three; the heavy lifting (mmap reads, dequant casts, scale
+        // multiplies) stays parallel on CPU.
         use rayon::prelude::*;
         let entries: Vec<(String, Tensor)> = names
             .par_iter()
@@ -273,10 +372,11 @@ impl ModelWeights {
                 let t = load_tensor_with_dtype(
                     &mmap,
                     name,
-                    device,
+                    &Device::Cpu,
                     dtype,
-                    preserve_fp8_weight,
+                    preserve_fp8_weight && !device.is_metal(),
                     force_f32,
+                    f8_names.contains(name),
                 )?;
                 Ok::<_, anyhow::Error>((name.clone(), t))
             })
@@ -288,6 +388,22 @@ impl ModelWeights {
         }
 
         apply_weight_scale_inv(&mut tensors)?;
+
+        if !matches!(device, Device::Cpu) {
+            let names: Vec<String> = tensors.keys().cloned().collect();
+            for (i, name) in names.iter().enumerate() {
+                let cpu_t = tensors.remove(name).expect("key from the same map");
+                let dev_t = cpu_t
+                    .to_device(device)
+                    .with_context(|| format!("Failed to move tensor {} to device", name))?;
+                drop(cpu_t);
+                tensors.insert(name.clone(), dev_t);
+                if i % 16 == 15 {
+                    drain_metal(device, name)?;
+                }
+            }
+            drain_metal(device, "post-load")?;
+        }
 
         Ok(Self {
             tensors,

@@ -3734,3 +3734,35 @@ GPTQ_DET_BATCH_KERNEL(gptq4_gemv_batch_f16, half, 4)
 GPTQ_DET_BATCH_KERNEL(gptq4_gemv_batch_bf16, bfloat, 4)
 GPTQ_DET_BATCH_KERNEL(gptq8_gemv_batch_f16, half, 8)
 GPTQ_DET_BATCH_KERNEL(gptq8_gemv_batch_bf16, bfloat, 8)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// F8E4M3 (fn variant) to F32 elementwise cast. candle 0.11's Metal backend
+// supports F8E4M3 as storage only (no cast kernels), but the FP8 runtime
+// dequant reads the resident F8 weights and widens them on every forward.
+// E4M3fn: 1 sign, 4 exponent (bias 7), 3 mantissa; exp=15/mant=7 is NaN and
+// there is no infinity encoding.
+// ─────────────────────────────────────────────────────────────────────────────
+
+kernel void cast_f8e4m3_f32(
+    device const uchar* input  [[buffer(0)]],
+    device float*       output [[buffer(1)]],
+    constant uint&      n      [[buffer(2)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= n) {
+        return;
+    }
+    uchar v = input[gid];
+    uint s = v >> 7;
+    uint e = (v >> 3) & 0xFu;
+    uint m = v & 0x7u;
+    float val;
+    if (e == 0u) {
+        val = ldexp(float(m) * 0.125f, -6);
+    } else if (e == 15u && m == 7u) {
+        val = NAN;
+    } else {
+        val = ldexp(1.0f + float(m) * 0.125f, int(e) - 7);
+    }
+    output[gid] = s != 0u ? -val : val;
+}

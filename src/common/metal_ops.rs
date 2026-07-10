@@ -22,8 +22,8 @@ use candle_metal_kernels::{
     SdpaDType,
     metal::{ComputeCommandEncoder, ComputePipeline, Library},
 };
+use objc2_metal::MTLSize;
 use objc2_metal::{MTLDevice, MTLGPUFamily};
-use objc2_metal::{MTLResourceUsage, MTLSize};
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
@@ -113,6 +113,7 @@ impl CustomOp3 for Sdpa {
         };
 
         let encoder = device.command_encoder()?;
+        let encoder = encoder.as_ref();
 
         if supports_sdpa_vector {
             const TWO_PASS_K_THRESHOLD: usize = 1024;
@@ -143,7 +144,7 @@ impl CustomOp3 for Sdpa {
 
                 candle_metal_kernels::call_sdpa_vector_2pass(
                     device.device(),
-                    &encoder,
+                    encoder,
                     device.kernels(),
                     q_l.start_offset(),
                     q_l.dims(),
@@ -167,7 +168,7 @@ impl CustomOp3 for Sdpa {
             } else {
                 candle_metal_kernels::call_sdpa_vector(
                     device.device(),
-                    &encoder,
+                    encoder,
                     device.kernels(),
                     q_l.start_offset(),
                     q_l.dims(),
@@ -227,7 +228,7 @@ impl CustomOp3 for Sdpa {
 
             candle_metal_kernels::call_sdpa_full(
                 device.device(),
-                &encoder,
+                encoder,
                 device.kernels(),
                 q_l.start_offset(),
                 q_l.dims(),
@@ -302,10 +303,11 @@ impl CustomOp2 for RmsNormOp {
         let elem_count = l_x.shape().elem_count();
         let output = device.new_buffer(elem_count, x.dtype(), "rms_norm_out")?;
         let encoder = device.command_encoder()?;
+        let encoder = encoder.as_ref();
 
         candle_metal_kernels::call_rms_norm(
             device.device(),
-            &encoder,
+            encoder,
             device.kernels(),
             name,
             elem_count,
@@ -355,10 +357,11 @@ impl CustomOp1 for SoftmaxOp {
         let elem_count = l.shape().elem_count();
         let output = device.new_buffer(elem_count, x.dtype(), "softmax_out")?;
         let encoder = device.command_encoder()?;
+        let encoder = encoder.as_ref();
 
         candle_metal_kernels::call_last_softmax(
             device.device(),
-            &encoder,
+            encoder,
             device.kernels(),
             name,
             elem_count,
@@ -430,10 +433,11 @@ impl CustomOp3 for RopeOp {
         let el = b * h * t * d;
         let output = device.new_buffer(el, src.dtype(), "rope_out")?;
         let encoder = device.command_encoder()?;
+        let encoder = encoder.as_ref();
 
         candle_metal_kernels::call_rope(
             device.device(),
-            &encoder,
+            encoder,
             device.kernels(),
             name,
             b * h, // bh
@@ -552,19 +556,18 @@ impl CustomOp1 for GatedSiluOp {
         let output = device.new_buffer(out_elems, x.dtype(), "gated_silu_out")?;
         let pipeline = get_or_compile_ffn_pipeline(device.device(), kernel_name)?;
         let encoder = device.command_encoder()?;
+        let encoder = encoder.as_ref();
 
         encoder.set_compute_pipeline_state(&pipeline);
-        encoder.set_buffer(
+        encoder.set_input_buffer(
             0,
             Some(x.buffer()),
             lx.start_offset() * x.dtype().size_in_bytes(),
         );
-        encoder.set_buffer(1, Some(&*output), 0);
+        encoder.set_output_buffer(1, Some(&*output), 0);
         encoder.set_bytes(2, &(out_elems as u32));
         encoder.set_bytes(3, &(self.intermediate_size as u32));
-        encoder.use_resource(x.buffer(), MTLResourceUsage::Read);
-        encoder.use_resource(&*output, MTLResourceUsage::Write);
-        ffn_dispatch(&pipeline, &encoder, out_elems);
+        ffn_dispatch(&pipeline, encoder, out_elems);
 
         Ok((
             MetalStorage::new(output, device.clone(), out_elems, x.dtype()),
@@ -623,24 +626,22 @@ impl CustomOp2 for SiluMulOp {
         let output = device.new_buffer(elem_count, gate.dtype(), "silu_mul_out")?;
         let pipeline = get_or_compile_ffn_pipeline(device.device(), kernel_name)?;
         let encoder = device.command_encoder()?;
+        let encoder = encoder.as_ref();
 
         encoder.set_compute_pipeline_state(&pipeline);
-        encoder.set_buffer(
+        encoder.set_input_buffer(
             0,
             Some(gate.buffer()),
             lg.start_offset() * gate.dtype().size_in_bytes(),
         );
-        encoder.set_buffer(
+        encoder.set_input_buffer(
             1,
             Some(up.buffer()),
             lu.start_offset() * up.dtype().size_in_bytes(),
         );
-        encoder.set_buffer(2, Some(&*output), 0);
+        encoder.set_output_buffer(2, Some(&*output), 0);
         encoder.set_bytes(3, &(elem_count as u32));
-        encoder.use_resource(gate.buffer(), MTLResourceUsage::Read);
-        encoder.use_resource(up.buffer(), MTLResourceUsage::Read);
-        encoder.use_resource(&*output, MTLResourceUsage::Write);
-        ffn_dispatch(&pipeline, &encoder, elem_count);
+        ffn_dispatch(&pipeline, encoder, elem_count);
 
         Ok((
             MetalStorage::new(output, device.clone(), elem_count, gate.dtype()),
@@ -691,19 +692,18 @@ impl CustomOp1 for GatedGeluTanhOp {
         let output = device.new_buffer(out_elems, x.dtype(), "gated_gelu_tanh_out")?;
         let pipeline = get_or_compile_ffn_pipeline(device.device(), kernel_name)?;
         let encoder = device.command_encoder()?;
+        let encoder = encoder.as_ref();
 
         encoder.set_compute_pipeline_state(&pipeline);
-        encoder.set_buffer(
+        encoder.set_input_buffer(
             0,
             Some(x.buffer()),
             lx.start_offset() * x.dtype().size_in_bytes(),
         );
-        encoder.set_buffer(1, Some(&*output), 0);
+        encoder.set_output_buffer(1, Some(&*output), 0);
         encoder.set_bytes(2, &(out_elems as u32));
         encoder.set_bytes(3, &(self.intermediate_size as u32));
-        encoder.use_resource(x.buffer(), MTLResourceUsage::Read);
-        encoder.use_resource(&*output, MTLResourceUsage::Write);
-        ffn_dispatch(&pipeline, &encoder, out_elems);
+        ffn_dispatch(&pipeline, encoder, out_elems);
 
         Ok((
             MetalStorage::new(output, device.clone(), out_elems, x.dtype()),
@@ -762,24 +762,22 @@ impl CustomOp2 for GeluTanhMulOp {
         let output = device.new_buffer(elem_count, gate.dtype(), "gelu_tanh_mul_out")?;
         let pipeline = get_or_compile_ffn_pipeline(device.device(), kernel_name)?;
         let encoder = device.command_encoder()?;
+        let encoder = encoder.as_ref();
 
         encoder.set_compute_pipeline_state(&pipeline);
-        encoder.set_buffer(
+        encoder.set_input_buffer(
             0,
             Some(gate.buffer()),
             lg.start_offset() * gate.dtype().size_in_bytes(),
         );
-        encoder.set_buffer(
+        encoder.set_input_buffer(
             1,
             Some(up.buffer()),
             lu.start_offset() * up.dtype().size_in_bytes(),
         );
-        encoder.set_buffer(2, Some(&*output), 0);
+        encoder.set_output_buffer(2, Some(&*output), 0);
         encoder.set_bytes(3, &(elem_count as u32));
-        encoder.use_resource(gate.buffer(), MTLResourceUsage::Read);
-        encoder.use_resource(up.buffer(), MTLResourceUsage::Read);
-        encoder.use_resource(&*output, MTLResourceUsage::Write);
-        ffn_dispatch(&pipeline, &encoder, elem_count);
+        ffn_dispatch(&pipeline, encoder, elem_count);
 
         Ok((
             MetalStorage::new(output, device.clone(), elem_count, gate.dtype()),
@@ -817,19 +815,18 @@ impl CustomOp1 for SoftcapOp {
         let output = device.new_buffer(elem_count, x.dtype(), "softcap_out")?;
         let pipeline = get_or_compile_ffn_pipeline(device.device(), kernel_name)?;
         let encoder = device.command_encoder()?;
+        let encoder = encoder.as_ref();
 
         encoder.set_compute_pipeline_state(&pipeline);
-        encoder.set_buffer(
+        encoder.set_input_buffer(
             0,
             Some(x.buffer()),
             l.start_offset() * x.dtype().size_in_bytes(),
         );
-        encoder.set_buffer(1, Some(&*output), 0);
+        encoder.set_output_buffer(1, Some(&*output), 0);
         encoder.set_bytes(2, &(elem_count as u32));
         encoder.set_bytes(3, &self.softcap);
-        encoder.use_resource(x.buffer(), MTLResourceUsage::Read);
-        encoder.use_resource(&*output, MTLResourceUsage::Write);
-        ffn_dispatch(&pipeline, &encoder, elem_count);
+        ffn_dispatch(&pipeline, encoder, elem_count);
 
         Ok((
             MetalStorage::new(output, device.clone(), elem_count, x.dtype()),
@@ -1048,17 +1045,14 @@ impl CustomOp3 for FlashAttnPrefill {
         let tg_size = threads_per_group.min(max_threads);
 
         let encoder = device.command_encoder()?;
+        let encoder = encoder.as_ref();
         encoder.set_compute_pipeline_state(&pipeline);
-        encoder.set_buffer(0, Some(q.buffer()), q_l.start_offset() * dtype_bytes);
-        encoder.set_buffer(1, Some(k.buffer()), k_l.start_offset() * dtype_bytes);
-        encoder.set_buffer(2, Some(v.buffer()), v_l.start_offset() * dtype_bytes);
-        encoder.set_buffer(3, Some(&*output), 0);
+        encoder.set_input_buffer(0, Some(q.buffer()), q_l.start_offset() * dtype_bytes);
+        encoder.set_input_buffer(1, Some(k.buffer()), k_l.start_offset() * dtype_bytes);
+        encoder.set_input_buffer(2, Some(v.buffer()), v_l.start_offset() * dtype_bytes);
+        encoder.set_output_buffer(3, Some(&*output), 0);
         encoder.set_bytes(4, &params);
         encoder.set_threadgroup_memory_length(0, tg_bytes);
-        encoder.use_resource(q.buffer(), MTLResourceUsage::Read);
-        encoder.use_resource(k.buffer(), MTLResourceUsage::Read);
-        encoder.use_resource(v.buffer(), MTLResourceUsage::Read);
-        encoder.use_resource(&*output, MTLResourceUsage::Write);
 
         encoder.dispatch_thread_groups(
             MTLSize {
@@ -1503,18 +1497,14 @@ impl InplaceOp1 for W4A16Matmul {
 
         let pipeline = get_or_compile_quant_pipeline(device.device(), kernel_name)?;
         let encoder = device.command_encoder()?;
+        let encoder = encoder.as_ref();
         encoder.set_compute_pipeline_state(&pipeline);
-        encoder.set_buffer(0, Some(x_buf), x_l.start_offset() * dtype_bytes);
-        encoder.set_buffer(1, Some(qweight_buf), qw_sl.1.start_offset() * 4);
-        encoder.set_buffer(2, Some(qzeros_buf), qz_sl.1.start_offset() * 4);
-        encoder.set_buffer(3, Some(scales_buf), sc_sl.1.start_offset() * dtype_bytes);
-        encoder.set_buffer(4, Some(out.buffer()), out_l.start_offset() * 4);
+        encoder.set_input_buffer(0, Some(x_buf), x_l.start_offset() * dtype_bytes);
+        encoder.set_input_buffer(1, Some(qweight_buf), qw_sl.1.start_offset() * 4);
+        encoder.set_input_buffer(2, Some(qzeros_buf), qz_sl.1.start_offset() * 4);
+        encoder.set_input_buffer(3, Some(scales_buf), sc_sl.1.start_offset() * dtype_bytes);
+        encoder.set_output_buffer(4, Some(out.buffer()), out_l.start_offset() * 4);
         encoder.set_bytes(5, &params);
-        encoder.use_resource(x_buf, MTLResourceUsage::Read);
-        encoder.use_resource(qweight_buf, MTLResourceUsage::Read);
-        encoder.use_resource(qzeros_buf, MTLResourceUsage::Read);
-        encoder.use_resource(scales_buf, MTLResourceUsage::Read);
-        encoder.use_resource(out.buffer(), MTLResourceUsage::Write);
 
         if atomic {
             const TG_WIDTH: usize = 64;
@@ -1621,16 +1611,13 @@ impl CustomOp1 for DequantizeW4 {
 
         let pipeline = get_or_compile_quant_pipeline(device.device(), kernel_name)?;
         let encoder = device.command_encoder()?;
+        let encoder = encoder.as_ref();
         encoder.set_compute_pipeline_state(&pipeline);
-        encoder.set_buffer(0, Some(qweight.buffer()), qw_l.start_offset() * 4);
-        encoder.set_buffer(1, Some(qzeros_buf), qz_sl.1.start_offset() * 4);
-        encoder.set_buffer(2, Some(scales_buf), sc_sl.1.start_offset() * dtype_bytes);
-        encoder.set_buffer(3, Some(&*output), 0);
+        encoder.set_input_buffer(0, Some(qweight.buffer()), qw_l.start_offset() * 4);
+        encoder.set_input_buffer(1, Some(qzeros_buf), qz_sl.1.start_offset() * 4);
+        encoder.set_input_buffer(2, Some(scales_buf), sc_sl.1.start_offset() * dtype_bytes);
+        encoder.set_output_buffer(3, Some(&*output), 0);
         encoder.set_bytes(4, &params);
-        encoder.use_resource(qweight.buffer(), MTLResourceUsage::Read);
-        encoder.use_resource(qzeros_buf, MTLResourceUsage::Read);
-        encoder.use_resource(scales_buf, MTLResourceUsage::Read);
-        encoder.use_resource(&*output, MTLResourceUsage::Write);
 
         const TG_WIDTH: usize = 64;
         encoder.dispatch_thread_groups(
@@ -1923,18 +1910,14 @@ impl InplaceOp1 for GptqMatmul {
 
         let pipeline = get_or_compile_quant_pipeline(device.device(), kernel_name)?;
         let encoder = device.command_encoder()?;
+        let encoder = encoder.as_ref();
         encoder.set_compute_pipeline_state(&pipeline);
-        encoder.set_buffer(0, Some(x_buf), x_l.start_offset() * dtype_bytes);
-        encoder.set_buffer(1, Some(qweight_buf), qw_sl.1.start_offset() * 4);
-        encoder.set_buffer(2, Some(qzeros_buf), qz_sl.1.start_offset() * 4);
-        encoder.set_buffer(3, Some(scales_buf), sc_sl.1.start_offset() * dtype_bytes);
-        encoder.set_buffer(4, Some(out.buffer()), out_l.start_offset() * 4);
+        encoder.set_input_buffer(0, Some(x_buf), x_l.start_offset() * dtype_bytes);
+        encoder.set_input_buffer(1, Some(qweight_buf), qw_sl.1.start_offset() * 4);
+        encoder.set_input_buffer(2, Some(qzeros_buf), qz_sl.1.start_offset() * 4);
+        encoder.set_input_buffer(3, Some(scales_buf), sc_sl.1.start_offset() * dtype_bytes);
+        encoder.set_output_buffer(4, Some(out.buffer()), out_l.start_offset() * 4);
         encoder.set_bytes(5, &params);
-        encoder.use_resource(x_buf, MTLResourceUsage::Read);
-        encoder.use_resource(qweight_buf, MTLResourceUsage::Read);
-        encoder.use_resource(qzeros_buf, MTLResourceUsage::Read);
-        encoder.use_resource(scales_buf, MTLResourceUsage::Read);
-        encoder.use_resource(out.buffer(), MTLResourceUsage::Write);
 
         if atomic {
             const TG_WIDTH: usize = 64;
@@ -2050,16 +2033,13 @@ impl CustomOp1 for DequantizeGptqPacked {
 
         let pipeline = get_or_compile_quant_pipeline(device.device(), kernel_name)?;
         let encoder = device.command_encoder()?;
+        let encoder = encoder.as_ref();
         encoder.set_compute_pipeline_state(&pipeline);
-        encoder.set_buffer(0, Some(qweight.buffer()), qw_l.start_offset() * 4);
-        encoder.set_buffer(1, Some(qzeros_buf), qz_sl.1.start_offset() * 4);
-        encoder.set_buffer(2, Some(scales_buf), sc_sl.1.start_offset() * dtype_bytes);
-        encoder.set_buffer(3, Some(&*output), 0);
+        encoder.set_input_buffer(0, Some(qweight.buffer()), qw_l.start_offset() * 4);
+        encoder.set_input_buffer(1, Some(qzeros_buf), qz_sl.1.start_offset() * 4);
+        encoder.set_input_buffer(2, Some(scales_buf), sc_sl.1.start_offset() * dtype_bytes);
+        encoder.set_output_buffer(3, Some(&*output), 0);
         encoder.set_bytes(4, &params);
-        encoder.use_resource(qweight.buffer(), MTLResourceUsage::Read);
-        encoder.use_resource(qzeros_buf, MTLResourceUsage::Read);
-        encoder.use_resource(scales_buf, MTLResourceUsage::Read);
-        encoder.use_resource(&*output, MTLResourceUsage::Write);
 
         const TG_WIDTH: usize = 64;
         encoder.dispatch_thread_groups(
@@ -2297,14 +2277,12 @@ impl CustomOp1 for MppMatmul {
 
         let pipeline = get_or_compile_mpp_pipeline(device.device(), kernel)?;
         let encoder = device.command_encoder()?;
+        let encoder = encoder.as_ref();
         encoder.set_compute_pipeline_state(&pipeline);
-        encoder.set_buffer(0, Some(a.buffer()), a_l.start_offset() * 2);
-        encoder.set_buffer(1, Some(b_buf), b_l.start_offset() * 2);
-        encoder.set_buffer(2, Some(&*output), 0);
+        encoder.set_input_buffer(0, Some(a.buffer()), a_l.start_offset() * 2);
+        encoder.set_input_buffer(1, Some(b_buf), b_l.start_offset() * 2);
+        encoder.set_output_buffer(2, Some(&*output), 0);
         encoder.set_bytes(3, &params);
-        encoder.use_resource(a.buffer(), MTLResourceUsage::Read);
-        encoder.use_resource(b_buf, MTLResourceUsage::Read);
-        encoder.use_resource(&*output, MTLResourceUsage::Write);
 
         encoder.dispatch_thread_groups(
             MTLSize {
@@ -2471,18 +2449,14 @@ impl CustomOp1 for MppQuantMatmul {
 
         let pipeline = get_or_compile_mpp_pipeline(device.device(), kernel)?;
         let encoder = device.command_encoder()?;
+        let encoder = encoder.as_ref();
         encoder.set_compute_pipeline_state(&pipeline);
-        encoder.set_buffer(0, Some(x.buffer()), x_l.start_offset() * 2);
-        encoder.set_buffer(1, Some(qw_buf), qw_sl.1.start_offset() * 4);
-        encoder.set_buffer(2, Some(qz_buf), qz_sl.1.start_offset() * 4);
-        encoder.set_buffer(3, Some(sc_buf), sc_sl.1.start_offset() * 2);
-        encoder.set_buffer(4, Some(&*output), 0);
+        encoder.set_input_buffer(0, Some(x.buffer()), x_l.start_offset() * 2);
+        encoder.set_input_buffer(1, Some(qw_buf), qw_sl.1.start_offset() * 4);
+        encoder.set_input_buffer(2, Some(qz_buf), qz_sl.1.start_offset() * 4);
+        encoder.set_input_buffer(3, Some(sc_buf), sc_sl.1.start_offset() * 2);
+        encoder.set_output_buffer(4, Some(&*output), 0);
         encoder.set_bytes(5, &params);
-        encoder.use_resource(x.buffer(), MTLResourceUsage::Read);
-        encoder.use_resource(qw_buf, MTLResourceUsage::Read);
-        encoder.use_resource(qz_buf, MTLResourceUsage::Read);
-        encoder.use_resource(sc_buf, MTLResourceUsage::Read);
-        encoder.use_resource(&*output, MTLResourceUsage::Write);
 
         encoder.dispatch_thread_groups(
             MTLSize {
@@ -2643,16 +2617,13 @@ impl CustomOp3 for MppFlashAttn {
 
         let pipeline = get_or_compile_mpp_pipeline(device.device(), kernel)?;
         let encoder = device.command_encoder()?;
+        let encoder = encoder.as_ref();
         encoder.set_compute_pipeline_state(&pipeline);
-        encoder.set_buffer(0, Some(q.buffer()), q_l.start_offset() * 2);
-        encoder.set_buffer(1, Some(k.buffer()), k_l.start_offset() * 2);
-        encoder.set_buffer(2, Some(v.buffer()), v_l.start_offset() * 2);
-        encoder.set_buffer(3, Some(&*output), 0);
+        encoder.set_input_buffer(0, Some(q.buffer()), q_l.start_offset() * 2);
+        encoder.set_input_buffer(1, Some(k.buffer()), k_l.start_offset() * 2);
+        encoder.set_input_buffer(2, Some(v.buffer()), v_l.start_offset() * 2);
+        encoder.set_output_buffer(3, Some(&*output), 0);
         encoder.set_bytes(4, &params);
-        encoder.use_resource(q.buffer(), MTLResourceUsage::Read);
-        encoder.use_resource(k.buffer(), MTLResourceUsage::Read);
-        encoder.use_resource(v.buffer(), MTLResourceUsage::Read);
-        encoder.use_resource(&*output, MTLResourceUsage::Write);
 
         encoder.dispatch_thread_groups(
             MTLSize {
@@ -2689,6 +2660,103 @@ mod fused_kernel_parity_tests {
             .zip(b.iter())
             .map(|(x, y)| (x - y).abs())
             .fold(0.0f32, f32::max)
+    }
+
+    /// TEMPORARY diagnostic: single-threaded MmapedSafetensors loads of the
+    /// Reference software decode of one E4M3fn byte, straight from the spec:
+    /// 1 sign, 4 exponent (bias 7), 3 mantissa; 0xS.1111.111 is NaN, no inf.
+    fn e4m3_decode(v: u8) -> f32 {
+        let s = v >> 7;
+        let e = (v >> 3) & 0xF;
+        let m = v & 0x7;
+        let val = if e == 0 {
+            (m as f32) * 0.125 * 2f32.powi(-6)
+        } else if e == 15 && m == 7 {
+            f32::NAN
+        } else {
+            (1.0 + (m as f32) * 0.125) * 2f32.powi(e as i32 - 7)
+        };
+        if s != 0 { -val } else { val }
+    }
+
+    /// Contract: candle's CPU F8E4M3->F32 cast matches the spec decode for
+    /// every byte encoding. The FP8 load path dequantizes every weight
+    /// through this cast; a regression here poisons the whole model.
+    #[test]
+    fn f8e4m3_cpu_cast_matches_spec() {
+        // Values that round-trip exactly through E4M3 (spec-decoded bytes).
+        let bytes: Vec<u8> = (0..=255u8).filter(|&b| !e4m3_decode(b).is_nan()).collect();
+        let expected: Vec<f32> = bytes.iter().map(|&b| e4m3_decode(b)).collect();
+
+        let t = Tensor::from_vec(expected.clone(), (expected.len(),), &Device::Cpu).unwrap();
+        let f8 = t.to_dtype(DType::F8E4M3).unwrap();
+        let back: Vec<f32> = f8
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+
+        let mut bad = Vec::new();
+        for (i, (&e, &g)) in expected.iter().zip(back.iter()).enumerate() {
+            if e.to_bits() != g.to_bits() {
+                bad.push((bytes[i], e, g));
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "CPU F8E4M3 round-trip diverges from spec for {} encodings, e.g. {:?}",
+            bad.len(),
+            &bad[..bad.len().min(6)]
+        );
+    }
+
+    /// Contract: [`cast_f8e4m3_to_f32`] on Metal is bitwise identical to
+    /// candle's CPU cast over every representable byte. The FP8 runtime
+    /// dequant (`Fp8Linear::forward`) relies on it every forward; candle
+    /// 0.11's own Metal `to_dtype` for this dtype is unimplemented.
+    #[test]
+    fn f8e4m3_metal_cast_matches_cpu() {
+        let Some(dev) = metal_device_or_skip() else {
+            return;
+        };
+        // 256 values spanning both signs, subnormals and zero after the F8
+        // round-trip on CPU (the reference encoder).
+        let vals: Vec<f32> = (0..256).map(|i| (i as f32 - 128.0) * 0.037).collect();
+        let cpu = Tensor::from_vec(vals, (16, 16), &Device::Cpu).unwrap();
+        let f8_cpu = cpu.to_dtype(DType::F8E4M3).unwrap();
+        let ref_f32: Vec<f32> = f8_cpu
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+
+        let f8_metal = f8_cpu.to_device(&dev).unwrap();
+        let got: Vec<f32> = cast_f8e4m3_to_f32(&f8_metal)
+            .unwrap()
+            .to_device(&Device::Cpu)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+
+        assert!(
+            got.iter().all(|v| v.is_finite()),
+            "Metal F8E4M3->F32 cast produced non-finite values: {:?}",
+            &got[..8]
+        );
+        let diff = max_abs_diff_f32(&got, &ref_f32);
+        assert!(
+            diff == 0.0,
+            "Metal F8E4M3->F32 cast diverges from CPU: max diff {diff} \
+             (metal {:?} vs cpu {:?})",
+            &got[..4],
+            &ref_f32[..4]
+        );
     }
 
     #[test]
@@ -3973,10 +4041,6 @@ mod fused_kernel_parity_tests {
     #[test]
     #[ignore]
     fn quant_gemv_bench() {
-        // Match the runtime configuration (main() forces the pool to 1);
-        // with the default pool of 5 the flush boundaries vary run to run
-        // and the timings are unusable.
-        unsafe { std::env::set_var("CANDLE_METAL_COMMAND_POOL_SIZE", "1") };
         let Some(dev) = metal_device_or_skip() else {
             return;
         };
@@ -4959,10 +5023,11 @@ impl InplaceOp1 for GgufQuantMatmul {
         };
         let pipeline = get_or_compile_quant_pipeline(device.device(), kernel)?;
         let encoder = device.command_encoder()?;
+        let encoder = encoder.as_ref();
         encoder.set_compute_pipeline_state(&pipeline);
-        encoder.set_buffer(0, Some(x_buf), x_l.start_offset() * 2);
-        encoder.set_buffer(1, Some(w_buf), w_sl.1.start_offset());
-        encoder.set_buffer(2, Some(out.buffer()), out_l.start_offset() * 2);
+        encoder.set_input_buffer(0, Some(x_buf), x_l.start_offset() * 2);
+        encoder.set_input_buffer(1, Some(w_buf), w_sl.1.start_offset());
+        encoder.set_output_buffer(2, Some(out.buffer()), out_l.start_offset() * 2);
         if self.m == 1 {
             encoder.set_bytes(
                 3,
@@ -4981,9 +5046,6 @@ impl InplaceOp1 for GgufQuantMatmul {
                 },
             );
         }
-        encoder.use_resource(x_buf, MTLResourceUsage::Read);
-        encoder.use_resource(w_buf, MTLResourceUsage::Read);
-        encoder.use_resource(out.buffer(), MTLResourceUsage::Write);
 
         // Batch kernels keep the gemv geometry (same threads/rows per TG).
         let (tg_threads, rows_per_tg) = self.quant.dispatch_geometry();
@@ -5002,6 +5064,74 @@ impl InplaceOp1 for GgufQuantMatmul {
 
         Ok(())
     }
+}
+
+struct CastF8E4M3ToF32;
+
+impl CustomOp1 for CastF8E4M3ToF32 {
+    fn name(&self) -> &'static str {
+        "cast-f8e4m3-f32"
+    }
+
+    fn cpu_fwd(&self, _s: &CpuStorage, _l: &Layout) -> Result<(CpuStorage, Shape)> {
+        candle_core::bail!("cast-f8e4m3-f32 is Metal-only; use Tensor::to_dtype on CPU")
+    }
+
+    fn metal_fwd(&self, s: &MetalStorage, l: &Layout) -> Result<(MetalStorage, Shape)> {
+        if s.dtype() != DType::F8E4M3 {
+            candle_core::bail!(
+                "cast-f8e4m3-f32: expected F8E4M3 input, got {:?}",
+                s.dtype()
+            );
+        }
+        if !l.is_contiguous() {
+            candle_core::bail!("cast-f8e4m3-f32: input must be contiguous");
+        }
+        let n = l.shape().elem_count();
+        let device = s.device();
+        let output = device.new_buffer(n, DType::F32, "cast_f8e4m3_out")?;
+        let pipeline = get_or_compile_quant_pipeline(device.device(), "cast_f8e4m3_f32")?;
+        let encoder = device.command_encoder()?;
+        let encoder = encoder.as_ref();
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_input_buffer(0, Some(s.buffer()), l.start_offset());
+        encoder.set_output_buffer(1, Some(&output), 0);
+        encoder.set_bytes(2, &(n as u32));
+        const TG: usize = 256;
+        encoder.dispatch_thread_groups(
+            MTLSize {
+                width: n.div_ceil(TG),
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: TG,
+                height: 1,
+                depth: 1,
+            },
+        );
+        Ok((
+            MetalStorage::new(output, device.clone(), n, DType::F32),
+            l.shape().clone(),
+        ))
+    }
+}
+
+/// Widens an F8E4M3 tensor to F32.
+///
+/// candle 0.11's Metal backend stores F8E4M3 but ships no cast kernels for
+/// it, so `Tensor::to_dtype` fails (contiguous) or miscomputes (strided);
+/// this runs a dedicated elementwise kernel instead. The CPU path defers to
+/// candle's native cast.
+///
+/// ## Errors
+/// Fails if the tensor is not F8E4M3 or the kernel dispatch fails.
+pub fn cast_f8e4m3_to_f32(t: &Tensor) -> Result<Tensor> {
+    if !t.device().is_metal() {
+        return t.to_dtype(DType::F32);
+    }
+    let t = t.contiguous()?;
+    t.apply_op1_no_bwd(&CastF8E4M3ToF32)
 }
 
 /// Decode matmul for x of shape [m, in_features] with 1 <= m <= GGUF_BATCH_MAX;
@@ -5122,14 +5252,12 @@ impl CustomOp1 for GgufQuantMulMM {
 
         let pipeline = get_or_compile_quant_pipeline(device.device(), self.quant.mul_mm_kernel())?;
         let encoder = device.command_encoder()?;
+        let encoder = encoder.as_ref();
         encoder.set_compute_pipeline_state(&pipeline);
-        encoder.set_buffer(0, Some(x_buf), x_l.start_offset() * 2); // bf16 = 2 bytes
-        encoder.set_buffer(1, Some(w_buf), w_sl.1.start_offset()); // u8 = 1 byte
-        encoder.set_buffer(2, Some(&*output), 0);
+        encoder.set_input_buffer(0, Some(x_buf), x_l.start_offset() * 2); // bf16 = 2 bytes
+        encoder.set_input_buffer(1, Some(w_buf), w_sl.1.start_offset()); // u8 = 1 byte
+        encoder.set_output_buffer(2, Some(&*output), 0);
         encoder.set_bytes(3, &params);
-        encoder.use_resource(x_buf, MTLResourceUsage::Read);
-        encoder.use_resource(w_buf, MTLResourceUsage::Read);
-        encoder.use_resource(&*output, MTLResourceUsage::Write);
 
         encoder.dispatch_thread_groups(
             MTLSize {
@@ -5259,16 +5387,13 @@ impl InplaceOp1 for Mxfp4Matmul {
 
         let pipeline = get_or_compile_quant_pipeline(device.device(), "mxfp4_gemv_batch_bf16")?;
         let encoder = device.command_encoder()?;
+        let encoder = encoder.as_ref();
         encoder.set_compute_pipeline_state(&pipeline);
-        encoder.set_buffer(0, Some(x_buf), x_l.start_offset() * 2);
-        encoder.set_buffer(1, Some(b_buf), b_sl.1.start_offset());
-        encoder.set_buffer(2, Some(s_buf), s_sl.1.start_offset());
-        encoder.set_buffer(3, Some(out.buffer()), out_l.start_offset() * 2);
+        encoder.set_input_buffer(0, Some(x_buf), x_l.start_offset() * 2);
+        encoder.set_input_buffer(1, Some(b_buf), b_sl.1.start_offset());
+        encoder.set_input_buffer(2, Some(s_buf), s_sl.1.start_offset());
+        encoder.set_output_buffer(3, Some(out.buffer()), out_l.start_offset() * 2);
         encoder.set_bytes(4, &params);
-        encoder.use_resource(x_buf, MTLResourceUsage::Read);
-        encoder.use_resource(b_buf, MTLResourceUsage::Read);
-        encoder.use_resource(s_buf, MTLResourceUsage::Read);
-        encoder.use_resource(out.buffer(), MTLResourceUsage::Write);
 
         // 2 simdgroups x GGUF_N_DST(4) rows per TG, must match the kernel.
         encoder.dispatch_thread_groups(
@@ -5341,16 +5466,13 @@ impl CustomOp1 for Mxfp4MulMM {
 
         let pipeline = get_or_compile_quant_pipeline(device.device(), "mxfp4_mul_mm_bf16")?;
         let encoder = device.command_encoder()?;
+        let encoder = encoder.as_ref();
         encoder.set_compute_pipeline_state(&pipeline);
-        encoder.set_buffer(0, Some(x_buf), x_l.start_offset() * 2);
-        encoder.set_buffer(1, Some(b_buf), b_sl.1.start_offset());
-        encoder.set_buffer(2, Some(s_buf), s_sl.1.start_offset());
-        encoder.set_buffer(3, Some(&*output), 0);
+        encoder.set_input_buffer(0, Some(x_buf), x_l.start_offset() * 2);
+        encoder.set_input_buffer(1, Some(b_buf), b_sl.1.start_offset());
+        encoder.set_input_buffer(2, Some(s_buf), s_sl.1.start_offset());
+        encoder.set_output_buffer(3, Some(&*output), 0);
         encoder.set_bytes(4, &params);
-        encoder.use_resource(x_buf, MTLResourceUsage::Read);
-        encoder.use_resource(b_buf, MTLResourceUsage::Read);
-        encoder.use_resource(s_buf, MTLResourceUsage::Read);
-        encoder.use_resource(&*output, MTLResourceUsage::Write);
 
         encoder.dispatch_thread_groups(
             MTLSize {
@@ -5493,18 +5615,14 @@ impl CustomOp3 for SdpaVectorSink {
 
         let pipeline = get_or_compile_quant_pipeline(device.device(), "sdpa_vector_sink_bf16")?;
         let encoder = device.command_encoder()?;
+        let encoder = encoder.as_ref();
         encoder.set_compute_pipeline_state(&pipeline);
-        encoder.set_buffer(0, Some(q.buffer()), q_l.start_offset() * 2);
-        encoder.set_buffer(1, Some(k.buffer()), k_l.start_offset() * 2);
-        encoder.set_buffer(2, Some(v.buffer()), v_l.start_offset() * 2);
-        encoder.set_buffer(3, Some(s_buf), s_sl.1.start_offset() * 2);
-        encoder.set_buffer(4, Some(&*output), 0);
+        encoder.set_input_buffer(0, Some(q.buffer()), q_l.start_offset() * 2);
+        encoder.set_input_buffer(1, Some(k.buffer()), k_l.start_offset() * 2);
+        encoder.set_input_buffer(2, Some(v.buffer()), v_l.start_offset() * 2);
+        encoder.set_input_buffer(3, Some(s_buf), s_sl.1.start_offset() * 2);
+        encoder.set_output_buffer(4, Some(&*output), 0);
         encoder.set_bytes(5, &params);
-        encoder.use_resource(q.buffer(), MTLResourceUsage::Read);
-        encoder.use_resource(k.buffer(), MTLResourceUsage::Read);
-        encoder.use_resource(v.buffer(), MTLResourceUsage::Read);
-        encoder.use_resource(s_buf, MTLResourceUsage::Read);
-        encoder.use_resource(&*output, MTLResourceUsage::Write);
 
         encoder.dispatch_thread_groups(
             MTLSize {

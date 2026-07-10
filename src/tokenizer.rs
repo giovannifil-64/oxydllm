@@ -222,51 +222,6 @@ impl Tokenizer {
         })
     }
 
-    /// Repairs the pre-tokenizer that candle built for a GGUF, for the
-    /// `tokenizer.ggml.pre` kinds candle mishandles.
-    ///
-    /// candle maps unknown pre kinds to `ByteLevel::default()`, whose
-    /// `add_prefix_space = true` injects a spurious `Ġ` at the start of every
-    /// text segment that follows a special token, so chat markup like
-    /// `<|start_of_role|>user` encodes the role name as `Ġuser` instead of
-    /// `user`. Two families need repair:
-    ///
-    /// - `refact` / `starcoder` (bigcode: Granite 3.x, granite-code) and plain
-    ///   `gpt-2`: the reference pipeline is GPT-2 ByteLevel with
-    ///   `add_prefix_space = false`.
-    /// - `llama-bpe` (Llama 3 family): llama.cpp writes `llama-bpe` but candle
-    ///   only matches `llama3`, so these fall through to the broken default;
-    ///   the reference pipeline splits with the Llama 3 regex (digit runs
-    ///   capped at 3) and then byte-encodes without a prefix space.
-    fn fix_gguf_pre_tokenizer(inner: &mut tokenizers::Tokenizer, pre: &str) -> Result<()> {
-        use tokenizers::pre_tokenizers::byte_level::ByteLevel;
-        use tokenizers::pre_tokenizers::sequence::Sequence;
-        use tokenizers::pre_tokenizers::split::{Split, SplitPattern};
-        use tokenizers::tokenizer::SplitDelimiterBehavior;
-
-        const REGEX_LLAMA3: &str = r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
-
-        match pre {
-            "refact" | "starcoder" | "gpt-2" => {
-                inner.with_pre_tokenizer(Some(ByteLevel::new(false, true, true)));
-            }
-            "llama-bpe" => {
-                let split = Split::new(
-                    SplitPattern::Regex(REGEX_LLAMA3.to_string()),
-                    SplitDelimiterBehavior::Isolated,
-                    false,
-                )
-                .map_err(|e| anyhow::anyhow!("llama-bpe split regex: {e}"))?;
-                inner.with_pre_tokenizer(Some(Sequence::new(vec![
-                    split.into(),
-                    ByteLevel::new(false, true, false).into(),
-                ])));
-            }
-            _ => {}
-        }
-        Ok(())
-    }
-
     pub fn from_gguf_file(gguf_path: &str) -> Result<Self> {
         use candle_core::quantized::gguf_file;
 
@@ -278,18 +233,7 @@ impl Tokenizer {
     }
 
     fn from_gguf_content(content: &candle_core::quantized::gguf_file::Content) -> Result<Self> {
-        use candle_core::quantized::tokenizer::TokenizerFromGguf;
-
-        let mut inner = tokenizers::Tokenizer::from_gguf(content)
-            .map_err(|e| anyhow::anyhow!("Failed to build tokenizer from GGUF: {}", e))?;
-
-        let pre_kind = content
-            .metadata
-            .get("tokenizer.ggml.pre")
-            .and_then(|v| v.to_string().ok())
-            .cloned()
-            .unwrap_or_default();
-        Self::fix_gguf_pre_tokenizer(&mut inner, &pre_kind)?;
+        let inner = gguf::build_tokenizer(content)?;
 
         let chat_template = content
             .metadata
@@ -499,6 +443,331 @@ impl Tokenizer {
     }
 }
 
+/// Builds a [`tokenizers::Tokenizer`] from GGUF metadata.
+///
+/// Ported from candle-core 0.10.2 `quantized::tokenizer` (Apache-2.0/MIT):
+/// candle 0.11 pins tokenizers 0.22, so its `TokenizerFromGguf` impl targets
+/// a different `Tokenizer` type than the 0.23 crate this project ships.
+/// Owning the builder also lets the pre-tokenizer table cover the
+/// `tokenizer.ggml.pre` kinds candle mishandles: its fallback is
+/// `ByteLevel::default()`, whose `add_prefix_space = true` injects a spurious
+/// `Ġ` at the start of every text segment that follows a special token, so
+/// chat markup like `<|start_of_role|>user` encodes the role name as `Ġuser`
+/// instead of `user`.
+mod gguf {
+    use anyhow::{Context, Result};
+    use candle_core::quantized::gguf_file;
+    use tokenizers::pre_tokenizers::split::{Split, SplitPattern};
+    use tokenizers::pre_tokenizers::{byte_level::ByteLevel as ByteLevelPre, sequence::Sequence};
+    use tokenizers::tokenizer::SplitDelimiterBehavior;
+    use tokenizers::{
+        AddedToken, Tokenizer,
+        decoders::{DecoderWrapper, byte_level::ByteLevel as ByteLevelDecoder},
+        models::bpe::{BPE, Vocab},
+        normalizers::{NormalizerWrapper, unicode::NFC},
+        pre_tokenizers::PreTokenizerWrapper,
+        processors::sequence::Sequence as ProcessorSequence,
+        processors::{PostProcessorWrapper, byte_level::ByteLevel as ByteLevelProcessor},
+    };
+
+    fn metadata_value<'a>(ct: &'a gguf_file::Content, key: &str) -> Result<&'a gguf_file::Value> {
+        ct.metadata
+            .get(key)
+            .with_context(|| format!("missing GGUF metadata key `{key}`"))
+    }
+
+    fn value_to_u32(v: &gguf_file::Value) -> Result<u32> {
+        use gguf_file::Value::*;
+        match v {
+            U8(v) => Ok(*v as u32),
+            I8(v) => Ok(*v as u32),
+            U16(v) => Ok(*v as u32),
+            I16(v) => Ok(*v as u32),
+            U32(v) => Ok(*v),
+            I32(v) => Ok(*v as u32),
+            U64(v) => Ok(*v as u32),
+            I64(v) => Ok(*v as u32),
+            _ => anyhow::bail!("expected numeric value for token type/id, got {v:?}"),
+        }
+    }
+
+    fn value_to_string_array(v: &gguf_file::Value, name: &str) -> Result<Vec<String>> {
+        let arr = v
+            .to_vec()
+            .map_err(|e| anyhow::anyhow!("`{name}` is not an array: {e}"))?;
+        arr.iter()
+            .map(|v| {
+                v.to_string()
+                    .map(|s| s.to_string())
+                    .map_err(|e| anyhow::anyhow!("`{name}` element is not a string: {e}"))
+            })
+            .collect()
+    }
+
+    fn merges_from_value(v: &gguf_file::Value) -> Result<Vec<(String, String)>> {
+        value_to_string_array(v, "tokenizer.ggml.merges")?
+            .into_iter()
+            .map(|m| {
+                m.split_once(' ')
+                    .map(|(a, b)| (a.to_string(), b.to_string()))
+                    .ok_or_else(|| anyhow::anyhow!("invalid merge entry `{m}`"))
+            })
+            .collect()
+    }
+
+    struct Pipeline {
+        normalizer: Option<NormalizerWrapper>,
+        pretokenizer: Option<PreTokenizerWrapper>,
+        decoder: Option<DecoderWrapper>,
+        post_processor: Option<PostProcessorWrapper>,
+    }
+
+    fn pre_tokenizer_sequence(
+        regex: &str,
+        byte_level: ByteLevelPre,
+    ) -> Result<PreTokenizerWrapper> {
+        let split = Split::new(
+            SplitPattern::Regex(regex.to_string()),
+            SplitDelimiterBehavior::Isolated,
+            false,
+        )
+        .map_err(|e| anyhow::anyhow!("pre-tokenizer split regex: {e}"))?;
+        Ok(Sequence::new(vec![split.into(), byte_level.into()]).into())
+    }
+
+    fn pipeline_from_pre(pre: &str) -> Result<Pipeline> {
+        const REGEX_QWEN2: &str = r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+        const REGEX_LLAMA3: &str = r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+
+        Ok(match pre {
+            // Matches Qwen2 tokenizer.json settings.
+            "qwen2" => Pipeline {
+                normalizer: Some(NFC.into()),
+                pretokenizer: Some(pre_tokenizer_sequence(
+                    REGEX_QWEN2,
+                    ByteLevelPre::new(false, false, false),
+                )?),
+                decoder: Some(ByteLevelDecoder::new(false, false, false).into()),
+                post_processor: Some(ByteLevelProcessor::new(false, false, false).into()),
+            },
+            // Llama 3 style byte-level BPE (digit runs capped at 3);
+            // llama.cpp writes "llama-bpe" for the Llama 3 family.
+            "smaug-bpe" | "lfm2" | "llama3" | "llama-bpe" => Pipeline {
+                normalizer: None,
+                pretokenizer: Some(pre_tokenizer_sequence(
+                    REGEX_LLAMA3,
+                    ByteLevelPre::new(false, true, false),
+                )?),
+                decoder: Some(ByteLevelDecoder::new(true, true, true).into()),
+                post_processor: Some(ByteLevelProcessor::new(true, false, true).into()),
+            },
+            // bigcode family (Granite 3.x publishes "refact", granite-code
+            // "starcoder") and plain GPT-2: ByteLevel WITHOUT the prefix
+            // space, matching the reference tokenizer.json.
+            "refact" | "starcoder" | "gpt-2" => Pipeline {
+                normalizer: None,
+                pretokenizer: Some(ByteLevelPre::new(false, true, true).into()),
+                decoder: Some(ByteLevelDecoder::default().into()),
+                post_processor: Some(ByteLevelProcessor::default().into()),
+            },
+            // Default GPT-2 style BPE.
+            _ => Pipeline {
+                normalizer: None,
+                pretokenizer: Some(ByteLevelPre::default().into()),
+                decoder: Some(ByteLevelDecoder::default().into()),
+                post_processor: Some(ByteLevelProcessor::default().into()),
+            },
+        })
+    }
+
+    fn template_processor(
+        tokens: &[String],
+        bos_id: Option<u32>,
+        eos_id: Option<u32>,
+        add_bos: bool,
+        add_eos: bool,
+    ) -> Option<PostProcessorWrapper> {
+        if (!add_bos && !add_eos) || tokens.is_empty() {
+            return None;
+        }
+
+        let bos = bos_id.and_then(|id| tokens.get(id as usize)).cloned();
+        let eos = eos_id.and_then(|id| tokens.get(id as usize)).cloned();
+
+        let mut specials = Vec::new();
+        if add_bos {
+            specials.push((bos.clone()?, bos_id?));
+        }
+        if add_eos {
+            specials.push((eos.clone()?, eos_id?));
+        }
+
+        let mut single = Vec::new();
+        if add_bos {
+            single.push(bos.clone()?);
+        }
+        single.push("$0".to_string());
+        if add_eos {
+            single.push(eos.clone()?);
+        }
+
+        let mut pair = Vec::new();
+        if add_bos {
+            pair.push(format!("{}:0", bos.clone()?));
+        }
+        pair.push("$A:0".to_string());
+        if add_eos {
+            pair.push(format!("{}:0", eos.clone()?));
+        }
+        if add_bos {
+            pair.push(format!("{}:1", bos.clone()?));
+        }
+        pair.push("$B:1".to_string());
+        if add_eos {
+            pair.push(format!("{}:1", eos?));
+        }
+
+        let proc = tokenizers::processors::template::TemplateProcessing::builder()
+            .try_single(single)
+            .ok()?
+            .try_pair(pair)
+            .ok()?
+            .special_tokens(specials)
+            .build()
+            .ok()?;
+
+        Some(PostProcessorWrapper::Template(proc))
+    }
+
+    pub(super) fn build_tokenizer(ct: &gguf_file::Content) -> Result<Tokenizer> {
+        let model_kind = metadata_value(ct, "tokenizer.ggml.model")?
+            .to_string()
+            .map_err(|e| anyhow::anyhow!("tokenizer.ggml.model: {e}"))?
+            .to_lowercase();
+        if model_kind != "gpt2" {
+            anyhow::bail!("unsupported tokenizer model `{model_kind}`");
+        }
+
+        let tokens = value_to_string_array(
+            metadata_value(ct, "tokenizer.ggml.tokens")?,
+            "tokenizer.ggml.tokens",
+        )?;
+        let vocab: Vocab = tokens
+            .iter()
+            .enumerate()
+            .map(|(i, t)| (t.clone(), i as u32))
+            .collect();
+        let merges = merges_from_value(metadata_value(ct, "tokenizer.ggml.merges")?)?;
+
+        let mut builder = BPE::builder().vocab_and_merges(vocab, merges);
+
+        if let Ok(val) = metadata_value(ct, "tokenizer.ggml.unk_token_id") {
+            let token_id = value_to_u32(val)?;
+            if let Some(token) = tokens.get(token_id as usize) {
+                builder = builder.unk_token(token.clone());
+            }
+        }
+        if let Ok(val) = metadata_value(ct, "tokenizer.ggml.byte_fallback") {
+            builder = builder.byte_fallback(val.to_bool().map_err(|e| anyhow::anyhow!("{e}"))?);
+        }
+        if let Ok(val) = metadata_value(ct, "tokenizer.ggml.ignore_merges") {
+            builder = builder.ignore_merges(val.to_bool().map_err(|e| anyhow::anyhow!("{e}"))?);
+        }
+
+        let bpe = builder
+            .build()
+            .map_err(|e| anyhow::anyhow!("BPE build: {e}"))?;
+        let mut tokenizer = Tokenizer::new(bpe);
+
+        let pre = metadata_value(ct, "tokenizer.ggml.pre")
+            .and_then(|v| v.to_string().map_err(|e| anyhow::anyhow!("{e}")))
+            .map(|s| s.to_string())
+            .unwrap_or_else(|_| "gpt2".to_string());
+        let pipeline = pipeline_from_pre(pre.as_str())?;
+        let post_processor_base = pipeline.post_processor.clone();
+
+        let add_bos = metadata_value(ct, "tokenizer.ggml.add_bos_token")
+            .and_then(|v| v.to_bool().map_err(|e| anyhow::anyhow!("{e}")))
+            .unwrap_or(false);
+        let add_eos = metadata_value(ct, "tokenizer.ggml.add_eos_token")
+            .and_then(|v| v.to_bool().map_err(|e| anyhow::anyhow!("{e}")))
+            .unwrap_or(false);
+        let bos_id = metadata_value(ct, "tokenizer.ggml.bos_token_id")
+            .and_then(value_to_u32)
+            .ok();
+        let eos_id = metadata_value(ct, "tokenizer.ggml.eos_token_id")
+            .and_then(value_to_u32)
+            .ok();
+
+        if let Some(norm) = pipeline.normalizer {
+            let _ = tokenizer.with_normalizer(Some(norm));
+        }
+        if let Some(pt) = pipeline.pretokenizer {
+            let _ = tokenizer.with_pre_tokenizer(Some(pt));
+        }
+        if let Some(dec) = pipeline.decoder {
+            let _ = tokenizer.with_decoder(Some(dec));
+        }
+
+        // Compose the byte-level post-processor with a BOS/EOS template one.
+        let template_pp = template_processor(&tokens, bos_id, eos_id, add_bos, add_eos);
+        let mut steps = Vec::new();
+        if let Some(pp) = post_processor_base {
+            steps.push(pp);
+        }
+        if let Some(tp) = template_pp {
+            steps.push(tp);
+        }
+        if !steps.is_empty() {
+            let pp = if steps.len() == 1 {
+                steps.pop().unwrap()
+            } else {
+                ProcessorSequence::new(steps).into()
+            };
+            let _ = tokenizer.with_post_processor(Some(pp));
+        }
+
+        // Mark special tokens so decode(skip_special_tokens = true) works.
+        if let Ok(gguf_file::Value::Array(arr)) = metadata_value(ct, "tokenizer.ggml.token_type") {
+            let mut specials = Vec::new();
+            for (idx, v) in arr.iter().enumerate() {
+                // Aligns with llama_token_type: non-normal/non-byte = special.
+                if matches!(value_to_u32(v)?, 2..=5)
+                    && let Some(tok) = tokens.get(idx)
+                {
+                    specials.push(AddedToken::from(tok.clone(), true));
+                }
+            }
+            if !specials.is_empty() {
+                let _ = tokenizer.add_special_tokens(specials);
+            }
+        }
+
+        let mut explicit_specials = std::collections::HashSet::new();
+        for key in [
+            "tokenizer.ggml.bos_token_id",
+            "tokenizer.ggml.eos_token_id",
+            "tokenizer.ggml.pad_token_id",
+            "tokenizer.ggml.sep_token_id",
+            "tokenizer.ggml.unk_token_id",
+        ] {
+            if let Ok(val) = metadata_value(ct, key) {
+                explicit_specials.insert(value_to_u32(val)?);
+            }
+        }
+        let specials: Vec<_> = explicit_specials
+            .into_iter()
+            .filter_map(|id| tokens.get(id as usize))
+            .map(|tok| AddedToken::from(tok.clone(), true))
+            .collect();
+        if !specials.is_empty() {
+            let _ = tokenizer.add_special_tokens(specials);
+        }
+
+        Ok(tokenizer)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -523,7 +792,7 @@ mod tests {
             .build()
             .unwrap();
         let mut inner = tokenizers::Tokenizer::new(model);
-        inner.with_pre_tokenizer(Some(Whitespace {}));
+        let _ = inner.with_pre_tokenizer(Some(Whitespace {}));
         inner
             .save(tmp.path().join("tokenizer.json"), false)
             .unwrap();

@@ -45,28 +45,16 @@ fn keeps_file_dtype(name: &str) -> bool {
         || name.ends_with(".linear_attn.norm.weight")
 }
 
-/// Serializes Metal tensor creation across the rayon loader threads.
-///
-/// candle 0.11's Metal device registers every allocation in an
-/// `MTLResidencySet`, which Apple documents as not supporting concurrent
-/// mutation; candle mutates it without a lock, so parallel `to_device` /
-/// tensor creation races and leaves buffers non-resident (the GPU then reads
-/// zeros from them). Guard every device-touching call in the parallel load
-/// paths with this lock; the CPU-side work (mmap reads, dequant casts) stays
-/// parallel.
+/// Serializes Metal tensor creation across the rayon loader threads: candle
+/// 0.11 mutates its `MTLResidencySet` without a lock, so concurrent creation
+/// races and leaves buffers non-resident (the GPU reads zeros from them).
 pub(crate) fn metal_alloc_lock() -> &'static std::sync::Mutex<()> {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     &LOCK
 }
 
-/// Drains the queued Metal work after a device transfer during loading.
-///
-/// candle 0.11 queues even host-to-device copies as GPU commands and reclaims
-/// staging/dropped buffers only at sync points; loading a whole checkpoint
-/// without syncing accumulates every staging copy until the Metal working-set
-/// limit is hit and command buffers fail with
-/// kIOGPUCommandBufferCallbackErrorOutOfMemory (the weights then read as
-/// zeros).
+/// Drains the queued Metal work after a device transfer during loading; see
+/// the two-phase note in [`ModelWeights::load`] for why this is mandatory.
 fn drain_metal(device: &Device, what: &str) -> Result<()> {
     if device.is_metal() {
         device
@@ -100,12 +88,8 @@ fn load_tensor_with_dtype(
     let target_dtype = if force_f32 { DType::F32 } else { dtype };
 
     // FP8 on Metal: dequantize entirely on CPU and transfer the final tensor
-    // once. The file dtype comes from the safetensors metadata, so the F8
-    // original is never materialized on the device: candle 0.11 reclaims
-    // dropped Metal buffers only at sync points, and staging every F8 tensor
-    // on the GPU pushed the load peak past the Metal working-set limit
-    // (command buffers then fail with kIOGPUCommandBufferCallbackError-
-    // OutOfMemory and the model loads as zeros).
+    // once, so the F8 original is never staged on the device (see the
+    // two-phase note in ModelWeights::load).
     if file_is_f8 && device.is_metal() && !keeps_file_dtype(name) {
         let t_cpu = mmap
             .load(name, &Device::Cpu)
@@ -176,9 +160,8 @@ fn load_tensor_with_dtype(
             .is_metal()
             .then(|| metal_alloc_lock().lock().unwrap());
         let r = t.to_dtype(target_dtype);
-        // The queued GPU cast still reads `t` when this function returns and
-        // drops it; candle 0.11's pool would recycle the buffer under the
-        // pending command (see the module comment on metal_alloc_lock).
+        // The queued GPU cast still reads `t` after this function drops it;
+        // drain before returning or the buffer is recycled under the command.
         if r.is_ok() {
             drain_metal(device, name)?;
         }
@@ -299,9 +282,8 @@ fn apply_weight_scale_inv(tensors: &mut FxHashMap<String, Tensor>) -> Result<()>
         let scaled = scaled_f32.to_dtype(weight_dtype).with_context(|| {
             format!("Failed to cast scaled '{weight_name}' back to {weight_dtype:?}")
         })?;
-        // Drain per weight: the queue otherwise accumulates an F32 copy of
-        // every scaled weight before anything is reclaimed, which blows the
-        // Metal working-set limit on multi-GB checkpoints.
+        // Drain per weight or the queue accumulates an F32 copy of every
+        // scaled weight (see the two-phase note in ModelWeights::load).
         drain_metal(scaled.device(), &weight_name)?;
         tensors.insert(weight_name, scaled);
     }

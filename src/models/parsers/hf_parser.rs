@@ -431,7 +431,7 @@ fn validate_quantization_config(v: &Value) -> Result<Option<crate::common::weigh
             Ok(None)
         }
         // MXFP4 (GPT-OSS) only quantizes the MoE expert tensors, which the MoE
-        // loader consumes directly as packed U8 — no global scheme needed.
+        // loader consumes directly as packed U8; no global scheme needed.
         "mxfp4" => {
             tracing::info!(
                 quant = "mxfp4",

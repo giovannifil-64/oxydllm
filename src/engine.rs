@@ -621,7 +621,7 @@ impl Engine {
     /// must share the target's tokenizer/vocab and run on the same device.
     pub fn with_draft_model(mut self, draft: Box<dyn BatchModel>) -> Self {
         // Rejected speculative tokens roll the cache back via truncation, which
-        // a recurrent state cannot do — silently corrupting generation. Refuse.
+        // a recurrent state cannot do, silently corrupting generation. Refuse.
         if self.model.has_recurrent_state() {
             tracing::error!(
                 "speculative decoding is not supported for recurrent (hybrid \

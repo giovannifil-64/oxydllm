@@ -75,7 +75,7 @@ pub static KV_CACHE_ALLOCATED_BYTES: LazyLock<GaugeVec> = LazyLock::new(|| {
     register_gauge_vec!(
         "oxydllm_kv_cache_allocated_bytes",
         "KV cache memory reserved in bytes at model load time. \
-         Not the dynamically occupied portion — see queue_depth for utilisation. \
+         Not the dynamically occupied portion; see queue_depth for utilisation. \
          On Apple Silicon this is unified memory, not a discrete VRAM pool. \
          Labeled by model.",
         &["model"]

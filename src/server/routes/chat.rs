@@ -644,7 +644,6 @@ fn parse_tool_call_tag_blocks(raw: &str) -> Option<Vec<ToolCall>> {
         rest = &after[end + "</tool_call>".len()..];
 
         let Some(fstart) = block.find("<function=") else {
-            // JSON payload block.
             if let Ok(value) =
                 serde_json::from_str::<serde_json::Value>(strip_json_fences(block.trim()))
             {
@@ -2576,7 +2575,7 @@ mod tests {
 
     /// Contract: the XML-ish format emitted by Qwen3.5-class templates
     /// (`<tool_call><function=NAME><parameter=K>V</parameter>…`) parses into
-    /// proper tool calls — multiline values preserved, JSON-typed scalars
+    /// proper tool calls: multiline values preserved, JSON-typed scalars
     /// coerced, free-form reasoning before the block tolerated, parallel
     /// calls supported, unknown functions filtered out.
     #[test]
@@ -2596,7 +2595,7 @@ mod tests {
         assert_eq!(args["days"], 3, "bare integers must coerce to numbers");
         assert_eq!(args["note"], "line one\nline two");
 
-        // Parallel calls: two blocks → two calls; unknown function dropped.
+        // Parallel calls: two blocks give two calls; unknown function dropped.
         let raw2 = "<tool_call>\n<function=get_weather>\n<parameter=location>\nParis\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=not_a_real_tool>\n<parameter=x>\n1\n</parameter>\n</function>\n</tool_call>";
         let parsed2 = try_parse_tool_calls(raw2, &config).expect("should parse");
         assert_eq!(parsed2.len(), 1, "unknown function must be filtered");
@@ -2604,7 +2603,7 @@ mod tests {
     }
 
     /// Contract: the JSON payloads that Qwen2.5/Qwen3-class templates wrap in
-    /// `<tool_call>` tags parse into proper tool calls — both the canonical
+    /// `<tool_call>` tags parse into proper tool calls: both the canonical
     /// single `{"name": …, "arguments": …}` object and the
     /// `{"tool_calls": […]}` shape models produce when echoing the injected
     /// system-prompt instruction. Parallel blocks supported, unknown
@@ -2631,7 +2630,7 @@ mod tests {
         assert_eq!(parsed2.len(), 1);
         assert_eq!(parsed2[0].function.name, "get_weather");
 
-        // Two blocks → parallel calls; unknown function filtered.
+        // Two blocks become parallel calls; unknown function filtered.
         let raw3 = "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"location\": \"Paris\"}}\n</tool_call>\n<tool_call>\n{\"name\": \"not_a_real_tool\", \"arguments\": {}}\n</tool_call>";
         let parsed3 = try_parse_tool_calls(raw3, &config).expect("should parse");
         assert_eq!(parsed3.len(), 1, "unknown function must be filtered");

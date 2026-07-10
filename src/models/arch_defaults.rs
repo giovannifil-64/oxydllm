@@ -162,7 +162,7 @@ pub fn arch_defaults(arch: &str) -> Option<ArchDefaults> {
             extra_eos_ids: &[],
             ..llama_defaults()
         }),
-        // Qwen3.5 — hybrid Gated DeltaNet + gated full attention. HF
+        // Qwen3.5: hybrid Gated DeltaNet + gated full attention. HF
         // checkpoints store all RMSNorms zero-centered (Gemma-style ×(1+w));
         // activation SiLU; embeddings unscaled. Hybrid layout comes from
         // `layer_types`; gate/partial-RoPE from
@@ -179,7 +179,7 @@ pub fn arch_defaults(arch: &str) -> Option<ArchDefaults> {
         }
         // GGUF flavour of the same arch: llama.cpp's converter bakes the +1
         // into every norm weight (except the DeltaNet gated norm), so the
-        // runtime must NOT re-shift — Standard norms here. Hybrid layout
+        // runtime must NOT re-shift; Standard norms here. Hybrid layout
         // comes from `full_attention_interval` + ssm.* metadata.
         "qwen35" => Some(ArchDefaults {
             qk_norm: true,
@@ -189,7 +189,7 @@ pub fn arch_defaults(arch: &str) -> Option<ArchDefaults> {
             attn_output_gate: true,
             ..llama_defaults()
         }),
-        // Qwen3-MoE — same attention defaults as Qwen3, MoE FFN handled by
+        // Qwen3-MoE: same attention defaults as Qwen3, MoE FFN handled by
         // `BlockConfig.moe` (parsed from `num_experts` / `num_experts_per_tok`).
         "qwen3_moe" | "Qwen3MoeForCausalLM" => Some(ArchDefaults {
             qk_norm: true,
@@ -197,7 +197,7 @@ pub fn arch_defaults(arch: &str) -> Option<ArchDefaults> {
             extra_eos_ids: &[],
             ..llama_defaults()
         }),
-        // OLMoE (1B-7B/7B-A1B family) — Llama-style attention with per-head
+        // OLMoE (1B-7B/7B-A1B family): Llama-style attention with per-head
         // q_norm/k_norm (qk_norm=true), MoE FFN, rope_theta=10k. `clip_qkv`
         // (sometimes set in OLMoE configs) is currently ignored; on the
         // 0924-Instruct checkpoint it's `null` so this is a no-op.

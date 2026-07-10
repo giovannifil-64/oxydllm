@@ -1,5 +1,5 @@
 // ─────────────────────────────────────────────────────────────────────────────
-// gguf_model.rs — StandardTransformer: unified model for all standard archs
+// gguf_model.rs: StandardTransformer: unified model for all standard archs
 // ─────────────────────────────────────────────────────────────────────────────
 //
 // `StandardTransformer` is the single concrete model struct used by every
@@ -50,7 +50,7 @@ pub struct StandardTransformer {
     pub(crate) per_layer_projection_norm: Option<RMSNorm>,
     pub(crate) per_layer_input_scale: Option<f64>,
     pub(crate) kv_shared_layer_map: Option<Vec<Option<usize>>>,
-    /// True when any layer is a recurrent (linear-attention) mixer — disables
+    /// True when any layer is a recurrent (linear-attention) mixer; disables
     /// prefix caching and speculative decoding.
     pub(crate) has_recurrent_state: bool,
 }

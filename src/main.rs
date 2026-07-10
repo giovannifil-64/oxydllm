@@ -1274,13 +1274,6 @@ fn run_interactive(args: &RunArgs) -> anyhow::Result<()> {
 }
 
 fn main() -> anyhow::Result<()> {
-    // Historical note: candle-metal-kernels 0.10.x needed
-    // CANDLE_METAL_COMMAND_POOL_SIZE=1 forced here (its command-buffer pool
-    // corrupted output under concurrent encoding). 0.11 replaced the pool
-    // with a single current buffer plus per-encoder hazard tracking
-    // (set_input_buffer/set_output_buffer insert barriers automatically), so
-    // the variable no longer exists and no workaround is required.
-
     let args: Vec<String> = std::env::args().collect();
 
     // OTLP trace export is only meaningful for the long-running server; resolve

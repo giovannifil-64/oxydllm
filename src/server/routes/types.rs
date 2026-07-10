@@ -127,7 +127,7 @@ pub struct ChatCompletionRequest {
     #[serde(default)]
     pub enable_thinking: Option<bool>,
     /// Reasoning effort for harmony-format models (gpt-oss): low | medium | high.
-    /// These models cannot disable reasoning — this only scales it.
+    /// These models cannot disable reasoning; this only scales it.
     #[serde(default)]
     pub reasoning_effort: Option<String>,
     #[serde(default)]

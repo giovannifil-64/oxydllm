@@ -619,7 +619,7 @@ fn best_recommendation(files: &[(String, u64)]) -> Option<&str> {
 }
 
 /// Approximate expansion factor from GGUF on-disk size to F32 loaded size.
-/// On CPU every tensor is dequantized to F32 at load — Q4_K_M ≈ 7×, Q8_0 ≈ 4×.
+/// On CPU every tensor is dequantized to F32 at load (Q4_K_M ≈ 7×, Q8_0 ≈ 4×).
 pub fn gguf_cpu_expansion(gguf_path: &Path) -> f64 {
     let mut file = match std::fs::File::open(gguf_path) {
         Ok(f) => f,

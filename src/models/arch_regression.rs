@@ -1,5 +1,5 @@
 //
-// arch_regression.rs — Architecture regression test matrix
+// arch_regression.rs: Architecture regression test matrix
 //
 // Each test builds a tiny StandardTransformer (hidden=32, 2 layers, 4 heads)
 // with random weights matching a specific architecture's feature combination,
@@ -9,7 +9,7 @@
 //   3. Decode after prefill doesn't crash
 //
 // This catches regressions when modifying shared code paths (attention, FFN,
-// block, norm) — if adding Qwen5 breaks Gemma2's softcap+sliding window
+// block, norm): if adding Qwen5 breaks Gemma2's softcap+sliding window
 // path, the test fails immediately.
 //
 // Usage in `src/models/mod.rs`:
@@ -696,7 +696,7 @@ mod tests {
     }
 
     /// Single packed forward over `[seq_a; seq_b]` must match two sequential
-    /// per-seq forwards concatenated along the seq dim — the engine relies on
+    /// per-seq forwards concatenated along the seq dim; the engine relies on
     /// this when splitting prefill into multiple `forward_batch` calls.
     #[test]
     fn chunked_forward_matches_single_packed_forward() {

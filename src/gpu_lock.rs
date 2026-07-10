@@ -1,5 +1,5 @@
 // ─────────────────────────────────────────────────────────────────────────────
-// gpu_lock.rs — Per-device GPU lock for cross-model serialisation
+// gpu_lock.rs: Per-device GPU lock for cross-model serialisation
 // ─────────────────────────────────────────────────────────────────────────────
 //
 // When multiple models are loaded simultaneously, their independent engine

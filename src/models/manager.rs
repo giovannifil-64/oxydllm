@@ -315,7 +315,7 @@ impl ModelManager {
             .collect()
     }
 
-    /// Atomic `(discovered, registry)` snapshot — both reads happen under the
+    /// Atomic `(discovered, registry)` snapshot; both reads happen under the
     /// same manager lock acquisition, with discovery cached for
     /// `DISCOVERY_CACHE_TTL` to avoid re-scanning the filesystem on each call.
     pub fn discovered_with_registry(

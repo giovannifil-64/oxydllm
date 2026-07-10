@@ -405,7 +405,7 @@ mod tests {
 
     #[test]
     fn preemption_under_memory_pressure() {
-        // 2 blocks per layer — very tight memory
+        // 2 blocks per layer: very tight memory
         let allocators = make_allocators(2, 2);
         let config = SchedulerConfig {
             max_num_sequences: 4,
@@ -501,7 +501,7 @@ mod tests {
             seq.phase = SequencePhase::Decode;
         }
 
-        // schedule() → decode needs new block, none free → preemption
+        // schedule(): decode needs a new block, none free, so preemption
         sched.schedule(None);
         assert_eq!(sched.num_running(), 0);
         assert_eq!(
@@ -510,7 +510,7 @@ mod tests {
             "preempted seq should be back in waiting"
         );
 
-        // Release blocks and re-schedule → seq re-admitted as Prefill with reset state
+        // Release blocks and re-schedule: seq re-admitted as Prefill with reset state
         allocators[0].lock().unwrap().free(b0);
         allocators[0].lock().unwrap().free(b1);
 

@@ -78,11 +78,11 @@ type PendingRawLogprob = (u32, f32, RawTopLogprobs);
 /// only when the tokenizer has the harmony marker tokens.
 #[derive(Clone, Copy, PartialEq)]
 enum HarmonyState {
-    /// Between messages — expecting marker tokens.
+    /// Between messages: expecting marker tokens.
     Markers,
-    /// After `<|start|>` — plain role-name tokens until the next marker.
+    /// After `<|start|>`: plain role-name tokens until the next marker.
     Role,
-    /// After `<|channel|>` — collecting the channel name until `<|message|>`.
+    /// After `<|channel|>`: collecting the channel name until `<|message|>`.
     Header,
     Body {
         final_channel: bool,
@@ -144,7 +144,7 @@ fn harmony_route(
             } else if ids.end == Some(tok) {
                 *state = HarmonyState::Markers;
             }
-            // Plain tokens here are the role name — protocol framing, skip.
+            // Plain tokens here are the role name: protocol framing, skip.
             None
         }
         HarmonyState::Header => {

@@ -218,7 +218,7 @@ fn is_incomplete_download(dir: &Path) -> bool {
     }
 
     // Sharded safetensors: every shard listed in the index must exist and the
-    // on-disk bytes must cover the index's total_size — a bare existence check
+    // on-disk bytes must cover the index's total_size; a bare existence check
     // would accept a shard truncated by an interrupted download.
     let st_index = dir.join("model.safetensors.index.json");
     if st_index.exists() {

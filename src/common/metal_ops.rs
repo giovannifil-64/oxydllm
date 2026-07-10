@@ -1864,10 +1864,9 @@ impl InplaceOp1 for GptqMatmul {
             }
         };
 
-        // `chunk` must be a multiple of pack_factor (kernel iterates whole
-        // words). Deterministic kernels reduce their k-splits inside one
-        // threadgroup, so the split count is the kernel's threadgroup height;
-        // the atomic kernels size the grid for occupancy instead.
+        // Same split-count rules as the AWQ path above; `chunk` must
+        // additionally be a multiple of pack_factor (kernel iterates whole
+        // words).
         let s_rows = if m == 1 { QDET_S } else { QDET_S_BATCH };
         let (k_splits, chunk) = if atomic {
             const TARGET_THREADS: usize = 32768;
@@ -2662,7 +2661,6 @@ mod fused_kernel_parity_tests {
             .fold(0.0f32, f32::max)
     }
 
-    /// TEMPORARY diagnostic: single-threaded MmapedSafetensors loads of the
     /// Reference software decode of one E4M3fn byte, straight from the spec:
     /// 1 sign, 4 exponent (bias 7), 3 mantissa; 0xS.1111.111 is NaN, no inf.
     fn e4m3_decode(v: u8) -> f32 {

@@ -36,7 +36,7 @@ impl Default for SamplingParams {
 }
 
 impl SamplingParams {
-    /// True when sampling reduces to a plain argmax — no temperature, logprobs,
+    /// True when sampling reduces to a plain argmax: no temperature, logprobs,
     /// penalties, or logit bias. This is the only case greedy speculative
     /// decoding can serve exactly; everything else must use the normal sampler.
     pub fn is_plain_greedy(&self) -> bool {
@@ -164,7 +164,7 @@ pub fn sample(
         }
     } else {
         let mut probs_vec = softmax_probs(&logits_vec, params.temperature);
-        // Log-probs must reflect the PRE-filter distribution; computed lazily —
+        // Log-probs must reflect the PRE-filter distribution; computed lazily;
         // skipping the full-vocab ln pass when logprobs aren't requested.
         let log_probs: Option<Vec<f32>> =
             (params.top_logprobs_k > 0).then(|| log_probs_from(&probs_vec));
@@ -459,7 +459,7 @@ fn apply_top_p(probs: &mut [f32], top_p: f32) {
         // max-relative threshold (typically hundreds, not the full vocab) almost
         // always carry >= top_p mass. Every candidate prob >= threshold > every
         // non-candidate prob, so when the candidate mass covers top_p the global
-        // descending-order prefix is provably contained in the candidates — the
+        // descending-order prefix is provably contained in the candidates; the
         // full-vocab sort reduces to sorting just the candidates.
         let max_prob = probs.iter().cloned().fold(0.0_f32, f32::max);
         let threshold = max_prob * 1e-4;
@@ -472,7 +472,7 @@ fn apply_top_p(probs: &mut [f32], top_p: f32) {
         }
         let fast_hit = candidate_mass >= top_p;
         if !fast_hit {
-            // Flat distribution: candidates don't cover top_p — full sort.
+            // Flat distribution: candidates don't cover top_p: full sort.
             indexed.clear();
             indexed.extend(probs.iter().enumerate().map(|(i, &p)| (i, p)));
         }
@@ -555,7 +555,7 @@ thread_local! {
 fn thread_rand_u64() -> u64 {
     THREAD_RNG_STATE.with(|s| {
         let mut x = s.get();
-        // xorshift64 — fine here; we don't need cryptographic quality.
+        // xorshift64: fine here; we don't need cryptographic quality.
         x ^= x << 13;
         x ^= x >> 7;
         x ^= x << 17;

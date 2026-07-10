@@ -779,7 +779,7 @@ fn load_standard_safetensors(
                 tracing::warn!(
                     model_dir,
                     "config has tie_word_embeddings=true but file also contains explicit \
-                     `lm_head.weight` — the file's lm_head will be ignored. If the model \
+                     `lm_head.weight`; the file's lm_head will be ignored. If the model \
                      produces wrong output, set `tie_word_embeddings: false` in config.json."
                 );
             }

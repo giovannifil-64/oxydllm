@@ -70,7 +70,7 @@ pub fn apply_chat_template(
 /// HF chat templates are written against the transformers convention where
 /// `tool_call.function.arguments` is a mapping (Qwen3.5 iterates it with
 /// `|items`; Qwen3 serializes it with `|tojson`). The OpenAI wire format we
-/// receive stores arguments as a JSON *string* — parse it for the template
+/// receive stores arguments as a JSON *string*: parse it for the template
 /// context so both conventions render correctly. Unparseable strings are
 /// passed through unchanged.
 fn parse_arguments_for_template(mut tool_calls: serde_json::Value) -> serde_json::Value {
@@ -375,7 +375,7 @@ mod tests {
     }
 
     /// Contract: tool-call `arguments` reach the template as a MAPPING, not
-    /// the OpenAI wire string — Qwen3.5's template iterates them with
+    /// the OpenAI wire string: Qwen3.5's template iterates them with
     /// `|items` (a string there fails the whole render with a 500), and
     /// Qwen3-style `|tojson` would double-encode a string.
     #[test]
@@ -407,7 +407,7 @@ mod tests {
     }
 
     // Contract: reasoning_effort reaches the template when set, and is ABSENT
-    // (not null) when None — the harmony template's `is not defined` default
+    // (not null) when None: the harmony template's `is not defined` default
     // ("medium") must fire. This mirrors gpt-oss's chat_template.jinja lines
     // 203-206.
     #[test]

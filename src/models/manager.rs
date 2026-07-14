@@ -86,6 +86,7 @@ pub struct ModelManager {
     max_num_seqs: Option<usize>,
     max_queued_requests: usize,
     draft_model: Option<String>,
+    expert_stream_mb: Option<usize>,
     discovery_cache: Option<DiscoveryCache>,
 }
 
@@ -192,6 +193,7 @@ pub struct ModelManagerConfig {
     pub max_num_seqs: Option<usize>,
     pub max_queued_requests: usize,
     pub draft_model: Option<String>,
+    pub expert_stream_mb: Option<usize>,
 }
 
 impl ModelManager {
@@ -208,6 +210,7 @@ impl ModelManager {
             max_num_seqs,
             max_queued_requests,
             draft_model,
+            expert_stream_mb,
         } = config;
         let mut registry = load_registry(&models_dir);
         let valid_ids: std::collections::HashSet<String> = loader::discover_models(&models_dir)
@@ -266,6 +269,7 @@ impl ModelManager {
             max_num_seqs,
             max_queued_requests,
             draft_model,
+            expert_stream_mb,
             discovery_cache: None,
         }
     }
@@ -528,6 +532,7 @@ impl ModelManager {
             require_gpu: self.require_gpu,
             max_num_seqs: self.max_num_seqs,
             max_queued_requests: self.max_queued_requests,
+            expert_stream_mb: self.expert_stream_mb,
             draft_model,
         });
 
@@ -685,6 +690,7 @@ struct SpawnLoadParams {
     max_queued_requests: usize,
     /// Optional draft model as (resolved_path, id) for speculative decoding.
     draft_model: Option<(PathBuf, String)>,
+    expert_stream_mb: Option<usize>,
 }
 
 /// JIT-compile all SDPA kernels before marking the model Ready, otherwise the
@@ -812,6 +818,7 @@ fn spawn_load(params: SpawnLoadParams) {
         max_num_seqs,
         max_queued_requests,
         draft_model,
+        expert_stream_mb,
     } = params;
 
     let (result_tx, result_rx) = oneshot::channel::<Result<LoadResult, String>>();
@@ -873,6 +880,7 @@ fn spawn_load(params: SpawnLoadParams) {
                 kv_budget: &kv_budget,
                 kv_quant,
                 qjl_quantization,
+                expert_stream_mb,
             },
         ) {
             Ok(m) => m,
@@ -1010,6 +1018,7 @@ fn spawn_load(params: SpawnLoadParams) {
                     kv_budget: &kv_budget,
                     kv_quant,
                     qjl_quantization,
+                    expert_stream_mb: None,
                 },
             ) {
                 Ok((d, _)) if d.vocab_size() == vocab_size => {
@@ -1200,6 +1209,7 @@ mod tests {
             max_num_seqs: None,
             max_queued_requests: 200,
             draft_model: None,
+            expert_stream_mb: None,
         })
     }
 

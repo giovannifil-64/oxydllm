@@ -35,6 +35,7 @@ pub enum QuantScheme {
 pub struct ModelWeights {
     tensors: FxHashMap<String, Tensor>,
     quant_scheme: Option<QuantScheme>,
+    expert_pool: Option<std::sync::Arc<crate::common::expert_stream::StreamedExperts>>,
 }
 
 /// Gated DeltaNet scalar parameters are stored F32 and consumed F32 (the
@@ -55,7 +56,7 @@ pub(crate) fn metal_alloc_lock() -> &'static std::sync::Mutex<()> {
 
 /// Drains the queued Metal work after a device transfer during loading; see
 /// the two-phase note in [`ModelWeights::load`] for why this is mandatory.
-fn drain_metal(device: &Device, what: &str) -> Result<()> {
+pub(crate) fn drain_metal(device: &Device, what: &str) -> Result<()> {
     if device.is_metal() {
         device
             .synchronize()
@@ -300,10 +301,22 @@ impl ModelWeights {
     /// cost on Qwen3.5-class checkpoints. After loading, every
     /// `*.weight_scale_inv` factor is folded into its weight.
     ///
+    /// With `stream` set, MoE expert tensors (see
+    /// [`is_streamed_expert_tensor`](crate::common::expert_stream::is_streamed_expert_tensor))
+    /// are not loaded; the checkpoint mmap is retained in a
+    /// [`StreamedExperts`](crate::common::expert_stream::StreamedExperts) pool
+    /// that serves them on demand, exposed via
+    /// [`expert_pool`](Self::expert_pool).
+    ///
     /// ## Errors
     /// Fails if the files cannot be mapped, or any tensor cannot be loaded, cast,
     /// or scaled.
-    pub fn load(paths: &[&str], device: &Device, dtype: DType) -> Result<Self> {
+    pub fn load(
+        paths: &[&str],
+        device: &Device,
+        dtype: DType,
+        stream: Option<crate::common::expert_stream::ExpertStreamConfig>,
+    ) -> Result<Self> {
         // SAFETY: the server owns models_dir exclusively; no external process
         // will truncate or replace these files while the mmap is live.
         let mmap = unsafe {
@@ -315,6 +328,9 @@ impl ModelWeights {
             .into_iter()
             .map(|(n, _)| n)
             .filter(|n| !n.starts_with("model.visual.") && !n.starts_with("mtp."))
+            .filter(|n| {
+                stream.is_none() || !crate::common::expert_stream::is_streamed_expert_tensor(n)
+            })
             .collect();
         let scale_inv_names: std::collections::HashSet<String> = names
             .iter()
@@ -387,10 +403,28 @@ impl ModelWeights {
             drain_metal(device, "post-load")?;
         }
 
+        let expert_pool = stream.map(|cfg| {
+            std::sync::Arc::new(crate::common::expert_stream::StreamedExperts::new(
+                mmap,
+                cfg,
+                device.clone(),
+                dtype,
+            ))
+        });
+
         Ok(Self {
             tensors,
             quant_scheme: None,
+            expert_pool,
         })
+    }
+
+    /// The expert streaming pool, when this model was loaded with expert
+    /// streaming enabled. MoE layers switch to the streamed bank when present.
+    pub(crate) fn expert_pool(
+        &self,
+    ) -> Option<std::sync::Arc<crate::common::expert_stream::StreamedExperts>> {
+        self.expert_pool.clone()
     }
 
     /// Attaches (or clears) the packed-int [`QuantScheme`] and returns `self`.
@@ -549,6 +583,7 @@ impl ModelWeights {
         Self {
             tensors,
             quant_scheme: None,
+            expert_pool: None,
         }
     }
 }

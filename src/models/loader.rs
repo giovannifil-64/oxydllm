@@ -646,6 +646,9 @@ pub struct LoadBatchOptions<'a> {
     pub kv_budget: &'a SharedGlobalKvBudget,
     pub kv_quant: KvQuantMode,
     pub qjl_quantization: bool,
+    /// When set, MoE expert weights are streamed from the checkpoint mmap
+    /// through an LRU pool of this many megabytes instead of loaded resident.
+    pub expert_stream_mb: Option<usize>,
 }
 
 pub fn load_batch_model(
@@ -676,8 +679,35 @@ fn load_standard_safetensors(
 ) -> anyhow::Result<(Box<dyn BatchModel>, usize)> {
     let weight_paths = resolve_weight_paths(model_dir)?;
     let weight_path_refs: Vec<&str> = weight_paths.iter().map(|s| s.as_str()).collect();
-    let weights =
-        ModelWeights::load(&weight_path_refs, device, dtype)?.with_quant_scheme(cfg.quant_scheme);
+    let expert_stream = match opts.expert_stream_mb {
+        Some(mb) => {
+            let Some(num_experts) = cfg.moe_num_experts else {
+                anyhow::bail!(
+                    "--stream-experts requires a MoE model; this checkpoint has no experts \
+                     (dense streaming is bandwidth-bound and not supported)"
+                );
+            };
+            let layout = if cfg.moe_gpt_oss {
+                crate::common::expert_stream::ExpertLayout::GptOss {
+                    swiglu_limit: cfg.moe_swiglu_limit.unwrap_or(7.0),
+                }
+            } else {
+                crate::common::expert_stream::ExpertLayout::Standard
+            };
+            tracing::info!(
+                num_experts,
+                cache_mb = mb,
+                "expert streaming enabled; experts load on demand from the checkpoint mmap"
+            );
+            Some(crate::common::expert_stream::ExpertStreamConfig {
+                layout,
+                cache_bytes: mb << 20,
+            })
+        }
+        None => None,
+    };
+    let weights = ModelWeights::load(&weight_path_refs, device, dtype, expert_stream)?
+        .with_quant_scheme(cfg.quant_scheme);
     let weights_size = weights.runtime_size_bytes();
     #[cfg(feature = "metal")]
     let has_packed_quantized_weights = weights.has_packed_quantized_weights();

@@ -167,6 +167,9 @@ pub struct StartServerArgs {
     pub api_key: Option<String>,
     /// Wall-clock per-request timeout. `None` disables the timeout.
     pub request_timeout: Option<Duration>,
+    /// When set, MoE expert weights stream from the checkpoint mmap through an
+    /// LRU pool of this many megabytes instead of loading resident.
+    pub expert_stream_mb: Option<usize>,
     /// Optional speculative-decoding draft model id, applied to every loaded
     /// model whose vocab matches.
     pub draft_model: Option<String>,
@@ -188,6 +191,7 @@ pub fn start_server(args: StartServerArgs) -> anyhow::Result<()> {
         max_queued_requests,
         api_key,
         request_timeout,
+        expert_stream_mb,
         draft_model,
     } = args;
 
@@ -218,6 +222,7 @@ pub fn start_server(args: StartServerArgs) -> anyhow::Result<()> {
             max_num_seqs,
             max_queued_requests,
             draft_model,
+            expert_stream_mb,
         },
     )));
 

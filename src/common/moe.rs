@@ -45,10 +45,12 @@
 //! supported in this first cut.
 
 use super::config::Activation;
+use super::expert_stream::StreamedExperts;
 use super::linear::{AnyLinear, gelu_tanh, silu, softmax_last_dim};
 use super::mxfp4::Mxfp4Linear;
 use super::weights::ModelWeights;
 use candle_core::{D, DType, Result, Tensor};
+use std::sync::Arc;
 
 /// A single MoE expert, in one of two formats.
 ///
@@ -58,7 +60,7 @@ use candle_core::{D, DType, Result, Tensor};
 /// clamped SwiGLU with alpha = 1.702 and a `+1` on the up branch, i.e.
 /// `glu = min(gate, limit) * sigmoid(1.702 * min(gate, limit))` then
 /// `out = down((clamp(up, ±limit) + 1) * glu)`.
-enum MoeExpert {
+pub(crate) enum MoeExpert {
     Standard {
         gate_proj: AnyLinear,
         up_proj: AnyLinear,
@@ -76,7 +78,7 @@ const GPT_OSS_SWIGLU_ALPHA: f64 = 1.702;
 impl MoeExpert {
     /// Runs this expert on `x`: gated SwiGLU for `Standard`, the clamped
     /// interleaved SwiGLU for `GptOss`.
-    fn forward(&self, x: &Tensor, activation: Activation) -> Result<Tensor> {
+    pub(crate) fn forward(&self, x: &Tensor, activation: Activation) -> Result<Tensor> {
         match self {
             Self::Standard {
                 gate_proj,
@@ -118,16 +120,73 @@ impl MoeExpert {
     }
 }
 
+/// Where a layer's experts live.
+///
+/// `Resident` holds every expert on the device (the eager path). `Streamed`
+/// resolves experts through the model-wide LRU pool
+/// ([`StreamedExperts`]), fetching missing ones from the checkpoint mmap on
+/// demand; the handles returned by [`resolve`](Self::resolve) keep fetched
+/// experts alive for the duration of a dispatch even across evictions.
+enum ExpertBank {
+    Resident(Vec<MoeExpert>),
+    Streamed {
+        layer_idx: usize,
+        num_experts: usize,
+        pool: Arc<StreamedExperts>,
+    },
+}
+
+/// A resolved expert handle, valid for one dispatch.
+enum ExpertHandle<'a> {
+    Borrowed(&'a MoeExpert),
+    Shared(Arc<MoeExpert>),
+}
+
+impl std::ops::Deref for ExpertHandle<'_> {
+    type Target = MoeExpert;
+    fn deref(&self) -> &MoeExpert {
+        match self {
+            Self::Borrowed(e) => e,
+            Self::Shared(e) => e,
+        }
+    }
+}
+
+impl ExpertBank {
+    fn num_experts(&self) -> usize {
+        match self {
+            Self::Resident(v) => v.len(),
+            Self::Streamed { num_experts, .. } => *num_experts,
+        }
+    }
+
+    /// Resolves the given expert ids for a dispatch, fetching streamed misses.
+    fn resolve(&self, ids: &[usize]) -> Result<Vec<(usize, ExpertHandle<'_>)>> {
+        ids.iter()
+            .map(|&e| {
+                let handle = match self {
+                    Self::Resident(v) => ExpertHandle::Borrowed(&v[e]),
+                    Self::Streamed {
+                        layer_idx, pool, ..
+                    } => ExpertHandle::Shared(pool.fetch(*layer_idx, e)?),
+                };
+                Ok((e, handle))
+            })
+            .collect()
+    }
+}
+
 /// A sparse Mixture-of-Experts feed-forward layer.
 ///
 /// A linear `router` scores the experts per token; the top `top_k` are run and
 /// their outputs combined (renormalised when `norm_topk`). See the module docs
 /// for the routing math and the naive/sparse dispatch. Load it with
 /// [`load`](Self::load) (standard experts) or
-/// [`load_gpt_oss`](Self::load_gpt_oss) (MXFP4 GPT-OSS experts).
+/// [`load_gpt_oss`](Self::load_gpt_oss) (MXFP4 GPT-OSS experts); both switch
+/// to the streamed bank when the weights carry an expert pool.
 pub struct MoeFeedForward {
     router: AnyLinear,
-    experts: Vec<MoeExpert>,
+    experts: ExpertBank,
     top_k: usize,
     activation: Activation,
     norm_topk: bool,
@@ -167,18 +226,27 @@ impl MoeFeedForward {
             .clone();
         let router = AnyLinear::from_weight(router_w, None)?;
 
-        let mut experts = Vec::with_capacity(num_experts);
-        for e in 0..num_experts {
-            let prefix = format!("{p}.experts.{e}");
-            let gate = weights.get(&format!("{prefix}.gate_proj.weight"))?.clone();
-            let up = weights.get(&format!("{prefix}.up_proj.weight"))?.clone();
-            let down = weights.get(&format!("{prefix}.down_proj.weight"))?.clone();
-            experts.push(MoeExpert::Standard {
-                gate_proj: AnyLinear::from_weight(gate, None)?,
-                up_proj: AnyLinear::from_weight(up, None)?,
-                down_proj: AnyLinear::from_weight(down, None)?,
-            });
-        }
+        let experts = if let Some(pool) = weights.expert_pool() {
+            ExpertBank::Streamed {
+                layer_idx,
+                num_experts,
+                pool,
+            }
+        } else {
+            let mut experts = Vec::with_capacity(num_experts);
+            for e in 0..num_experts {
+                let prefix = format!("{p}.experts.{e}");
+                let gate = weights.get(&format!("{prefix}.gate_proj.weight"))?.clone();
+                let up = weights.get(&format!("{prefix}.up_proj.weight"))?.clone();
+                let down = weights.get(&format!("{prefix}.down_proj.weight"))?.clone();
+                experts.push(MoeExpert::Standard {
+                    gate_proj: AnyLinear::from_weight(gate, None)?,
+                    up_proj: AnyLinear::from_weight(up, None)?,
+                    down_proj: AnyLinear::from_weight(down, None)?,
+                });
+            }
+            ExpertBank::Resident(experts)
+        };
 
         Ok(Self {
             router,
@@ -212,6 +280,20 @@ impl MoeFeedForward {
         let router_w = weights.get(&format!("{p}.router.weight"))?.clone();
         let router_b = weights.try_get(&format!("{p}.router.bias")).cloned();
         let router = AnyLinear::from_weight(router_w, router_b)?;
+
+        if let Some(pool) = weights.expert_pool() {
+            return Ok(Self {
+                router,
+                experts: ExpertBank::Streamed {
+                    layer_idx,
+                    num_experts,
+                    pool,
+                },
+                top_k,
+                activation: Activation::SiLU,
+                norm_topk: true,
+            });
+        }
 
         let slice_expert = |t: &Tensor, e: usize| -> Result<Tensor> {
             t.narrow(0, e, 1)?.squeeze(0)?.contiguous()
@@ -260,11 +342,19 @@ impl MoeFeedForward {
 
         Ok(Self {
             router,
-            experts,
+            experts: ExpertBank::Resident(experts),
             top_k,
             activation: Activation::SiLU,
             norm_topk: true,
         })
+    }
+
+    #[cfg(test)]
+    fn resident_expert(&self, e: usize) -> &MoeExpert {
+        match &self.experts {
+            ExpertBank::Resident(v) => &v[e],
+            ExpertBank::Streamed { .. } => panic!("resident_expert on a streamed bank"),
+        }
     }
 
     /// Routes `x` through the MoE: softmax router scores, top-k selection
@@ -319,7 +409,7 @@ impl MoeFeedForward {
         n_tokens: usize,
         hidden: usize,
     ) -> Result<Tensor> {
-        let num_experts = self.experts.len();
+        let num_experts = self.experts.num_experts();
         let device = x_flat.device();
 
         let top_idx_cpu: Vec<u32> = top_idx.flatten_all()?.to_vec1::<u32>()?;
@@ -334,11 +424,12 @@ impl MoeFeedForward {
             }
         }
 
+        let active: Vec<usize> = (0..num_experts)
+            .filter(|&e| per_expert_w[e].is_some())
+            .collect();
         let mut acc: Option<Tensor> = None;
-        for (e, expert) in self.experts.iter().enumerate() {
-            let Some(w) = &per_expert_w[e] else {
-                continue;
-            };
+        for (e, expert) in self.experts.resolve(&active)? {
+            let w = per_expert_w[e].as_ref().expect("resolved id is active");
             let w_t =
                 Tensor::from_vec(w.clone(), (n_tokens, 1), device)?.to_dtype(x_flat.dtype())?;
             let expert_out = expert.forward(x_flat, self.activation)?;
@@ -371,7 +462,7 @@ impl MoeFeedForward {
         n_tokens: usize,
         hidden: usize,
     ) -> Result<Tensor> {
-        let num_experts = self.experts.len();
+        let num_experts = self.experts.num_experts();
         let device = x_flat.device();
 
         let top_idx_cpu: Vec<u32> = top_idx.flatten_all()?.to_vec1::<u32>()?;
@@ -389,12 +480,12 @@ impl MoeFeedForward {
             }
         }
 
+        let active: Vec<usize> = (0..num_experts)
+            .filter(|&e| !per_expert_tokens[e].is_empty())
+            .collect();
         let mut output = Tensor::zeros((n_tokens, hidden), x_flat.dtype(), device)?;
-        for (e, expert) in self.experts.iter().enumerate() {
+        for (e, expert) in self.experts.resolve(&active)? {
             let token_idx = &per_expert_tokens[e];
-            if token_idx.is_empty() {
-                continue;
-            }
             let n_selected = token_idx.len();
             let idx_t = Tensor::from_vec(token_idx.clone(), (n_selected,), device)?;
             let weights_t = Tensor::from_vec(per_expert_weights[e].clone(), (n_selected,), device)?
@@ -454,7 +545,7 @@ mod tests {
 
         Ok(MoeFeedForward {
             router,
-            experts,
+            experts: ExpertBank::Resident(experts),
             top_k,
             activation: Activation::SiLU,
             norm_topk: true,
@@ -471,7 +562,7 @@ mod tests {
         let y = moe.forward(&x)?;
 
         let x_flat = x.reshape((8, 16))?.contiguous()?;
-        let ref_out = moe.experts[0].forward(&x_flat, Activation::SiLU)?;
+        let ref_out = moe.resident_expert(0).forward(&x_flat, Activation::SiLU)?;
         let ref_y = ref_out.reshape((2, 4, 16))?;
 
         let diff = (y - ref_y)?.abs()?.max_all()?.to_scalar::<f32>()?;
@@ -492,7 +583,7 @@ mod tests {
         assert!(y_norm.iter().all(|v| v.is_finite()));
 
         let x_flat = x.reshape((3, hidden))?.contiguous()?;
-        let ref0 = moe.experts[0].forward(&x_flat, Activation::SiLU)?;
+        let ref0 = moe.resident_expert(0).forward(&x_flat, Activation::SiLU)?;
         let ref_norm = ref0.flatten_all()?.to_vec1::<f32>()?;
         let y_mag: f32 = y_norm.iter().map(|v| v.abs()).sum::<f32>() / y_norm.len() as f32;
         let r_mag: f32 = ref_norm.iter().map(|v| v.abs()).sum::<f32>() / ref_norm.len() as f32;

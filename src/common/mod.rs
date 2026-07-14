@@ -60,6 +60,7 @@ pub mod awq;
 pub mod block;
 pub mod config;
 pub mod decode_profile;
+pub mod expert_stream;
 pub mod ffn;
 pub mod gdn;
 pub mod gguf_weights;

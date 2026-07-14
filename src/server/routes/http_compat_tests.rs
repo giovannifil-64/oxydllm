@@ -121,6 +121,7 @@ fn build_test_app(replies: Vec<ScriptedReply>) -> anyhow::Result<(Router, TempDi
         max_num_seqs: None,
         max_queued_requests: 200,
         draft_model: None,
+        expert_stream_mb: None,
     });
     manager.insert_ready_for_tests(
         model_id,
@@ -164,6 +165,7 @@ fn build_test_app_with_api_key(
         max_num_seqs: None,
         max_queued_requests: 200,
         draft_model: None,
+        expert_stream_mb: None,
     });
     manager.insert_ready_for_tests(
         model_id,
@@ -206,6 +208,7 @@ fn build_test_app_with_timeout(
         max_num_seqs: None,
         max_queued_requests: 200,
         draft_model: None,
+        expert_stream_mb: None,
     });
     manager.insert_ready_for_tests(
         model_id,
@@ -1289,6 +1292,7 @@ async fn tools_streaming_error_emits_done_sentinel() {
         max_num_seqs: None,
         max_queued_requests: 200,
         draft_model: None,
+        expert_stream_mb: None,
     });
     manager.insert_ready_for_tests(
         model_id,
@@ -1489,6 +1493,7 @@ async fn stream_error_mid_stream_emits_done_after_error_chunk() {
         max_num_seqs: None,
         max_queued_requests: 200,
         draft_model: None,
+        expert_stream_mb: None,
     });
     manager.insert_ready_for_tests(
         model_id,

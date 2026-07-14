@@ -49,6 +49,7 @@ struct StartArgs {
     api_key: Option<String>,
     request_timeout: Option<Duration>,
     draft_model: Option<String>,
+    expert_stream_mb: Option<usize>,
 }
 
 struct RunArgs {
@@ -62,6 +63,7 @@ struct RunArgs {
     require_gpu: bool,
     /// Optional speculative-decoding draft model as (resolved_dir, id).
     draft_model: Option<(String, String)>,
+    expert_stream_mb: Option<usize>,
 }
 
 struct RmArgs {
@@ -78,6 +80,9 @@ struct UpdateArgs {
 struct UninstallArgs {
     purge: bool,
 }
+
+/// Default LRU byte budget for streamed MoE experts (`--stream-experts`).
+const DEFAULT_EXPERT_CACHE_MB: usize = 8192;
 
 fn default_models_dir() -> PathBuf {
     dirs_home().join(".oxydllm").join("models")
@@ -169,6 +174,10 @@ Server options (start):
   --api-key <KEY>            Require `Authorization: Bearer <KEY>` (or `X-API-Key`) on /v1/* and /metrics (default: disabled, env: OXYDLLM_API_KEY)
   --request-timeout <SECS>   Wall-clock timeout per chat completion request; 0 disables (default: 300, env: OXYDLLM_REQUEST_TIMEOUT)
   --draft-model <NAME>       Enable greedy speculative decoding with this draft model (env: OXYDLLM_DRAFT_MODEL)
+  --stream-experts           Stream MoE expert weights from SSD on demand instead of loading them
+                             resident; enables models larger than memory (MoE checkpoints only)
+  --expert-cache-mb <MB>     LRU byte budget for streamed experts; implies --stream-experts
+                             (default: 8192, env: OXYDLLM_EXPERT_CACHE_MB)
   --otel-endpoint <URL>      Export per-request traces over OTLP/HTTP to this endpoint, e.g. http://localhost:4318
                              (env: OXYDLLM_OTEL_ENDPOINT or OTEL_EXPORTER_OTLP_ENDPOINT; default: disabled)
 
@@ -180,6 +189,8 @@ Chat options (run):
   --qjl-quantization         Enable Stage-2 QJL key residual quantization (default: disabled)
   --allow-cpu                Allow CPU fallback when no GPU is available (default: GPU required, env: OXYDLLM_ALLOW_CPU)
   --draft-model <NAME>       Enable greedy speculative decoding with this draft model
+  --stream-experts           Stream MoE expert weights from SSD on demand (MoE checkpoints only)
+  --expert-cache-mb <MB>     LRU byte budget for streamed experts; implies --stream-experts (default: 8192)
   --temperature <T>          Sampling temperature (default: 0.7)
   --top-k <K>                Top-k filtering (default: 0, disabled)
   --top-p <P>                Nucleus sampling (default: 1.0)
@@ -710,6 +721,7 @@ fn parse_start_args(args: &[String]) -> Result<StartArgs, String> {
         .filter(|s| !s.is_empty());
     // Default: 300 seconds; 0 disables the timeout.
     let mut request_timeout_secs: u64 = env_u64("OXYDLLM_REQUEST_TIMEOUT").unwrap_or(300);
+    let mut expert_stream_mb: Option<usize> = env_usize("OXYDLLM_EXPERT_CACHE_MB");
     let mut i = 0;
 
     while i < args.len() {
@@ -790,6 +802,18 @@ fn parse_start_args(args: &[String]) -> Result<StartArgs, String> {
             "--draft-model" => {
                 draft_model = Some(next_arg(args, &mut i, "--draft-model")?.to_string());
             }
+            "--stream-experts" => {
+                expert_stream_mb.get_or_insert(DEFAULT_EXPERT_CACHE_MB);
+            }
+            "--expert-cache-mb" => {
+                let mb: usize = next_arg(args, &mut i, "--expert-cache-mb")?
+                    .parse()
+                    .map_err(|_| "Invalid expert-cache-mb value (expected MB integer)")?;
+                if mb == 0 {
+                    return Err("--expert-cache-mb must be at least 1".to_string());
+                }
+                expert_stream_mb = Some(mb);
+            }
             "--otel-endpoint" => {
                 // Consumed at subscriber-init time (before arg parsing); accept it
                 // here so it is not rejected as an unknown option.
@@ -822,6 +846,7 @@ fn parse_start_args(args: &[String]) -> Result<StartArgs, String> {
         api_key,
         request_timeout,
         draft_model,
+        expert_stream_mb,
     })
 }
 
@@ -842,12 +867,25 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
         temperature: 0.7,
         ..SamplingParams::default()
     };
+    let mut expert_stream_mb: Option<usize> = env_usize("OXYDLLM_EXPERT_CACHE_MB");
     let mut i = 0;
 
     while i < args.len() {
         match args[i].as_str() {
             "--models-dir" => {
                 models_dir = Some(PathBuf::from(next_arg(args, &mut i, "--models-dir")?));
+            }
+            "--stream-experts" => {
+                expert_stream_mb.get_or_insert(DEFAULT_EXPERT_CACHE_MB);
+            }
+            "--expert-cache-mb" => {
+                let mb: usize = next_arg(args, &mut i, "--expert-cache-mb")?
+                    .parse()
+                    .map_err(|_| "Invalid expert-cache-mb value (expected MB integer)")?;
+                if mb == 0 {
+                    return Err("--expert-cache-mb must be at least 1".to_string());
+                }
+                expert_stream_mb = Some(mb);
             }
             "--devices" => {
                 let raw = next_arg(args, &mut i, "--devices")?;
@@ -938,6 +976,7 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
         qjl_quantization,
         require_gpu,
         draft_model,
+        expert_stream_mb,
     })
 }
 
@@ -1046,6 +1085,7 @@ fn run_interactive(args: &RunArgs) -> anyhow::Result<()> {
             kv_budget: &kv_budget,
             kv_quant: args.kv_quant,
             qjl_quantization: args.qjl_quantization,
+            expert_stream_mb: args.expert_stream_mb,
         },
     )?;
     let max_seq_len = batch_model.max_seq_len();
@@ -1072,6 +1112,7 @@ fn run_interactive(args: &RunArgs) -> anyhow::Result<()> {
                 kv_budget: &kv_budget,
                 kv_quant: args.kv_quant,
                 qjl_quantization: args.qjl_quantization,
+                expert_stream_mb: None,
             },
         )?;
         if draft.vocab_size() != batch_model.vocab_size() {
@@ -1322,6 +1363,7 @@ fn main() -> anyhow::Result<()> {
                 api_key: start_args.api_key,
                 request_timeout: start_args.request_timeout,
                 draft_model: start_args.draft_model,
+                expert_stream_mb: start_args.expert_stream_mb,
             });
             // Flush buffered spans before exit, on both clean shutdown and error.
             if let Some(provider) = otel_provider.take() {

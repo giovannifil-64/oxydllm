@@ -1135,7 +1135,7 @@ mod tests {
                 for k in 0..pf {
                     let i = i_word * pf + k;
                     let v = iweight[i][j] as u32;
-                    word |= (v & ((1 << bits) - 1)) << (bits as u32 * k as u32);
+                    word |= (v & ((1 << bits) - 1)) << (bits * k as u32);
                 }
                 out[i_word * out_features + j] = word as i32;
             }
@@ -1158,7 +1158,7 @@ mod tests {
                 for k in 0..pf {
                     let o = o_word * pf + k;
                     let v = izero[g][o] as u32;
-                    word |= (v & ((1 << bits) - 1)) << (bits as u32 * k as u32);
+                    word |= (v & ((1 << bits) - 1)) << (bits * k as u32);
                 }
                 out[g * packed_out + o_word] = word as i32;
             }

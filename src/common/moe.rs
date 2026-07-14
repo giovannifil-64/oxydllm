@@ -485,9 +485,7 @@ mod tests {
         let (hidden, intermediate, num_experts, top_k) = (8, 16, 4, 2);
         let moe = build_synth_moe(&device, hidden, intermediate, num_experts, top_k, 0xdead)?;
 
-        let input_data: Vec<f32> = (0..1 * 3 * hidden)
-            .map(|i| (i as f32 * 0.027).cos())
-            .collect();
+        let input_data: Vec<f32> = (0..3 * hidden).map(|i| (i as f32 * 0.027).cos()).collect();
         let x = Tensor::from_vec(input_data, (1, 3, hidden), &device)?;
         let y = moe.forward(&x)?;
         let y_norm = y.flatten_all()?.to_vec1::<f32>()?;

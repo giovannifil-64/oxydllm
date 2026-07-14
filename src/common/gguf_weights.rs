@@ -311,6 +311,52 @@ fn parallelise_tensor_load(
     Ok(tensors)
 }
 
+/// Builds one `QTensor` from its slice of the memory map, validating the element
+/// count against the block size and that the slice lies within bounds.
+fn build_qtensor_from_mmap(
+    mmap: &Mmap,
+    data_offset: u64,
+    info: &gguf_file::TensorInfo,
+    device: &Device,
+) -> anyhow::Result<QTensor> {
+    let tensor_elems = info.shape.elem_count();
+    let block_size = info.ggml_dtype.block_size();
+    if !tensor_elems.is_multiple_of(block_size) {
+        anyhow::bail!(
+            "tensor elements {} not divisible by block size {}",
+            tensor_elems,
+            block_size
+        );
+    }
+    let size_in_bytes = tensor_elems / block_size * info.ggml_dtype.type_size();
+    let start = (data_offset + info.offset) as usize;
+    let end = start
+        .checked_add(size_in_bytes)
+        .ok_or_else(|| anyhow::anyhow!("tensor offset overflow"))?;
+    if end > mmap.len() {
+        anyhow::bail!(
+            "tensor slice ({}..{}) out of mmap bounds ({})",
+            start,
+            end,
+            mmap.len()
+        );
+    }
+    let slice = &mmap[start..end];
+    // Serialize Metal storage creation across the rayon workers: candle
+    // 0.11's residency-set registration is not thread-safe (see
+    // `weights::metal_alloc_lock`).
+    let _guard = device
+        .is_metal()
+        .then(|| crate::common::weights::metal_alloc_lock().lock().unwrap());
+    candle_core::quantized::ggml_file::qtensor_from_ggml(
+        info.ggml_dtype,
+        slice,
+        info.shape.dims().to_vec(),
+        device,
+    )
+    .map_err(|e| anyhow::anyhow!("qtensor_from_ggml failed: {}", e))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -358,50 +404,4 @@ mod tests {
         let qt = QTensor::quantize(&t, GgmlDType::F32).unwrap();
         assert!(depermute_qk_rows(&qt, 3, 8, &dev).is_err());
     }
-}
-
-/// Builds one `QTensor` from its slice of the memory map, validating the element
-/// count against the block size and that the slice lies within bounds.
-fn build_qtensor_from_mmap(
-    mmap: &Mmap,
-    data_offset: u64,
-    info: &gguf_file::TensorInfo,
-    device: &Device,
-) -> anyhow::Result<QTensor> {
-    let tensor_elems = info.shape.elem_count();
-    let block_size = info.ggml_dtype.block_size();
-    if !tensor_elems.is_multiple_of(block_size) {
-        anyhow::bail!(
-            "tensor elements {} not divisible by block size {}",
-            tensor_elems,
-            block_size
-        );
-    }
-    let size_in_bytes = tensor_elems / block_size * info.ggml_dtype.type_size();
-    let start = (data_offset + info.offset) as usize;
-    let end = start
-        .checked_add(size_in_bytes)
-        .ok_or_else(|| anyhow::anyhow!("tensor offset overflow"))?;
-    if end > mmap.len() {
-        anyhow::bail!(
-            "tensor slice ({}..{}) out of mmap bounds ({})",
-            start,
-            end,
-            mmap.len()
-        );
-    }
-    let slice = &mmap[start..end];
-    // Serialize Metal storage creation across the rayon workers: candle
-    // 0.11's residency-set registration is not thread-safe (see
-    // `weights::metal_alloc_lock`).
-    let _guard = device
-        .is_metal()
-        .then(|| crate::common::weights::metal_alloc_lock().lock().unwrap());
-    candle_core::quantized::ggml_file::qtensor_from_ggml(
-        info.ggml_dtype,
-        slice,
-        info.shape.dims().to_vec(),
-        device,
-    )
-    .map_err(|e| anyhow::anyhow!("qtensor_from_ggml failed: {}", e))
 }

@@ -2780,9 +2780,7 @@ mod fused_kernel_parity_tests {
 
         // [batch=1, seq=4, 2*N=16] to output [1, 4, 8]
         let n = 8usize;
-        let data: Vec<f32> = (0..1 * 4 * 2 * n)
-            .map(|i| (i as f32 - 32.0) * 0.05)
-            .collect();
+        let data: Vec<f32> = (0..4 * 2 * n).map(|i| (i as f32 - 32.0) * 0.05).collect();
         let x = Tensor::from_vec(data, (1, 4, 2 * n), &dev).unwrap();
 
         let fused = gated_silu_fused(&x, n).unwrap();
@@ -2804,7 +2802,7 @@ mod fused_kernel_parity_tests {
         };
 
         let n = 4usize;
-        let data: Vec<f32> = (0..1 * 2 * 2 * n).map(|i| (i as f32 - 8.0) * 0.1).collect();
+        let data: Vec<f32> = (0..2 * 2 * n).map(|i| (i as f32 - 8.0) * 0.1).collect();
         let x = Tensor::from_vec(data, (1, 2, 2 * n), &dev)
             .unwrap()
             .to_dtype(DType::BF16)
@@ -2874,9 +2872,7 @@ mod fused_kernel_parity_tests {
         };
 
         let n = 8usize;
-        let data: Vec<f32> = (0..1 * 4 * 2 * n)
-            .map(|i| (i as f32 - 32.0) * 0.05)
-            .collect();
+        let data: Vec<f32> = (0..4 * 2 * n).map(|i| (i as f32 - 32.0) * 0.05).collect();
         let x = Tensor::from_vec(data, (1, 4, 2 * n), &dev).unwrap();
 
         let fused = gated_gelu_tanh_fused(&x, n).unwrap();
@@ -2898,7 +2894,7 @@ mod fused_kernel_parity_tests {
         };
 
         let n = 4usize;
-        let data: Vec<f32> = (0..1 * 2 * 2 * n).map(|i| (i as f32 - 8.0) * 0.1).collect();
+        let data: Vec<f32> = (0..2 * 2 * n).map(|i| (i as f32 - 8.0) * 0.1).collect();
         let x = Tensor::from_vec(data, (1, 2, 2 * n), &dev)
             .unwrap()
             .to_dtype(DType::BF16)
@@ -3876,7 +3872,7 @@ mod fused_kernel_parity_tests {
                 for k in 0..pf {
                     let i = iw * pf + k;
                     let v = ((i * 13 + o * 7) as u32) & mask;
-                    w |= v << (bits as u32 * k as u32);
+                    w |= v << (bits * k as u32);
                 }
                 qw[iw * out_features + o] = w as i32;
             }
@@ -3889,7 +3885,7 @@ mod fused_kernel_parity_tests {
                 for k in 0..pf {
                     let o = ow * pf + k;
                     let v = ((g * 31 + o * 17 + 1) as u32) & mask;
-                    w |= v << (bits as u32 * k as u32);
+                    w |= v << (bits * k as u32);
                 }
                 qz[g * packed_out + ow] = w as i32;
             }

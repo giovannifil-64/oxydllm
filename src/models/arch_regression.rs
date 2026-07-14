@@ -294,7 +294,7 @@ mod tests {
             .collect()
     }
 
-    fn clear_caches(caches: &mut Vec<PagedKvCache>) {
+    fn clear_caches(caches: &mut [PagedKvCache]) {
         for c in caches.iter_mut() {
             c.clear();
         }

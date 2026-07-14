@@ -1275,7 +1275,7 @@ mod tests {
 
         let mgr = build_test_manager(&tmp, Duration::from_secs(60), None);
         assert!(
-            mgr.registry.get("ghost-model").is_none(),
+            !mgr.registry.contains_key("ghost-model"),
             "stale registry entry should be pruned on startup"
         );
     }

@@ -649,6 +649,10 @@ pub struct LoadBatchOptions<'a> {
     /// When set, MoE expert weights are streamed from the checkpoint mmap
     /// through an LRU pool of this many megabytes instead of loaded resident.
     pub expert_stream_mb: Option<usize>,
+    /// The operator's `--memory-budget`, used as the memory envelope for the
+    /// automatic expert-streaming decision; free memory at load time when
+    /// unset.
+    pub memory_budget_bytes: Option<usize>,
 }
 
 pub fn load_batch_model(
@@ -670,6 +674,74 @@ pub fn load_batch_model(
     load_standard_safetensors(cfg, model_dir, device, dtype, opts)
 }
 
+/// Sums a checkpoint's tensor bytes as they will exist at runtime, split into
+/// streamable experts and everything else. Reads only the safetensors
+/// headers; float tensors are scaled by `runtime dtype size / file dtype
+/// size` (an FP8 file doubles into BF16), integer tensors keep their size.
+fn expert_split_runtime_bytes(paths: &[&str], dtype: DType) -> anyhow::Result<(usize, usize)> {
+    // SAFETY: same exclusive-ownership argument as ModelWeights::load.
+    let mmap = unsafe {
+        candle_core::safetensors::MmapedSafetensors::multi(paths)
+            .map_err(|e| anyhow::anyhow!("Failed to memory-map weight files: {e:#}"))?
+    };
+    let (mut expert, mut rest) = (0usize, 0usize);
+    for (name, view) in mmap.tensors() {
+        if name.starts_with("model.visual.") || name.starts_with("mtp.") {
+            continue;
+        }
+        let file_elem = match format!("{:?}", view.dtype()).as_str() {
+            "F8_E4M3" => Some(1),
+            "F16" | "BF16" => Some(2),
+            "F32" => Some(4),
+            _ => None,
+        };
+        let bytes = view.data().len();
+        let runtime_bytes = match file_elem {
+            Some(fe) => bytes * dtype.size_in_bytes() / fe,
+            None => bytes,
+        };
+        if crate::common::expert_stream::is_streamed_expert_tensor(&name) {
+            expert += runtime_bytes;
+        } else {
+            rest += runtime_bytes;
+        }
+    }
+    Ok((expert, rest))
+}
+
+/// Headroom reserved next to the weights for KV cache, activations, and the
+/// OS when deciding whether a MoE checkpoint fits resident.
+const STREAM_HEADROOM: usize = 2 << 30;
+/// Below this expert-cache size streaming would thrash; the model is rejected.
+const MIN_EXPERT_CACHE: usize = 1 << 30;
+
+/// Decides expert streaming for a MoE checkpoint: `None` when everything fits
+/// resident (fastest), `Some(cache_bytes)` when streaming makes it fit, and an
+/// error when not even the non-expert weights plus a minimum cache fit.
+fn auto_expert_stream_budget(
+    expert_bytes: usize,
+    non_expert_bytes: usize,
+    available_bytes: usize,
+) -> anyhow::Result<Option<usize>> {
+    if expert_bytes + non_expert_bytes + STREAM_HEADROOM <= available_bytes {
+        return Ok(None);
+    }
+    let cache = available_bytes
+        .saturating_sub(non_expert_bytes)
+        .saturating_sub(STREAM_HEADROOM);
+    if cache < MIN_EXPERT_CACHE {
+        anyhow::bail!(
+            "model needs {:.1} GB resident plus a streamed-expert cache, but only \
+             {:.1} GB of memory is available; free memory or use a smaller quant",
+            (non_expert_bytes + MIN_EXPERT_CACHE + STREAM_HEADROOM) as f64 / 1_073_741_824.0,
+            available_bytes as f64 / 1_073_741_824.0,
+        );
+    }
+    // cache < expert_bytes always holds here: if the remainder covered every
+    // expert, the resident branch above would have taken it.
+    Ok(Some(cache))
+}
+
 fn load_standard_safetensors(
     cfg: StandardTransformerConfig,
     model_dir: &str,
@@ -679,36 +751,58 @@ fn load_standard_safetensors(
 ) -> anyhow::Result<(Box<dyn BatchModel>, usize)> {
     let weight_paths = resolve_weight_paths(model_dir)?;
     let weight_path_refs: Vec<&str> = weight_paths.iter().map(|s| s.as_str()).collect();
-    let expert_stream = match opts.expert_stream_mb {
-        Some(mb) => {
-            let Some(num_experts) = cfg.moe_num_experts else {
-                anyhow::bail!(
-                    "--stream-experts requires a MoE model; this checkpoint has no experts \
-                     (dense streaming is bandwidth-bound and not supported)"
+
+    // Expert streaming: automatic for MoE checkpoints that do not fit in the
+    // currently available memory; the flags only override the auto decision.
+    let cache_bytes: Option<usize> = match (opts.expert_stream_mb, cfg.moe_num_experts) {
+        (Some(_), None) => anyhow::bail!(
+            "--stream-experts requires a MoE model; this checkpoint has no experts \
+             (dense streaming is bandwidth-bound and not supported)"
+        ),
+        (Some(mb), Some(_)) => Some(mb << 20),
+        (None, Some(_)) => {
+            let (expert_b, rest_b) = expert_split_runtime_bytes(&weight_path_refs, dtype)?;
+            let available = opts
+                .memory_budget_bytes
+                .or_else(crate::common::paged::detect_reclaimable_memory_bytes)
+                .unwrap_or(usize::MAX);
+            let decision = auto_expert_stream_budget(expert_b, rest_b, available)?;
+            if let Some(cache) = decision {
+                tracing::info!(
+                    expert_gb = expert_b >> 30,
+                    resident_gb = rest_b >> 30,
+                    available_gb = available >> 30,
+                    cache_gb = cache >> 30,
+                    "model exceeds available memory; streaming experts from disk automatically"
                 );
-            };
-            let layout = if cfg.moe_gpt_oss {
-                crate::common::expert_stream::ExpertLayout::GptOss {
-                    swiglu_limit: cfg.moe_swiglu_limit.unwrap_or(7.0),
-                }
-            } else {
-                crate::common::expert_stream::ExpertLayout::Standard
-            };
-            tracing::info!(
-                num_experts,
-                cache_mb = mb,
-                "expert streaming enabled; experts load on demand from the checkpoint mmap"
-            );
-            Some(crate::common::expert_stream::ExpertStreamConfig {
-                layout,
-                cache_bytes: mb << 20,
-            })
+            }
+            decision
         }
-        None => None,
+        (None, None) => None,
     };
+    let expert_stream = cache_bytes.map(|cache| {
+        let layout = if cfg.moe_gpt_oss {
+            crate::common::expert_stream::ExpertLayout::GptOss {
+                swiglu_limit: cfg.moe_swiglu_limit.unwrap_or(7.0),
+            }
+        } else {
+            crate::common::expert_stream::ExpertLayout::Standard
+        };
+        tracing::info!(
+            num_experts = cfg.moe_num_experts.unwrap_or(0),
+            cache_mb = cache >> 20,
+            "expert streaming enabled; experts load on demand from the checkpoint mmap"
+        );
+        crate::common::expert_stream::ExpertStreamConfig {
+            layout,
+            cache_bytes: cache,
+        }
+    });
     let weights = ModelWeights::load(&weight_path_refs, device, dtype, expert_stream)?
         .with_quant_scheme(cfg.quant_scheme);
-    let weights_size = weights.runtime_size_bytes();
+    // A streamed model's footprint is its resident tensors plus the expert
+    // cache budget; report both so the manager's memory accounting holds.
+    let weights_size = weights.runtime_size_bytes() + cache_bytes.unwrap_or(0);
     #[cfg(feature = "metal")]
     let has_packed_quantized_weights = weights.has_packed_quantized_weights();
 
@@ -1182,4 +1276,34 @@ fn compute_kv_blocks(
     }
 
     Ok((granted_blocks, granted_bytes))
+}
+
+#[cfg(test)]
+mod expert_stream_decision_tests {
+    use super::*;
+
+    const GB: usize = 1 << 30;
+
+    /// Contract: a model that fits resident (with headroom) is never streamed.
+    #[test]
+    fn fitting_model_stays_resident() {
+        let d = auto_expert_stream_budget(11 * GB, 2 * GB, 20 * GB).unwrap();
+        assert!(d.is_none());
+    }
+
+    /// Contract: a model over the envelope streams, with the cache sized to
+    /// what remains after resident weights and headroom.
+    #[test]
+    fn oversized_model_streams_with_remaining_cache() {
+        let d = auto_expert_stream_budget(64 * GB, 5 * GB, 20 * GB).unwrap();
+        assert_eq!(d, Some(13 * GB));
+    }
+
+    /// Contract: when the non-expert weights plus a minimum cache do not fit,
+    /// loading fails with a clear error instead of thrashing.
+    #[test]
+    fn hopeless_model_is_rejected() {
+        let err = auto_expert_stream_budget(64 * GB, 10 * GB, 12 * GB).unwrap_err();
+        assert!(err.to_string().contains("available"), "{err}");
+    }
 }

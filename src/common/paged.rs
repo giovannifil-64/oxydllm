@@ -79,8 +79,38 @@ fn detect_system_memory_bytes() -> Option<usize> {
         .ok()
 }
 
+/// Memory the system could hand to a large allocation, by the kernel's own
+/// pressure metric (`kern.memorystatus_level` = percentage of memory
+/// available, including purgeable and compressor-reclaimable pages that
+/// [`detect_available_memory_bytes`] does not count). Used for the automatic
+/// expert-streaming decision; falls back to the conservative helper.
 #[cfg(target_os = "macos")]
-fn detect_available_memory_bytes() -> Option<usize> {
+pub(crate) fn detect_reclaimable_memory_bytes() -> Option<usize> {
+    let level = std::process::Command::new("sysctl")
+        .args(["-n", "kern.memorystatus_level"])
+        .output()
+        .ok()
+        .and_then(|o| {
+            std::str::from_utf8(&o.stdout)
+                .ok()?
+                .trim()
+                .parse::<usize>()
+                .ok()
+        })
+        .filter(|p| (1..=100).contains(p));
+    match (level, detect_system_memory_bytes()) {
+        (Some(pct), Some(total)) => Some(total / 100 * pct),
+        _ => detect_available_memory_bytes(),
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn detect_reclaimable_memory_bytes() -> Option<usize> {
+    detect_available_memory_bytes()
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn detect_available_memory_bytes() -> Option<usize> {
     let ps = std::process::Command::new("sysctl")
         .args(["-n", "hw.pagesize"])
         .output()
@@ -124,7 +154,7 @@ fn detect_system_memory_bytes() -> Option<usize> {
 }
 
 #[cfg(target_os = "linux")]
-fn detect_available_memory_bytes() -> Option<usize> {
+pub(crate) fn detect_available_memory_bytes() -> Option<usize> {
     parse_meminfo_kb("MemAvailable:")
 }
 
@@ -134,7 +164,7 @@ fn detect_system_memory_bytes() -> Option<usize> {
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn detect_available_memory_bytes() -> Option<usize> {
+pub(crate) fn detect_available_memory_bytes() -> Option<usize> {
     None
 }
 

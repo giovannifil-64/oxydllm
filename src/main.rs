@@ -174,10 +174,10 @@ Server options (start):
   --api-key <KEY>            Require `Authorization: Bearer <KEY>` (or `X-API-Key`) on /v1/* and /metrics (default: disabled, env: OXYDLLM_API_KEY)
   --request-timeout <SECS>   Wall-clock timeout per chat completion request; 0 disables (default: 300, env: OXYDLLM_REQUEST_TIMEOUT)
   --draft-model <NAME>       Enable greedy speculative decoding with this draft model (env: OXYDLLM_DRAFT_MODEL)
-  --stream-experts           Stream MoE expert weights from SSD on demand instead of loading them
-                             resident; enables models larger than memory (MoE checkpoints only)
-  --expert-cache-mb <MB>     LRU byte budget for streamed experts; implies --stream-experts
-                             (default: 8192, env: OXYDLLM_EXPERT_CACHE_MB)
+  --stream-experts           Force SSD expert streaming on a MoE model (default: automatic,
+                             streams only when the model does not fit in available memory)
+  --expert-cache-mb <MB>     Override the streamed-expert cache budget; implies --stream-experts
+                             (default: sized automatically, env: OXYDLLM_EXPERT_CACHE_MB)
   --otel-endpoint <URL>      Export per-request traces over OTLP/HTTP to this endpoint, e.g. http://localhost:4318
                              (env: OXYDLLM_OTEL_ENDPOINT or OTEL_EXPORTER_OTLP_ENDPOINT; default: disabled)
 
@@ -189,8 +189,8 @@ Chat options (run):
   --qjl-quantization         Enable Stage-2 QJL key residual quantization (default: disabled)
   --allow-cpu                Allow CPU fallback when no GPU is available (default: GPU required, env: OXYDLLM_ALLOW_CPU)
   --draft-model <NAME>       Enable greedy speculative decoding with this draft model
-  --stream-experts           Stream MoE expert weights from SSD on demand (MoE checkpoints only)
-  --expert-cache-mb <MB>     LRU byte budget for streamed experts; implies --stream-experts (default: 8192)
+  --stream-experts           Force SSD expert streaming on a MoE model (default: automatic)
+  --expert-cache-mb <MB>     Override the streamed-expert cache budget; implies --stream-experts
   --temperature <T>          Sampling temperature (default: 0.7)
   --top-k <K>                Top-k filtering (default: 0, disabled)
   --top-p <P>                Nucleus sampling (default: 1.0)
@@ -1086,6 +1086,7 @@ fn run_interactive(args: &RunArgs) -> anyhow::Result<()> {
             kv_quant: args.kv_quant,
             qjl_quantization: args.qjl_quantization,
             expert_stream_mb: args.expert_stream_mb,
+            memory_budget_bytes: None,
         },
     )?;
     let max_seq_len = batch_model.max_seq_len();
@@ -1113,6 +1114,7 @@ fn run_interactive(args: &RunArgs) -> anyhow::Result<()> {
                 kv_quant: args.kv_quant,
                 qjl_quantization: args.qjl_quantization,
                 expert_stream_mb: None,
+                memory_budget_bytes: None,
             },
         )?;
         if draft.vocab_size() != batch_model.vocab_size() {

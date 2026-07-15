@@ -533,6 +533,7 @@ impl ModelManager {
             max_num_seqs: self.max_num_seqs,
             max_queued_requests: self.max_queued_requests,
             expert_stream_mb: self.expert_stream_mb,
+            memory_budget_bytes: self.memory_budget_bytes,
             draft_model,
         });
 
@@ -691,6 +692,7 @@ struct SpawnLoadParams {
     /// Optional draft model as (resolved_path, id) for speculative decoding.
     draft_model: Option<(PathBuf, String)>,
     expert_stream_mb: Option<usize>,
+    memory_budget_bytes: Option<usize>,
 }
 
 /// JIT-compile all SDPA kernels before marking the model Ready, otherwise the
@@ -819,6 +821,7 @@ fn spawn_load(params: SpawnLoadParams) {
         max_queued_requests,
         draft_model,
         expert_stream_mb,
+        memory_budget_bytes,
     } = params;
 
     let (result_tx, result_rx) = oneshot::channel::<Result<LoadResult, String>>();
@@ -881,6 +884,7 @@ fn spawn_load(params: SpawnLoadParams) {
                 kv_quant,
                 qjl_quantization,
                 expert_stream_mb,
+                memory_budget_bytes,
             },
         ) {
             Ok(m) => m,
@@ -1019,6 +1023,7 @@ fn spawn_load(params: SpawnLoadParams) {
                     kv_quant,
                     qjl_quantization,
                     expert_stream_mb: None,
+                    memory_budget_bytes,
                 },
             ) {
                 Ok((d, _)) if d.vocab_size() == vocab_size => {

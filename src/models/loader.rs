@@ -717,7 +717,9 @@ const MIN_EXPERT_CACHE: usize = 1 << 30;
 
 /// Decides expert streaming for a MoE checkpoint: `None` when everything fits
 /// resident (fastest), `Some(cache_bytes)` when streaming makes it fit, and an
-/// error when not even the non-expert weights plus a minimum cache fit.
+/// error when not even the non-expert weights plus a minimum cache fit. The
+/// returned cache is always smaller than the expert bytes: a remainder that
+/// covered every expert would have taken the resident branch.
 fn auto_expert_stream_budget(
     expert_bytes: usize,
     non_expert_bytes: usize,
@@ -737,11 +739,16 @@ fn auto_expert_stream_budget(
             available_bytes as f64 / 1_073_741_824.0,
         );
     }
-    // cache < expert_bytes always holds here: if the remainder covered every
-    // expert, the resident branch above would have taken it.
     Ok(Some(cache))
 }
 
+/// Loads a safetensors checkpoint into a [`StandardTransformer`].
+///
+/// For MoE checkpoints, expert streaming is decided automatically from the
+/// tensor sizes and the memory envelope ([`auto_expert_stream_budget`]); the
+/// CLI flags only override that decision. The returned weight size counts a
+/// streamed model as its resident tensors plus the expert-cache budget, so
+/// the manager's memory accounting holds either way.
 fn load_standard_safetensors(
     cfg: StandardTransformerConfig,
     model_dir: &str,
@@ -752,8 +759,6 @@ fn load_standard_safetensors(
     let weight_paths = resolve_weight_paths(model_dir)?;
     let weight_path_refs: Vec<&str> = weight_paths.iter().map(|s| s.as_str()).collect();
 
-    // Expert streaming: automatic for MoE checkpoints that do not fit in the
-    // currently available memory; the flags only override the auto decision.
     let cache_bytes: Option<usize> = match (opts.expert_stream_mb, cfg.moe_num_experts) {
         (Some(_), None) => anyhow::bail!(
             "--stream-experts requires a MoE model; this checkpoint has no experts \
@@ -800,8 +805,6 @@ fn load_standard_safetensors(
     });
     let weights = ModelWeights::load(&weight_path_refs, device, dtype, expert_stream)?
         .with_quant_scheme(cfg.quant_scheme);
-    // A streamed model's footprint is its resident tensors plus the expert
-    // cache budget; report both so the manager's memory accounting holds.
     let weights_size = weights.runtime_size_bytes() + cache_bytes.unwrap_or(0);
     #[cfg(feature = "metal")]
     let has_packed_quantized_weights = weights.has_packed_quantized_weights();

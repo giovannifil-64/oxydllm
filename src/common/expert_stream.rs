@@ -102,6 +102,11 @@ impl StreamedExperts {
     /// cache miss. The returned `Arc` keeps the expert alive for the caller's
     /// dispatch even if it is evicted concurrently.
     ///
+    /// Eviction runs before insertion so the byte budget bounds the peak, and
+    /// each eviction batch is followed by a Metal drain: dropped buffers are
+    /// only reclaimed at sync points (see the two-phase note in
+    /// [`ModelWeights::load`](super::weights::ModelWeights::load)).
+    ///
     /// ## Errors
     /// Fails if a tensor is missing from the checkpoint, malformed, or a cast
     /// or device transfer fails.
@@ -125,9 +130,6 @@ impl StreamedExperts {
             }
         };
 
-        // Evict before inserting so the budget bounds the peak, then drain so
-        // the dropped Metal buffers are actually reclaimed (they are only
-        // freed at sync points, see the two-phase note in ModelWeights::load).
         let mut evicted = false;
         while state.bytes + bytes > self.cache_bytes && !state.cache.is_empty() {
             let (&victim, _) = state
@@ -343,11 +345,11 @@ mod tests {
     use crate::common::config::Activation;
     use candle_core::Device;
 
+    /// Writes two layers x three experts of gate/up `[4, 8]` and down
+    /// `[8, 4]` F32 weights (candle's CPU matmul has no BF16; the fetch
+    /// pipeline under test is dtype-generic), plus one stacked u8 tensor
+    /// `[3, 2, 2, 16]` mimicking the GPT-OSS layout on dim 0.
     fn write_synthetic_checkpoint(dir: &std::path::Path) -> std::path::PathBuf {
-        // Two layers x three experts of [4, 8] F32 weights (candle's CPU
-        // matmul has no BF16; the fetch pipeline under test is dtype-generic)
-        // plus one stacked u8 tensor [3, 2, 2, 16] mimicking the GPT-OSS
-        // layout on dim 0.
         let device = Device::Cpu;
         let mut tensors: Vec<(String, Tensor)> = Vec::new();
         for layer in 0..2 {
@@ -471,13 +473,13 @@ mod tests {
         }
     }
 
-    /// Contract: the LRU respects its byte budget, evicts the least recently
-    /// used expert first, and re-fetches evicted experts correctly.
+    /// Contract: the LRU respects its byte budget (800 bytes here, fitting
+    /// two 384-byte experts), evicts the least recently used expert first,
+    /// and evicted experts re-fetch as misses while survivors stay hits.
     #[test]
     fn lru_evicts_least_recent_and_refetches() {
         let dir = tempfile::tempdir().unwrap();
         let path = write_synthetic_checkpoint(dir.path());
-        // One expert = 3 x [4, 8] F32 = 384 bytes; budget fits two experts.
         let pool = pool_over(&path, 800);
 
         pool.fetch(0, 0).unwrap();
@@ -489,8 +491,6 @@ mod tests {
         assert_eq!((hits, misses), (1, 3));
         assert!(bytes <= 800, "cache bytes {bytes} over budget");
 
-        // Expert 1 was evicted: fetching it again must miss and still be
-        // correct; expert 0 must still be a hit.
         pool.fetch(0, 0).unwrap();
         pool.fetch(0, 1).unwrap();
         let (hits, misses, _) = pool.stats();

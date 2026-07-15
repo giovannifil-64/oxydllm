@@ -160,19 +160,25 @@ impl ExpertBank {
         }
     }
 
-    /// Resolves the given expert ids for a dispatch, fetching streamed misses.
+    /// Resolves the given expert ids for a dispatch. Streamed banks fetch all
+    /// misses in one coalesced batch (one eviction drain, disk-ordered reads).
     fn resolve(&self, ids: &[usize]) -> Result<Vec<(usize, ExpertHandle<'_>)>> {
-        ids.iter()
-            .map(|&e| {
-                let handle = match self {
-                    Self::Resident(v) => ExpertHandle::Borrowed(&v[e]),
-                    Self::Streamed {
-                        layer_idx, pool, ..
-                    } => ExpertHandle::Shared(pool.fetch(*layer_idx, e)?),
-                };
-                Ok((e, handle))
-            })
-            .collect()
+        match self {
+            Self::Resident(v) => Ok(ids
+                .iter()
+                .map(|&e| (e, ExpertHandle::Borrowed(&v[e])))
+                .collect()),
+            Self::Streamed {
+                layer_idx, pool, ..
+            } => {
+                let experts = pool.fetch_many(*layer_idx, ids)?;
+                Ok(ids
+                    .iter()
+                    .copied()
+                    .zip(experts.into_iter().map(ExpertHandle::Shared))
+                    .collect())
+            }
+        }
     }
 }
 

@@ -2087,6 +2087,7 @@ dependencies = [
  "candle-metal-kernels",
  "chrono",
  "half",
+ "libc",
  "lru",
  "memmap2",
  "minijinja",

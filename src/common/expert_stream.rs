@@ -99,44 +99,84 @@ impl StreamedExperts {
     }
 
     /// Returns expert `e` of layer `layer_idx`, fetching it from the mmap on a
-    /// cache miss. The returned `Arc` keeps the expert alive for the caller's
-    /// dispatch even if it is evicted concurrently.
-    ///
-    /// Eviction runs before insertion so the byte budget bounds the peak, and
-    /// each eviction batch is followed by a Metal drain: dropped buffers are
-    /// only reclaimed at sync points (see the two-phase note in
-    /// [`ModelWeights::load`](super::weights::ModelWeights::load)).
+    /// cache miss. Test-only convenience over [`fetch_many`](Self::fetch_many),
+    /// which production dispatch always uses.
     ///
     /// ## Errors
-    /// Fails if a tensor is missing from the checkpoint, malformed, or a cast
-    /// or device transfer fails.
-    pub(crate) fn fetch(&self, layer_idx: usize, e: usize) -> Result<Arc<MoeExpert>> {
-        let key = (layer_idx as u32, e as u32);
+    /// As [`fetch_many`](Self::fetch_many).
+    #[cfg(test)]
+    fn fetch(&self, layer_idx: usize, e: usize) -> Result<Arc<MoeExpert>> {
+        Ok(self.fetch_many(layer_idx, &[e])?.pop().expect("one id in"))
+    }
+
+    /// Returns the requested experts of `layer_idx` in the order of `ids`,
+    /// fetching cache misses from the mmap. The returned `Arc`s keep the
+    /// experts alive for the caller's dispatch even across evictions.
+    ///
+    /// Misses are built in ascending id order, which is disk order for
+    /// stacked expert tensors, so a multi-miss batch reads the file mostly
+    /// sequentially. Host-to-device uploads are synchronous memcpys into
+    /// fresh buffers (candle's `new_buffer_with_data`) and need no
+    /// synchronization; the one Metal drain per batch happens after
+    /// evictions, because an evicted expert's buffers return to candle's
+    /// pool and must not be reused while queued commands may still read
+    /// them. Eviction runs after insertion, so the transient peak is the
+    /// budget plus the batch being inserted.
+    ///
+    /// ## Errors
+    /// Fails if a tensor is missing from the checkpoint, malformed, or a
+    /// cast or device transfer fails.
+    pub(crate) fn fetch_many(
+        &self,
+        layer_idx: usize,
+        ids: &[usize],
+    ) -> Result<Vec<Arc<MoeExpert>>> {
         let mut state = self.state.lock().unwrap();
         state.clock += 1;
         let clock = state.clock;
-        if let Some(entry) = state.cache.get_mut(&key) {
-            entry.last_use = clock;
-            let expert = Arc::clone(&entry.expert);
-            state.hits += 1;
-            return Ok(expert);
-        }
-        state.misses += 1;
 
-        let (expert, bytes) = match self.layout {
-            ExpertLayout::Standard => self.build_standard(layer_idx, e)?,
-            ExpertLayout::GptOss { swiglu_limit } => {
-                self.build_gpt_oss(layer_idx, e, swiglu_limit)?
+        let mut misses: Vec<usize> = Vec::new();
+        for &e in ids {
+            let key = (layer_idx as u32, e as u32);
+            if let Some(entry) = state.cache.get_mut(&key) {
+                entry.last_use = clock;
+                state.hits += 1;
+            } else if !misses.contains(&e) {
+                misses.push(e);
             }
-        };
+        }
+        misses.sort_unstable();
+
+        for &e in &misses {
+            self.advise_expert(layer_idx, e);
+        }
+        for &e in &misses {
+            state.misses += 1;
+            let (expert, bytes) = match self.layout {
+                ExpertLayout::Standard => self.build_standard(layer_idx, e)?,
+                ExpertLayout::GptOss { swiglu_limit } => {
+                    self.build_gpt_oss(layer_idx, e, swiglu_limit)?
+                }
+            };
+            state.bytes += bytes;
+            state.cache.insert(
+                (layer_idx as u32, e as u32),
+                CacheEntry {
+                    expert: Arc::new(expert),
+                    bytes,
+                    last_use: clock,
+                },
+            );
+        }
 
         let mut evicted = false;
-        while state.bytes + bytes > self.cache_bytes && !state.cache.is_empty() {
+        while state.bytes > self.cache_bytes && state.cache.len() > ids.len() {
             let (&victim, _) = state
                 .cache
                 .iter()
+                .filter(|(_, entry)| entry.last_use != clock)
                 .min_by_key(|(_, entry)| entry.last_use)
-                .expect("non-empty cache");
+                .expect("cache larger than current batch");
             let entry = state.cache.remove(&victim).expect("victim exists");
             state.bytes -= entry.bytes;
             drop(entry);
@@ -147,17 +187,72 @@ impl StreamedExperts {
                 .map_err(|e| candle_core::Error::Msg(format!("{e:#}")))?;
         }
 
-        let expert = Arc::new(expert);
-        state.bytes += bytes;
-        state.cache.insert(
-            key,
-            CacheEntry {
-                expert: Arc::clone(&expert),
-                bytes,
-                last_use: clock,
-            },
-        );
-        Ok(expert)
+        ids.iter()
+            .map(|&e| {
+                let key = (layer_idx as u32, e as u32);
+                Ok(Arc::clone(
+                    &state.cache.get(&key).expect("just inserted or hit").expert,
+                ))
+            })
+            .collect()
+    }
+
+    /// Asks the kernel to page in every mmap slice of the given expert
+    /// asynchronously (`madvise(MADV_WILLNEED)` on the page-aligned range),
+    /// so the builds that follow copy from resident pages instead of
+    /// fault-clustering through the file 16 KB at a time. Purely advisory:
+    /// lookup or syscall failures are ignored, the build path re-reads
+    /// authoritatively.
+    fn advise_expert(&self, layer_idx: usize, e: usize) {
+        let advise = |name: &str, row: Option<usize>| {
+            let Ok(view) = self.mmap.get(name) else {
+                return;
+            };
+            let data = view.data();
+            let (ptr, len) = match row {
+                Some(r) => {
+                    let dims = view.shape();
+                    if dims.is_empty() || r >= dims[0] || data.is_empty() {
+                        return;
+                    }
+                    let row_bytes = data.len() / dims[0];
+                    (data[r * row_bytes..].as_ptr(), row_bytes)
+                }
+                None => (data.as_ptr(), data.len()),
+            };
+            unsafe {
+                let page = libc::sysconf(libc::_SC_PAGESIZE) as usize;
+                let addr = ptr as usize;
+                let aligned = addr & !(page - 1);
+                libc::madvise(
+                    aligned as *mut libc::c_void,
+                    len + (addr - aligned),
+                    libc::MADV_WILLNEED,
+                );
+            }
+        };
+        match self.layout {
+            ExpertLayout::Standard => {
+                let p = format!("model.layers.{layer_idx}.mlp.experts.{e}");
+                for proj in ["gate_proj", "up_proj", "down_proj"] {
+                    advise(&format!("{p}.{proj}.weight"), None);
+                    advise(&format!("{p}.{proj}.weight_scale_inv"), None);
+                }
+            }
+            ExpertLayout::GptOss { .. } => {
+                let p = format!("model.layers.{layer_idx}.mlp.experts");
+                for t in [
+                    "gate_up_proj_blocks",
+                    "gate_up_proj_scales",
+                    "gate_up_proj_bias",
+                    "down_proj_blocks",
+                    "down_proj_scales",
+                    "down_proj_bias",
+                ] {
+                    advise(&format!("{p}.{t}"), Some(e));
+                }
+            }
+        }
     }
 
     /// `(hits, misses, resident_bytes)` since construction, for logging.
@@ -470,6 +565,53 @@ mod tests {
                 .unwrap();
             let got = row.flatten_all().unwrap().to_vec1::<u8>().unwrap();
             assert_eq!(got, want, "row {e}");
+        }
+    }
+
+    /// Contract: a mixed hit/miss batch returns experts in the order of
+    /// `ids`, deduplicates repeated ids, and each returned expert behaves
+    /// identically to one obtained through a sequential single fetch.
+    #[test]
+    fn fetch_many_preserves_order_and_matches_sequential() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_synthetic_checkpoint(dir.path());
+
+        let batched = pool_over(&path, usize::MAX);
+        let sequential = pool_over(&path, usize::MAX);
+
+        sequential.fetch(0, 1).unwrap();
+        batched.fetch(0, 1).unwrap();
+
+        let many = batched.fetch_many(0, &[2, 1, 0, 2]).unwrap();
+        assert_eq!(many.len(), 4);
+        assert!(Arc::ptr_eq(&many[0], &many[3]), "duplicate id, same expert");
+        let (hits, misses, _) = batched.stats();
+        assert_eq!(
+            (hits, misses),
+            (1, 3),
+            "one warm hit; the pre-warm miss plus two batch builds; a \
+             duplicated miss id within one batch is a single build"
+        );
+
+        let x_data: Vec<f32> = (0..2 * 8).map(|i| (i as f32 * 0.29).cos()).collect();
+        let x = Tensor::from_vec(x_data, (2, 8), &Device::Cpu).unwrap();
+        for (slot, e) in [(0usize, 2usize), (1, 1), (2, 0)] {
+            let seq = sequential.fetch(0, e).unwrap();
+            let a = many[slot]
+                .forward(&x, Activation::SiLU)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            let b = seq
+                .forward(&x, Activation::SiLU)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            assert_eq!(a, b, "expert {e}");
         }
     }
 

@@ -403,14 +403,18 @@ impl ModelWeights {
             drain_metal(device, "post-load")?;
         }
 
-        let expert_pool = stream.map(|cfg| {
-            std::sync::Arc::new(crate::common::expert_stream::StreamedExperts::new(
-                mmap,
-                cfg,
-                device.clone(),
-                dtype,
-            ))
-        });
+        let expert_pool = match stream {
+            Some(cfg) => Some(std::sync::Arc::new(
+                crate::common::expert_stream::StreamedExperts::new(
+                    paths,
+                    cfg,
+                    device.clone(),
+                    dtype,
+                )
+                .map_err(|e| anyhow::anyhow!("expert stream pool: {e:#}"))?,
+            )),
+            None => None,
+        };
 
         Ok(Self {
             tensors,

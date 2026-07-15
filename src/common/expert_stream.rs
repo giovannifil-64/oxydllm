@@ -115,13 +115,7 @@ impl StreamedExperts {
         for (fi, path) in paths.iter().enumerate() {
             let file = File::open(path)
                 .map_err(|e| candle_core::Error::Msg(format!("open {path}: {e}")))?;
-            unsafe {
-                libc::fcntl(
-                    std::os::unix::io::AsRawFd::as_raw_fd(&file),
-                    libc::F_NOCACHE,
-                    1,
-                );
-            }
+            set_nocache(&file);
             let mut len_bytes = [0u8; 8];
             file.read_exact_at(&mut len_bytes, 0)
                 .map_err(|e| candle_core::Error::Msg(format!("read header size {path}: {e}")))?;
@@ -523,6 +517,24 @@ impl StreamedExperts {
 fn tensor_bytes(t: &Tensor) -> usize {
     t.elem_count() * t.dtype().size_in_bytes()
 }
+
+/// Opts the file out of the page cache (`fcntl` + `F_NOCACHE`), so expert
+/// re-reads do not keep a kernel-side copy of the pool competing with the
+/// LRU for memory. Darwin-only: on other platforms reads simply go through
+/// the page cache, which stays correct.
+#[cfg(target_os = "macos")]
+fn set_nocache(file: &File) {
+    unsafe {
+        libc::fcntl(
+            std::os::unix::io::AsRawFd::as_raw_fd(file),
+            libc::F_NOCACHE,
+            1,
+        );
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn set_nocache(_file: &File) {}
 
 /// Maps a safetensors header dtype string to candle's [`DType`].
 fn st_dtype(dtype: &str, name: &str) -> Result<DType> {

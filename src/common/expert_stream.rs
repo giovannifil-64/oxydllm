@@ -210,9 +210,15 @@ impl StreamedExperts {
     /// fetching cache misses from the mmap. The returned `Arc`s keep the
     /// experts alive for the caller's dispatch even across evictions.
     ///
-    /// Misses are built in ascending id order, which is disk order for
-    /// stacked expert tensors, so a multi-miss batch reads the files mostly
-    /// sequentially through the uncached positioned-read path. Host-to-device
+    /// Misses are read and built in parallel (reads one task per tensor,
+    /// dtype conversion one task per expert): FP8 checkpoints pay a CPU
+    /// dequantization per fetched expert that would otherwise serialize.
+    /// Parallel device uploads are safe here because they are synchronous
+    /// memcpys guarded by the allocation lock and the forward thread is
+    /// blocked inside this call, so nothing encodes GPU work concurrently.
+    /// Miss ids are sorted ascending, which is disk order for stacked expert
+    /// tensors, so a multi-miss batch reads the files mostly sequentially
+    /// through the uncached positioned-read path. Host-to-device
     /// uploads are synchronous memcpys into fresh buffers (candle's
     /// `new_buffer_with_data`) and need no synchronization; the one Metal
     /// drain per batch happens after evictions, because an evicted expert's
@@ -245,14 +251,21 @@ impl StreamedExperts {
         misses.sort_unstable();
 
         let reads = self.read_misses(layer_idx, &misses)?;
-        for (&e, tensors) in misses.iter().zip(reads) {
+        let built: Vec<(MoeExpert, usize)> = {
+            use rayon::prelude::*;
+            misses
+                .par_iter()
+                .zip(reads.into_par_iter())
+                .map(|(&e, tensors)| match self.layout {
+                    ExpertLayout::Standard => self.build_standard(tensors),
+                    ExpertLayout::GptOss { swiglu_limit } => {
+                        self.build_gpt_oss(layer_idx, e, swiglu_limit, tensors)
+                    }
+                })
+                .collect::<Result<_>>()?
+        };
+        for (&e, (expert, bytes)) in misses.iter().zip(built) {
             state.misses += 1;
-            let (expert, bytes) = match self.layout {
-                ExpertLayout::Standard => self.build_standard(tensors)?,
-                ExpertLayout::GptOss { swiglu_limit } => {
-                    self.build_gpt_oss(layer_idx, e, swiglu_limit, tensors)?
-                }
-            };
             state.bytes += bytes;
             state.cache.insert(
                 (layer_idx as u32, e as u32),

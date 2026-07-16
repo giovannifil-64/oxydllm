@@ -652,6 +652,68 @@ mod tests {
         assert_eq!(cfg.head_dim, 128);
     }
 
+    /// Contract: the Qwen3.6 MoE hybrid config parses into a blueprint with
+    /// the qwen3_5 mechanisms (hybrid layer types, gated attention, partial
+    /// RoPE, Gemma norms) plus the MoE fields, with top-k renormalisation
+    /// defaulted on as in the reference modeling code.
+    #[test]
+    fn parses_qwen3_5_moe_hybrid_config() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("config.json");
+        let config = json!({
+            "architectures": ["Qwen3_5MoeForConditionalGeneration"],
+            "text_config": {
+                "hidden_size": 2048,
+                "num_hidden_layers": 8,
+                "num_attention_heads": 16,
+                "num_key_value_heads": 2,
+                "head_dim": 256,
+                "vocab_size": 248320,
+                "num_experts": 256,
+                "num_experts_per_tok": 8,
+                "moe_intermediate_size": 512,
+                "shared_expert_intermediate_size": 512,
+                "full_attention_interval": 4,
+                "layer_types": [
+                    "linear_attention", "linear_attention", "linear_attention",
+                    "full_attention", "linear_attention", "linear_attention",
+                    "linear_attention", "full_attention"
+                ],
+                "linear_conv_kernel_dim": 4,
+                "linear_key_head_dim": 128,
+                "linear_num_key_heads": 16,
+                "linear_num_value_heads": 32,
+                "linear_value_head_dim": 128,
+                "rms_norm_eps": 1e-6,
+                "tie_word_embeddings": false,
+                "rope_parameters": {
+                    "mrope_interleaved": true,
+                    "mrope_section": [11, 11, 10],
+                    "partial_rotary_factor": 0.25,
+                    "rope_theta": 10000000,
+                    "rope_type": "default"
+                },
+                "quantization_config": {"quant_method": "fp8", "fmt": "e4m3"}
+            }
+        });
+        fs::write(&config_path, serde_json::to_string_pretty(&config).unwrap()).unwrap();
+
+        let cfg = parse(config_path.to_string_lossy().as_ref()).unwrap();
+        assert_eq!(cfg.moe_num_experts, Some(256));
+        assert_eq!(cfg.moe_num_experts_per_tok, Some(8));
+        assert!(!cfg.moe_gpt_oss);
+        assert!(cfg.quant_scheme.is_none(), "fp8 runs on the dense loader");
+        let block = cfg.block_config();
+        let moe = block.moe.expect("MoE config present");
+        assert!(moe.norm_topk_prob, "qwen3_5_moe always renormalises top-k");
+        assert!(
+            cfg.linear_attn.is_some(),
+            "hybrid GDN parameters parsed (loader applies them per layer)"
+        );
+        let types = cfg.layer_types.as_ref().expect("layer types");
+        assert_eq!(types.len(), 8);
+    }
+
     #[test]
     fn parse_longrope_scaling_from_config() {
         let v = json!({

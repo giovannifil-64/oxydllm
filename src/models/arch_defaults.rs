@@ -167,16 +167,20 @@ pub fn arch_defaults(arch: &str) -> Option<ArchDefaults> {
         // activation SiLU; embeddings unscaled. Hybrid layout comes from
         // `layer_types`; gate/partial-RoPE from
         // `attn_output_gate`/`partial_rotary_factor`.
-        "qwen3_5" | "qwen3_5_text" | "Qwen3_5ForConditionalGeneration" | "Qwen3_5ForCausalLM" => {
-            Some(ArchDefaults {
-                qk_norm: true,
-                norm_type: NormType::Gemma,
-                default_rope_theta: 10_000_000.0,
-                extra_eos_ids: &[],
-                attn_output_gate: true,
-                ..llama_defaults()
-            })
-        }
+        "qwen3_5"
+        | "qwen3_5_text"
+        | "Qwen3_5ForConditionalGeneration"
+        | "Qwen3_5ForCausalLM"
+        | "qwen3_5_moe"
+        | "Qwen3_5MoeForConditionalGeneration"
+        | "Qwen3_5MoeForCausalLM" => Some(ArchDefaults {
+            qk_norm: true,
+            norm_type: NormType::Gemma,
+            default_rope_theta: 10_000_000.0,
+            extra_eos_ids: &[],
+            attn_output_gate: true,
+            ..llama_defaults()
+        }),
         // GGUF flavour of the same arch: llama.cpp's converter bakes the +1
         // into every norm weight (except the DeltaNet gated norm), so the
         // runtime must NOT re-shift; Standard norms here. Hybrid layout

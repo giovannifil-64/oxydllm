@@ -40,6 +40,9 @@
 //! `OlmoeForCausalLM` convention:
 //!   * Router: `model.layers.{layer}.mlp.gate.weight`
 //!   * Per-expert: `model.layers.{layer}.mlp.experts.{e}.{gate,up,down}_proj.weight`
+//!   * Optional shared expert (Qwen3.5-MoE):
+//!     `mlp.shared_expert.{gate,up,down}_proj.weight` + `mlp.shared_expert_gate.weight`,
+//!     auto-detected from tensor presence
 //!
 //! Mixtral's `block_sparse_moe.experts.{e}.{w1,w2,w3}` naming is **not**
 //! supported in this first cut.
@@ -182,6 +185,17 @@ impl ExpertBank {
     }
 }
 
+/// The always-active shared expert of Qwen-MoE-style layers.
+///
+/// Runs on every token next to the routed experts; its output is scaled by a
+/// per-token sigmoid gate (`mlp.shared_expert_gate`, one logit per token) and
+/// added to the routed output:
+/// `out = routed + sigmoid(gate(x)) * shared(x)`.
+struct SharedExpert {
+    expert: MoeExpert,
+    gate: AnyLinear,
+}
+
 /// A sparse Mixture-of-Experts feed-forward layer.
 ///
 /// A linear `router` scores the experts per token; the top `top_k` are run and
@@ -193,6 +207,7 @@ impl ExpertBank {
 pub struct MoeFeedForward {
     router: AnyLinear,
     experts: ExpertBank,
+    shared: Option<SharedExpert>,
     top_k: usize,
     activation: Activation,
     norm_topk: bool,
@@ -232,6 +247,30 @@ impl MoeFeedForward {
             .clone();
         let router = AnyLinear::from_weight(router_w, None)?;
 
+        let shared = match weights.try_get(&format!("{p}.shared_expert.gate_proj.weight")) {
+            None => None,
+            Some(gate_w) => {
+                let gate_w = gate_w.clone();
+                let up = weights
+                    .get(&format!("{p}.shared_expert.up_proj.weight"))?
+                    .clone();
+                let down = weights
+                    .get(&format!("{p}.shared_expert.down_proj.weight"))?
+                    .clone();
+                let gate_logit = weights
+                    .get(&format!("{p}.shared_expert_gate.weight"))?
+                    .clone();
+                Some(SharedExpert {
+                    expert: MoeExpert::Standard {
+                        gate_proj: AnyLinear::from_weight(gate_w, None)?,
+                        up_proj: AnyLinear::from_weight(up, None)?,
+                        down_proj: AnyLinear::from_weight(down, None)?,
+                    },
+                    gate: AnyLinear::from_weight(gate_logit, None)?,
+                })
+            }
+        };
+
         let experts = if let Some(pool) = weights.expert_pool() {
             ExpertBank::Streamed {
                 layer_idx,
@@ -257,6 +296,7 @@ impl MoeFeedForward {
         Ok(Self {
             router,
             experts,
+            shared,
             top_k,
             activation,
             norm_topk,
@@ -295,6 +335,7 @@ impl MoeFeedForward {
                     num_experts,
                     pool,
                 },
+                shared: None,
                 top_k,
                 activation: Activation::SiLU,
                 norm_topk: true,
@@ -349,6 +390,7 @@ impl MoeFeedForward {
         Ok(Self {
             router,
             experts: ExpertBank::Resident(experts),
+            shared: None,
             top_k,
             activation: Activation::SiLU,
             norm_topk: true,
@@ -390,11 +432,17 @@ impl MoeFeedForward {
             top_vals
         };
 
-        let out = if n_tokens > self.top_k {
+        let mut out = if n_tokens > self.top_k {
             self.dispatch_sparse(&x_flat, &top_idx, &top_vals, n_tokens, hidden)?
         } else {
             self.dispatch_naive(&x_flat, &top_idx, &top_vals, n_tokens, hidden)?
         };
+        if let Some(shared) = &self.shared {
+            let shared_out = shared.expert.forward(&x_flat, self.activation)?;
+            let logit = shared.gate.forward(&x_flat)?;
+            let gate = (logit.neg()?.exp()?.affine(1.0, 1.0)?).recip()?;
+            out = (out + shared_out.broadcast_mul(&gate)?)?;
+        }
         out.reshape(original_shape)
     }
 
@@ -552,6 +600,7 @@ mod tests {
         Ok(MoeFeedForward {
             router,
             experts: ExpertBank::Resident(experts),
+            shared: None,
             top_k,
             activation: Activation::SiLU,
             norm_topk: true,
@@ -712,6 +761,55 @@ mod tests {
         let sparse = moe.dispatch_sparse(&x_flat, &top_idx, &top_vals, 2, hidden)?;
         let diff = (naive - sparse)?.abs()?.max_all()?.to_scalar::<f32>()?;
         assert!(diff < 1e-5, "naive vs sparse max_abs_diff = {diff}");
+        Ok(())
+    }
+
+    /// Contract: with a shared expert attached, the layer output equals the
+    /// routed-only output plus `sigmoid(gate(x)) * shared(x)`, computed
+    /// independently.
+    #[test]
+    fn shared_expert_adds_sigmoid_gated_contribution() -> Result<()> {
+        let device = Device::Cpu;
+        let (hidden, intermediate) = (8, 16);
+        let mut moe = build_synth_moe(&device, hidden, intermediate, 4, 2, 0xfeed)?;
+
+        let mk = |rows: usize, cols: usize, off: u64| -> Result<Tensor> {
+            let data: Vec<f32> = (0..rows * cols)
+                .map(|i| {
+                    let raw = (i as u64).wrapping_mul(2654435761).wrapping_add(off);
+                    ((raw & 0xFFFF) as f32 / 65535.0 - 0.5) * 0.1
+                })
+                .collect();
+            Tensor::from_vec(data, (rows, cols), &device)
+        };
+        let shared = SharedExpert {
+            expert: MoeExpert::Standard {
+                gate_proj: AnyLinear::Float(Linear::new(mk(intermediate, hidden, 7)?, None)?),
+                up_proj: AnyLinear::Float(Linear::new(mk(intermediate, hidden, 8)?, None)?),
+                down_proj: AnyLinear::Float(Linear::new(mk(hidden, intermediate, 9)?, None)?),
+            },
+            gate: AnyLinear::Float(Linear::new(mk(1, hidden, 10)?, None)?),
+        };
+
+        let x_data: Vec<f32> = (0..3 * hidden).map(|i| (i as f32 * 0.11).sin()).collect();
+        let x = Tensor::from_vec(x_data, (1, 3, hidden), &device)?;
+        let routed_only = moe.forward(&x)?;
+
+        let x_flat = x.reshape((3, hidden))?.contiguous()?;
+        let shared_out = shared.expert.forward(&x_flat, Activation::SiLU)?;
+        let logit = shared.gate.forward(&x_flat)?;
+        let sig = (logit.neg()?.exp()?.affine(1.0, 1.0)?).recip()?;
+        let expected = (routed_only.reshape((3, hidden))? + shared_out.broadcast_mul(&sig)?)?
+            .reshape((1, 3, hidden))?;
+
+        moe.shared = Some(shared);
+        let with_shared = moe.forward(&x)?;
+
+        let diff = (with_shared - expected)?
+            .abs()?
+            .max_all()?
+            .to_scalar::<f32>()?;
+        assert!(diff < 1e-6, "max_abs_diff = {diff}");
         Ok(())
     }
 

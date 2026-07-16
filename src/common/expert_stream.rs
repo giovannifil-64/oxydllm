@@ -47,6 +47,16 @@ pub struct ExpertStreamConfig {
     pub cache_bytes: usize,
 }
 
+/// Canonicalizes a multimodal-nested tensor name: the loaders address
+/// tensors as `model.layers.*`, while multimodal checkpoints (Qwen3.5 family)
+/// store the text model under `model.language_model.*`.
+fn canonical_name(name: &str) -> String {
+    match name.strip_prefix("model.language_model.") {
+        Some(rest) => format!("model.{rest}"),
+        None => name.to_string(),
+    }
+}
+
 /// Marks the tensors that are skipped at load and served by the streamer
 /// instead. Routers (`mlp.gate` / `mlp.router`) and shared experts
 /// (`mlp.shared_expert`) do not match and stay resident.
@@ -130,9 +140,14 @@ impl StreamedExperts {
                 .as_object()
                 .ok_or_else(|| candle_core::Error::Msg(format!("{path}: header not an object")))?;
             for (name, meta) in entries {
-                if name == "__metadata__" || !is_streamed_expert_tensor(name) {
+                if name == "__metadata__"
+                    || !is_streamed_expert_tensor(name)
+                    || name.starts_with("model.visual.")
+                    || name.starts_with("mtp.")
+                {
                     continue;
                 }
+                let canonical = canonical_name(name);
                 let get = |k: &str| {
                     meta.get(k).ok_or_else(|| {
                         candle_core::Error::Msg(format!("{path}: {name} missing {k}"))
@@ -151,7 +166,7 @@ impl StreamedExperts {
                         candle_core::Error::Msg(format!("{path}: {name} bad data_offsets"))
                     })?;
                 index.insert(
-                    name.clone(),
+                    canonical,
                     TensorMeta {
                         file: fi as u32,
                         offset: data_start + offs.0,

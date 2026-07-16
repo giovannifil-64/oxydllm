@@ -3743,6 +3743,45 @@ GPTQ_DET_BATCH_KERNEL(gptq8_gemv_batch_bf16, bfloat, 8)
 // there is no infinity encoding.
 // ─────────────────────────────────────────────────────────────────────────────
 
+// Block-scaled F8E4M3 to BF16 dequantization for streamed FP8 experts.
+// Replicates the resident loader's cast chain bit-for-bit: the F8 value is
+// first rounded to BF16 (the loader materializes the BF16 tensor before the
+// scale fold), then re-widened to F32, multiplied by the block scale in F32,
+// and rounded back to BF16.
+kernel void f8_block_dequant_bf16(
+    device const uchar* input   [[buffer(0)]],
+    device const float* scales  [[buffer(1)]],
+    device bfloat*      output  [[buffer(2)]],
+    constant uint&      cols    [[buffer(3)]],
+    constant uint&      n       [[buffer(4)]],
+    constant uint&      block_r [[buffer(5)]],
+    constant uint&      block_c [[buffer(6)]],
+    constant uint&      s_cols  [[buffer(7)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= n) {
+        return;
+    }
+    uchar v = input[gid];
+    uint s = v >> 7;
+    uint e = (v >> 3) & 0xFu;
+    uint m = v & 0x7u;
+    float val;
+    if (e == 0u) {
+        val = ldexp(float(m) * 0.125f, -6);
+    } else if (e == 15u && m == 7u) {
+        val = NAN;
+    } else {
+        val = ldexp(1.0f + float(m) * 0.125f, int(e) - 7);
+    }
+    val = s != 0u ? -val : val;
+    bfloat w = bfloat(val);
+    uint r = gid / cols;
+    uint c = gid - r * cols;
+    float sc = scales[(r / block_r) * s_cols + (c / block_c)];
+    output[gid] = bfloat(float(w) * sc);
+}
+
 kernel void cast_f8e4m3_f32(
     device const uchar* input  [[buffer(0)]],
     device float*       output [[buffer(1)]],

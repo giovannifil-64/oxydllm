@@ -47,6 +47,19 @@ pub struct ExpertStreamConfig {
     pub cache_bytes: usize,
 }
 
+/// Serializes Metal command encoding across the parallel expert-build tasks.
+///
+/// The streamed FP8 fast path dispatches a dequantization kernel from inside
+/// rayon workers; candle 0.11 corrupts state when two threads encode
+/// concurrently (the same landmine documented in `ModelWeights::load`), so
+/// every kernel dispatch in the build phase takes this lock. Uploads need
+/// only the allocation lock: they are synchronous memcpys, not commands.
+#[cfg(feature = "metal")]
+fn dequant_encode_lock() -> &'static Mutex<()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    &LOCK
+}
+
 /// Canonicalizes a multimodal-nested tensor name: the loaders address
 /// tensors as `model.layers.*`, while multimodal checkpoints (Qwen3.5 family)
 /// store the text model under `model.language_model.*`.
@@ -76,7 +89,22 @@ struct LruState {
     bytes: usize,
     hits: u64,
     misses: u64,
+    graveyard: Vec<Arc<MoeExpert>>,
+    graveyard_bytes: usize,
 }
+
+/// Deferred-reclamation threshold for evicted experts.
+///
+/// candle's Metal buffer pool reuses any buffer whose strong count drops to
+/// one with no completion check, so an evicted expert's buffers must not be
+/// released while queued commands may still read them. Instead of paying one
+/// full-pipeline drain per eviction batch, evicted `Arc`s are parked in a
+/// graveyard (the reference count keeps their buffers unreusable, which is
+/// hazard-free without any synchronization) and released together behind a
+/// single drain once this many bytes accumulate. The transient memory peak is
+/// the cache budget plus this threshold, covered by the auto-sizer's
+/// headroom.
+const GRAVEYARD_DRAIN_BYTES: usize = 512 << 20;
 
 /// One tensor as read from disk: typing plus its raw bytes.
 struct RawRead {
@@ -191,6 +219,8 @@ impl StreamedExperts {
                 bytes: 0,
                 hits: 0,
                 misses: 0,
+                graveyard: Vec::new(),
+                graveyard_bytes: 0,
             }),
         })
     }
@@ -277,7 +307,6 @@ impl StreamedExperts {
             );
         }
 
-        let mut evicted = false;
         while state.bytes > self.cache_bytes && state.cache.len() > ids.len() {
             let (&victim, _) = state
                 .cache
@@ -287,12 +316,14 @@ impl StreamedExperts {
                 .expect("cache larger than current batch");
             let entry = state.cache.remove(&victim).expect("victim exists");
             state.bytes -= entry.bytes;
-            drop(entry);
-            evicted = true;
+            state.graveyard_bytes += entry.bytes;
+            state.graveyard.push(entry.expert);
         }
-        if evicted {
-            drain_metal(&self.device, "expert eviction")
+        if state.graveyard_bytes >= GRAVEYARD_DRAIN_BYTES {
+            drain_metal(&self.device, "expert graveyard reclamation")
                 .map_err(|e| candle_core::Error::Msg(format!("{e:#}")))?;
+            state.graveyard.clear();
+            state.graveyard_bytes = 0;
         }
 
         ids.iter()
@@ -427,6 +458,30 @@ impl StreamedExperts {
                 .is_metal()
                 .then(|| metal_alloc_lock().lock().unwrap());
             return Tensor::from_raw_buffer(&r.bytes, r.dtype, &r.dims, &self.device);
+        }
+        #[cfg(feature = "metal")]
+        if r.dtype == DType::F8E4M3
+            && self.dtype == DType::BF16
+            && self.device.is_metal()
+            && r.dims.len() == 2
+            && let Some(sc) = scale
+            && sc.dims.len() == 2
+            && sc.dims[0] > 0
+            && sc.dims[1] > 0
+            && r.dims[0].is_multiple_of(sc.dims[0])
+            && r.dims[1].is_multiple_of(sc.dims[1])
+        {
+            let scale_f32 = Tensor::from_raw_buffer(&sc.bytes, sc.dtype, &sc.dims, &Device::Cpu)?
+                .to_dtype(DType::F32)?;
+            let (bytes_dev, scales_dev) = {
+                let _guard = metal_alloc_lock().lock().unwrap();
+                (
+                    Tensor::from_raw_buffer(&r.bytes, DType::U8, &r.dims, &self.device)?,
+                    scale_f32.to_device(&self.device)?,
+                )
+            };
+            let _enc = dequant_encode_lock().lock().unwrap();
+            return crate::common::metal_ops::f8_block_dequant_bf16(&bytes_dev, &scales_dev);
         }
         let cpu = Tensor::from_raw_buffer(&r.bytes, r.dtype, &r.dims, &Device::Cpu)?;
         let cpu = if r.dtype == DType::F8E4M3 {

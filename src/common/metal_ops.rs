@@ -4028,6 +4028,69 @@ mod fused_kernel_parity_tests {
         run_gptq_dequant_parity(&dev, DType::BF16, 8, 256, 128, 128, "gptq8/bf16/g128");
     }
 
+    /// Contract: [`f8_block_dequant_bf16`] is bitwise identical to the
+    /// resident loader's CPU chain (F8 to F32 to BF16, then the F32 block
+    /// scale fold, then back to BF16) over every byte encoding and a
+    /// non-trivial scale grid. The streamed FP8 expert path relies on this
+    /// for output byte-identity with resident loads.
+    #[test]
+    fn f8_block_dequant_matches_cpu_chain() {
+        let Some(dev) = metal_device_or_skip() else {
+            return;
+        };
+        let (rows, cols) = (8usize, 256usize);
+        let bytes: Vec<u8> = (0..rows * cols)
+            .map(|i| {
+                let b = (i * 37 + 11) as u8;
+                // Avoid the NaN encoding 0bS1111111: NaN != NaN breaks compare.
+                if b & 0x7F == 0x7F { b ^ 0x08 } else { b }
+            })
+            .collect();
+        let scales: Vec<f32> = (0..4).map(|i| 0.5 + i as f32 * 0.75).collect();
+
+        let cpu_w =
+            Tensor::from_raw_buffer(&bytes, DType::F8E4M3, &[rows, cols], &Device::Cpu).unwrap();
+        let cpu_sc = Tensor::from_vec(scales.clone(), (2, 2), &Device::Cpu).unwrap();
+        let dequant = cpu_w
+            .to_dtype(DType::F32)
+            .unwrap()
+            .to_dtype(DType::BF16)
+            .unwrap();
+        let want: Vec<f32> = crate::common::weights::apply_scale_inv(
+            &dequant.to_dtype(DType::F32).unwrap(),
+            &cpu_sc,
+        )
+        .unwrap()
+        .to_dtype(DType::BF16)
+        .unwrap()
+        .to_dtype(DType::F32)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+
+        let m_w = Tensor::from_raw_buffer(&bytes, DType::U8, &[rows, cols], &dev).unwrap();
+        let m_sc = Tensor::from_vec(scales, (2, 2), &dev).unwrap();
+        let got: Vec<f32> = f8_block_dequant_bf16(&m_w, &m_sc)
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+
+        for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+            assert!(
+                g.to_bits() == w.to_bits(),
+                "elem {i}: kernel {g} (bits {:08x}) != cpu {w} (bits {:08x})",
+                g.to_bits(),
+                w.to_bits()
+            );
+        }
+    }
+
     /// Micro-benchmark for the quantized GEMV kernels on the layer shapes of
     /// the locally tested models (Qwen3-4B-AWQ, Qwen3-0.6B-GPTQ-Int8).
     /// Ignored by default; run explicitly when touching these kernels:
@@ -5126,6 +5189,105 @@ pub fn cast_f8e4m3_to_f32(t: &Tensor) -> Result<Tensor> {
     }
     let t = t.contiguous()?;
     t.apply_op1_no_bwd(&CastF8E4M3ToF32)
+}
+
+struct F8BlockDequantBf16;
+
+impl CustomOp2 for F8BlockDequantBf16 {
+    fn name(&self) -> &'static str {
+        "f8-block-dequant-bf16"
+    }
+
+    fn cpu_fwd(
+        &self,
+        _s1: &CpuStorage,
+        _l1: &Layout,
+        _s2: &CpuStorage,
+        _l2: &Layout,
+    ) -> Result<(CpuStorage, Shape)> {
+        candle_core::bail!("f8-block-dequant-bf16 is Metal-only")
+    }
+
+    fn metal_fwd(
+        &self,
+        w: &MetalStorage,
+        w_l: &Layout,
+        sc: &MetalStorage,
+        sc_l: &Layout,
+    ) -> Result<(MetalStorage, Shape)> {
+        if w.dtype() != DType::U8 || sc.dtype() != DType::F32 {
+            candle_core::bail!(
+                "f8-block-dequant-bf16: expected U8 bytes and F32 scales, got {:?}/{:?}",
+                w.dtype(),
+                sc.dtype()
+            );
+        }
+        if !w_l.is_contiguous() || !sc_l.is_contiguous() {
+            candle_core::bail!("f8-block-dequant-bf16: inputs must be contiguous");
+        }
+        let (rows, cols) = w_l.shape().dims2()?;
+        let (s_rows, s_cols) = sc_l.shape().dims2()?;
+        if s_rows == 0
+            || s_cols == 0
+            || !rows.is_multiple_of(s_rows)
+            || !cols.is_multiple_of(s_cols)
+        {
+            candle_core::bail!(
+                "f8-block-dequant-bf16: scale grid [{s_rows}, {s_cols}] does not tile weight [{rows}, {cols}]"
+            );
+        }
+        let n = rows * cols;
+        let device = w.device();
+        let output = device.new_buffer(n, DType::BF16, "f8_block_dequant_out")?;
+        let pipeline = get_or_compile_quant_pipeline(device.device(), "f8_block_dequant_bf16")?;
+        let encoder = device.command_encoder()?;
+        let encoder = encoder.as_ref();
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_input_buffer(0, Some(w.buffer()), w_l.start_offset());
+        encoder.set_input_buffer(
+            1,
+            Some(sc.buffer()),
+            sc_l.start_offset() * DType::F32.size_in_bytes(),
+        );
+        encoder.set_output_buffer(2, Some(&output), 0);
+        encoder.set_bytes(3, &(cols as u32));
+        encoder.set_bytes(4, &(n as u32));
+        encoder.set_bytes(5, &((rows / s_rows) as u32));
+        encoder.set_bytes(6, &((cols / s_cols) as u32));
+        encoder.set_bytes(7, &(s_cols as u32));
+        const TG: usize = 256;
+        encoder.dispatch_thread_groups(
+            MTLSize {
+                width: n.div_ceil(TG),
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: TG,
+                height: 1,
+                depth: 1,
+            },
+        );
+        Ok((
+            MetalStorage::new(output, device.clone(), n, DType::BF16),
+            w_l.shape().clone(),
+        ))
+    }
+}
+
+/// Dequantizes a block-scaled F8E4M3 weight straight to BF16 on the device.
+///
+/// `bytes` holds the raw F8 encodings as a U8 tensor of the weight's shape;
+/// `scales` is the F32 block-scale grid that tiles it. The kernel replicates
+/// the resident loader's cast chain bit-for-bit (BF16 rounding before the F32
+/// scale fold), so the result is byte-identical to the CPU dequantization in
+/// `ModelWeights::load`.
+///
+/// ## Errors
+/// Fails off-Metal, on non-2D inputs, or when the scale grid does not tile
+/// the weight evenly.
+pub fn f8_block_dequant_bf16(bytes: &Tensor, scales: &Tensor) -> Result<Tensor> {
+    bytes.apply_op2_no_bwd(scales, &F8BlockDequantBf16)
 }
 
 /// Decode matmul for x of shape [m, in_features] with 1 <= m <= GGUF_BATCH_MAX;

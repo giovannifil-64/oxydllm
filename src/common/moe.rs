@@ -74,6 +74,32 @@ pub(crate) enum MoeExpert {
         down: Mxfp4Linear,
         limit: f64,
     },
+    /// A streamed FP8 expert cached in its file encoding: raw F8 bytes plus
+    /// the F32 block-scale grid per projection, at half the bytes of the
+    /// dequantized form (double the experts per cache budget). Each use
+    /// dequantizes on the device and runs the exact ops of the `Standard`
+    /// path, so outputs stay byte-identical to a dequantize-at-fetch cache.
+    #[cfg(feature = "metal")]
+    Fp8Resident {
+        gate_proj: Fp8Cached,
+        up_proj: Fp8Cached,
+        down_proj: Fp8Cached,
+    },
+}
+
+/// One F8-encoded projection of an [`MoeExpert::Fp8Resident`] expert.
+#[cfg(feature = "metal")]
+pub(crate) struct Fp8Cached {
+    pub(crate) bytes: Tensor,
+    pub(crate) scales: Tensor,
+}
+
+#[cfg(feature = "metal")]
+impl Fp8Cached {
+    fn linear(&self) -> Result<crate::common::linear::Linear> {
+        let w = crate::common::metal_ops::f8_block_dequant_bf16(&self.bytes, &self.scales)?;
+        crate::common::linear::Linear::new(w, None)
+    }
 }
 
 const GPT_OSS_SWIGLU_ALPHA: f64 = 1.702;
@@ -96,6 +122,21 @@ impl MoeExpert {
                 };
                 let gated = (activated * up)?;
                 down_proj.forward(&gated)
+            }
+            #[cfg(feature = "metal")]
+            Self::Fp8Resident {
+                gate_proj,
+                up_proj,
+                down_proj,
+            } => {
+                let gate = gate_proj.linear()?.forward(x)?;
+                let up = up_proj.linear()?.forward(x)?;
+                let activated = match activation {
+                    Activation::SiLU => silu(&gate)?,
+                    Activation::GeLUTanh => gelu_tanh(&gate)?,
+                };
+                let gated = (activated * up)?;
+                down_proj.linear()?.forward(&gated)
             }
             Self::GptOss {
                 gate_up,
@@ -810,6 +851,75 @@ mod tests {
             .max_all()?
             .to_scalar::<f32>()?;
         assert!(diff < 1e-6, "max_abs_diff = {diff}");
+        Ok(())
+    }
+
+    /// Contract: an F8-resident expert's forward is bitwise identical to a
+    /// `Standard` expert built from the same weights dequantized up front
+    /// (the on-use kernel replays the resident cast chain, and the matmul
+    /// runs through the same `Linear` ops).
+    #[cfg(feature = "metal")]
+    #[test]
+    fn fp8_resident_expert_matches_standard() -> Result<()> {
+        let Ok(dev) = Device::new_metal(0) else {
+            return Ok(());
+        };
+        let (hidden, inter) = (128usize, 64usize);
+        let mk_proj = |rows: usize, cols: usize, salt: u8| -> Result<(Fp8Cached, AnyLinear)> {
+            let bytes: Vec<u8> = (0..rows * cols)
+                .map(|i| {
+                    let b = (i as u32 * 31 + salt as u32) as u8;
+                    if b & 0x7F == 0x7F { b ^ 0x08 } else { b }
+                })
+                .collect();
+            let scales: Vec<f32> = (0..4).map(|i| 0.25 + i as f32 * 0.5).collect();
+            let cpu_w =
+                Tensor::from_raw_buffer(&bytes, DType::F8E4M3, &[rows, cols], &Device::Cpu)?;
+            let cpu_sc = Tensor::from_vec(scales.clone(), (2, 2), &Device::Cpu)?;
+            let dequant = cpu_w.to_dtype(DType::F32)?.to_dtype(DType::BF16)?;
+            let folded =
+                crate::common::weights::apply_scale_inv(&dequant.to_dtype(DType::F32)?, &cpu_sc)?
+                    .to_dtype(DType::BF16)?
+                    .to_device(&dev)?;
+            let cached = Fp8Cached {
+                bytes: Tensor::from_raw_buffer(&bytes, DType::U8, &[rows, cols], &dev)?,
+                scales: Tensor::from_vec(scales, (2, 2), &dev)?,
+            };
+            Ok((cached, AnyLinear::from_weight(folded, None)?))
+        };
+
+        let (g8, gs) = mk_proj(inter, hidden, 3)?;
+        let (u8_, us) = mk_proj(inter, hidden, 5)?;
+        let (d8, ds) = mk_proj(hidden, inter, 7)?;
+        let fp8 = MoeExpert::Fp8Resident {
+            gate_proj: g8,
+            up_proj: u8_,
+            down_proj: d8,
+        };
+        let std_ = MoeExpert::Standard {
+            gate_proj: gs,
+            up_proj: us,
+            down_proj: ds,
+        };
+
+        let x_data: Vec<f32> = (0..2 * hidden).map(|i| (i as f32 * 0.07).sin()).collect();
+        let x = Tensor::from_vec(x_data, (2, hidden), &dev)?.to_dtype(DType::BF16)?;
+        let a: Vec<f32> = fp8
+            .forward(&x, Activation::SiLU)?
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1()?;
+        let b: Vec<f32> = std_
+            .forward(&x, Activation::SiLU)?
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1()?;
+        for (i, (x, y)) in a.iter().zip(&b).enumerate() {
+            assert!(
+                x.to_bits() == y.to_bits(),
+                "elem {i}: fp8 {x} != standard {y}"
+            );
+        }
         Ok(())
     }
 

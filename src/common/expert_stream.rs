@@ -47,19 +47,6 @@ pub struct ExpertStreamConfig {
     pub cache_bytes: usize,
 }
 
-/// Serializes Metal command encoding across the parallel expert-build tasks.
-///
-/// The streamed FP8 fast path dispatches a dequantization kernel from inside
-/// rayon workers; candle 0.11 corrupts state when two threads encode
-/// concurrently (the same landmine documented in `ModelWeights::load`), so
-/// every kernel dispatch in the build phase takes this lock. Uploads need
-/// only the allocation lock: they are synchronous memcpys, not commands.
-#[cfg(feature = "metal")]
-fn dequant_encode_lock() -> &'static Mutex<()> {
-    static LOCK: Mutex<()> = Mutex::new(());
-    &LOCK
-}
-
 /// Canonicalizes a multimodal-nested tensor name: the loaders address
 /// tensors as `model.layers.*`, while multimodal checkpoints (Qwen3.5 family)
 /// store the text model under `model.language_model.*`.
@@ -459,30 +446,6 @@ impl StreamedExperts {
                 .then(|| metal_alloc_lock().lock().unwrap());
             return Tensor::from_raw_buffer(&r.bytes, r.dtype, &r.dims, &self.device);
         }
-        #[cfg(feature = "metal")]
-        if r.dtype == DType::F8E4M3
-            && self.dtype == DType::BF16
-            && self.device.is_metal()
-            && r.dims.len() == 2
-            && let Some(sc) = scale
-            && sc.dims.len() == 2
-            && sc.dims[0] > 0
-            && sc.dims[1] > 0
-            && r.dims[0].is_multiple_of(sc.dims[0])
-            && r.dims[1].is_multiple_of(sc.dims[1])
-        {
-            let scale_f32 = Tensor::from_raw_buffer(&sc.bytes, sc.dtype, &sc.dims, &Device::Cpu)?
-                .to_dtype(DType::F32)?;
-            let (bytes_dev, scales_dev) = {
-                let _guard = metal_alloc_lock().lock().unwrap();
-                (
-                    Tensor::from_raw_buffer(&r.bytes, DType::U8, &r.dims, &self.device)?,
-                    scale_f32.to_device(&self.device)?,
-                )
-            };
-            let _enc = dequant_encode_lock().lock().unwrap();
-            return crate::common::metal_ops::f8_block_dequant_bf16(&bytes_dev, &scales_dev);
-        }
         let cpu = Tensor::from_raw_buffer(&r.bytes, r.dtype, &r.dims, &Device::Cpu)?;
         let cpu = if r.dtype == DType::F8E4M3 {
             cpu.to_dtype(DType::F32)?.to_dtype(self.dtype)?
@@ -516,8 +479,13 @@ impl StreamedExperts {
     /// Assembles a standard expert from its reads: each `*.weight` entry,
     /// optionally followed by its `*_scale_inv` companion, in gate/up/down
     /// order as produced by [`read_misses`](Self::read_misses).
+    ///
+    /// Block-scaled FP8 projections on a BF16 Metal target cache in their
+    /// file encoding ([`MoeExpert::Fp8Resident`]): half the bytes per expert,
+    /// so double the experts per cache budget, at the cost of an on-use
+    /// device dequantization that replays the exact resident cast chain.
     fn build_standard(&self, reads: Vec<RawRead>) -> Result<(MoeExpert, usize)> {
-        let mut projections = Vec::with_capacity(3);
+        let mut pairs: Vec<(&RawRead, Option<&RawRead>)> = Vec::with_capacity(3);
         let mut i = 0;
         while i < reads.len() {
             let weight = &reads[i];
@@ -525,6 +493,53 @@ impl StreamedExperts {
                 .get(i + 1)
                 .filter(|r| r.name.ends_with(".weight_scale_inv"));
             i += 1 + usize::from(scale.is_some());
+            pairs.push((weight, scale));
+        }
+
+        #[cfg(feature = "metal")]
+        if pairs.len() == 3
+            && self.dtype == DType::BF16
+            && self.device.is_metal()
+            && pairs.iter().all(|(w, sc)| {
+                w.dtype == DType::F8E4M3
+                    && w.dims.len() == 2
+                    && matches!(sc, Some(sc) if sc.dims.len() == 2
+                        && sc.dims[0] > 0
+                        && sc.dims[1] > 0
+                        && w.dims[0].is_multiple_of(sc.dims[0])
+                        && w.dims[1].is_multiple_of(sc.dims[1]))
+            })
+        {
+            let mut cached = Vec::with_capacity(3);
+            let mut bytes = 0usize;
+            for (w, sc) in &pairs {
+                let sc = sc.expect("checked above");
+                let scale_f32 =
+                    Tensor::from_raw_buffer(&sc.bytes, sc.dtype, &sc.dims, &Device::Cpu)?
+                        .to_dtype(DType::F32)?;
+                let _guard = metal_alloc_lock().lock().unwrap();
+                let proj = crate::common::moe::Fp8Cached {
+                    bytes: Tensor::from_raw_buffer(&w.bytes, DType::U8, &w.dims, &self.device)?,
+                    scales: scale_f32.to_device(&self.device)?,
+                };
+                bytes += tensor_bytes(&proj.bytes) + tensor_bytes(&proj.scales);
+                cached.push(proj);
+            }
+            let down_proj = cached.pop().expect("three projections");
+            let up_proj = cached.pop().expect("three projections");
+            let gate_proj = cached.pop().expect("three projections");
+            return Ok((
+                MoeExpert::Fp8Resident {
+                    gate_proj,
+                    up_proj,
+                    down_proj,
+                },
+                bytes,
+            ));
+        }
+
+        let mut projections = Vec::with_capacity(3);
+        for (weight, scale) in pairs {
             projections.push(self.tensor_from_read(weight, scale)?);
         }
         let [gate, up, down]: [Tensor; 3] = projections.try_into().map_err(|_| {

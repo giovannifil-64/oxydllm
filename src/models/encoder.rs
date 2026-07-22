@@ -1,17 +1,22 @@
-//! Encoder-only models (BERT / RoBERTa family) for text embeddings.
+//! Embedding models: BERT/RoBERTa encoders and causal (decoder-based)
+//! embedders like Qwen3-Embedding.
 //!
-//! A self-contained runtime, deliberately separate from the decoder engine:
-//! encoders need bidirectional attention with no KV cache, LayerNorm with
-//! bias, absolute position embeddings, and exact (erf) GELU, none of which
-//! the paged decode path provides. [`EncoderModel::embed`] runs one sequence
-//! through the stack and returns the pooled, L2-normalised sentence
-//! embedding as sentence-transformers computes it (CLS pooling for the
-//! granite-embedding r1 family).
+//! A self-contained runtime, deliberately separate from the decode engine:
+//! embedding forwards are single full-sequence passes with no KV cache, and
+//! the bidirectional family additionally needs LayerNorm with bias, absolute
+//! position embeddings, and exact (erf) GELU, none of which the paged decode
+//! path provides. [`EncoderModel::embed`] runs one sequence through the
+//! stack and returns the pooled, L2-normalised sentence embedding exactly as
+//! sentence-transformers computes it: CLS pooling for granite-embedding r1,
+//! last-token pooling on the appended EOS for Qwen3-Embedding.
 //!
 //! Config parsing lives here rather than in `hf_parser`, which remains the
 //! single source of truth for decoder blueprints only.
 
-use crate::common::linear::{Linear, softmax_last_dim};
+use crate::common::config::NormType;
+use crate::common::linear::{Linear, silu, softmax_last_dim};
+use crate::common::norm::RMSNorm;
+use crate::common::rope::RotaryEmbedding;
 use crate::common::weights::ModelWeights;
 use anyhow::{Context, Result};
 use candle_core::{D, DType, Device, Tensor};
@@ -66,8 +71,75 @@ pub enum Pooling {
     Mean,
 }
 
-/// A loaded encoder-only embedding model.
-pub struct EncoderModel {
+/// A loaded embedding model of either family.
+pub enum EncoderModel {
+    Bidirectional(BidirectionalEncoder),
+    Causal(CausalEmbedder),
+}
+
+impl EncoderModel {
+    /// Loads an embedding checkpoint, dispatching on `model_type`:
+    /// BERT/RoBERTa load the bidirectional encoder, `qwen3` with last-token
+    /// pooling loads the causal embedder.
+    ///
+    /// ## Errors
+    /// Fails on unsupported architectures, missing tensors, or load errors.
+    pub fn load(model_dir: &str, device: &Device, dtype: DType) -> Result<Self> {
+        let config_raw = std::fs::read_to_string(format!("{model_dir}/config.json"))
+            .with_context(|| format!("read {model_dir}/config.json"))?;
+        let config: serde_json::Value = serde_json::from_str(&config_raw)?;
+        match config["model_type"].as_str().unwrap_or_default() {
+            "roberta" | "bert" | "xlm-roberta" => Ok(Self::Bidirectional(
+                BidirectionalEncoder::load(model_dir, &config, device, dtype)?,
+            )),
+            "qwen3" => {
+                let pooling_raw =
+                    std::fs::read_to_string(format!("{model_dir}/1_Pooling/config.json"))
+                        .unwrap_or_default();
+                if !pooling_raw.contains("\"pooling_mode_lasttoken\": true") {
+                    anyhow::bail!(
+                        "encoder: '{model_dir}' is a qwen3 checkpoint without last-token \
+                         pooling; use /v1/chat/completions for generative models"
+                    );
+                }
+                Ok(Self::Causal(CausalEmbedder::load(
+                    model_dir, &config, device, dtype,
+                )?))
+            }
+            other => anyhow::bail!("encoder: unsupported model_type '{other}'"),
+        }
+    }
+
+    /// Embeds one tokenized sequence; see the variants' docs.
+    ///
+    /// ## Errors
+    /// As the underlying variant.
+    pub fn embed(&self, ids: &[u32]) -> Result<Vec<f32>> {
+        match self {
+            Self::Bidirectional(m) => m.embed(ids),
+            Self::Causal(m) => m.embed(ids),
+        }
+    }
+
+    /// The embedding dimension of the pooled vectors.
+    pub fn hidden_size(&self) -> usize {
+        match self {
+            Self::Bidirectional(m) => m.hidden_size(),
+            Self::Causal(m) => m.hidden_size(),
+        }
+    }
+
+    /// The device this model runs on, for GPU-lock scoping.
+    pub fn device(&self) -> &Device {
+        match self {
+            Self::Bidirectional(m) => &m.device,
+            Self::Causal(m) => &m.device,
+        }
+    }
+}
+
+/// A loaded bidirectional (BERT/RoBERTa) encoder.
+pub struct BidirectionalEncoder {
     word_embeddings: Tensor,
     position_embeddings: Tensor,
     token_type_embeddings: Tensor,
@@ -83,21 +155,20 @@ pub struct EncoderModel {
     dtype: DType,
 }
 
-impl EncoderModel {
-    /// Loads an encoder checkpoint (`RobertaModel` / `BertModel`) from
-    /// `model_dir`. Pooling comes from the sentence-transformers
-    /// `1_Pooling/config.json` when present, defaulting to CLS.
+impl BidirectionalEncoder {
+    /// Loads a `RobertaModel` / `BertModel` checkpoint. Pooling comes from
+    /// the sentence-transformers `1_Pooling/config.json` when present,
+    /// defaulting to CLS.
     ///
     /// ## Errors
-    /// Fails on unsupported architectures, missing tensors, or load errors.
-    pub fn load(model_dir: &str, device: &Device, dtype: DType) -> Result<Self> {
-        let config_raw = std::fs::read_to_string(format!("{model_dir}/config.json"))
-            .with_context(|| format!("read {model_dir}/config.json"))?;
-        let config: serde_json::Value = serde_json::from_str(&config_raw)?;
+    /// Fails on missing tensors or load errors.
+    fn load(
+        model_dir: &str,
+        config: &serde_json::Value,
+        device: &Device,
+        dtype: DType,
+    ) -> Result<Self> {
         let model_type = config["model_type"].as_str().unwrap_or_default();
-        if !matches!(model_type, "roberta" | "bert" | "xlm-roberta") {
-            anyhow::bail!("encoder: unsupported model_type '{model_type}'");
-        }
         let hidden = config["hidden_size"].as_u64().context("hidden_size")? as usize;
         let n_layers = config["num_hidden_layers"].as_u64().context("layers")? as usize;
         let n_heads = config["num_attention_heads"].as_u64().context("heads")? as usize;
@@ -237,13 +308,220 @@ impl EncoderModel {
     }
 
     /// The embedding dimension of the pooled vectors.
-    pub fn hidden_size(&self) -> usize {
+    fn hidden_size(&self) -> usize {
         self.n_heads * self.head_dim
     }
+}
 
-    /// The device this encoder runs on, for GPU-lock scoping.
-    pub fn device(&self) -> &Device {
-        &self.device
+struct CausalLayer {
+    input_norm: RMSNorm,
+    q_proj: Linear,
+    k_proj: Linear,
+    v_proj: Linear,
+    o_proj: Linear,
+    q_norm: RMSNorm,
+    k_norm: RMSNorm,
+    post_norm: RMSNorm,
+    gate_proj: Linear,
+    up_proj: Linear,
+    down_proj: Linear,
+}
+
+/// A causal (decoder-stack) embedder: Qwen3-Embedding class. One full-sequence
+/// forward through the Qwen3 architecture (RMSNorm, per-head qk-norm, RoPE,
+/// GQA, SwiGLU) with a causal mask, pooled on the last token (the tokenizer's
+/// appended EOS) and L2-normalised.
+pub struct CausalEmbedder {
+    embed_tokens: Tensor,
+    layers: Vec<CausalLayer>,
+    final_norm: RMSNorm,
+    rope: RotaryEmbedding,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    hidden: usize,
+    max_positions: usize,
+    device: Device,
+    dtype: DType,
+}
+
+impl CausalEmbedder {
+    fn load(
+        model_dir: &str,
+        config: &serde_json::Value,
+        device: &Device,
+        dtype: DType,
+    ) -> Result<Self> {
+        let hidden = config["hidden_size"].as_u64().context("hidden_size")? as usize;
+        let n_layers = config["num_hidden_layers"].as_u64().context("layers")? as usize;
+        let n_heads = config["num_attention_heads"].as_u64().context("heads")? as usize;
+        let n_kv_heads = config["num_key_value_heads"]
+            .as_u64()
+            .unwrap_or(n_heads as u64) as usize;
+        let head_dim = config["head_dim"]
+            .as_u64()
+            .map(|v| v as usize)
+            .unwrap_or(hidden / n_heads);
+        let eps = config["rms_norm_eps"].as_f64().unwrap_or(1e-6);
+        let rope_theta = config["rope_theta"].as_f64().unwrap_or(1_000_000.0);
+        let max_positions = config["max_position_embeddings"].as_u64().unwrap_or(32768) as usize;
+
+        let weight_path = format!("{model_dir}/model.safetensors");
+        let weights = ModelWeights::load(&[weight_path.as_str()], device, dtype, None)?;
+        let prefix = if weights.try_get("model.embed_tokens.weight").is_some() {
+            "model."
+        } else {
+            ""
+        };
+
+        let lin = |name: &str| -> Result<Linear> {
+            Ok(Linear::new(
+                weights.get(&format!("{name}.weight"))?.clone(),
+                None,
+            )?)
+        };
+        let norm = |name: &str| RMSNorm::load(&weights, name, eps, NormType::Standard);
+
+        let mut layers = Vec::with_capacity(n_layers);
+        for i in 0..n_layers {
+            let p = format!("{prefix}layers.{i}");
+            layers.push(CausalLayer {
+                input_norm: norm(&format!("{p}.input_layernorm"))?,
+                q_proj: lin(&format!("{p}.self_attn.q_proj"))?,
+                k_proj: lin(&format!("{p}.self_attn.k_proj"))?,
+                v_proj: lin(&format!("{p}.self_attn.v_proj"))?,
+                o_proj: lin(&format!("{p}.self_attn.o_proj"))?,
+                q_norm: norm(&format!("{p}.self_attn.q_norm"))?,
+                k_norm: norm(&format!("{p}.self_attn.k_norm"))?,
+                post_norm: norm(&format!("{p}.post_attention_layernorm"))?,
+                gate_proj: lin(&format!("{p}.mlp.gate_proj"))?,
+                up_proj: lin(&format!("{p}.mlp.up_proj"))?,
+                down_proj: lin(&format!("{p}.mlp.down_proj"))?,
+            });
+        }
+
+        Ok(Self {
+            embed_tokens: weights
+                .get(&format!("{prefix}embed_tokens.weight"))?
+                .clone(),
+            layers,
+            final_norm: norm(&format!("{prefix}norm"))?,
+            rope: RotaryEmbedding::new(head_dim, max_positions, rope_theta, dtype, device)?,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            hidden,
+            max_positions,
+            device: device.clone(),
+            dtype,
+        })
+    }
+
+    /// Embeds one tokenized sequence (EOS included) and returns the
+    /// last-token hidden state, L2-normalised, in F32.
+    ///
+    /// ## Errors
+    /// Fails on empty or over-length input, or tensor-op failures.
+    fn embed(&self, ids: &[u32]) -> Result<Vec<f32>> {
+        let n = ids.len();
+        if n == 0 {
+            anyhow::bail!("encoder: empty input");
+        }
+        if n > self.max_positions {
+            anyhow::bail!(
+                "encoder: input of {n} tokens exceeds the model's {} positions",
+                self.max_positions
+            );
+        }
+
+        let ids_t = Tensor::from_vec(ids.to_vec(), (n,), &self.device)?;
+        let pos_t = Tensor::from_vec((0..n as u32).collect::<Vec<_>>(), (n,), &self.device)?;
+        let mut x = self
+            .embed_tokens
+            .index_select(&ids_t, 0)?
+            .to_dtype(self.dtype)?;
+
+        let mask = {
+            let mut data = vec![0f32; n * n];
+            for r in 0..n {
+                for c in (r + 1)..n {
+                    data[r * n + c] = f32::NEG_INFINITY;
+                }
+            }
+            Tensor::from_vec(data, (n, n), &self.device)?
+        };
+
+        let group = self.n_heads / self.n_kv_heads;
+        let scale = 1.0 / (self.head_dim as f64).sqrt();
+        for layer in &self.layers {
+            let h = layer.input_norm.forward(&x)?;
+            let shape_heads = |t: Tensor, heads: usize| -> Result<Tensor> {
+                Ok(t.reshape((n, heads, self.head_dim))?
+                    .transpose(0, 1)?
+                    .unsqueeze(0)?
+                    .contiguous()?)
+            };
+            let q = shape_heads(
+                layer
+                    .q_norm
+                    .forward(&layer.q_proj.forward(&h)?.reshape((
+                        n,
+                        self.n_heads,
+                        self.head_dim,
+                    ))?)?
+                    .reshape((n, self.n_heads * self.head_dim))?,
+                self.n_heads,
+            )?;
+            let k = shape_heads(
+                layer
+                    .k_norm
+                    .forward(&layer.k_proj.forward(&h)?.reshape((
+                        n,
+                        self.n_kv_heads,
+                        self.head_dim,
+                    ))?)?
+                    .reshape((n, self.n_kv_heads * self.head_dim))?,
+                self.n_kv_heads,
+            )?;
+            let v = shape_heads(layer.v_proj.forward(&h)?, self.n_kv_heads)?;
+
+            let q = self.rope.apply_with_positions(&q, &pos_t)?;
+            let k = self.rope.apply_with_positions(&k, &pos_t)?;
+
+            let expand_kv = |t: Tensor| -> Result<Tensor> {
+                Ok(t.unsqueeze(2)?
+                    .expand((1, self.n_kv_heads, group, n, self.head_dim))?
+                    .reshape((1, self.n_heads, n, self.head_dim))?
+                    .contiguous()?)
+            };
+            let k = expand_kv(k)?;
+            let v = expand_kv(v)?;
+
+            let scores = (q.matmul(&k.transpose(2, 3)?)? * scale)?;
+            let scores = scores.to_dtype(DType::F32)?.broadcast_add(&mask)?;
+            let probs = softmax_last_dim(&scores)?.to_dtype(self.dtype)?;
+            let ctx = probs
+                .matmul(&v)?
+                .squeeze(0)?
+                .transpose(0, 1)?
+                .reshape((n, self.n_heads * self.head_dim))?;
+            x = (x + layer.o_proj.forward(&ctx)?)?;
+
+            let h2 = layer.post_norm.forward(&x)?;
+            let ffn = layer
+                .down_proj
+                .forward(&(silu(&layer.gate_proj.forward(&h2)?)? * layer.up_proj.forward(&h2)?)?)?;
+            x = (x + ffn)?;
+        }
+
+        let x = self.final_norm.forward(&x)?;
+        let pooled = x.narrow(0, n - 1, 1)?.squeeze(0)?.to_dtype(DType::F32)?;
+        let norm = pooled.sqr()?.sum_all()?.sqrt()?.to_scalar::<f32>()?;
+        Ok((pooled / norm as f64)?.to_vec1()?)
+    }
+
+    fn hidden_size(&self) -> usize {
+        self.hidden
     }
 }
 
@@ -257,6 +535,54 @@ mod tests {
         env!("HOME"),
         "/.oxydllm/models/ibm-granite/granite-embedding-125m-english"
     );
+
+    /// Contract: the causal embedder (Qwen3-Embedding) matches the
+    /// sentence-transformers reference: identical token ids including the
+    /// appended EOS, and cosine above 0.999 in F32 on CPU per fixture.
+    /// Skips when the HF-cache snapshot is absent.
+    #[test]
+    fn causal_embedder_matches_sentence_transformers_reference() {
+        let snapshots = concat!(
+            env!("HOME"),
+            "/.cache/huggingface/hub/models--Qwen--Qwen3-Embedding-0.6B/snapshots"
+        );
+        let Some(dir) = std::fs::read_dir(snapshots)
+            .ok()
+            .and_then(|mut d| d.next())
+            .and_then(|e| e.ok())
+            .map(|e| e.path())
+        else {
+            return;
+        };
+        let dir = dir.to_string_lossy().to_string();
+        let fixtures: serde_json::Value =
+            serde_json::from_str(include_str!("encoder_fixtures_qwen.json")).unwrap();
+        let tokenizer = Tokenizer::from_dir(&dir).unwrap();
+        let model = EncoderModel::load(&dir, &Device::Cpu, DType::F32).unwrap();
+        assert_eq!(model.hidden_size(), 1024);
+
+        for f in fixtures.as_array().unwrap() {
+            let text = f["text"].as_str().unwrap();
+            let want_ids: Vec<u32> = f["input_ids"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_u64().unwrap() as u32)
+                .collect();
+            let want: Vec<f32> = f["embedding"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_f64().unwrap() as f32)
+                .collect();
+
+            let ids = tokenizer.encode_with_special_tokens(text).unwrap();
+            assert_eq!(ids, want_ids, "tokenization of {text:?}");
+            let got = model.embed(&ids).unwrap();
+            let dot: f32 = got.iter().zip(&want).map(|(a, b)| a * b).sum();
+            assert!(dot > 0.999, "cosine {dot} for {text:?}");
+        }
+    }
 
     /// Contract: tokenization and the full encoder forward match the
     /// transformers reference: identical input ids, and cosine similarity

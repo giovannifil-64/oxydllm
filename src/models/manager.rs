@@ -71,9 +71,17 @@ pub struct RegistryEntry {
     pub last_used_secs: u64,
 }
 
+/// A loaded encoder-only embedding model, shared across requests.
+#[derive(Clone)]
+pub struct EncoderHandle {
+    pub model: Arc<crate::models::encoder::EncoderModel>,
+    pub tokenizer: Arc<Tokenizer>,
+}
+
 pub struct ModelManager {
     models_dir: PathBuf,
     slots: HashMap<String, SlotState>,
+    encoders: HashMap<String, EncoderHandle>,
     keep_alive: Duration,
     memory_budget_bytes: Option<usize>,
     registry: BTreeMap<String, RegistryEntry>,
@@ -271,6 +279,7 @@ impl ModelManager {
             draft_model,
             expert_stream_mb,
             discovery_cache: None,
+            encoders: HashMap::new(),
         }
     }
 
@@ -357,6 +366,33 @@ impl ModelManager {
     /// Best pre-load size estimate (weights + KV) for eviction decisions.
     /// Uses registry data when available; otherwise estimates from disk with
     /// dtype correction (CPU=F32 doubles BF16, AWQ keeps packed 4-bit).
+    /// The cached encoder for `model_id`, if one is already loaded.
+    pub fn encoder_cached(&self, model_id: &str) -> Option<EncoderHandle> {
+        self.encoders.get(model_id).cloned()
+    }
+
+    /// Caches a loaded encoder. Encoder models are small (hundreds of MB)
+    /// and stay resident until shutdown; they are not part of the decoder
+    /// LRU or memory-budget accounting.
+    pub fn insert_encoder(&mut self, model_id: &str, handle: EncoderHandle) {
+        self.encoders.insert(model_id.to_string(), handle);
+    }
+
+    /// Resolves the on-disk directory and device parameters an encoder load
+    /// needs, without holding anything locked during the load itself.
+    pub fn encoder_load_info(
+        &self,
+        model_id: &str,
+    ) -> Result<(String, Option<usize>, bool), String> {
+        let path = loader::resolve_model_path(&self.models_dir, model_id)
+            .ok_or_else(|| format!("model '{model_id}' not found in models directory"))?;
+        Ok((
+            path.to_string_lossy().to_string(),
+            self.cuda_devices.first().copied(),
+            self.require_gpu,
+        ))
+    }
+
     fn projected_size_bytes(&self, model_id: &str, model_path: &Path) -> usize {
         if let Some(entry) = self.registry.get(model_id)
             && entry.size_bytes > 0

@@ -1,4 +1,5 @@
 pub mod arch_defaults;
+pub mod encoder;
 pub mod estimate;
 pub mod gguf_model;
 pub mod hub;

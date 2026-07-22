@@ -309,6 +309,17 @@ impl Tokenizer {
         Ok(encoding.get_ids().to_vec())
     }
 
+    /// Encodes with the tokenizer's special-token template applied (e.g.
+    /// `<s> ... </s>` for the BERT/RoBERTa encoder models, whose embeddings
+    /// are computed over the full templated sequence).
+    pub fn encode_with_special_tokens(&self, text: &str) -> Result<Vec<u32>> {
+        let encoding = self
+            .inner
+            .encode(text, true)
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+        Ok(encoding.get_ids().to_vec())
+    }
+
     pub fn decode(&self, ids: &[u32]) -> Result<String> {
         self.inner
             .decode(ids, true)

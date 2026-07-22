@@ -1,4 +1,5 @@
 mod chat;
+mod embeddings;
 mod engine_loop;
 mod handlers;
 #[cfg(test)]
@@ -119,6 +120,7 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/v1/models/running", get(handlers::list_running_models))
         .route("/v1/models/{*model_id}", get(handlers::get_model))
         .route("/v1/chat/completions", post(chat::chat_completions))
+        .route("/v1/embeddings", post(embeddings::embeddings))
         .route_layer(middleware::from_fn_with_state(
             Arc::clone(&state),
             require_api_key,

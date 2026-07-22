@@ -76,9 +76,10 @@ pub(crate) enum MoeExpert {
     },
     /// A streamed FP8 expert cached in its file encoding: raw F8 bytes plus
     /// the F32 block-scale grid per projection, at half the bytes of the
-    /// dequantized form (double the experts per cache budget). Each use
-    /// dequantizes on the device and runs the exact ops of the `Standard`
-    /// path, so outputs stay byte-identical to a dequantize-at-fetch cache.
+    /// dequantized form (double the experts per cache budget). Decode-sized
+    /// batches run the native F8 GEMV (bit-exact weight values, own
+    /// deterministic summation order); larger batches dequantize on the
+    /// device and run the exact ops of the `Standard` path.
     #[cfg(feature = "metal")]
     Fp8Resident {
         gate_proj: Fp8Cached,
@@ -99,6 +100,16 @@ impl Fp8Cached {
     fn linear(&self) -> Result<crate::common::linear::Linear> {
         let w = crate::common::metal_ops::f8_block_dequant_bf16(&self.bytes, &self.scales)?;
         crate::common::linear::Linear::new(w, None)
+    }
+
+    /// Applies the projection to `x` (`[m, in]`): the native F8 GEMV for
+    /// decode-sized batches, the dequantize-then-matmul path beyond it.
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let m = x.dim(0)?;
+        if (1..=8).contains(&m) && x.device().is_metal() && x.dtype() == DType::BF16 {
+            return crate::common::metal_ops::f8_gemv(x, &self.bytes, &self.scales);
+        }
+        self.linear()?.forward(x)
     }
 }
 
@@ -129,14 +140,14 @@ impl MoeExpert {
                 up_proj,
                 down_proj,
             } => {
-                let gate = gate_proj.linear()?.forward(x)?;
-                let up = up_proj.linear()?.forward(x)?;
+                let gate = gate_proj.forward(x)?;
+                let up = up_proj.forward(x)?;
                 let activated = match activation {
                     Activation::SiLU => silu(&gate)?,
                     Activation::GeLUTanh => gelu_tanh(&gate)?,
                 };
                 let gated = (activated * up)?;
-                down_proj.linear()?.forward(&gated)
+                down_proj.forward(&gated)
             }
             Self::GptOss {
                 gate_up,

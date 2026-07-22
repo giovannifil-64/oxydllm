@@ -3743,6 +3743,133 @@ GPTQ_DET_BATCH_KERNEL(gptq8_gemv_batch_bf16, bfloat, 8)
 // there is no infinity encoding.
 // ─────────────────────────────────────────────────────────────────────────────
 
+// Native GEMV over block-scaled F8E4M3 weights (streamed FP8 experts).
+//
+// Reads the raw F8 bytes and the F32 block-scale grid directly, so the
+// BF16 weight tensor is never materialized. Each weight value replays the
+// resident dequantization chain bit-for-bit (decode, BF16 round, F32 scale
+// fold, BF16 round) before the F32 multiply-accumulate; only the summation
+// order differs from the dequantize-then-matmul path. Deterministic by the
+// same construction as the AWQ/GPTQ kernels: every k-split of an output
+// lives in one threadgroup and reduces in a fixed order with one writer.
+// The threadgroup is (QDET_TGW, QDET_S); dispatch must use exactly QDET_S
+// rows so every partial slot is written.
+
+struct F8GemvParams {
+    uint in_features;
+    uint out_features;
+    uint k_splits;
+    uint chunk;
+    uint block_r;
+    uint block_c;
+    uint s_cols;
+    uint m;
+};
+
+inline float f8_weight_value(uchar v, float sc) {
+    uint sgn = v >> 7;
+    uint e = (v >> 3) & 0xFu;
+    uint mant = v & 0x7u;
+    float val;
+    if (e == 0u) {
+        val = ldexp(float(mant) * 0.125f, -6);
+    } else if (e == 15u && mant == 7u) {
+        val = NAN;
+    } else {
+        val = ldexp(1.0f + float(mant) * 0.125f, int(e) - 7);
+    }
+    val = sgn != 0u ? -val : val;
+    return float(bfloat(float(bfloat(val)) * sc));
+}
+
+kernel void f8_gemv_bf16(
+    device const bfloat*  x       [[buffer(0)]],
+    device const uchar*   w       [[buffer(1)]],
+    device const float*   scales  [[buffer(2)]],
+    device bfloat*        out     [[buffer(3)]],
+    constant F8GemvParams& p      [[buffer(4)]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint2 tid  [[thread_position_in_threadgroup]])
+{
+    threadgroup float partials[QDET_S * QDET_TGW];
+    uint o = tgid.x * QDET_TGW + tid.x;
+    uint ks = tid.y;
+
+    float acc = 0.0f;
+    if (o < p.out_features && ks < p.k_splits) {
+        uint i = ks * p.chunk;
+        uint i_end = min(i + p.chunk, p.in_features);
+        uint srow_off = (o / p.block_r) * p.s_cols;
+        device const uchar* wrow = w + ulong(o) * p.in_features;
+        while (i < i_end) {
+            float sc = scales[srow_off + i / p.block_c];
+            uint blk_end = min(i_end, (i / p.block_c + 1u) * p.block_c);
+            for (; i < blk_end; ++i) {
+                acc += float(x[i]) * f8_weight_value(wrow[i], sc);
+            }
+        }
+    }
+
+    partials[ks * QDET_TGW + tid.x] = acc;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid.y == 0 && o < p.out_features) {
+        float sum = 0.0f;
+        for (uint sslot = 0; sslot < QDET_S; ++sslot) {
+            sum += partials[sslot * QDET_TGW + tid.x];
+        }
+        out[o] = bfloat(sum);
+    }
+}
+
+// Batch variant for 2 <= m <= 8 rows: each weight byte decodes once and
+// multiplies into per-row register accumulators, then one reduction round
+// per row reuses the same threadgroup scratch.
+kernel void f8_gemv_batch_bf16(
+    device const bfloat*  x       [[buffer(0)]],
+    device const uchar*   w       [[buffer(1)]],
+    device const float*   scales  [[buffer(2)]],
+    device bfloat*        out     [[buffer(3)]],
+    constant F8GemvParams& p      [[buffer(4)]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint2 tid  [[thread_position_in_threadgroup]])
+{
+    threadgroup float partials[QDET_S * QDET_TGW];
+    uint o = tgid.x * QDET_TGW + tid.x;
+    uint ks = tid.y;
+
+    float acc[8] = {0.0f};
+    if (o < p.out_features && ks < p.k_splits) {
+        uint i = ks * p.chunk;
+        uint i_end = min(i + p.chunk, p.in_features);
+        uint srow_off = (o / p.block_r) * p.s_cols;
+        device const uchar* wrow = w + ulong(o) * p.in_features;
+        while (i < i_end) {
+            float sc = scales[srow_off + i / p.block_c];
+            uint blk_end = min(i_end, (i / p.block_c + 1u) * p.block_c);
+            for (; i < blk_end; ++i) {
+                float wv = f8_weight_value(wrow[i], sc);
+                for (uint r = 0; r < p.m; ++r) {
+                    acc[r] += float(x[ulong(r) * p.in_features + i]) * wv;
+                }
+            }
+        }
+    }
+
+    for (uint r = 0; r < p.m; ++r) {
+        partials[ks * QDET_TGW + tid.x] = acc[r];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid.y == 0 && o < p.out_features) {
+            float sum = 0.0f;
+            for (uint sslot = 0; sslot < QDET_S; ++sslot) {
+                sum += partials[sslot * QDET_TGW + tid.x];
+            }
+            out[ulong(r) * p.out_features + o] = bfloat(sum);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
 // Block-scaled F8E4M3 to BF16 dequantization for streamed FP8 experts.
 // Replicates the resident loader's cast chain bit-for-bit: the F8 value is
 // first rounded to BF16 (the loader materializes the BF16 tensor before the

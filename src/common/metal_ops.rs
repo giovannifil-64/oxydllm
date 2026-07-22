@@ -4091,6 +4091,87 @@ mod fused_kernel_parity_tests {
         }
     }
 
+    /// Contract: the native F8 GEMV matches the dequantize-then-matmul
+    /// reference within F32-reduction-order tolerance, for m = 1 and a
+    /// batched m, on the Qwen3.6 expert shapes plus an odd-sized case, and
+    /// its output is bitwise deterministic across 48 runs.
+    #[test]
+    fn f8_gemv_parity_and_determinism() {
+        let Some(dev) = metal_device_or_skip() else {
+            return;
+        };
+        for (out_f, in_f, s_r, s_c, m) in [
+            (512usize, 2048usize, 4usize, 16usize, 1usize),
+            (2048, 512, 16, 4, 1),
+            (512, 2048, 4, 16, 4),
+            (96, 160, 3, 5, 2),
+        ] {
+            let bytes: Vec<u8> = (0..out_f * in_f)
+                .map(|i| {
+                    let b = (i as u32 * 29 + 13) as u8;
+                    if b & 0x7F == 0x7F { b ^ 0x08 } else { b }
+                })
+                .collect();
+            let scales: Vec<f32> = (0..s_r * s_c).map(|i| 0.2 + (i % 7) as f32 * 0.3).collect();
+            let x_data: Vec<f32> = (0..m * in_f).map(|i| (i as f32 * 0.013).sin()).collect();
+
+            let w_dev = Tensor::from_raw_buffer(&bytes, DType::U8, &[out_f, in_f], &dev).unwrap();
+            let sc_dev = Tensor::from_vec(scales.clone(), (s_r, s_c), &dev).unwrap();
+            let x = Tensor::from_vec(x_data, (m, in_f), &dev)
+                .unwrap()
+                .to_dtype(DType::BF16)
+                .unwrap();
+
+            let got = f8_gemv(&x, &w_dev, &sc_dev)
+                .unwrap()
+                .to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+
+            let w_bf16 = f8_block_dequant_bf16(&w_dev, &sc_dev).unwrap();
+            let want = x
+                .matmul(&w_bf16.t().unwrap())
+                .unwrap()
+                .to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+
+            let scale = want.iter().fold(0f32, |a, v| a.max(v.abs())).max(1.0);
+            let max_diff = got
+                .iter()
+                .zip(&want)
+                .fold(0f32, |a, (g, w)| a.max((g - w).abs()));
+            assert!(
+                max_diff < 0.02 * scale,
+                "[{out_f}x{in_f} m={m}] parity max_diff {max_diff} vs scale {scale}"
+            );
+
+            let reference: Vec<f32> = got;
+            for run in 0..48 {
+                let again = f8_gemv(&x, &w_dev, &sc_dev)
+                    .unwrap()
+                    .to_dtype(DType::F32)
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap();
+                for (i, (a, b)) in again.iter().zip(&reference).enumerate() {
+                    assert!(
+                        a.to_bits() == b.to_bits(),
+                        "[{out_f}x{in_f} m={m}] run {run} elem {i}: {a} != {b}"
+                    );
+                }
+            }
+        }
+    }
+
     /// Micro-benchmark for the quantized GEMV kernels on the layer shapes of
     /// the locally tested models (Qwen3-4B-AWQ, Qwen3-0.6B-GPTQ-Int8).
     /// Ignored by default; run explicitly when touching these kernels:
@@ -5273,6 +5354,143 @@ impl CustomOp2 for F8BlockDequantBf16 {
             w_l.shape().clone(),
         ))
     }
+}
+
+#[repr(C)]
+struct F8GemvParams {
+    in_features: u32,
+    out_features: u32,
+    k_splits: u32,
+    chunk: u32,
+    block_r: u32,
+    block_c: u32,
+    s_cols: u32,
+    m: u32,
+}
+
+struct F8Gemv {
+    bytes: Tensor,
+    scales: Tensor,
+    in_features: usize,
+    out_features: usize,
+}
+
+impl CustomOp1 for F8Gemv {
+    fn name(&self) -> &'static str {
+        "f8-gemv"
+    }
+
+    fn cpu_fwd(&self, _s: &CpuStorage, _l: &Layout) -> Result<(CpuStorage, Shape)> {
+        candle_core::bail!("f8-gemv is Metal-only")
+    }
+
+    fn metal_fwd(&self, x: &MetalStorage, x_l: &Layout) -> Result<(MetalStorage, Shape)> {
+        if x.dtype() != DType::BF16 {
+            candle_core::bail!("f8-gemv: x must be BF16, got {:?}", x.dtype());
+        }
+        if !x_l.is_contiguous() {
+            candle_core::bail!("f8-gemv: x must be contiguous");
+        }
+        let (m, k) = x_l.shape().dims2()?;
+        if k != self.in_features || m == 0 || m > 8 {
+            candle_core::bail!(
+                "f8-gemv: x shape {:?} incompatible with in_features {} (m must be 1..=8)",
+                x_l.dims(),
+                self.in_features
+            );
+        }
+        let (rows, cols) = self.bytes.shape().dims2()?;
+        let (s_rows, s_cols) = self.scales.shape().dims2()?;
+        if rows != self.out_features
+            || cols != self.in_features
+            || s_rows == 0
+            || s_cols == 0
+            || !rows.is_multiple_of(s_rows)
+            || !cols.is_multiple_of(s_cols)
+        {
+            candle_core::bail!(
+                "f8-gemv: weight [{rows}, {cols}] / scales [{s_rows}, {s_cols}] mismatch"
+            );
+        }
+
+        let chunk = self.in_features.div_ceil(QDET_S);
+        let params = F8GemvParams {
+            in_features: self.in_features as u32,
+            out_features: self.out_features as u32,
+            k_splits: self.in_features.div_ceil(chunk) as u32,
+            chunk: chunk as u32,
+            block_r: (rows / s_rows) as u32,
+            block_c: (cols / s_cols) as u32,
+            s_cols: s_cols as u32,
+            m: m as u32,
+        };
+
+        let device = x.device();
+        let n_out = m * self.out_features;
+        let output = device.new_buffer(n_out, DType::BF16, "f8_gemv_out")?;
+        let w_sl = self.bytes.storage_and_layout();
+        let sc_sl = self.scales.storage_and_layout();
+        let w_buf = match &*w_sl.0 {
+            candle_core::Storage::Metal(ms) => ms.buffer(),
+            _ => candle_core::bail!("f8-gemv: weight bytes must be Metal-resident"),
+        };
+        let sc_buf = match &*sc_sl.0 {
+            candle_core::Storage::Metal(ms) => ms.buffer(),
+            _ => candle_core::bail!("f8-gemv: scales must be Metal-resident"),
+        };
+        let kernel_name = if m == 1 {
+            "f8_gemv_bf16"
+        } else {
+            "f8_gemv_batch_bf16"
+        };
+        let pipeline = get_or_compile_quant_pipeline(device.device(), kernel_name)?;
+        let encoder = device.command_encoder()?;
+        let encoder = encoder.as_ref();
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_input_buffer(0, Some(x.buffer()), x_l.start_offset() * 2);
+        encoder.set_input_buffer(1, Some(w_buf), w_sl.1.start_offset());
+        encoder.set_input_buffer(2, Some(sc_buf), sc_sl.1.start_offset() * 4);
+        encoder.set_output_buffer(3, Some(&output), 0);
+        encoder.set_bytes(4, &params);
+        encoder.dispatch_thread_groups(
+            MTLSize {
+                width: self.out_features.div_ceil(QDET_TGW),
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: QDET_TGW,
+                height: QDET_S,
+                depth: 1,
+            },
+        );
+        Ok((
+            MetalStorage::new(output, device.clone(), n_out, DType::BF16),
+            Shape::from_dims(&[m, self.out_features]),
+        ))
+    }
+}
+
+/// Matrix-vector product over a block-scaled F8E4M3 weight, without
+/// materializing the BF16 weight tensor.
+///
+/// `x` is `[m, in_features]` BF16 with `1 <= m <= 8`; `bytes` the raw F8
+/// weight `[out, in]`; `scales` its F32 block grid. Every weight value
+/// replays the resident dequantization chain bit-for-bit before the F32
+/// multiply-accumulate; the fixed-order threadgroup reduction makes the
+/// result bitwise deterministic. Larger `m` belongs on the
+/// dequantize-then-matmul path.
+///
+/// ## Errors
+/// Fails off-Metal or on shape, dtype, or contiguity mismatches.
+pub fn f8_gemv(x: &Tensor, bytes: &Tensor, scales: &Tensor) -> Result<Tensor> {
+    let (out_features, in_features) = bytes.shape().dims2()?;
+    x.apply_op1_no_bwd(&F8Gemv {
+        bytes: bytes.clone(),
+        scales: scales.clone(),
+        in_features,
+        out_features,
+    })
 }
 
 /// Dequantizes a block-scaled F8E4M3 weight straight to BF16 on the device.

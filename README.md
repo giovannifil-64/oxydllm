@@ -89,7 +89,7 @@ These architecture classes are covered by the regression suite, each with at lea
 - `GraniteForCausalLM` (Granite 3.x dense)
 - `OlmoeForCausalLM` and `GptOssForCausalLM` (Mixture-of-Experts)
 - `Qwen3_5MoeForConditionalGeneration` (Qwen3.6 MoE hybrid; 35B-A3B runs on 24 GB via automatic SSD expert streaming)
-- `RobertaModel` / `BertModel` encoders for `/v1/embeddings` (granite-embedding r1 class)
+- `RobertaModel` / `BertModel` encoders and `qwen3` last-token-pooling embedders for `/v1/embeddings` (granite-embedding r1, Qwen3-Embedding)
 
 Formats span BF16 safetensors, GGUF, AWQ/GPTQ, compressed-tensors INT4, FP8, and MXFP4, auto-detected per checkpoint. Other checkpoints in the same families and sizes (e.g. other Llama 3.2, Gemma 3, or Qwen2.5 variants) are likely to work but are not regularly tested.
 

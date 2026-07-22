@@ -52,6 +52,7 @@ A rust-based inference engine for Large Language Models.
 
 ## Features
 - OpenAI-compatible chat completions endpoint (`/v1/chat/completions`) with streaming via Server-Sent Events
+- Text embeddings endpoint (`/v1/embeddings`) for encoder-only models (BERT/RoBERTa family, e.g. granite-embedding), CLS/mean pooling with L2-normalised output, verified against sentence-transformers
 - Function calling / tool use: `tools`, `tool_choice` (`auto`, `required`, `none`, forced function, `allowed_tools`), `parallel_tool_calls`, with incremental tool-call deltas in streaming
 - Structured output: `response_format` with `json_object` and `json_schema` (strict mode, recursive `$ref`/`$defs`, `anyOf`, enums, nested objects/arrays, nullable unions)
 - Thinking/reasoning models with a separated `reasoning_content` field: `<think>`-style (Qwen3/Qwen3.5, toggled with `enable_thinking`) and harmony channels (gpt-oss, scaled with `reasoning_effort`)
@@ -88,6 +89,7 @@ These architecture classes are covered by the regression suite, each with at lea
 - `GraniteForCausalLM` (Granite 3.x dense)
 - `OlmoeForCausalLM` and `GptOssForCausalLM` (Mixture-of-Experts)
 - `Qwen3_5MoeForConditionalGeneration` (Qwen3.6 MoE hybrid; 35B-A3B runs on 24 GB via automatic SSD expert streaming)
+- `RobertaModel` / `BertModel` encoders for `/v1/embeddings` (granite-embedding r1 class)
 
 Formats span BF16 safetensors, GGUF, AWQ/GPTQ, compressed-tensors INT4, FP8, and MXFP4, auto-detected per checkpoint. Other checkpoints in the same families and sizes (e.g. other Llama 3.2, Gemma 3, or Qwen2.5 variants) are likely to work but are not regularly tested.
 
@@ -100,7 +102,7 @@ The following model families are not currently supported:
 - DeepSeek-V2/V3: Mixture-of-Experts plus Multi-head Latent Attention (MLA); MLA is not implemented yet.
 - GGUF MoE checkpoints: quant-per-expert tensor layout not yet wired; safetensors MoE works.
 - Multimodal inference (vision+language) is not supported yet; text-only paths from some multimodal checkpoints may work.
-- Encoder-only models (BERT, etc.)
+- Encoder-only models beyond the BERT/RoBERTa embedding family (e.g. ModernBERT-based granite-embedding r2)
 
 ## Installation
 To use oxydLLM, build from source or use the provided installers.

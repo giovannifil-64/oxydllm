@@ -54,7 +54,7 @@ A rust-based inference engine for Large Language Models.
 - OpenAI-compatible chat completions endpoint (`/v1/chat/completions`) with streaming via Server-Sent Events
 - Text embeddings endpoint (`/v1/embeddings`) for encoder-only models (BERT/RoBERTa family, e.g. granite-embedding), CLS/mean pooling with L2-normalised output, verified against sentence-transformers
 - Function calling / tool use: `tools`, `tool_choice` (`auto`, `required`, `none`, forced function, `allowed_tools`), `parallel_tool_calls`, with incremental tool-call deltas in streaming
-- Structured output: `response_format` with `json_object` and `json_schema` (strict mode, recursive `$ref`/`$defs`, `anyOf`, enums, nested objects/arrays, nullable unions)
+- Structured output: `response_format` with `json_object` and `json_schema` (strict mode, recursive `$ref`/`$defs`, `anyOf`, enums, nested objects/arrays, nullable unions). Output is grammar-constrained at sampling time: on `finish_reason: "stop"` the JSON is valid by construction (byte-level token masking; applies to byte-level BPE models generating content directly, with post-hoc validation as the second layer everywhere)
 - Thinking/reasoning models with a separated `reasoning_content` field: `<think>`-style (Qwen3/Qwen3.5, toggled with `enable_thinking`) and harmony channels (gpt-oss, scaled with `reasoning_effort`)
 - Metal acceleration on Apple Silicon with fused attention, RMSNorm, RoPE, and Softmax kernels; on macOS 26+ prefill matmuls use Metal 4 TensorOps (M5 neural accelerator) automatically
 - Continuous batching: all active sequences share each GPU forward pass; `max_num_seqs` is auto-computed at load and can be overridden with `--max-num-seqs`

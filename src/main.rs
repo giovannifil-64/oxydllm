@@ -1,5 +1,6 @@
 mod chat_template;
 mod common;
+mod constrain;
 mod engine;
 mod gpu_lock;
 mod models;

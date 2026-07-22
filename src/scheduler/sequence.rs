@@ -32,6 +32,9 @@ pub struct SequenceState {
     pub max_tokens: usize,
     pub finish_reason: Option<String>,
     pub extra_stop_token_ids: Vec<u32>,
+    /// Grammar constraint for JSON-mode requests; masks illegal tokens at
+    /// sampling time and advances with each accepted token.
+    pub constraint: Option<crate::constrain::JsonConstraint>,
 }
 
 impl SequenceState {

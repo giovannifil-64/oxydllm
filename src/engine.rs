@@ -381,16 +381,22 @@ fn sample_prefill_outputs(
 
         let sample_out = {
             let seq = scheduler.get_running(info.seq_id).unwrap();
+            let vocab = seq_logits.dims1()?;
+            let allowed = seq.constraint.as_ref().map(|c| c.allowed(vocab));
             sampling::sample(
                 &seq_logits,
                 &seq.sampling_params,
                 &seq.all_tokens,
                 Some(&seq.token_counts),
+                allowed.as_deref(),
             )?
         };
         let next_token = sample_out.token;
         let emit = {
             let seq = scheduler.get_running_mut(info.seq_id).unwrap();
+            if let Some(c) = seq.constraint.as_mut() {
+                c.advance(next_token);
+            }
             seq.append_token(next_token);
             seq.num_processed_tokens = seq.all_tokens.len() - 1;
             seq.phase = SequencePhase::Decode;
@@ -438,15 +444,21 @@ fn sample_decode_outputs(
         let seq_logits = batch_logits.get(total_prefill_tokens + i)?;
         let sample_out = {
             let seq = scheduler.get_running(seq_id).unwrap();
+            let vocab = seq_logits.dims1()?;
+            let allowed = seq.constraint.as_ref().map(|c| c.allowed(vocab));
             sampling::sample(
                 &seq_logits,
                 &seq.sampling_params,
                 &seq.all_tokens,
                 Some(&seq.token_counts),
+                allowed.as_deref(),
             )?
         };
         let next_token = sample_out.token;
         let seq = scheduler.get_running_mut(seq_id).unwrap();
+        if let Some(c) = seq.constraint.as_mut() {
+            c.advance(next_token);
+        }
         seq.append_token(next_token);
         seq.num_processed_tokens = seq.all_tokens.len() - 1;
         let is_stop = stop.matches(next_token, &seq.extra_stop_token_ids, &seq.all_tokens);
@@ -665,6 +677,26 @@ impl Engine {
         )
     }
 
+    /// [`add_request_with_stop`](Self::add_request_with_stop) with a grammar
+    /// constraint attached; constrained sequences never join the speculative
+    /// cycle (the mask changes the sampled distribution).
+    pub fn add_request_constrained(
+        &mut self,
+        prompt_tokens: Vec<u32>,
+        sampling_params: SamplingParams,
+        max_tokens: usize,
+        extra_stop_token_ids: Vec<u32>,
+        constraint: crate::constrain::JsonConstraint,
+    ) -> SequenceId {
+        self.scheduler.add_request_full(
+            prompt_tokens,
+            sampling_params,
+            max_tokens,
+            extra_stop_token_ids,
+            Some(constraint),
+        )
+    }
+
     pub fn step(&mut self) -> Result<StepOutput> {
         let Engine {
             model,
@@ -698,7 +730,7 @@ impl Engine {
             decode_ids.iter().copied().partition(|&id| {
                 scheduler
                     .get_running(id)
-                    .is_some_and(|s| s.sampling_params.is_plain_greedy())
+                    .is_some_and(|s| s.sampling_params.is_plain_greedy() && s.constraint.is_none())
             })
         } else {
             (Vec::new(), decode_ids.clone())

@@ -232,18 +232,35 @@ fn enqueue_request(
     req: IncomingRequest,
     engine: &mut Engine,
     trackers: &mut HashMap<SequenceId, SeqTracker>,
+    byte_table: Option<&std::sync::Arc<crate::constrain::TokenByteTable>>,
+    harmony: bool,
 ) {
     let request_id = req.request_id.clone();
     let model_id = req.model_id.clone();
     let enqueued_at = req.enqueued_at;
     let prompt_len = req.prompt_tokens.len();
     let max_tokens = req.max_tokens;
-    let seq_id = engine.add_request_with_stop(
-        req.prompt_tokens,
-        req.sampling_params,
-        req.max_tokens,
-        req.extra_stop_token_ids,
-    );
+    let constraint = match (req.json_mode, byte_table) {
+        (Some(mode), Some(table)) if !req.enable_thinking && !harmony => Some(
+            crate::constrain::JsonConstraint::new(std::sync::Arc::clone(table), mode),
+        ),
+        _ => None,
+    };
+    let seq_id = match constraint {
+        Some(c) => engine.add_request_constrained(
+            req.prompt_tokens,
+            req.sampling_params,
+            req.max_tokens,
+            req.extra_stop_token_ids,
+            c,
+        ),
+        None => engine.add_request_with_stop(
+            req.prompt_tokens,
+            req.sampling_params,
+            req.max_tokens,
+            req.extra_stop_token_ids,
+        ),
+    };
     tracing::debug!(
         request_id = %request_id,
         model_id = %model_id,
@@ -493,6 +510,14 @@ pub fn engine_loop(
     };
     let mut decode_cache = TokenDecodeCache::new();
 
+    let byte_table = crate::constrain::TokenByteTable::build(&tokenizer);
+    if byte_table.is_none() {
+        tracing::info!(
+            "tokenizer is not byte-level BPE; JSON-constrained decoding unavailable \
+             for this model (post-hoc validation still applies)"
+        );
+    }
+
     let neutral_id = tokenizer
         .encode("a")
         .ok()
@@ -507,11 +532,23 @@ pub fn engine_loop(
 
         if engine.has_pending_work() {
             while let Ok(req) = request_rx.try_recv() {
-                enqueue_request(req, &mut engine, &mut trackers);
+                enqueue_request(
+                    req,
+                    &mut engine,
+                    &mut trackers,
+                    byte_table.as_ref(),
+                    harmony_ids.is_some(),
+                );
             }
         } else {
             match request_rx.blocking_recv() {
-                Some(req) => enqueue_request(req, &mut engine, &mut trackers),
+                Some(req) => enqueue_request(
+                    req,
+                    &mut engine,
+                    &mut trackers,
+                    byte_table.as_ref(),
+                    harmony_ids.is_some(),
+                ),
                 None => break,
             }
         }
@@ -984,6 +1021,7 @@ mod metrics_loop_tests {
             enqueued_at: std::time::Instant::now(),
             enable_thinking: false,
             extra_stop_token_ids: vec![],
+            json_mode: None,
             parent_span: tracing::Span::none(),
         };
         req_tx.try_send(req).expect("enqueue request");

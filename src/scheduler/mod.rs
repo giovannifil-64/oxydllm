@@ -105,6 +105,23 @@ impl Scheduler {
         max_tokens: usize,
         extra_stop_token_ids: Vec<u32>,
     ) -> SequenceId {
+        self.add_request_full(
+            prompt_tokens,
+            sampling_params,
+            max_tokens,
+            extra_stop_token_ids,
+            None,
+        )
+    }
+
+    pub fn add_request_full(
+        &mut self,
+        prompt_tokens: Vec<u32>,
+        sampling_params: SamplingParams,
+        max_tokens: usize,
+        extra_stop_token_ids: Vec<u32>,
+        constraint: Option<crate::constrain::JsonConstraint>,
+    ) -> SequenceId {
         let id = self.next_id;
         self.next_id += 1;
 
@@ -135,6 +152,7 @@ impl Scheduler {
             max_tokens,
             finish_reason: None,
             extra_stop_token_ids,
+            constraint,
         };
 
         self.waiting.push_back(seq);

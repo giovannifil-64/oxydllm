@@ -1607,6 +1607,29 @@ pub(super) async fn chat_completions(
             ..base_sampling_params.clone()
         };
 
+        let json_mode =
+            body.response_format
+                .as_ref()
+                .and_then(|rf| match rf.format_type.as_str() {
+                    "json_object" => Some(crate::constrain::JsonMode::Object),
+                    "json_schema" => {
+                        let root_is_object = rf
+                            .json_schema
+                            .as_ref()
+                            .and_then(|spec| spec.schema.as_ref())
+                            .map(|schema| {
+                                schema["type"].as_str() == Some("object")
+                                    || schema.get("properties").is_some()
+                            })
+                            .unwrap_or(true);
+                        Some(if root_is_object {
+                            crate::constrain::JsonMode::Object
+                        } else {
+                            crate::constrain::JsonMode::Value
+                        })
+                    }
+                    _ => None,
+                });
         handle
             .request_tx
             .try_send(IncomingRequest {
@@ -1619,6 +1642,7 @@ pub(super) async fn chat_completions(
                 enqueued_at: std::time::Instant::now(),
                 enable_thinking,
                 extra_stop_token_ids: extra_stop_token_ids.clone(),
+                json_mode,
                 parent_span: http_span.clone(),
             })
             .map_err(|e| match e {

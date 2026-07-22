@@ -60,8 +60,9 @@ pub fn sample(
     params: &SamplingParams,
     prev_tokens: &[u32],
     token_counts: Option<&std::collections::HashMap<u32, u32>>,
+    allowed: Option<&[bool]>,
 ) -> Result<SampleOutput> {
-    if params.is_plain_greedy() {
+    if params.is_plain_greedy() && allowed.is_none() {
         let token = logits.argmax(D::Minus1)?.to_scalar::<u32>()?;
         // NaN guard reduced in native dtype (no full-vocab F32 cast per token).
         let sum: f32 = logits
@@ -82,6 +83,27 @@ pub fn sample(
 
     if logits_vec.iter().any(|l| l.is_nan()) {
         candle_core::bail!("model returned NaN logits — numerical instability detected");
+    }
+
+    if let Some(allowed) = allowed {
+        for (l, &ok) in logits_vec.iter_mut().zip(allowed) {
+            if !ok {
+                *l = f32::NEG_INFINITY;
+            }
+        }
+        if params.is_plain_greedy() {
+            let token = logits_vec
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.total_cmp(b.1))
+                .map(|(i, _)| i as u32)
+                .unwrap_or(0);
+            return Ok(SampleOutput {
+                token,
+                logprob: None,
+                top_logprobs: Vec::new(),
+            });
+        }
     }
 
     if params.repetition_penalty != 1.0 {
@@ -709,7 +731,7 @@ mod tests {
         let device = candle_core::Device::Cpu;
         let logits = Tensor::from_vec(vec![1.0_f32, 5.0, 3.0, 2.0], (4,), &device).unwrap();
         let params = SamplingParams::default();
-        let token = sample(&logits, &params, &[], None).unwrap().token;
+        let token = sample(&logits, &params, &[], None, None).unwrap().token;
         assert_eq!(token, 1);
     }
 
@@ -721,7 +743,7 @@ mod tests {
             temperature: 0.8,
             ..Default::default()
         };
-        let token = sample(&logits, &params, &[], None).unwrap().token;
+        let token = sample(&logits, &params, &[], None, None).unwrap().token;
         assert!(token < 4);
     }
 
@@ -757,7 +779,7 @@ mod tests {
             ..Default::default()
         };
 
-        let out = sample(&logits, &params, &prev_tokens, Some(&counts)).unwrap();
+        let out = sample(&logits, &params, &prev_tokens, Some(&counts), None).unwrap();
         assert_eq!(
             out.token, 0,
             "only the last token should be repetition-penalized"
@@ -869,7 +891,7 @@ mod tests {
             top_logprobs_k: 3,
             ..Default::default()
         };
-        let out = sample(&logits, &params, &[], None).unwrap();
+        let out = sample(&logits, &params, &[], None, None).unwrap();
         assert!(out.logprob.is_some(), "logprob should be set");
         assert_eq!(out.top_logprobs.len(), 3, "should have 3 top logprobs");
         let lps: Vec<f32> = out.top_logprobs.iter().map(|&(_, lp)| lp).collect();
@@ -890,7 +912,7 @@ mod tests {
             logit_bias: Some(vec![(0, -100.0)]),
             ..Default::default()
         };
-        let out = sample(&logits, &params, &[], None).unwrap();
+        let out = sample(&logits, &params, &[], None, None).unwrap();
         assert_ne!(out.token, 0, "token 0 should be suppressed by logit_bias");
     }
 
@@ -903,7 +925,7 @@ mod tests {
             top_logprobs_k: 4,
             ..Default::default()
         };
-        let out = sample(&logits, &params, &[], None).unwrap();
+        let out = sample(&logits, &params, &[], None, None).unwrap();
         let sum: f32 = out.top_logprobs.iter().map(|&(_, lp)| lp.exp()).sum();
         assert!((sum - 1.0).abs() < 1e-4, "exp(logprobs) should sum to ~1");
     }

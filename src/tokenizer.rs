@@ -309,6 +309,22 @@ impl Tokenizer {
         Ok(encoding.get_ids().to_vec())
     }
 
+    /// The full vocabulary size, added tokens included.
+    pub fn vocab_size(&self) -> usize {
+        self.inner.get_vocab_size(true)
+    }
+
+    /// The raw vocabulary form of a token id (byte-level BPE alphabet for
+    /// BPE tokenizers), for building constrained-decoding byte tables.
+    pub fn id_to_token(&self, id: u32) -> Option<String> {
+        self.inner.id_to_token(id)
+    }
+
+    /// The ids of every registered special token.
+    pub fn special_token_id_values(&self) -> Vec<u32> {
+        self.special_token_ids.values().copied().collect()
+    }
+
     /// Encodes with the tokenizer's special-token template applied (e.g.
     /// `<s> ... </s>` for the BERT/RoBERTa encoder models, whose embeddings
     /// are computed over the full templated sequence).

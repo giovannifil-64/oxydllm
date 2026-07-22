@@ -2,6 +2,33 @@
 
 All notable changes to this project will be documented in this file.
 
+## 0.0.0-alpha.14
+
+- SSD expert streaming: Mixture-of-Experts checkpoints larger than memory now run by keeping only the router-selected experts resident. The decision is automatic: at load the checkpoint's expert and non-expert tensor sizes are compared against the memory envelope (the operator's `--memory-budget`, or the kernel's own availability metric), and streaming engages only when the model does not fit; models that fit keep loading fully resident, which is always fastest. Dense checkpoints are rejected for streaming with an explicit message: dense decode is capped at SSD bandwidth divided by model size, well below one token per second for any model that would need it.
+- Qwen3.6-35B-A3B runs on a 24 GB machine with no configuration: `Qwen3_5MoeForConditionalGeneration` support (the MoE sibling of the Qwen3.5 hybrid) plus automatic streaming of its FP8 experts, verified deterministic and correct end to end.
+- A native FP8 expert pipeline drove the streamed 35B from 0.38 to 4.01 tok/s across six A/B-measured steps, ending with experts cached in their file encoding and matrix products that read the F8 bytes directly.
+
+### New Features
+- Expert streaming (`src/common/expert_stream.rs`): the safetensors headers are parsed once and misses are fetched with parallel uncached positioned reads (`pread`, one rayon task per tensor, `F_NOCACHE` on macOS so the page cache never holds a second copy of the expert pool). Misses build in disk order and in parallel; an LRU cache with a byte budget serves hits; evicted experts park in a graveyard whose reference counts keep their buffers unreusable and are released together behind a single drain every 512 MB (candle's Metal buffer pool reuses any free buffer without checking command completion, verified in source). The pool logs its hit rate on retirement.
+- Automatic streaming decision (`src/models/loader.rs`): tensor sizes are summed from the headers scaled to the runtime dtype (an FP8 file counts double into BF16); the cache budget is whatever remains after the resident weights and a fixed headroom. `--stream-experts` and `--expert-cache-mb` remain as overrides only. A streamed model reports resident bytes plus cache budget as its footprint, so the manager's memory accounting holds.
+- `Qwen3_5MoeForConditionalGeneration` (Qwen3.6 MoE hybrid): Gated DeltaNet + gated attention layers as in Qwen3.5, MoE FFN on every layer (256 experts, top-8 softmax routing with renormalisation always on, matching the reference modeling code), and a Qwen2-MoE-style shared expert (`out = routed + sigmoid(shared_expert_gate(x)) * shared_expert(x)`) auto-detected from tensor presence and always resident. Multimodal-nested tensor names (`model.language_model.*`) are canonicalised in the streamer index.
+- FP8 experts stream and cache in their file encoding (`MoeExpert::Fp8Resident`): raw F8 bytes plus the F32 block-scale grid, half the bytes of the dequantized form, so double the experts per cache budget. Decode-sized batches (m <= 8) run native F8 GEMV kernels that read the bytes and block scales directly with the fixed-order deterministic reduction of the AWQ/GPTQ family; larger batches dequantize on the device through `f8_block_dequant_bf16`, a kernel proven bitwise identical to the resident loader's CPU cast chain over every byte encoding.
+
+### Performance and Efficiency
+- Streamed gpt-oss-20b with a deliberately strangled 4 GB cache went from 2.34 to 6.51 tok/s (coalesced fetches with kernel-page prefetch, then parallel uncached reads); with a hot cache the streamed model matches resident speed (13.2 vs 12.3 tok/s), placing all streaming overhead in the miss path.
+- Streamed Qwen3.6-35B-A3B-FP8 decode across the chain: 0.38 (first run) to 1.13 (parallel expert builds) to 1.34 (device-side block dequantization) to 2.00 (deferred eviction reclamation) to +37 percent (F8-resident cache, same-day A/B at a pinned 3400 MB cache: 1.53 to 2.09) to +12 percent more (native F8 GEMV, 3.57 to 4.01 on the same pinned probe).
+- Two candidate optimizations were measured and rejected, recorded in the roadmap so they are not relitigated: frequency-weighted eviction (LRU beats LFU-with-aging 7.23 to 4.36 tok/s; decode locality is temporal) and recency-based speculative prefetch (misses are by definition the experts recency cannot predict).
+
+### Reliability and Correctness
+- Byte-identity contract: a streamed expert is bitwise identical to the same expert loaded resident; the fetch path replicates the resident loader's exact cast chain including the FP8 F32 round-trip and block-scale fold. Verified end to end on gpt-oss-20b (streamed output byte-identical to the resident reference, including the full reasoning chain, with evictions active) and preserved through every optimization step.
+- The native F8 GEMV changes generation on borderline tokens relative to alpha.13 for FP8-streamed models only (its summation order differs from the matmul it replaces); verified correct and deterministic (identical double-runs, exact repetition, arithmetic, coherent long generations). No other model class is affected.
+- `estimate` no longer labels fine-grained FP8 checkpoints as "AWQ 4-bit": both the local and remote paths branch on `quant_method`, and FP8 gets its own label with the 2x BF16 dequantization sizing.
+- Retired after measurement: the historical "Phi-3 GGUF Q4 decodes at ~0.5 tok/s" note (now 20.9 tok/s, correct output, on the official microsoft Q4 GGUF).
+
+### Tests
+- 324 unit tests green. New coverage: streamed-vs-direct byte equality, positioned row reads against `narrow`, LRU budget/eviction/refetch, coalesced-batch ordering and dedup, the shared-expert contract (output equals routed plus sigmoid-gated shared contribution computed independently), the Qwen3.6 parser contract on the real config shape, bitwise equality of the block-dequant kernel against the CPU chain over all encodings, `Fp8Resident` versus `Standard` bitwise equality, and F8 GEMV parity plus 48-run bitwise determinism across the real expert shapes and an odd-sized case.
+- E2E batteries on the streamed 35B: temperature-0 determinism across double runs, arithmetic, exact repetition, coherent long generations, all through the automatic streaming path.
+
 ## 0.0.0-alpha.13
 
 - IBM Granite 3.x dense support (`GraniteForCausalLM`), safetensors and GGUF, verified E2E on granite-3.3-2b-instruct across chat, streaming, concurrency, multi-turn prefix reuse, tool calling, and structured output.

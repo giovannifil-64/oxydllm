@@ -64,8 +64,9 @@ A rust-based inference engine for Large Language Models.
   - **AWQ** 4/8-bit and **GPTQ** 4/8-bit (`desc_act=false`): packed weights stay resident on Metal with fused GEMV kernels (batched across concurrent sequences for AWQ-layout checkpoints)
   - **compressed-tensors** pack-quantized INT4 (llm-compressor): converted to the AWQ layout at load, fully-quantized or mixed-precision
   - **FP8** (E4M3) block-wise and **MXFP4** (GPT-OSS experts, packed-resident)
-- Mixture-of-Experts: `Qwen3MoeForCausalLM`, `OlmoeForCausalLM`, `GptOssForCausalLM` (attention sinks, alternating sliding/full attention, harmony channels)
-- Hybrid linear-attention models (Qwen3.5 family, text-only): Gated DeltaNet + gated full attention, in BF16 safetensors, compressed-tensors INT4, and GGUF (`qwen35`) formats
+- Mixture-of-Experts: `Qwen3MoeForCausalLM`, `OlmoeForCausalLM`, `GptOssForCausalLM` (attention sinks, alternating sliding/full attention, harmony channels), `Qwen3_5MoeForConditionalGeneration` (Qwen3.6, shared expert)
+- SSD expert streaming: MoE checkpoints larger than memory run by streaming the router-selected experts from disk through an LRU cache; engages automatically when the model does not fit, with `--stream-experts` / `--expert-cache-mb` as overrides only. FP8 experts cache in their file encoding and run native F8 GEMV kernels
+- Hybrid linear-attention models (Qwen3.5 / Qwen3.6 families, text-only): Gated DeltaNet + gated full attention, in BF16 safetensors, compressed-tensors INT4, and GGUF (`qwen35`) formats
 - Model download directly from HuggingFace with interactive variant selection
 
 ## Architecture
@@ -84,7 +85,9 @@ These architecture classes are covered by the regression suite, each with at lea
 - `GemmaForCausalLM`, `Gemma2ForCausalLM`, `Gemma3ForCausalLM`, `Gemma4ForConditionalGeneration`
 - `Mistral3ForConditionalGeneration`
 - `Phi3ForCausalLM` (Phi-3 / Phi-3.5)
+- `GraniteForCausalLM` (Granite 3.x dense)
 - `OlmoeForCausalLM` and `GptOssForCausalLM` (Mixture-of-Experts)
+- `Qwen3_5MoeForConditionalGeneration` (Qwen3.6 MoE hybrid; 35B-A3B runs on 24 GB via automatic SSD expert streaming)
 
 Formats span BF16 safetensors, GGUF, AWQ/GPTQ, compressed-tensors INT4, FP8, and MXFP4, auto-detected per checkpoint. Other checkpoints in the same families and sizes (e.g. other Llama 3.2, Gemma 3, or Qwen2.5 variants) are likely to work but are not regularly tested.
 
@@ -373,6 +376,8 @@ Every option can be set via a CLI flag or an environment variable. CLI flags tak
 | `--max-queued-requests <N>` | `OXYDLLM_MAX_QUEUED_REQUESTS` | `200` | Request queue depth; returns HTTP 429 when full |
 | `--devices <IDS>` | `OXYDLLM_DEVICES` | auto | Comma-separated CUDA device indices |
 | `--kv-quant <MODE>` | `OXYDLLM_KV_QUANT` | `off` | KV cache quantization: `off`, `lossless`, `balanced`, `aggressive` |
+| `--stream-experts` | - | automatic | Force SSD expert streaming on a MoE model. By default streaming engages only when the model does not fit in available memory. |
+| `--expert-cache-mb <MB>` | `OXYDLLM_EXPERT_CACHE_MB` | automatic | Override the LRU byte budget for streamed experts; implies `--stream-experts`. |
 | `--shutdown-timeout <SECS>` | `OXYDLLM_SHUTDOWN_TIMEOUT` | `30` | Grace period for in-flight requests on shutdown |
 | `--qjl-quantization` | - | disabled | Enable Stage-2 QJL key residual quantization |
 | `--allow-cpu` | `OXYDLLM_ALLOW_CPU` | disabled | Permit CPU fallback when no GPU is available. By default startup fails fast on a GPU-less host. |
@@ -519,8 +524,19 @@ All numbers were measured on the Apple Silicon reference machine (M5, 24 GB unif
 | `google/gemma-3-1b-it` | Gemma3ForCausalLM | BF16 safetensors | 36.1 |
 | `google/gemma-4-E2B-it` | Gemma4ForConditionalGeneration | BF16 safetensors | 15.4 |
 | `mistralai/Ministral-3-3B-Instruct-2512` | Mistral3ForConditionalGeneration | BF16 safetensors | 12.1 |
+| `microsoft/Phi-3-mini-4k-instruct-gguf` | Phi3 (GGUF) | Q4 | 17.9 |
+| `ibm-granite/granite-3.3-2b-instruct-Q4_K_M` | GraniteForCausalLM (GGUF) | Q4_K_M | 44.3 |
 | `allenai/OLMoE-1B-7B-0924-Instruct` | OlmoeForCausalLM (MoE) | BF16 safetensors, 64 experts × top-k 8 | 13.6 |
 | `openai/gpt-oss-20b` | GptOssForCausalLM (MoE) | MXFP4 experts + BF16, 32 experts × top-k 4 | 14.3 |
+
+### SSD expert streaming
+
+Streamed models use a different protocol (the throughput depends on the expert-cache budget, so runs pin it explicitly): median of 3 warm generations at temperature 0.
+
+| Model | Cache | Decode tok/s | Notes |
+|---|---|---|---|
+| `Qwen/Qwen3.6-35B-A3B-FP8` (36 GB checkpoint) | 3.4 GB pinned | 4.0 | F8-resident cache + native F8 GEMV; deterministic, correctness battery green |
+| `openai/gpt-oss-20b` streamed | 4 GB pinned | 6.5 | Byte-identical to the resident run; hot-cache streaming matches resident speed (13.2 vs 12.3) |
 
 ### Qwen3.5 (hybrid linear attention)
 

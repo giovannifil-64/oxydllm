@@ -131,7 +131,15 @@ fn estimate_local_safetensors(dir: &Path, ctx_len: usize, num_seqs: usize) -> Re
     let quant_info = read_quantization_config(&config_path);
 
     let (effective_bytes, format_label, accuracy_label) = if let Some(qi) = quant_info.as_ref() {
-        if let Some(expansion) = awq_qweight_expansion(qi.bits.unwrap_or(4)) {
+        if qi.method.eq_ignore_ascii_case("fp8") {
+            (
+                weights_bytes * 2,
+                "FP8 (E4M3, block-scaled) safetensors  (Metal: dequantized to BF16 at load → 2× file size; streamed experts stay F8)".to_string(),
+                "Accuracy ~lossless  (FP8 weights, near-bf16 quality)",
+            )
+        } else if is_packed_int_method(&qi.method)
+            && let Some(expansion) = awq_qweight_expansion(qi.bits.unwrap_or(4))
+        {
             let (total_bytes, qweight_bytes) =
                 sum_safetensors_bytes(dir).unwrap_or((weights_bytes, 0));
             let other_bytes = total_bytes.saturating_sub(qweight_bytes);
@@ -319,10 +327,15 @@ fn estimate_remote(
 
     if safetensors_bytes > 0 {
         println!();
-        let is_awq = quant_info
+        let is_fp8_quant = quant_info
             .as_ref()
-            .and_then(|qi| awq_qweight_expansion(qi.bits.unwrap_or(4)))
-            .is_some();
+            .is_some_and(|qi| qi.method.eq_ignore_ascii_case("fp8"));
+        let is_awq = !is_fp8_quant
+            && quant_info
+                .as_ref()
+                .filter(|qi| is_packed_int_method(&qi.method))
+                .and_then(|qi| awq_qweight_expansion(qi.bits.unwrap_or(4)))
+                .is_some();
 
         let tied_extra = if is_awq {
             config_json.as_ref().and_then(tied_lm_head_extra_bytes)
@@ -351,6 +364,8 @@ fn estimate_remote(
                 format!("AWQ {bits}-bit safetensors")
             };
             (label, "~lossy")
+        } else if is_fp8_quant {
+            ("FP8 (E4M3) safetensors".to_string(), "~lossless")
         } else {
             ("safetensors (F32/BF16)".to_string(), "100%")
         };
@@ -394,6 +409,16 @@ fn fetch_remote_config_json(
         return None;
     }
     resp.json().ok()
+}
+
+/// True for the packed-integer quantization methods whose weights stay
+/// packed at runtime (AWQ-class expansion applies). FP8 checkpoints carry a
+/// `quantization_config` too but dequantize to BF16 on Metal.
+fn is_packed_int_method(method: &str) -> bool {
+    matches!(
+        method.to_ascii_lowercase().as_str(),
+        "awq" | "gptq" | "compressed-tensors" | "compressed_tensors"
+    )
 }
 
 fn parse_quantization_from_json(json: &serde_json::Value) -> Option<QuantInfo> {

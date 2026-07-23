@@ -531,6 +531,15 @@ All numbers were measured on the Apple Silicon reference machine (M5, 24 GB unif
 | `allenai/OLMoE-1B-7B-0924-Instruct` | OlmoeForCausalLM (MoE) | BF16 safetensors, 64 experts × top-k 8 | 13.6 |
 | `openai/gpt-oss-20b` | GptOssForCausalLM (MoE) | MXFP4 experts + BF16, 32 experts × top-k 4 | 14.3 |
 
+### Embeddings
+
+Embedding models are verified by parity against the reference stack rather than throughput: identical token ids and cosine similarity between our output and sentence-transformers on fixed sentence fixtures (F32 on CPU for the contract test in the repo, BF16 on Metal end to end).
+
+| Model | Class | Pooling | Parity (cosine) |
+|---|---|---|---|
+| `ibm-granite/granite-embedding-125m-english` | RobertaModel (bidirectional encoder) | CLS + L2 | 0.99999 CPU / 0.99998+ Metal |
+| `Qwen/Qwen3-Embedding-0.6B` | Qwen3 (causal embedder) | last token + L2 | 0.999+ CPU / 0.9996+ Metal |
+
 ### SSD expert streaming
 
 Streamed models use a different protocol (the throughput depends on the expert-cache budget, so runs pin it explicitly): median of 3 warm generations at temperature 0.

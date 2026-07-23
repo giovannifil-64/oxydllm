@@ -80,6 +80,26 @@ enum S {
     Done,
 }
 
+/// Structural events one byte can trigger, as a bitset: a single byte may
+/// both finish a scalar and close a container (`5}` finishes the number and
+/// closes the object).
+pub type Events = u16;
+pub const EV_VALUE_START: Events = 1 << 0;
+pub const EV_SCALAR_END: Events = 1 << 1;
+pub const EV_OBJ_OPEN: Events = 1 << 2;
+pub const EV_OBJ_CLOSE: Events = 1 << 3;
+pub const EV_ARR_OPEN: Events = 1 << 4;
+pub const EV_ARR_CLOSE: Events = 1 << 5;
+pub const EV_KEY_START: Events = 1 << 6;
+pub const EV_KEY_END: Events = 1 << 7;
+pub const EV_OBJ_COMMA: Events = 1 << 8;
+
+impl JsonMachine {
+    fn in_number(&self) -> bool {
+        matches!(self.state, S::Num(_))
+    }
+}
+
 /// The incremental JSON syntax automaton. `Copy` by design: the per-step mask
 /// probes every vocabulary token from the same start state.
 #[derive(Clone, Copy, Debug)]
@@ -214,6 +234,84 @@ impl JsonMachine {
 
     /// Advances by one byte; `false` means the byte is illegal here.
     pub fn step(&mut self, b: u8, mode: JsonMode) -> bool {
+        self.step_ev(b, mode).is_some()
+    }
+
+    /// Advances by one byte, reporting the structural [`Events`] it caused;
+    /// `None` means the byte is illegal here.
+    pub fn step_ev(&mut self, b: u8, mode: JsonMode) -> Option<Events> {
+        let before_state = self.state;
+        let before_depth = self.depth;
+        if !self.step_inner(b, mode) {
+            return None;
+        }
+        let mut ev: Events = 0;
+        let value_started =
+            matches!(before_state, S::Value | S::ArrFirst) && !is_ws(b) && b != b']';
+        if value_started {
+            ev |= EV_VALUE_START;
+        }
+        match b {
+            b'{' if value_started => ev |= EV_OBJ_OPEN,
+            b'[' if value_started => ev |= EV_ARR_OPEN,
+            b'"' => {
+                if matches!(before_state, S::ObjFirst | S::ObjComma) {
+                    ev |= EV_KEY_START;
+                } else if let S::Str {
+                    esc: false,
+                    uni: 0,
+                    key,
+                    ..
+                } = before_state
+                {
+                    if key {
+                        ev |= EV_KEY_END;
+                    } else {
+                        ev |= EV_SCALAR_END;
+                    }
+                }
+            }
+            b',' => {
+                if matches!(before_state, S::ObjNext) {
+                    ev |= EV_OBJ_COMMA;
+                }
+            }
+            b'}' => {
+                if matches!(before_state, S::ObjFirst | S::ObjNext | S::Num(_)) {
+                    if matches!(before_state, S::Num(_)) {
+                        ev |= EV_SCALAR_END;
+                    }
+                    ev |= EV_OBJ_CLOSE;
+                }
+            }
+            b']' => {
+                if matches!(before_state, S::ArrFirst | S::ArrNext | S::Num(_)) {
+                    if matches!(before_state, S::Num(_)) {
+                        ev |= EV_SCALAR_END;
+                    }
+                    ev |= EV_ARR_CLOSE;
+                }
+            }
+            _ => {}
+        }
+        // A literal or number that just completed into a delimiter, or a
+        // literal that hit its final letter.
+        if matches!(before_state, S::Lit { .. }) && !matches!(self.state, S::Lit { .. }) {
+            ev |= EV_SCALAR_END;
+        }
+        if matches!(before_state, S::Num(_))
+            && !matches!(self.state, S::Num(_))
+            && !matches!(b, b'}' | b']')
+        {
+            ev |= EV_SCALAR_END;
+        }
+        if before_depth < self.depth {
+            // already flagged via byte match above
+        }
+        Some(ev)
+    }
+
+    fn step_inner(&mut self, b: u8, mode: JsonMode) -> bool {
         let top_only = Self::object_only(mode);
         match self.state {
             S::Value => self.start_value(b, top_only),
@@ -395,6 +493,206 @@ impl JsonMachine {
     }
 }
 
+/// A request's JSON constraint specification: the top-level shape plus the
+/// compiled schema guidance (unconstrained for plain `json_object`).
+#[derive(Clone)]
+pub struct JsonSpec {
+    pub mode: JsonMode,
+    pub arena: Arc<SchemaArena>,
+}
+
+/// A node id into a [`SchemaArena`]; id 0 is always the unconstrained `Any`.
+pub type NodeId = u16;
+const ANY: NodeId = 0;
+const NO_PROP: u16 = u16::MAX;
+/// Schema guidance tracks at most this much nesting; deeper levels fall back
+/// to syntax-only (sound: never stricter than the schema requires... looser).
+const GUIDED_DEPTH: usize = 8;
+
+/// A compiled schema node. Anything the compiler does not understand becomes
+/// [`SchemaNode::Any`], which keeps the mask sound: unsupported subtrees are
+/// guided by syntax only and judged by post-hoc validation.
+pub enum SchemaNode {
+    Any,
+    Object {
+        /// Property names as raw bytes with their value nodes.
+        props: Vec<(Vec<u8>, NodeId)>,
+        /// Bitmask over `props` of the required ones.
+        required: u64,
+        /// Whether unknown keys are allowed.
+        additional: bool,
+    },
+    Array {
+        items: NodeId,
+    },
+    Str,
+    Number {
+        integer: bool,
+    },
+    Boolean,
+    Null,
+    /// Scalar enum: the exact canonical JSON serializations allowed.
+    Enum {
+        literals: Vec<Vec<u8>>,
+    },
+}
+
+/// The compiled schema, arena-allocated so states are plain indices.
+pub struct SchemaArena {
+    nodes: Vec<SchemaNode>,
+}
+
+impl SchemaArena {
+    /// An arena whose root constrains nothing (plain JSON-syntax guidance).
+    pub fn unconstrained() -> Arc<Self> {
+        Arc::new(Self {
+            nodes: vec![SchemaNode::Any],
+        })
+    }
+
+    /// The root node of the compiled schema.
+    pub fn root(&self) -> NodeId {
+        (self.nodes.len() - 1) as NodeId
+    }
+
+    fn node(&self, id: NodeId) -> &SchemaNode {
+        &self.nodes[id as usize]
+    }
+
+    /// Compiles a JSON Schema into guidance nodes; the root is
+    /// [`root`](Self::root). Unsupported constructs compile to `Any`.
+    pub fn compile(schema: &serde_json::Value) -> Arc<Self> {
+        let mut arena = Self {
+            nodes: vec![SchemaNode::Any],
+        };
+        let root = arena.compile_node(schema, schema, 0);
+        if root != arena.nodes.len() as NodeId - 1 {
+            // Root resolved to an existing node (e.g. Any): append an alias
+            // is unnecessary because root() must be the last: push a copy.
+            let clone_target = root;
+            let node = match arena.node(clone_target) {
+                SchemaNode::Any => SchemaNode::Any,
+                _ => unreachable!("only Any is shared"),
+            };
+            arena.nodes.push(node);
+        }
+        Arc::new(arena)
+    }
+
+    fn compile_node(
+        &mut self,
+        schema: &serde_json::Value,
+        root: &serde_json::Value,
+        depth: u8,
+    ) -> NodeId {
+        if depth > 32 {
+            return ANY;
+        }
+        let Some(obj) = schema.as_object() else {
+            return ANY;
+        };
+        if let Some(r) = obj.get("$ref").and_then(|v| v.as_str()) {
+            for prefix in ["#/$defs/", "#/definitions/"] {
+                if let Some(name) = r.strip_prefix(prefix) {
+                    let key = if prefix.contains("definitions") {
+                        "definitions"
+                    } else {
+                        "$defs"
+                    };
+                    if let Some(target) = root.get(key).and_then(|d| d.get(name)) {
+                        return self.compile_node(target, root, depth + 1);
+                    }
+                }
+            }
+            return ANY;
+        }
+        if let Some(values) = obj.get("enum").and_then(|v| v.as_array()) {
+            let mut literals = Vec::with_capacity(values.len());
+            if values.is_empty() || values.len() > 64 {
+                return ANY;
+            }
+            for v in values {
+                if v.is_object() || v.is_array() {
+                    return ANY;
+                }
+                match serde_json::to_vec(v) {
+                    Ok(bytes) => literals.push(bytes),
+                    Err(_) => return ANY,
+                }
+            }
+            self.nodes.push(SchemaNode::Enum { literals });
+            return (self.nodes.len() - 1) as NodeId;
+        }
+        if obj.contains_key("anyOf") || obj.contains_key("oneOf") || obj.contains_key("allOf") {
+            return ANY;
+        }
+        let ty = obj.get("type").and_then(|v| v.as_str());
+        match ty {
+            Some("object") | None if obj.contains_key("properties") || ty == Some("object") => {
+                let mut props: Vec<(Vec<u8>, NodeId)> = Vec::new();
+                if let Some(properties) = obj.get("properties").and_then(|v| v.as_object()) {
+                    if properties.len() > 64 {
+                        return ANY;
+                    }
+                    for (name, sub) in properties {
+                        let node = self.compile_node(sub, root, depth + 1);
+                        props.push((name.clone().into_bytes(), node));
+                    }
+                }
+                let mut required = 0u64;
+                if let Some(req) = obj.get("required").and_then(|v| v.as_array()) {
+                    for r in req {
+                        let Some(name) = r.as_str() else { return ANY };
+                        match props.iter().position(|(p, _)| p == name.as_bytes()) {
+                            Some(i) => required |= 1 << i,
+                            None => return ANY,
+                        }
+                    }
+                }
+                let additional = obj
+                    .get("additionalProperties")
+                    .map(|v| v != &serde_json::Value::Bool(false))
+                    .unwrap_or(true);
+                self.nodes.push(SchemaNode::Object {
+                    props,
+                    required,
+                    additional,
+                });
+                (self.nodes.len() - 1) as NodeId
+            }
+            Some("array") => {
+                let items = obj
+                    .get("items")
+                    .map(|it| self.compile_node(it, root, depth + 1))
+                    .unwrap_or(ANY);
+                self.nodes.push(SchemaNode::Array { items });
+                (self.nodes.len() - 1) as NodeId
+            }
+            Some("string") => {
+                self.nodes.push(SchemaNode::Str);
+                (self.nodes.len() - 1) as NodeId
+            }
+            Some("number") => {
+                self.nodes.push(SchemaNode::Number { integer: false });
+                (self.nodes.len() - 1) as NodeId
+            }
+            Some("integer") => {
+                self.nodes.push(SchemaNode::Number { integer: true });
+                (self.nodes.len() - 1) as NodeId
+            }
+            Some("boolean") => {
+                self.nodes.push(SchemaNode::Boolean);
+                (self.nodes.len() - 1) as NodeId
+            }
+            Some("null") => {
+                self.nodes.push(SchemaNode::Null);
+                (self.nodes.len() - 1) as NodeId
+            }
+            _ => ANY,
+        }
+    }
+}
+
 /// Every vocabulary token's produced bytes, or `None` for tokens that must
 /// never appear inside constrained output (added/special tokens).
 pub struct TokenByteTable {
@@ -456,24 +754,386 @@ impl TokenByteTable {
     }
 }
 
-/// The per-sequence constraint: automaton state plus the shared byte table.
+/// One guided nesting level: the governing schema node, which known
+/// properties have been emitted, and the property whose value is pending.
+#[derive(Clone, Copy)]
+struct Level {
+    node: NodeId,
+    emitted: u64,
+    cur_prop: u16,
+}
+
+/// The constraint on the scalar currently being emitted.
+#[derive(Clone, Copy)]
+enum ValCtx {
+    Free,
+    /// Matching enum literals byte-exactly; `alive` is a bitmask over the
+    /// literals of the enum `node`.
+    EnumScan {
+        node: NodeId,
+        alive: u64,
+        pos: u16,
+    },
+    /// Matching an object key against the level's property names.
+    KeyScan {
+        alive: u64,
+        pos: u16,
+        any: bool,
+    },
+    /// Inside a number under an `integer` schema: `.` and exponents masked.
+    IntNumber,
+}
+
+/// The schema-guidance half of the walker: `Copy`, so the per-token probe
+/// costs one memcpy. Nesting deeper than [`GUIDED_DEPTH`] is counted in
+/// `overflow` and guided by syntax only.
+#[derive(Clone, Copy)]
+struct GuideState {
+    levels: [Level; GUIDED_DEPTH],
+    depth: u8,
+    overflow: u8,
+    val: ValCtx,
+}
+
+impl GuideState {
+    fn new() -> Self {
+        Self {
+            levels: [Level {
+                node: ANY,
+                emitted: 0,
+                cur_prop: NO_PROP,
+            }; GUIDED_DEPTH],
+            depth: 0,
+            overflow: 0,
+            val: ValCtx::Free,
+        }
+    }
+
+    /// The schema node governing the next value at the current position.
+    fn expected(&self, arena: &SchemaArena, root: NodeId) -> NodeId {
+        if self.overflow > 0 {
+            return ANY;
+        }
+        if self.depth == 0 {
+            return root;
+        }
+        let level = &self.levels[self.depth as usize - 1];
+        match arena.node(level.node) {
+            SchemaNode::Array { items } => *items,
+            SchemaNode::Object { props, .. } => {
+                if level.cur_prop == NO_PROP {
+                    ANY
+                } else {
+                    props[level.cur_prop as usize].1
+                }
+            }
+            _ => ANY,
+        }
+    }
+
+    /// Processes one accepted byte and its machine events; `false` rejects
+    /// the byte on schema grounds.
+    fn on_byte(
+        &mut self,
+        arena: &SchemaArena,
+        root: NodeId,
+        b: u8,
+        ev: Events,
+        was_num: bool,
+    ) -> bool {
+        // A number ending on a delimiter: the delimiter byte is not part of
+        // the scalar, so settle the scalar constraint first.
+        if ev & EV_SCALAR_END != 0 && was_num && !self.finish_scalar(arena, false, b) {
+            return false;
+        }
+
+        if ev & EV_OBJ_COMMA != 0 && !self.has_available_key(arena) {
+            return false;
+        }
+        if ev & EV_VALUE_START != 0 {
+            let node = self.expected(arena, root);
+            if !self.enter_value(arena, node, b) {
+                return false;
+            }
+        } else if ev & EV_KEY_START != 0 {
+            if !self.has_available_key(arena) {
+                return false;
+            }
+            self.start_key(arena);
+        } else {
+            // Content byte of the current scalar or key.
+            match &mut self.val {
+                ValCtx::EnumScan { node, alive, pos } => {
+                    if ev & (EV_KEY_END | EV_SCALAR_END | EV_OBJ_CLOSE | EV_ARR_CLOSE) == 0 {
+                        if let SchemaNode::Enum { literals } = arena.node(*node) {
+                            let mut next = 0u64;
+                            for (i, lit) in literals.iter().enumerate() {
+                                if *alive & (1 << i) != 0 && lit.get(*pos as usize) == Some(&b) {
+                                    next |= 1 << i;
+                                }
+                            }
+                            *alive = next;
+                        }
+                        if *alive == 0 {
+                            return false;
+                        }
+                        *pos += 1;
+                    }
+                }
+                ValCtx::KeyScan { alive, pos, any } => {
+                    if ev & EV_KEY_END == 0 {
+                        let level = &self.levels[self.depth as usize - 1];
+                        if let SchemaNode::Object { props, .. } = arena.node(level.node) {
+                            let mut next = 0u64;
+                            for (i, (name, _)) in props.iter().enumerate() {
+                                if *alive & (1 << i) != 0 && name.get(*pos as usize) == Some(&b) {
+                                    next |= 1 << i;
+                                }
+                            }
+                            *alive = next;
+                        }
+                        if *alive == 0 && !*any {
+                            return false;
+                        }
+                        *pos += 1;
+                    }
+                }
+                ValCtx::IntNumber => {
+                    if matches!(b, b'.' | b'e' | b'E') {
+                        return false;
+                    }
+                }
+                ValCtx::Free => {}
+            }
+        }
+
+        if ev & EV_SCALAR_END != 0 && !was_num && !self.finish_scalar(arena, true, b) {
+            return false;
+        }
+        if ev & EV_KEY_END != 0 && !self.finish_key(arena) {
+            return false;
+        }
+        if ev & (EV_OBJ_CLOSE | EV_ARR_CLOSE) != 0 && !self.close_container(arena) {
+            return false;
+        }
+        true
+    }
+
+    fn enter_value(&mut self, arena: &SchemaArena, node: NodeId, b: u8) -> bool {
+        self.val = ValCtx::Free;
+        let opens = matches!(b, b'{' | b'[');
+        let type_ok = match arena.node(node) {
+            SchemaNode::Any => true,
+            SchemaNode::Object { .. } => b == b'{',
+            SchemaNode::Array { .. } => b == b'[',
+            SchemaNode::Str => b == b'"',
+            SchemaNode::Number { integer } => {
+                if matches!(b, b'-' | b'0'..=b'9') {
+                    if *integer {
+                        self.val = ValCtx::IntNumber;
+                    }
+                    true
+                } else {
+                    false
+                }
+            }
+            SchemaNode::Boolean => matches!(b, b't' | b'f'),
+            SchemaNode::Null => b == b'n',
+            SchemaNode::Enum { literals } => {
+                let mut alive = 0u64;
+                for (i, lit) in literals.iter().enumerate() {
+                    if lit.first() == Some(&b) {
+                        alive |= 1 << i;
+                    }
+                }
+                if alive == 0 {
+                    return false;
+                }
+                self.val = ValCtx::EnumScan {
+                    node,
+                    alive,
+                    pos: 1,
+                };
+                true
+            }
+        };
+        if !type_ok {
+            return false;
+        }
+        if opens {
+            if self.overflow > 0 || self.depth as usize >= GUIDED_DEPTH {
+                self.overflow = self.overflow.saturating_add(1);
+            } else {
+                let level_node = match arena.node(node) {
+                    SchemaNode::Object { .. } | SchemaNode::Array { .. } => node,
+                    _ => ANY,
+                };
+                self.levels[self.depth as usize] = Level {
+                    node: level_node,
+                    emitted: 0,
+                    cur_prop: NO_PROP,
+                };
+                self.depth += 1;
+            }
+        }
+        true
+    }
+
+    /// Whether the current object can accept another key: any unknown key
+    /// when `additionalProperties`, otherwise at least one property not yet
+    /// emitted.
+    fn has_available_key(&self, arena: &SchemaArena) -> bool {
+        if self.overflow > 0 || self.depth == 0 {
+            return true;
+        }
+        let level = &self.levels[self.depth as usize - 1];
+        match arena.node(level.node) {
+            SchemaNode::Object {
+                props, additional, ..
+            } => *additional || (0..props.len()).any(|i| level.emitted & (1 << i) == 0),
+            _ => true,
+        }
+    }
+
+    fn start_key(&mut self, arena: &SchemaArena) {
+        if self.overflow > 0 || self.depth == 0 {
+            self.val = ValCtx::Free;
+            return;
+        }
+        let level = &self.levels[self.depth as usize - 1];
+        match arena.node(level.node) {
+            SchemaNode::Object {
+                props, additional, ..
+            } => {
+                let mut alive = 0u64;
+                for i in 0..props.len() {
+                    if level.emitted & (1 << i) == 0 {
+                        alive |= 1 << i;
+                    }
+                }
+                self.val = ValCtx::KeyScan {
+                    alive,
+                    pos: 0,
+                    any: *additional,
+                };
+            }
+            _ => self.val = ValCtx::Free,
+        }
+    }
+
+    fn finish_key(&mut self, arena: &SchemaArena) -> bool {
+        let ValCtx::KeyScan { alive, pos, any } = self.val else {
+            self.val = ValCtx::Free;
+            return true;
+        };
+        self.val = ValCtx::Free;
+        let level = &mut self.levels[self.depth as usize - 1];
+        if let SchemaNode::Object { props, .. } = arena.node(level.node) {
+            let exact = (0..props.len())
+                .find(|&i| alive & (1 << i) != 0 && props[i].0.len() == pos as usize);
+            match exact {
+                Some(i) => {
+                    level.emitted |= 1 << i;
+                    level.cur_prop = i as u16;
+                    true
+                }
+                None => {
+                    level.cur_prop = NO_PROP;
+                    any
+                }
+            }
+        } else {
+            true
+        }
+    }
+
+    fn finish_scalar(&mut self, arena: &SchemaArena, byte_included: bool, b: u8) -> bool {
+        let ok = match self.val {
+            ValCtx::EnumScan { node, alive, pos } => {
+                if let SchemaNode::Enum { literals } = arena.node(node) {
+                    literals.iter().enumerate().any(|(i, lit)| {
+                        alive & (1 << i) != 0
+                            && if byte_included {
+                                lit.get(pos as usize) == Some(&b) && lit.len() == pos as usize + 1
+                            } else {
+                                lit.len() == pos as usize
+                            }
+                    })
+                } else {
+                    true
+                }
+            }
+            _ => true,
+        };
+        self.val = ValCtx::Free;
+        if self.depth > 0 && self.overflow == 0 {
+            self.levels[self.depth as usize - 1].cur_prop = NO_PROP;
+        }
+        ok
+    }
+
+    fn close_container(&mut self, arena: &SchemaArena) -> bool {
+        if self.overflow > 0 {
+            self.overflow -= 1;
+            return true;
+        }
+        if self.depth == 0 {
+            return true;
+        }
+        let level = &self.levels[self.depth as usize - 1];
+        let ok = match arena.node(level.node) {
+            SchemaNode::Object { required, .. } => level.emitted & *required == *required,
+            _ => true,
+        };
+        self.depth -= 1;
+        self.val = ValCtx::Free;
+        if self.depth > 0 {
+            self.levels[self.depth as usize - 1].cur_prop = NO_PROP;
+        }
+        ok
+    }
+}
+
+/// The per-sequence constraint: automaton state, schema guidance, and the
+/// shared byte table.
 pub struct JsonConstraint {
     table: Arc<TokenByteTable>,
+    arena: Arc<SchemaArena>,
+    root: NodeId,
     machine: JsonMachine,
+    guide: GuideState,
     mode: JsonMode,
 }
 
 impl JsonConstraint {
-    pub fn new(table: Arc<TokenByteTable>, mode: JsonMode) -> Self {
+    pub fn new(table: Arc<TokenByteTable>, mode: JsonMode, arena: Arc<SchemaArena>) -> Self {
+        let root = arena.root();
         Self {
             table,
+            arena,
+            root,
             machine: JsonMachine::new(mode),
+            guide: GuideState::new(),
             mode,
         }
     }
 
-    /// Marks every token whose bytes are illegal from the current state as
-    /// `false`; stop tokens are `true` only when the machine accepts.
+    fn walk(&self, machine: &mut JsonMachine, guide: &mut GuideState, bytes: &[u8]) -> bool {
+        for &b in bytes {
+            let was_num = machine.in_number();
+            let Some(ev) = machine.step_ev(b, self.mode) else {
+                return false;
+            };
+            if !guide.on_byte(&self.arena, self.root, b, ev, was_num) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Marks every token whose bytes are illegal (syntactically or against
+    /// the schema guidance) as `false`; stop tokens are `true` only when the
+    /// machine accepts a complete value.
     pub fn allowed(&self, vocab_size: usize) -> Vec<bool> {
         let accepting = self.machine.accepting();
         let mut allowed = vec![false; vocab_size];
@@ -483,7 +1143,8 @@ impl JsonConstraint {
                 continue;
             }
             let mut m = self.machine;
-            if tok_bytes.iter().all(|&b| m.step(b, self.mode)) {
+            let mut g = self.guide;
+            if self.walk(&mut m, &mut g, tok_bytes) {
                 allowed[id] = true;
             }
         }
@@ -497,18 +1158,21 @@ impl JsonConstraint {
         allowed
     }
 
-    /// Advances the automaton with the chosen token. Stop tokens (legal only
-    /// in the accepting state) leave the machine unchanged.
+    /// Advances with the chosen token. Stop tokens (legal only when
+    /// accepting) leave the state unchanged.
     pub fn advance(&mut self, token: u32) {
         if self.table.stop_ids.contains(&token) {
             return;
         }
-        if let Some(Some(tok_bytes)) = self.table.bytes.get(token as usize) {
-            for &b in tok_bytes {
-                if !self.machine.step(b, self.mode) {
-                    return;
-                }
-            }
+        let Some(Some(tok_bytes)) = self.table.bytes.get(token as usize) else {
+            return;
+        };
+        let bytes = tok_bytes.clone();
+        let mut m = self.machine;
+        let mut g = self.guide;
+        if self.walk(&mut m, &mut g, &bytes) {
+            self.machine = m;
+            self.guide = g;
         }
     }
 }
@@ -625,6 +1289,177 @@ mod tests {
         assert!(m.accepting());
     }
 
+    fn person_schema() -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "age": {"type": "integer"},
+                "color": {"enum": ["red", "green", "blue"]},
+                "tags": {"type": "array", "items": {"type": "string"}}
+            },
+            "required": ["name", "age"],
+            "additionalProperties": false
+        })
+    }
+
+    fn guided(schema: &serde_json::Value) -> JsonConstraint {
+        let table = TokenByteTable::from_raw(
+            (0x20u8..0x7F)
+                .map(|b| Some(vec![b]))
+                .chain([Some(b"\n".to_vec()), None])
+                .collect(),
+            vec![96],
+        );
+        JsonConstraint::new(table, JsonMode::Object, SchemaArena::compile(schema))
+    }
+
+    fn walk_str(c: &mut JsonConstraint, doc: &str) -> bool {
+        let mut m = c.machine;
+        let mut g = c.guide;
+        let ok = c.walk(&mut m, &mut g, doc.as_bytes());
+        if ok {
+            c.machine = m;
+            c.guide = g;
+        }
+        ok
+    }
+
+    /// Contract: schema guidance accepts schema-valid documents and rejects,
+    /// at the first offending byte, unknown keys, missing-required closes,
+    /// wrong value types, non-integer numbers under integer, non-member enum
+    /// values, and wrongly typed array items.
+    #[test]
+    fn schema_guidance_accepts_and_rejects() {
+        let schema = person_schema();
+        let mut c = guided(&schema);
+        assert!(walk_str(
+            &mut c,
+            r#"{"name": "Ada", "age": 36, "color": "green", "tags": ["x", "y"]}"#
+        ));
+        assert!(c.machine.accepting());
+
+        for (doc, why) in [
+            (
+                r#"{"nickname"#,
+                "unknown key with additionalProperties false",
+            ),
+            (r#"{"name": "Ada"}"#, "close before required 'age'"),
+            (r#"{"name": 3"#, "number where string required"),
+            (r#"{"name": "A", "age": 3.5"#, "non-integer under integer"),
+            (
+                r#"{"name": "A", "age": 3, "color": "purple"#,
+                "non-member enum",
+            ),
+            (
+                r#"{"name": "A", "age": 3, "tags": [1"#,
+                "wrong array item type",
+            ),
+            (r#"{"name": "A", "name"#, "duplicate known key"),
+        ] {
+            let mut c = guided(&schema);
+            assert!(!walk_str(&mut c, doc), "accepted invalid ({why}): {doc:?}");
+        }
+    }
+
+    /// Contract: unsupported constructs (anyOf) fall back to syntax-only
+    /// guidance, and $ref into $defs resolves.
+    #[test]
+    fn schema_fallback_and_ref() {
+        let any_of = serde_json::json!({
+            "type": "object",
+            "properties": {"x": {"anyOf": [{"type": "string"}, {"type": "number"}]}},
+            "required": ["x"]
+        });
+        let mut c = guided(&any_of);
+        assert!(
+            walk_str(&mut c, r#"{"x": [1, 2]}"#),
+            "anyOf subtree must be unguided"
+        );
+
+        let with_ref = serde_json::json!({
+            "type": "object",
+            "properties": {"p": {"$ref": "#/$defs/point"}},
+            "required": ["p"],
+            "$defs": {"point": {"type": "object", "properties": {"x": {"type": "integer"}},
+                                  "required": ["x"], "additionalProperties": false}}
+        });
+        let mut c = guided(&with_ref);
+        assert!(walk_str(&mut c, r#"{"p": {"x": 7}}"#));
+        let mut c = guided(&with_ref);
+        assert!(
+            !walk_str(&mut c, r#"{"p": {"y"#),
+            "ref'd schema must guide keys"
+        );
+    }
+
+    /// Contract (soundness + strictness): random mask-guided generation with
+    /// single-byte tokens is never stuck (some token or stop is always
+    /// allowed) and every accepted document parses and satisfies the schema.
+    #[test]
+    fn fuzz_guided_walks_always_valid() {
+        let schema = person_schema();
+        for seed in 0u64..40 {
+            let mut c = guided(&schema);
+            let mut rng = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let mut out: Vec<u8> = Vec::new();
+            let mut finished = false;
+            for _ in 0..400 {
+                let allowed = c.allowed(97);
+                let choices: Vec<usize> = allowed
+                    .iter()
+                    .enumerate()
+                    .filter(|&(_, &a)| a)
+                    .map(|(i, _)| i)
+                    .collect();
+                assert!(
+                    !choices.is_empty(),
+                    "stuck at {:?}",
+                    String::from_utf8_lossy(&out)
+                );
+                rng = rng
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                let pick = choices[(rng >> 33) as usize % choices.len()];
+                if pick == 96 {
+                    finished = true;
+                    break;
+                }
+                out.extend(c.table.bytes[pick].as_ref().unwrap());
+                c.advance(pick as u32);
+            }
+            if !finished {
+                continue;
+            }
+            let text = String::from_utf8(out).expect("guided output is UTF-8");
+            let v: serde_json::Value =
+                serde_json::from_str(&text).unwrap_or_else(|e| panic!("unparseable {text:?}: {e}"));
+            let obj = v
+                .as_object()
+                .unwrap_or_else(|| panic!("not an object: {text:?}"));
+            assert!(obj["name"].is_string(), "{text:?}");
+            assert!(obj["age"].is_i64() || obj["age"].is_u64(), "{text:?}");
+            if let Some(color) = obj.get("color") {
+                assert!(
+                    ["red", "green", "blue"].contains(&color.as_str().unwrap_or("")),
+                    "{text:?}"
+                );
+            }
+            if let Some(tags) = obj.get("tags") {
+                assert!(
+                    tags.as_array().unwrap().iter().all(|t| t.is_string()),
+                    "{text:?}"
+                );
+            }
+            for key in obj.keys() {
+                assert!(
+                    ["name", "age", "color", "tags"].contains(&key.as_str()),
+                    "unknown key in {text:?}"
+                );
+            }
+        }
+    }
+
     /// Contract: the mask allows exactly the tokens whose bytes fit the
     /// current state, and stop tokens only once accepting.
     #[test]
@@ -640,7 +1475,7 @@ mod tests {
             ],
             vec![5],
         );
-        let mut c = JsonConstraint::new(table, JsonMode::Object);
+        let mut c = JsonConstraint::new(table, JsonMode::Object, SchemaArena::unconstrained());
 
         let a = c.allowed(6);
         assert_eq!(a, vec![true, false, false, false, false, false]);

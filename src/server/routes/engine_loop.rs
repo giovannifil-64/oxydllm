@@ -241,9 +241,13 @@ fn enqueue_request(
     let prompt_len = req.prompt_tokens.len();
     let max_tokens = req.max_tokens;
     let constraint = match (req.json_mode, byte_table) {
-        (Some(mode), Some(table)) if !req.enable_thinking && !harmony => Some(
-            crate::constrain::JsonConstraint::new(std::sync::Arc::clone(table), mode),
-        ),
+        (Some(spec), Some(table)) if !req.enable_thinking && !harmony => {
+            Some(crate::constrain::JsonConstraint::new(
+                std::sync::Arc::clone(table),
+                spec.mode,
+                spec.arena,
+            ))
+        }
         _ => None,
     };
     let seq_id = match constraint {

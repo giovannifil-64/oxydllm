@@ -164,10 +164,11 @@ pub struct IncomingRequest {
     pub enqueued_at: std::time::Instant,
     pub enable_thinking: bool,
     pub extra_stop_token_ids: Vec<u32>,
-    /// Constrain generation to syntactically valid JSON of this shape.
-    /// Applied only when the model emits content directly (no thinking
-    /// preamble, no harmony channels); post-hoc validation runs regardless.
-    pub json_mode: Option<crate::constrain::JsonMode>,
+    /// Constrain generation to valid JSON of this shape, with optional
+    /// schema guidance. Applied only when the model emits content directly
+    /// (no thinking preamble, no harmony channels); post-hoc validation runs
+    /// regardless.
+    pub json_mode: Option<crate::constrain::JsonSpec>,
     /// HTTP-handler span this request belongs to. The engine's per-request span
     /// is created as its child, so the trace tree spans the HTTP boundary and
     /// links to any upstream caller. Cloning keeps the parent alive until the

@@ -1607,29 +1607,37 @@ pub(super) async fn chat_completions(
             ..base_sampling_params.clone()
         };
 
-        let json_mode =
-            body.response_format
-                .as_ref()
-                .and_then(|rf| match rf.format_type.as_str() {
-                    "json_object" => Some(crate::constrain::JsonMode::Object),
-                    "json_schema" => {
-                        let root_is_object = rf
-                            .json_schema
-                            .as_ref()
-                            .and_then(|spec| spec.schema.as_ref())
-                            .map(|schema| {
-                                schema["type"].as_str() == Some("object")
-                                    || schema.get("properties").is_some()
-                            })
-                            .unwrap_or(true);
-                        Some(if root_is_object {
-                            crate::constrain::JsonMode::Object
-                        } else {
-                            crate::constrain::JsonMode::Value
+        let json_mode = body.response_format.as_ref().and_then(|rf| {
+            use crate::constrain::{JsonMode, JsonSpec, SchemaArena};
+            match rf.format_type.as_str() {
+                "json_object" => Some(JsonSpec {
+                    mode: JsonMode::Object,
+                    arena: SchemaArena::unconstrained(),
+                }),
+                "json_schema" => {
+                    let schema = rf
+                        .json_schema
+                        .as_ref()
+                        .and_then(|spec| spec.schema.as_ref());
+                    let root_is_object = schema
+                        .map(|s| {
+                            s["type"].as_str() == Some("object") || s.get("properties").is_some()
                         })
-                    }
-                    _ => None,
-                });
+                        .unwrap_or(true);
+                    Some(JsonSpec {
+                        mode: if root_is_object {
+                            JsonMode::Object
+                        } else {
+                            JsonMode::Value
+                        },
+                        arena: schema
+                            .map(SchemaArena::compile)
+                            .unwrap_or_else(SchemaArena::unconstrained),
+                    })
+                }
+                _ => None,
+            }
+        });
         handle
             .request_tx
             .try_send(IncomingRequest {

@@ -2,6 +2,7 @@
 name = "oxydllm"
 version = "0.0.0-alpha.14"
 edition = "2024"
+rust-version = "1.94"
 
 [features]
 default = ["metal"]

@@ -114,6 +114,8 @@ git clone https://github.com/giovannifil-64/oxydllm
 cd oxydllm
 ```
 
+Requires Rust 1.94 or newer (candle's NEON f16 intrinsics stabilized there). rustup installs are always current; package-manager installs such as Homebrew can lag, so run `brew upgrade rust` or switch to rustup if the build reports an unsupported rustc.
+
 #### Apple Silicon
 ```bash
 cargo build --release --features metal

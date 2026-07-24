@@ -942,6 +942,51 @@ fn warm_up_model(model: &dyn BatchModel) {
     }
 }
 
+/// Removes a model's slot if its engine-loop thread dies without going
+/// through eviction (a panic in the engine or a kernel).
+///
+/// Lives on the engine thread for the whole life of [`engine_loop`] and runs
+/// on drop, unwinding included. Normal teardown paths (keep-alive expiry,
+/// LRU eviction, over-budget unload) remove the slot before the loop exits,
+/// so the drop-time check, "is this exact engine's channel still
+/// registered", fails and the guard does nothing; `same_channel` also keeps
+/// it from touching a reloaded successor slot. When the check passes the
+/// slot is stale: it is removed and its KV budget released, so the next
+/// request reloads the model instead of getting 503 forever.
+struct EngineSlotGuard {
+    manager: SharedModelManager,
+    model_id: String,
+    request_tx: tokio_mpsc::Sender<IncomingRequest>,
+}
+
+impl Drop for EngineSlotGuard {
+    fn drop(&mut self) {
+        let panicked = std::thread::panicking();
+        let mut mgr = self.manager.blocking_lock();
+        let stale = matches!(
+            mgr.slots.get(&self.model_id),
+            Some(SlotState::Ready { request_tx, .. }) if request_tx.same_channel(&self.request_tx)
+        );
+        if !stale {
+            return;
+        }
+        if let Some(SlotState::Ready { kv_cache_bytes, .. }) = mgr.slots.remove(&self.model_id) {
+            mgr.kv_budget.release(kv_cache_bytes);
+        }
+        if panicked {
+            tracing::error!(
+                model_id = %self.model_id,
+                "engine loop panicked; slot removed so the next request reloads the model"
+            );
+        } else {
+            tracing::warn!(
+                model_id = %self.model_id,
+                "engine loop exited with its slot still registered; slot removed"
+            );
+        }
+    }
+}
+
 /// Spawns the two halves of a model load.
 ///
 /// A dedicated OS thread loads the tokenizer and weights, warms up the model
@@ -974,6 +1019,7 @@ fn spawn_load(params: SpawnLoadParams) {
 
     let (result_tx, result_rx) = oneshot::channel::<Result<LoadResult, String>>();
 
+    let manager_thread = Arc::clone(&manager);
     let model_id_thread = model_id.clone();
     let model_path_thread = model_path.clone();
     let cuda_devices_thread = cuda_devices;
@@ -1126,6 +1172,7 @@ fn spawn_load(params: SpawnLoadParams) {
         };
 
         let (request_tx, request_rx) = tokio_mpsc::channel(max_queued_requests);
+        let engine_tx = request_tx.clone();
         let shutdown = Arc::new(AtomicBool::new(false));
 
         let result = LoadResult {
@@ -1197,11 +1244,32 @@ fn spawn_load(params: SpawnLoadParams) {
         if let Some(d) = draft {
             engine = engine.with_draft_model(d);
         }
+        let _slot_guard = EngineSlotGuard {
+            manager: manager_thread,
+            model_id: model_id_thread.clone(),
+            request_tx: engine_tx,
+        };
         engine_loop(engine, tokenizer, request_rx, shutdown, model_id_thread);
     });
 
     tokio::spawn(async move {
         match result_rx.await {
+            Ok(Ok(result)) if result.request_tx.is_closed() => {
+                let mut mgr = manager.lock().await;
+                let slot = mgr.slots.remove(&model_id);
+                let waiters = match slot {
+                    Some(SlotState::Loading { waiters }) => waiters,
+                    _ => Vec::new(),
+                };
+                mgr.kv_budget.release(result.kv_cache_bytes);
+                drop(mgr);
+
+                let err = format!("Model '{}' engine died during startup", model_id);
+                tracing::error!(model_id = %model_id, error = %err, "engine loop died before its slot was installed");
+                for waiter in waiters {
+                    let _ = waiter.send(Err(err.clone()));
+                }
+            }
             Ok(Ok(result)) => {
                 let mut mgr = manager.lock().await;
                 let slot = mgr.slots.remove(&model_id);
@@ -1500,6 +1568,58 @@ mod tests {
         let (_, registry) = mgr.discovered_with_registry();
         assert!(registry.contains_key("registered"));
         assert_eq!(registry["registered"].size_bytes, 1_000);
+    }
+
+    #[test]
+    fn engine_panic_removes_stale_slot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mgr = build_test_manager(&tmp, Duration::from_secs(60), None);
+        let shared: SharedModelManager = Arc::new(tokio::sync::Mutex::new(mgr));
+
+        let handle = build_dummy_handle();
+        let engine_tx = handle.request_tx.clone();
+        shared
+            .blocking_lock()
+            .insert_ready_for_tests("crashy", handle);
+
+        let guard = EngineSlotGuard {
+            manager: Arc::clone(&shared),
+            model_id: "crashy".to_string(),
+            request_tx: engine_tx,
+        };
+        let t = std::thread::spawn(move || {
+            let _guard = guard;
+            panic!("simulated engine panic");
+        });
+        assert!(t.join().is_err());
+        assert!(
+            shared.blocking_lock().list_running().is_empty(),
+            "a panicked engine must not leave its slot registered"
+        );
+    }
+
+    #[test]
+    fn engine_guard_leaves_replaced_slot_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mgr = build_test_manager(&tmp, Duration::from_secs(60), None);
+        let shared: SharedModelManager = Arc::new(tokio::sync::Mutex::new(mgr));
+
+        let (dead_tx, _dead_rx) = tokio_mpsc::channel::<IncomingRequest>(1);
+        let replacement = build_dummy_handle();
+        shared
+            .blocking_lock()
+            .insert_ready_for_tests("reloaded", replacement);
+
+        drop(EngineSlotGuard {
+            manager: Arc::clone(&shared),
+            model_id: "reloaded".to_string(),
+            request_tx: dead_tx,
+        });
+        assert_eq!(
+            shared.blocking_lock().list_running().len(),
+            1,
+            "the guard of a dead engine must not evict the reloaded slot"
+        );
     }
 
     #[test]

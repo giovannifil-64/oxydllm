@@ -108,6 +108,14 @@ Support is per architecture (the `architectures` field in a checkpoint's `config
 | `RobertaModel` / `BertModel` | granite-embedding r1, BERT-family sentence encoders | ibm-granite/granite-embedding-125m-english |
 | `qwen3` (causal, last-token pooling) | Qwen3-Embedding | Qwen/Qwen3-Embedding-0.6B |
 
+### Multimodal input (planned)
+
+Not supported yet. Vision input (image + text prompt, text-only output) is the next major work item; audio input may follow. No image/video generation is planned.
+
+### Reranking (planned)
+
+Not supported yet. A cross-encoder scoring endpoint reusing the embeddings runtime is on the roadmap.
+
 Formats span BF16 safetensors, GGUF, AWQ/GPTQ, compressed-tensors INT4, FP8, and MXFP4, auto-detected per checkpoint.
 
 > [!NOTE]

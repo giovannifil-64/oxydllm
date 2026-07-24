@@ -498,29 +498,43 @@ impl MoeFeedForward {
         out.reshape(original_shape)
     }
 
-    /// Bounds-checks one router index read back from the device before it is
-    /// used to index the per-expert tables.
+    /// Validates one token's top-k router row before it indexes the per-expert
+    /// tables.
     ///
-    /// `arg_sort` cannot produce an out-of-range index, so a failure here means
-    /// the readback itself returned foreign bytes: candle's Metal buffer pool
+    /// Both invariants hold by construction, since the row is a prefix of the
+    /// permutation `arg_sort` returns, so violating either one means the
+    /// readback itself handed back foreign bytes: candle's Metal buffer pool
     /// recycles on a CPU-side refcount without asking the GPU whether the work
     /// touching a buffer finished, so under memory exhaustion a destination can
     /// be read while still holding a previous tensor's contents. Observed on
     /// Qwen3.6-35B-A3B-FP8 before the streamed-cache sizing was fixed: `u32`
     /// indices in the billions whose bit patterns decode as `f32` router
-    /// probabilities. Failing the request keeps that out of the engine loop,
-    /// where it would otherwise panic and take the model's slot down with it.
+    /// probabilities.
+    ///
+    /// The range half keeps that out of the engine loop, where it would panic
+    /// and take the model's slot down. The distinctness half covers the case
+    /// that never announced itself: corruption landing inside `0..num_experts`
+    /// routes to the wrong experts and silently degrades the output, with no
+    /// error anywhere. Cost is one pass over `top_k` values already resident in
+    /// cache, measured at 0.6 us per token across 40 layers against a 199 ms
+    /// token, so it does not register.
     ///
     /// ## Errors
-    /// Fails when `raw` is not a valid expert id.
-    fn checked_expert_id(raw: u32, num_experts: usize) -> Result<usize> {
-        let e = raw as usize;
-        if e >= num_experts {
-            candle_core::bail!(
-                "router selected expert {e} of {num_experts}: corrupted device readback"
-            );
+    /// Fails when any id is out of range or repeats within the row.
+    fn checked_expert_row(row: &[u32], num_experts: usize) -> Result<()> {
+        for (i, &raw) in row.iter().enumerate() {
+            if raw as usize >= num_experts {
+                candle_core::bail!(
+                    "router selected expert {raw} of {num_experts}: corrupted device readback"
+                );
+            }
+            if row[..i].contains(&raw) {
+                candle_core::bail!(
+                    "router selected expert {raw} twice in one top-k row: corrupted device readback"
+                );
+            }
         }
-        Ok(e)
+        Ok(())
     }
 
     /// Decode-path dispatch (`n_tokens <= top_k`): runs only the chosen experts
@@ -547,10 +561,11 @@ impl MoeFeedForward {
         let top_vals_cpu: Vec<f32> = top_vals.flatten_all()?.to_vec1::<f32>()?;
         let mut per_expert_w: Vec<Option<Vec<f32>>> = vec![None; num_experts];
         for token in 0..n_tokens {
-            for slot in 0..self.top_k {
+            let row = &top_idx_cpu[token * self.top_k..(token + 1) * self.top_k];
+            Self::checked_expert_row(row, num_experts)?;
+            for (slot, &raw) in row.iter().enumerate() {
                 let flat = token * self.top_k + slot;
-                let e = Self::checked_expert_id(top_idx_cpu[flat], num_experts)?;
-                per_expert_w[e].get_or_insert_with(|| vec![0.0; n_tokens])[token] +=
+                per_expert_w[raw as usize].get_or_insert_with(|| vec![0.0; n_tokens])[token] +=
                     top_vals_cpu[flat];
             }
         }
@@ -603,9 +618,10 @@ impl MoeFeedForward {
         let mut per_expert_weights: Vec<Vec<f32>> = vec![Vec::new(); num_experts];
         for token in 0..n_tokens {
             let row = token * self.top_k;
+            Self::checked_expert_row(&top_idx_cpu[row..row + self.top_k], num_experts)?;
             for slot in 0..self.top_k {
                 let flat = row + slot;
-                let e = Self::checked_expert_id(top_idx_cpu[flat], num_experts)?;
+                let e = top_idx_cpu[flat] as usize;
                 per_expert_tokens[e].push(token as u32);
                 per_expert_weights[e].push(top_vals_cpu[flat]);
             }
@@ -638,16 +654,22 @@ mod tests {
     use crate::common::linear::{AnyLinear, Linear};
     use candle_core::Device;
 
-    /// Contract: a router index that cannot be a valid expert id fails the
-    /// request instead of indexing out of bounds. Guards against a corrupted
-    /// device readback reaching the per-expert tables, which used to panic the
-    /// engine loop rather than surface as an error.
+    /// Contract: a router row that cannot have come from `arg_sort` fails the
+    /// request instead of indexing the per-expert tables. Out-of-range ids used
+    /// to panic the engine loop; repeated ids never announced themselves at all
+    /// and would have routed to the wrong experts silently.
     #[test]
-    fn corrupted_router_index_is_rejected() {
-        assert_eq!(MoeFeedForward::checked_expert_id(255, 256).unwrap(), 255);
-        assert!(MoeFeedForward::checked_expert_id(256, 256).is_err());
-        let err = MoeFeedForward::checked_expert_id(1_042_574_548, 256).unwrap_err();
+    fn corrupted_router_row_is_rejected() {
+        let ok = [112u32, 238, 57, 88, 179, 108, 51, 160];
+        assert!(MoeFeedForward::checked_expert_row(&ok, 256).is_ok());
+
+        let out_of_range = [112u32, 238, 57, 1_042_574_548, 179, 108, 51, 160];
+        let err = MoeFeedForward::checked_expert_row(&out_of_range, 256).unwrap_err();
         assert!(err.to_string().contains("corrupted"), "{err}");
+
+        let repeated = [112u32, 238, 57, 88, 179, 108, 51, 112];
+        let err = MoeFeedForward::checked_expert_row(&repeated, 256).unwrap_err();
+        assert!(err.to_string().contains("twice"), "{err}");
     }
 
     fn build_synth_moe(

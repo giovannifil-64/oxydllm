@@ -1,3 +1,12 @@
+//! FCFS continuous-batching scheduler over paged KV memory.
+//!
+//! [`Scheduler`] owns every [`SequenceState`] across its lifecycle (waiting,
+//! running, finished) and decides which sequences advance each engine step.
+//! [`schedule`](Scheduler::schedule) keeps running decodes going, preempts
+//! them back to the waiting queue when no KV block is free, and admits
+//! waiting prompts first-come-first-served within the per-step token budget
+//! and the free-block supply.
+
 pub mod sequence;
 
 use std::collections::{HashMap, VecDeque};
@@ -8,32 +17,44 @@ use crate::common::prefix_cache::PrefixCache;
 use crate::sampling::SamplingParams;
 use sequence::*;
 
+/// Admission limits: at most `max_num_sequences` running concurrently and at
+/// most `max_tokens_per_step` fed to the model per step.
 pub struct SchedulerConfig {
     pub max_num_sequences: usize,
     pub max_tokens_per_step: usize,
 }
 
+/// A sequence selected for the current step, tagged with the phase it runs
+/// in.
 pub struct ScheduledSequence {
     pub id: SequenceId,
     pub phase: SequencePhase,
 }
 
+/// The set of sequences [`Scheduler::schedule`] selected for one engine step.
 pub struct SchedulerOutput {
     pub scheduled: Vec<ScheduledSequence>,
 }
 
+/// A retired sequence and its finish reason (`"stop"` or `"length"`).
 pub struct CompletedSequence {
     pub id: SequenceId,
     pub finish_reason: Option<String>,
 }
 
+/// Sequence lifecycle owner and per-step admission controller.
+///
+/// `waiting` is the FCFS queue and `running` the active set, with
+/// `running_index` mapping ids to slots. `allocators` (and
+/// `draft_allocators` when speculative decoding is enabled; empty otherwise)
+/// are the per-layer KV block allocators new sequences draw their caches
+/// from; `block_size` mirrors the allocators'.
 pub struct Scheduler {
     config: SchedulerConfig,
     waiting: VecDeque<SequenceState>,
     running: Vec<SequenceState>,
     running_index: HashMap<SequenceId, usize>,
     allocators: Vec<SharedBlockAllocator>,
-    /// Draft-model allocators for speculative decoding; empty when no draft.
     draft_allocators: Vec<SharedBlockAllocator>,
     draft_num_layers: usize,
     next_id: SequenceId,
@@ -42,6 +63,8 @@ pub struct Scheduler {
 }
 
 impl Scheduler {
+    /// Creates an empty scheduler drawing KV blocks from `allocators` (one
+    /// per model layer).
     pub fn new(
         config: SchedulerConfig,
         allocators: Vec<SharedBlockAllocator>,
@@ -79,6 +102,8 @@ impl Scheduler {
         self.running.push(seq);
     }
 
+    /// Removes the sequence at `vec_idx` via `swap_remove`, fixing the moved
+    /// sequence's index entry.
     fn remove_from_running(&mut self, vec_idx: usize) -> SequenceState {
         let seq_id = self.running[vec_idx].id;
         self.running_index.remove(&seq_id);
@@ -89,6 +114,8 @@ impl Scheduler {
         seq
     }
 
+    /// Queues a prompt with default stop behavior; returns the new sequence
+    /// id.
     pub fn add_request(
         &mut self,
         prompt_tokens: Vec<u32>,
@@ -98,6 +125,8 @@ impl Scheduler {
         self.add_request_with_stop(prompt_tokens, sampling_params, max_tokens, Vec::new())
     }
 
+    /// [`add_request`](Self::add_request) with request-specific extra stop
+    /// token ids.
     pub fn add_request_with_stop(
         &mut self,
         prompt_tokens: Vec<u32>,
@@ -114,6 +143,12 @@ impl Scheduler {
         )
     }
 
+    /// Queues a prompt with every per-request control: sampling parameters,
+    /// generation cap, extra stop ids, and an optional grammar constraint.
+    ///
+    /// The sequence starts `Waiting` in `Prefill` phase with fresh per-layer
+    /// caches (target, plus draft when speculative decoding is enabled) and
+    /// prompt token counts prebuilt for the penalty samplers.
     pub fn add_request_full(
         &mut self,
         prompt_tokens: Vec<u32>,
@@ -159,6 +194,8 @@ impl Scheduler {
         id
     }
 
+    /// Free blocks in the layer-0 allocator (all layers allocate in
+    /// lockstep).
     fn num_free_blocks(&self) -> usize {
         if self.allocators.is_empty() {
             return 0;
@@ -166,6 +203,8 @@ impl Scheduler {
         self.allocators[0].lock().unwrap().num_free()
     }
 
+    /// KV blocks a waiting prompt still needs, discounting blocks the prefix
+    /// cache would supply (capped so at least one token always runs).
     fn blocks_needed_for_prefill(
         &self,
         seq: &SequenceState,
@@ -181,10 +220,21 @@ impl Scheduler {
         total_blocks.saturating_sub(cached)
     }
 
+    /// True when the sequence's next decode token lands on a fresh block
+    /// boundary.
     fn decode_needs_new_block(&self, seq: &SequenceState) -> bool {
         seq.num_processed_tokens.is_multiple_of(self.block_size) && seq.num_processed_tokens > 0
     }
 
+    /// Selects the sequences to run this step.
+    ///
+    /// Running decodes are scheduled first (one token each). A decode
+    /// sitting on a block boundary needs a free block; when none is
+    /// available the sequence is preempted: its caches are cleared, its
+    /// progress reset, and it is pushed back to the front of the waiting
+    /// queue to re-prefill later. Waiting prompts are then admitted FCFS
+    /// while the running-set, token-budget, and free-block limits allow;
+    /// admission stops at the first prompt that does not fit.
     pub fn schedule(&mut self, prefix_cache: Option<&PrefixCache>) -> SchedulerOutput {
         let mut scheduled = Vec::new();
         let mut budget = self.config.max_tokens_per_step;
@@ -261,16 +311,20 @@ impl Scheduler {
         SchedulerOutput { scheduled }
     }
 
+    /// The running sequence with this id, if any.
     pub fn get_running(&self, seq_id: SequenceId) -> Option<&SequenceState> {
         let idx = *self.running_index.get(&seq_id)?;
         self.running.get(idx)
     }
 
+    /// Mutable access to the running sequence with this id, if any.
     pub fn get_running_mut(&mut self, seq_id: SequenceId) -> Option<&mut SequenceState> {
         let idx = *self.running_index.get(&seq_id)?;
         self.running.get_mut(idx)
     }
 
+    /// Removes every `Finished` running sequence, frees its KV blocks, and
+    /// reports the completions.
     pub fn retire_finished(&mut self) -> Vec<CompletedSequence> {
         let finished: Vec<SequenceId> = self
             .running
@@ -292,6 +346,8 @@ impl Scheduler {
         completed
     }
 
+    /// Removes all running sequences and frees their blocks; returns their
+    /// ids.
     pub fn abort_all_running(&mut self) -> Vec<SequenceId> {
         let ids: Vec<SequenceId> = self.running.iter().map(|s| s.id).collect();
         for mut seq in self.running.drain(..) {
@@ -301,6 +357,8 @@ impl Scheduler {
         ids
     }
 
+    /// Removes one sequence from running or waiting, freeing its blocks;
+    /// returns whether it was found.
     pub fn abort_sequence(&mut self, seq_id: SequenceId) -> bool {
         if let Some(&idx) = self.running_index.get(&seq_id) {
             let mut seq = self.remove_from_running(idx);
@@ -318,6 +376,7 @@ impl Scheduler {
         false
     }
 
+    /// Aborts everything, running and waiting; returns all ids.
     pub fn abort_all(&mut self) -> Vec<SequenceId> {
         let mut ids = self.abort_all_running();
         for mut seq in self.waiting.drain(..) {
@@ -327,10 +386,12 @@ impl Scheduler {
         ids
     }
 
+    /// True while any sequence is waiting or running.
     pub fn has_pending_work(&self) -> bool {
         !self.waiting.is_empty() || !self.running.is_empty()
     }
 
+    /// Number of sequences currently waiting or running.
     pub fn queue_depth(&self) -> usize {
         self.waiting.len() + self.running.len()
     }
@@ -393,7 +454,6 @@ mod tests {
         assert_eq!(sched.num_running(), 2);
         assert_eq!(sched.num_waiting(), 0);
 
-        // Mark one as finished
         sched.get_running_mut(id0).unwrap().status = SequenceStatus::Finished;
         let completed = sched.retire_finished();
         assert_eq!(completed.len(), 1);
@@ -415,7 +475,6 @@ mod tests {
         sched.add_request(vec![5, 6], SamplingParams::default(), 10);
 
         let output = sched.schedule(None);
-        // Only 2 should be admitted
         assert_eq!(output.scheduled.len(), 2);
         assert_eq!(sched.num_running(), 2);
         assert_eq!(sched.num_waiting(), 1);
@@ -435,7 +494,6 @@ mod tests {
         let tokens: Vec<u32> = (0..DEFAULT_BLOCK_SIZE as u32).collect();
         let id0 = sched.add_request(tokens.clone(), SamplingParams::default(), 100);
 
-        // Admit and "prefill" it
         let output = sched.schedule(None);
         assert_eq!(output.scheduled.len(), 1);
         assert_eq!(output.scheduled[0].id, id0);
@@ -479,7 +537,7 @@ mod tests {
         let allocators = make_allocators(1, 16);
         let config = SchedulerConfig {
             max_num_sequences: 4,
-            max_tokens_per_step: 2, // tight budget
+            max_tokens_per_step: 2,
         };
         let mut sched = Scheduler::new(config, allocators, 1);
 
@@ -493,7 +551,7 @@ mod tests {
 
     #[test]
     fn preempted_sequence_is_requeued_as_prefill() {
-        let allocators = make_allocators(1, 2); // 1 layer, 2 blocks
+        let allocators = make_allocators(1, 2);
         let config = SchedulerConfig {
             max_num_sequences: 4,
             max_tokens_per_step: 1024,

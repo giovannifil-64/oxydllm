@@ -1,17 +1,50 @@
+//! Hugging Face config.json to [`StandardTransformerConfig`] translation.
+//!
+//! This is the ONLY place in the codebase that knows HF config.json field
+//! names; everything downstream works from the parsed blueprint. Supporting a
+//! new checkpoint that reuses existing mechanisms therefore means touching
+//! only this parser and [`crate::models::arch_defaults`], which supplies the
+//! per-family defaults for everything a config leaves implicit. The inline
+//! comments beside individual fields record per-architecture semantics
+//! (Granite multiplier meanings, Gemma tie defaults, MoE key aliases) that
+//! exist nowhere else.
+//!
+//! [`parse`] is the sole entry point; the private helpers below it each
+//! decode one config sub-object (EOS ids, RoPE scaling, quantization).
+
 use crate::common::config::{LayerType, LinearAttnConfig, StandardTransformerConfig};
 use anyhow::{Context, Result};
 use serde_json::Value;
 
 use crate::common::rope::RopeScaling;
 
+/// Parses a checkpoint's config.json into a [`StandardTransformerConfig`].
+///
+/// Multimodal configs (Mistral3, Qwen3.5) nest the LLM params under
+/// `text_config`; those keys are merged into the root first, text_config
+/// winning on collision. The architecture name then selects the
+/// [`crate::models::arch_defaults::ArchDefaults`] baseline, and explicit
+/// config fields override it. Beyond plain fields, this derives: the EOS id
+/// set (config, architecture extras, and generation_config.json merged),
+/// hybrid per-layer vectors from `layer_types` (head dims, KV heads, sliding
+/// windows, rope thetas, shared-KV map), MoE parameters, partial-RoPE
+/// `rotary_dim`, the Gemma4-style per-layer input scales, and the validated
+/// quantization scheme.
+///
+/// ## Errors
+///
+/// Fails when the file is unreadable or not JSON, the architecture is
+/// unknown or known-unsupported, a required field (`hidden_size`,
+/// `num_hidden_layers`, `num_attention_heads`, `vocab_size`, the
+/// `linear_*` geometry of hybrid models) is missing, a hybrid
+/// `layer_types` entry is unrecognised, or the quantization config is
+/// unsupported ([`validate_quantization_config`]).
 pub fn parse(config_path: &str) -> Result<StandardTransformerConfig> {
     let raw = std::fs::read_to_string(config_path)
         .with_context(|| format!("Cannot read {config_path}"))?;
     let v: Value = serde_json::from_str(&raw)
         .with_context(|| format!("Cannot parse JSON from {config_path}"))?;
 
-    // Multimodal configs nest LLM params under "text_config"; merge them up,
-    // letting text_config win on key collision.
     let v = if let Some(text_cfg) = v.get("text_config").and_then(|tc| tc.as_object()) {
         let mut merged = v.clone();
         let root = merged.as_object_mut().unwrap();
@@ -343,6 +376,11 @@ pub fn parse(config_path: &str) -> Result<StandardTransformerConfig> {
     })
 }
 
+/// Reads a required unsigned-integer config field.
+///
+/// ## Errors
+///
+/// Fails when `key` is absent or not an unsigned integer.
 fn req_usize(v: &Value, key: &str) -> Result<usize> {
     v[key]
         .as_u64()
@@ -350,6 +388,8 @@ fn req_usize(v: &Value, key: &str) -> Result<usize> {
         .with_context(|| format!("Missing or invalid field '{key}' in config.json"))
 }
 
+/// Decodes an `eos_token_id` value, which HF configs store as either a
+/// single integer or an array; anything else yields an empty list.
 fn parse_eos(v: &Value) -> Vec<u32> {
     match v {
         Value::Number(n) => n.as_u64().map(|x| vec![x as u32]).unwrap_or_default(),
@@ -362,6 +402,8 @@ fn parse_eos(v: &Value) -> Vec<u32> {
     }
 }
 
+/// Reads a JSON array of strings (non-string elements dropped), or `None`
+/// when the value is not an array.
 fn parse_string_array(v: &Value) -> Option<Vec<String>> {
     v.as_array().map(|arr| {
         arr.iter()
@@ -370,6 +412,9 @@ fn parse_string_array(v: &Value) -> Option<Vec<String>> {
     })
 }
 
+/// EOS ids from the sibling generation_config.json, which often lists stop
+/// tokens (e.g. `<|eot_id|>`) that config.json omits; empty when the file is
+/// absent or malformed.
 fn parse_generation_eos(config_path: &str) -> Vec<u32> {
     let config_path = std::path::Path::new(config_path);
     let Some(parent) = config_path.parent() else {
@@ -387,6 +432,22 @@ fn parse_generation_eos(config_path: &str) -> Vec<u32> {
     parse_eos(&v["eos_token_id"])
 }
 
+/// Maps `quantization_config` to the runtime [`QuantScheme`], rejecting
+/// unsupported variants at parse time rather than mid-load.
+///
+/// `None` (with `Ok`) covers the schemes that need no global marker: absent
+/// config, FP8 (dequantized at load via `*_scale_inv`), and MXFP4, which
+/// only quantizes the GPT-OSS MoE expert tensors that the MoE loader
+/// consumes directly as packed U8.
+///
+/// ## Errors
+///
+/// Fails on any recognised-but-unsupported combination: AWQ other than
+/// 4/8-bit GEMM, GPTQ with `desc_act=true` or a non-canonical checkpoint
+/// format, compressed-tensors other than single-group symmetric int4
+/// pack-quantized, or an unknown `quant_method`.
+///
+/// [`QuantScheme`]: crate::common::weights::QuantScheme
 fn validate_quantization_config(v: &Value) -> Result<Option<crate::common::weights::QuantScheme>> {
     if v.is_null() {
         return Ok(None);
@@ -430,8 +491,6 @@ fn validate_quantization_config(v: &Value) -> Result<Option<crate::common::weigh
             );
             Ok(None)
         }
-        // MXFP4 (GPT-OSS) only quantizes the MoE expert tensors, which the MoE
-        // loader consumes directly as packed U8; no global scheme needed.
         "mxfp4" => {
             tracing::info!(
                 quant = "mxfp4",
@@ -525,6 +584,8 @@ fn validate_quantization_config(v: &Value) -> Result<Option<crate::common::weigh
     }
 }
 
+/// Logs an informational note for FP8 checkpoints (`torch_dtype:
+/// float8_e4m3fn`); purely diagnostic, no effect on parsing.
 fn maybe_log_torch_dtype(v: &Value) {
     let Some(torch_dtype) = v["torch_dtype"].as_str() else {
         return;
@@ -538,6 +599,10 @@ fn maybe_log_torch_dtype(v: &Value) {
     }
 }
 
+/// Decodes a `rope_scaling` (or `rope_parameters`) object into a
+/// [`RopeScaling`] variant, accepting both the `rope_type` and legacy `type`
+/// keys. Unknown types warn and fall back to no scaling rather than failing
+/// the load.
 fn parse_rope_scaling(v: &Value) -> RopeScaling {
     if v.is_null() {
         return RopeScaling::None;
@@ -603,6 +668,8 @@ fn parse_rope_scaling(v: &Value) -> RopeScaling {
     }
 }
 
+/// Reads a LongRoPE per-dimension factor list, accepting a scalar as a
+/// one-element list and substituting `default` when absent or empty.
 fn parse_rope_factor(v: &Value, default: f64) -> Vec<f64> {
     match v {
         Value::Number(n) => n.as_f64().map(|x| vec![x]).unwrap_or_else(|| vec![default]),
@@ -621,6 +688,8 @@ mod tests {
     use std::fs;
     use tempfile::tempdir;
 
+    /// Contract: multimodal configs nesting LLM params under `text_config`
+    /// win over root-level fields on collision.
     #[test]
     fn text_config_overrides_root_fields() {
         let dir = tempdir().unwrap();
@@ -746,6 +815,8 @@ mod tests {
         assert!(matches!(parse_rope_scaling(&v), RopeScaling::None));
     }
 
+    /// Contract: YaRN scaling in the newer `rope_parameters` key (no
+    /// `rope_scaling`) is picked up, including its nested `rope_theta`.
     #[test]
     fn mistral_v3_rope_parameters_yarn_picked_up() {
         let dir = tempdir().unwrap();
@@ -782,6 +853,8 @@ mod tests {
         assert_eq!(cfg.rope_theta, 1_000_000.0);
     }
 
+    /// Contract: Gemma2 alternates sliding/global layers from its arch
+    /// defaults alone; its configs publish no `layer_types`.
     #[test]
     fn gemma2_has_alternating_sliding_windows_without_layer_types() {
         let dir = tempdir().unwrap();
@@ -807,6 +880,8 @@ mod tests {
         );
     }
 
+    /// Contract: the alternating pattern stays scoped to Gemma2; Gemma3
+    /// applies its sliding window uniformly.
     #[test]
     fn gemma3_does_not_force_alternating_sliding_windows() {
         let dir = tempdir().unwrap();
@@ -884,6 +959,9 @@ mod tests {
         assert!(!cfg.tie_word_embeddings);
     }
 
+    /// Contract: Granite's four scalar multipliers reach the blueprint with
+    /// their Granite semantics, in particular `attention_multiplier` is the
+    /// softmax scale itself, not a divisor to invert.
     #[test]
     fn granite_multipliers_are_parsed() {
         let dir = tempdir().unwrap();
@@ -906,7 +984,6 @@ mod tests {
         fs::write(&config_path, config.to_string()).unwrap();
 
         let cfg = parse(config_path.to_str().unwrap()).unwrap();
-        // attention_multiplier is the softmax scale itself, not inverted.
         assert_eq!(cfg.attention_scale, Some(0.015625));
         assert_eq!(cfg.embed_scale, Some(12.0));
         assert_eq!(cfg.residual_multiplier, Some(0.22));

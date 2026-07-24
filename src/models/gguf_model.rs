@@ -1,18 +1,20 @@
-// ─────────────────────────────────────────────────────────────────────────────
-// gguf_model.rs: StandardTransformer: unified model for all standard archs
-// ─────────────────────────────────────────────────────────────────────────────
-//
-// `StandardTransformer` is the single concrete model struct used by every
-// standard pre-norm transformer architecture (Llama, Qwen3, GGUF, and any
-// future architecture that fits the same TransformerBlock pattern).
-//
-// • GGUF loading:       StandardTransformer::load_gguf(...)
-// • Safetensors loading: loader::load_standard_safetensors(cfg, ...)  ← in loader.rs
-//
-// Adding a new standard architecture requires only:
-//   1. Define its JSON config struct and implement From<Config> for StandardTransformerConfig.
-//   2. Add one arm to the match in loader::load_batch_model.
-// ─────────────────────────────────────────────────────────────────────────────
+//! [`StandardTransformer`]: the single runtime model for all standard
+//! pre-norm transformer architectures.
+//!
+//! Every supported architecture (Llama, Qwen3, Gemma, Granite, the MoE and
+//! hybrid families, ...) runs through this one struct; there are no
+//! per-architecture model types. Two frontends build it:
+//!
+//! 1. GGUF checkpoints: [`StandardTransformer::load_gguf`], which reads the
+//!    geometry from GGUF metadata via [`parse_gguf_topology`] and the
+//!    mechanism set from [`crate::models::arch_defaults`].
+//! 2. Safetensors checkpoints: `load_standard_safetensors` in
+//!    [`crate::models::loader`], fed by the config parsed in
+//!    [`crate::models::parsers::hf_parser`].
+//!
+//! Adding a new standard architecture therefore does not touch this file:
+//! add an [`crate::models::arch_defaults::arch_defaults`] entry and, for
+//! safetensors, teach the parser any new config fields.
 
 use candle_core::{DType, Device, Result, Tensor};
 use std::sync::{Arc, Mutex};
@@ -29,6 +31,19 @@ use crate::common::{
 };
 use crate::models::traits::BatchModel;
 
+/// Concrete [`BatchModel`] shared by every standard decoder architecture.
+///
+/// The core pipeline is [`Embedding`], a stack of [`TransformerBlock`]s with
+/// one [`RotaryEmbedding`] and one KV [`SharedBlockAllocator`] per layer, a
+/// final [`RMSNorm`], and the `lm_head` projection; `embed_scale`,
+/// `logit_softcap`, and `logits_scaling` apply the optional per-family
+/// scalings (Gemma, Granite) around that pipeline. The `per_layer_*` group
+/// carries the Gemma4-style per-layer input stream (a second small embedding
+/// projected and mixed into every layer); all `None` elsewhere.
+/// `kv_shared_layer_map` maps trailing layers to the earlier layer whose KV
+/// cache they reuse, and `has_recurrent_state` is true when any layer is a
+/// recurrent (linear-attention) mixer, which disables prefix caching and
+/// speculative decoding.
 pub struct StandardTransformer {
     pub(crate) embed_tokens: Embedding,
     pub(crate) blocks: Vec<TransformerBlock>,
@@ -50,24 +65,27 @@ pub struct StandardTransformer {
     pub(crate) per_layer_projection_norm: Option<RMSNorm>,
     pub(crate) per_layer_input_scale: Option<f64>,
     pub(crate) kv_shared_layer_map: Option<Vec<Option<usize>>>,
-    /// True when any layer is a recurrent (linear-attention) mixer; disables
-    /// prefix caching and speculative decoding.
     pub(crate) has_recurrent_state: bool,
 }
 
+/// Core model geometry read from GGUF metadata by [`parse_gguf_topology`].
+///
+/// `full_attention_interval` marks hybrid (qwen35-class) models: layer `i` is
+/// full attention iff `(i+1) % interval == 0`, and the rest are recurrent
+/// linear-attention layers without KV cache. `None` for standard
+/// transformers.
 pub(crate) struct GgufTopology {
     pub num_hidden_layers: usize,
     pub num_attention_heads: usize,
     pub num_key_value_heads: usize,
     pub head_dim: usize,
     pub context_length: usize,
-    /// Hybrid (qwen35-class): layer i is full attention iff
-    /// (i+1) % interval == 0; the rest are recurrent linear-attention layers
-    /// without KV cache. `None` for standard transformers.
     pub full_attention_interval: Option<usize>,
 }
 
 impl GgufTopology {
+    /// True when `layer_idx` is a recurrent linear-attention layer under the
+    /// hybrid interval; always false for standard transformers.
     pub fn layer_is_linear(&self, layer_idx: usize) -> bool {
         match self.full_attention_interval {
             Some(interval) => !(layer_idx + 1).is_multiple_of(interval),
@@ -83,6 +101,14 @@ fn positive_f64(gguf: &GgufWeights, key: &str) -> Option<f64> {
     (v > 0.0).then_some(v)
 }
 
+/// Reads a [`GgufTopology`] from `{arch}.*` metadata keys, falling back to
+/// tensor shapes (`blk.0.attn_q.weight` or the fused `blk.0.attn_qkv.weight`)
+/// when `attention.key_length` is absent.
+///
+/// ## Errors
+///
+/// Fails when the architecture or a required count key is missing, or when
+/// `head_dim` cannot be derived from either metadata or the layer-0 tensors.
 pub(crate) fn parse_gguf_topology(gguf: &GgufWeights) -> anyhow::Result<GgufTopology> {
     let arch = gguf.architecture()?;
     let prefix = &arch;
@@ -130,6 +156,8 @@ pub(crate) fn parse_gguf_topology(gguf: &GgufWeights) -> anyhow::Result<GgufTopo
 }
 
 impl StandardTransformer {
+    /// Borrowed view of the model handed to
+    /// [`run_transformer_layers_batch`] each forward pass.
     fn components(&self) -> TransformerComponents<'_> {
         TransformerComponents {
             embed_tokens: &self.embed_tokens,
@@ -150,6 +178,24 @@ impl StandardTransformer {
         }
     }
 
+    /// Builds a [`StandardTransformer`] from an already-mmapped GGUF
+    /// checkpoint, keeping weights quantized ([`QLinear`]) at runtime.
+    ///
+    /// Geometry comes from [`parse_gguf_topology`], mechanisms from
+    /// [`crate::models::arch_defaults::arch_defaults`] keyed on
+    /// `general.architecture`, and scalar overrides (rope base, norms
+    /// epsilon, Granite/Gemma scales, sliding window) from `{arch}.*`
+    /// metadata when published. A missing `output.weight` ties the LM head
+    /// to the token embedding. Each full-attention layer gets a KV
+    /// [`BlockAllocator`] of `num_kv_blocks` blocks; the GGUF path is
+    /// dense-only (no MoE).
+    ///
+    /// ## Errors
+    ///
+    /// Fails when the architecture is unsupported, required metadata or
+    /// tensors (`token_embd.weight`, `output_norm.weight`, block weights)
+    /// are missing, hybrid `ssm.*` metadata is inconsistent, or a hybrid
+    /// model has no full-attention layer at all.
     pub fn load_gguf(
         gguf: &GgufWeights,
         device: &Device,
@@ -201,9 +247,9 @@ impl StandardTransformer {
             } else {
                 None
             };
-        // Partial RoPE: rope.dimension_count < head_dim ⇒ rotate the leading
-        // dims only (qwen35: 64 of 256). Standard models publish the full
-        // head_dim here, which leaves rotary_dim disabled.
+        // Partial RoPE: rope.dimension_count < head_dim means rotating the
+        // leading dims only (qwen35: 64 of 256). Standard models publish the
+        // full head_dim here, which leaves rotary_dim disabled.
         let rotary_dim = {
             let rd = gguf.metadata_u32_or(&format!("{prefix}.rope.dimension_count"), 0) as usize;
             (rd > 0 && rd < head_dim).then_some(rd)
@@ -423,21 +469,27 @@ impl BatchModel for StandardTransformer {
     fn vocab_size(&self) -> usize {
         self.vocab_size
     }
+
     fn stop_token_ids(&self) -> &[u32] {
         &self.stop_token_ids
     }
+
     fn max_seq_len(&self) -> usize {
         self.max_seq_len
     }
+
     fn device(&self) -> &Device {
         &self.device
     }
+
     fn num_layers(&self) -> usize {
         self.blocks.len()
     }
+
     fn allocators(&self) -> &[SharedBlockAllocator] {
         &self.allocators
     }
+
     fn has_recurrent_state(&self) -> bool {
         self.has_recurrent_state
     }

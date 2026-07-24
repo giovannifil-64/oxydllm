@@ -108,7 +108,7 @@ fn select_variant<'a>(
         .filter(|v| !already_present.contains(&v.quant_name))
         .collect();
 
-    println!("  Multiple GGUF variants available — choose one to download:\n");
+    println!("  Multiple GGUF variants available, choose one to download:\n");
 
     if !present.is_empty() {
         println!("  Already downloaded:");
@@ -165,7 +165,7 @@ fn select_variant<'a>(
     use std::io::IsTerminal;
     if !std::io::stdin().is_terminal() {
         println!(
-            "  Non-interactive — selecting {} (#{}).",
+            "  Non-interactive: selecting {} (#{}).",
             available[default - 1].quant_name,
             default
         );
@@ -660,7 +660,7 @@ fn check_status(status: u16, repo_id: &str) -> anyhow::Result<()> {
              or set the HF_TOKEN environment variable."
         ),
         403 => anyhow::bail!(
-            "Access denied to '{repo_id}' — this model requires accepting a license.\n\
+            "Access denied to '{repo_id}': this model requires accepting a license.\n\
              1. Visit https://huggingface.co/{repo_id} and accept the terms\n\
              2. Create a token at https://huggingface.co/settings/tokens\n\
              3. Run:  oxydllm pull {repo_id} --token <TOKEN>"

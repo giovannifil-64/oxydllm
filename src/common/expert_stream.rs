@@ -40,7 +40,7 @@ pub enum ExpertLayout {
     GptOss { swiglu_limit: f64 },
 }
 
-/// Configuration handed from the model loader to [`ModelWeights::load`]
+/// Configuration handed from the model loader to [`ModelWeights::load`](crate::common::weights::ModelWeights::load)
 /// (`src/common/weights.rs`) when expert streaming is requested.
 pub struct ExpertStreamConfig {
     pub layout: ExpertLayout,

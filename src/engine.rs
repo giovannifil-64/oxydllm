@@ -1,3 +1,19 @@
+//! Batched inference engine: one [`step`](Engine::step) advances every
+//! scheduled sequence by one token (or several under speculative decoding).
+//!
+//! [`Engine`] owns the target [`BatchModel`], an optional draft model, the
+//! [`Scheduler`], and the block-level [`PrefixCache`]. Each step:
+//! 1. asks the scheduler which sequences to run and splits them into prefill
+//!    and decode sets,
+//! 2. plans prefill inputs against the prefix cache so cached leading blocks
+//!    are skipped,
+//! 3. runs one batched forward over all prefill tokens plus one token per
+//!    normal-decode sequence (large prefill batches run as two chunks),
+//! 4. samples the next token per sequence, registers freshly filled prompt
+//!    blocks in the prefix cache, and applies stop rules,
+//! 5. runs the greedy speculative cycle for eligible decode sequences, then
+//!    retires finished ones.
+
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -11,6 +27,8 @@ use crate::sampling::{self, SamplingParams};
 use crate::scheduler::sequence::*;
 use crate::scheduler::*;
 
+/// A token emitted for a sequence during [`Engine::step`], with logprob data
+/// when the request asked for it.
 pub struct NewToken {
     pub seq_id: SequenceId,
     pub token: u32,
@@ -18,6 +36,8 @@ pub struct NewToken {
     pub top_logprobs: Vec<(u32, f32)>,
 }
 
+/// Result of one [`Engine::step`]: emitted tokens, sequences that finished
+/// this step, and prefix-cache hit/miss counters for this step's prefills.
 pub struct StepOutput {
     pub new_tokens: Vec<NewToken>,
     pub completed: Vec<CompletedSequence>,
@@ -25,6 +45,15 @@ pub struct StepOutput {
     pub prefix_cache_misses: usize,
 }
 
+/// Moves every scheduled sequence's KV caches out of the [`Scheduler`] for
+/// the duration of a forward pass and guarantees they are moved back.
+///
+/// [`BatchModel::forward_batch`] needs simultaneous `&mut` access to the cache
+/// vectors of many sequences, which the scheduler's storage cannot hand out
+/// directly. The caches are taken with `mem::take` on construction and
+/// restored either explicitly via [`restore`](Self::restore) or on drop, so a
+/// forward error cannot leave sequences with empty caches (leaking their KV
+/// blocks).
 struct CacheRestoreGuard<'a> {
     scheduler: &'a mut Scheduler,
     prefill_ids: Vec<SequenceId>,
@@ -60,6 +89,8 @@ impl<'a> CacheRestoreGuard<'a> {
         }
     }
 
+    /// Mutable slice view over the taken cache vectors, prefills first then
+    /// decodes, in scheduling order.
     fn cache_slices(&mut self) -> Vec<&mut [PagedKvCache]> {
         self.cache_vecs
             .iter_mut()
@@ -97,6 +128,8 @@ impl<'a> CacheRestoreGuard<'a> {
         self.restored = true;
     }
 
+    /// Consumes the guard, restoring the caches immediately instead of at end
+    /// of scope.
     fn restore(mut self) {
         self.restore_inner();
     }
@@ -111,9 +144,17 @@ impl Drop for CacheRestoreGuard<'_> {
 /// Number of tokens the draft model proposes per speculative step.
 const SPEC_DRAFT_K: usize = 4;
 
+/// Synchronous inference core: owns the target model, the [`Scheduler`], and
+/// the [`PrefixCache`], and advances all admitted sequences one
+/// [`step`](Self::step) at a time.
+///
+/// `draft_model` is the speculative-decoding proposer (`None` disables
+/// speculation). `stop_token_ids` and `stop_token_sequences` merge the
+/// model's stop tokens with engine-level extras; `allocators` and
+/// `block_size` mirror the model's paged-KV layout for prefix-cache
+/// registration.
 pub struct Engine {
     model: Box<dyn BatchModel>,
-    /// Speculative-decoding draft model; `None` disables speculation.
     draft_model: Option<Box<dyn BatchModel>>,
     scheduler: Scheduler,
     device: Device,
@@ -124,6 +165,8 @@ pub struct Engine {
     block_size: usize,
 }
 
+/// True when `tokens` ends with any of the configured multi-token stop
+/// sequences.
 fn has_matching_stop_sequence(tokens: &[u32], stop_sequences: &[Vec<u32>]) -> bool {
     stop_sequences.iter().any(|seq| {
         let n = seq.len();
@@ -131,8 +174,16 @@ fn has_matching_stop_sequence(tokens: &[u32], stop_sequences: &[Vec<u32>]) -> bo
     })
 }
 
+/// Minimum total prefill tokens before a batch is split into two forward
+/// chunks.
 const PREFILL_CHUNK_THRESHOLD: usize = 1024;
 
+/// Chooses the sequence index at which to split a large prefill batch into
+/// two roughly token-balanced forward chunks.
+///
+/// Returns `None` when the batch is below [`PREFILL_CHUNK_THRESHOLD`], has
+/// fewer than two prefills, or the balance point would leave no prefill in
+/// the second half.
 fn pick_prefill_chunk_split(uncached_lens: &[usize], total_prefill_tokens: usize) -> Option<usize> {
     if uncached_lens.len() < 2 || total_prefill_tokens < PREFILL_CHUNK_THRESHOLD {
         return None;
@@ -142,7 +193,6 @@ fn pick_prefill_chunk_split(uncached_lens: &[usize], total_prefill_tokens: usize
     for (i, &n) in uncached_lens.iter().enumerate() {
         acc += n;
         if acc >= target {
-            // Need at least one prefill in each half for a meaningful split.
             return if i + 1 < uncached_lens.len() {
                 Some(i + 1)
             } else {
@@ -153,6 +203,10 @@ fn pick_prefill_chunk_split(uncached_lens: &[usize], total_prefill_tokens: usize
     None
 }
 
+/// Per-sequence prefill plan: how many leading tokens/blocks the prefix cache
+/// already covers, the uncached suffix that must run through the model
+/// (`input_tokens`, `uncached_len`), and the total count of full blocks the
+/// finished prompt occupies.
 struct PrefillInfo {
     seq_id: SequenceId,
     num_cached_tokens: usize,
@@ -162,6 +216,10 @@ struct PrefillInfo {
     input_tokens: Vec<u32>,
 }
 
+/// Flattened model input for one step: token ids and positions for all
+/// prefill suffixes followed by one token per decode sequence, with
+/// per-sequence `token_counts` and `total_prefill_tokens` marking the
+/// prefill/decode boundary.
 struct BatchInput {
     all_token_ids: Vec<u32>,
     all_positions: Vec<u32>,
@@ -169,12 +227,16 @@ struct BatchInput {
     total_prefill_tokens: usize,
 }
 
+/// Engine-level stop criteria: merged stop token ids plus multi-token stop
+/// sequences.
 struct StopRules<'a> {
     token_ids: &'a HashSet<u32>,
     sequences: &'a [Vec<u32>],
 }
 
 impl StopRules<'_> {
+    /// True when `token` is a stop token (engine-wide or in the sequence's
+    /// extras) or the tail of `all_tokens` matches a stop sequence.
     fn matches(&self, token: u32, seq_extra_ids: &[u32], all_tokens: &[u32]) -> bool {
         self.token_ids.contains(&token)
             || seq_extra_ids.contains(&token)
@@ -182,6 +244,8 @@ impl StopRules<'_> {
     }
 }
 
+/// Borrow bundle for registering freshly filled prompt blocks in the
+/// [`PrefixCache`].
 struct PrefixRegistry<'a> {
     cache: &'a mut PrefixCache,
     allocators: &'a [SharedBlockAllocator],
@@ -189,6 +253,7 @@ struct PrefixRegistry<'a> {
 }
 
 impl PrefixRegistry<'_> {
+    /// Registers the blocks a prefill filled beyond its cached prefix.
     fn register(
         &mut self,
         all_tokens: &[u32],
@@ -205,6 +270,12 @@ impl PrefixRegistry<'_> {
     }
 }
 
+/// Builds a [`PrefillInfo`] per prefill sequence, consulting the prefix
+/// cache.
+///
+/// Matched leading blocks are prepopulated into the sequence's caches and
+/// their tokens skipped; at least one token is always left uncached so the
+/// forward still produces logits to sample from.
 fn plan_prefill_inputs(
     scheduler: &mut Scheduler,
     prefix_cache: &mut PrefixCache,
@@ -261,6 +332,8 @@ fn plan_prefill_inputs(
     infos
 }
 
+/// Flattens the planned prefill suffixes and the decode sequences' last
+/// tokens into a single [`BatchInput`], prefills first.
 fn build_batch_input(
     scheduler: &mut Scheduler,
     prefill_infos: &[PrefillInfo],
@@ -295,6 +368,17 @@ fn build_batch_input(
     }
 }
 
+/// Runs the batched forward over prefill and decode inputs and returns the
+/// logits `[total_tokens, vocab]`.
+///
+/// Caches are moved out through a [`CacheRestoreGuard`] so they are restored
+/// even when the forward fails. When [`pick_prefill_chunk_split`] elects a
+/// split, the prefill portion runs as two consecutive forwards whose logits
+/// are concatenated; decode tokens always ride in the second chunk.
+///
+/// ## Errors
+///
+/// Propagates tensor-construction and model forward errors.
 fn run_forward_pass(
     model: &dyn BatchModel,
     device: &Device,
@@ -365,6 +449,13 @@ fn run_forward_pass(
     combined_result?.squeeze(0)
 }
 
+/// Samples the first generated token for each prefill sequence from its last
+/// logit row, advances constraint and stop state, and registers the prompt's
+/// newly filled blocks in the prefix cache.
+///
+/// ## Errors
+///
+/// Propagates logit indexing and sampling failures.
 fn sample_prefill_outputs(
     scheduler: &mut Scheduler,
     prefix: &mut PrefixRegistry,
@@ -432,6 +523,12 @@ fn sample_prefill_outputs(
     Ok(())
 }
 
+/// Samples one token per normal-decode sequence from the logit rows after the
+/// prefill section, advancing constraint and stop state.
+///
+/// ## Errors
+///
+/// Propagates logit indexing and sampling failures.
 fn sample_decode_outputs(
     scheduler: &mut Scheduler,
     decode_ids: &[SequenceId],
@@ -475,9 +572,15 @@ fn sample_decode_outputs(
     Ok(())
 }
 
-/// Run one forward on a single sequence's caches and return the greedy argmax
-/// token id at each input position. Greedy speculative decoding only needs
-/// argmaxes, so no full logits leave the GPU.
+/// Runs one forward on a single sequence's caches and returns the greedy
+/// argmax token id at each input position.
+///
+/// Greedy speculative decoding only needs argmaxes, so no full logits leave
+/// the GPU.
+///
+/// ## Errors
+///
+/// Propagates tensor-construction and model forward errors.
 fn greedy_forward(
     model: &dyn BatchModel,
     device: &Device,
@@ -494,11 +597,28 @@ fn greedy_forward(
     argmax.to_vec1::<u32>()
 }
 
-/// Greedy speculative decode for the given decode sequences (one at a time).
-/// The draft proposes `SPEC_DRAFT_K` tokens; the target verifies all of them in
-/// one forward and we accept the longest prefix matching the target's argmax,
-/// plus the target's own token at the first divergence (correction) or after the
-/// last accepted token (bonus). Output is identical to plain greedy decoding.
+/// Greedy speculative decode for the given decode sequences, one at a time.
+///
+/// Cycle per sequence: the draft proposes [`SPEC_DRAFT_K`] tokens
+/// autoregressively; the target verifies `[last, d_1..d_K]` in one forward,
+/// yielding K+1 argmaxes where `target_am[i]` is the target's token after
+/// `verify[i]` (its prediction of `verify[i+1]`). The longest draft prefix
+/// matching the target's argmax is accepted, plus the target's own token at
+/// the first divergence (correction) or after the last accepted token
+/// (bonus); a stop or length cap drops the remaining accepted tokens. Output
+/// is identical to plain greedy decoding.
+///
+/// Cache invariants: on entry the target cache holds `l - 1` confirmed
+/// tokens (all but the last, which is fed this step); the draft cache is
+/// lazily brought up to the same confirmed length, covering the first step's
+/// prompt and the gap left by a fully accepted draft (`m == K`). After
+/// acceptance both caches are rolled back to the new confirmed length minus
+/// the last token, and pending speculative verify writes are discarded so
+/// decode tokens never enter the prefix-cache block pool.
+///
+/// ## Errors
+///
+/// Propagates draft/target forward and cache truncation errors.
 fn run_speculative_decode(
     model: &dyn BatchModel,
     draft: &dyn BatchModel,
@@ -511,9 +631,6 @@ fn run_speculative_decode(
     for &seq_id in decode_ids {
         let seq = scheduler.get_running_mut(seq_id).unwrap();
         let l = seq.all_tokens.len();
-        // Invariant: the target cache holds `l - 1` tokens (all but the last,
-        // which is fed this step). Lazily bring the draft cache up to the same
-        // confirmed length (covers the first step's prompt and the m==K gap).
         let target_have = l - 1;
         let draft_have = seq.draft_caches.first().map_or(0, |c| c.num_tokens());
         if draft_have < target_have {
@@ -522,7 +639,6 @@ fn run_speculative_decode(
             greedy_forward(draft, device, &mut seq.draft_caches, &gap, &pos)?;
         }
 
-        // Draft K tokens autoregressively.
         let last = seq.all_tokens[l - 1];
         let mut drafts: Vec<u32> = Vec::with_capacity(SPEC_DRAFT_K);
         let mut cur = last;
@@ -532,21 +648,18 @@ fn run_speculative_decode(
             drafts.push(cur);
         }
 
-        // Target verifies [last, d_1..d_K] in one forward -> K+1 argmaxes:
-        // target_am[i] is the target's token after verify[i] (predicts verify[i+1]).
         let mut verify: Vec<u32> = Vec::with_capacity(SPEC_DRAFT_K + 1);
         verify.push(last);
         verify.extend_from_slice(&drafts);
         let vpos: Vec<u32> = ((l - 1) as u32..(l + SPEC_DRAFT_K) as u32).collect();
         let target_am = greedy_forward(model, device, &mut seq.caches, &verify, &vpos)?;
 
-        // Accept the longest prefix where the draft matches the target's argmax.
         let mut m = 0usize;
         while m < SPEC_DRAFT_K && target_am[m] == drafts[m] {
             m += 1;
         }
         let mut accepted: Vec<u32> = drafts[..m].to_vec();
-        accepted.push(target_am[m]); // correction (m<K) or bonus (m==K)
+        accepted.push(target_am[m]);
 
         for tok in accepted {
             seq.append_token(tok);
@@ -560,12 +673,10 @@ fn run_speculative_decode(
                     top_logprobs: Vec::new(),
                 });
             } else {
-                break; // stop or length cap: drop remaining speculative tokens
+                break;
             }
         }
 
-        // Roll both caches back to the new confirmed length minus the last token.
-        // Speculative verify writes (decode tokens) never belong in the pool.
         let keep = seq.all_tokens.len() - 1;
         for c in &mut seq.caches {
             c.discard_pending();
@@ -580,6 +691,12 @@ fn run_speculative_decode(
 }
 
 impl Engine {
+    /// Creates an engine over `model`, merging `extra_stop_ids` and
+    /// `extra_stop_sequences` (deduplicated) with the model's own stop
+    /// tokens.
+    ///
+    /// The prefix cache is disabled for recurrent (hybrid linear-attention)
+    /// models, whose per-sequence state cannot be shared block-wise.
     pub fn new_with_stop_controls(
         model: Box<dyn BatchModel>,
         config: SchedulerConfig,
@@ -627,11 +744,14 @@ impl Engine {
         }
     }
 
-    /// Enable greedy speculative decoding with `draft` as the proposer. The draft
-    /// must share the target's tokenizer/vocab and run on the same device.
+    /// Enables greedy speculative decoding with `draft` as the proposer.
+    ///
+    /// The draft must share the target's tokenizer/vocab and run on the same
+    /// device. Recurrent (hybrid linear-attention) targets are refused and
+    /// the draft ignored: rejected speculative tokens roll the KV cache back
+    /// via truncation, which a recurrent state cannot do, silently
+    /// corrupting generation.
     pub fn with_draft_model(mut self, draft: Box<dyn BatchModel>) -> Self {
-        // Rejected speculative tokens roll the cache back via truncation, which
-        // a recurrent state cannot do, silently corrupting generation. Refuse.
         if self.model.has_recurrent_state() {
             tracing::error!(
                 "speculative decoding is not supported for recurrent (hybrid \
@@ -646,10 +766,12 @@ impl Engine {
         self
     }
 
+    /// The device the target model runs on.
     pub fn device(&self) -> &Device {
         &self.device
     }
 
+    /// Queues a prompt for generation and returns its sequence id.
     pub fn add_request(
         &mut self,
         prompt_tokens: Vec<u32>,
@@ -660,6 +782,8 @@ impl Engine {
             .add_request(prompt_tokens, sampling_params, max_tokens)
     }
 
+    /// [`add_request`](Self::add_request) with request-specific extra stop
+    /// token ids.
     pub fn add_request_with_stop(
         &mut self,
         prompt_tokens: Vec<u32>,
@@ -695,6 +819,21 @@ impl Engine {
         )
     }
 
+    /// Runs one engine iteration and returns the tokens and completions it
+    /// produced.
+    ///
+    /// Scheduled sequences split three ways: prefills and normal decodes
+    /// share one batched forward (prefills consult the prefix cache first),
+    /// while plain-greedy, unconstrained decode sequences take the
+    /// speculative cycle when a draft model is configured. Only plain greedy
+    /// can use the (exact) greedy spec cycle; anything with temperature,
+    /// penalties, logprobs, bias, or a grammar constraint decodes normally
+    /// so its distribution is honored. Without a draft, everything decodes
+    /// in the batch.
+    ///
+    /// ## Errors
+    ///
+    /// Propagates model forward, sampling, and cache errors.
     pub fn step(&mut self) -> Result<StepOutput> {
         let Engine {
             model,
@@ -721,9 +860,6 @@ impl Engine {
             }
         }
 
-        // Only plain-greedy sequences can use the (exact) greedy spec cycle; the
-        // rest decode normally so their temperature/top-p/penalties are honored.
-        // Without a draft, everything decodes normally.
         let (spec_ids, normal_decode_ids): (Vec<SequenceId>, Vec<SequenceId>) = if draft.is_some() {
             decode_ids.iter().copied().partition(|&id| {
                 scheduler
@@ -734,8 +870,6 @@ impl Engine {
             (Vec::new(), decode_ids.clone())
         };
 
-        // Spec-cycle sequences run their own forwards and stay out of the batched
-        // target forward; normal decode rides along with prefill.
         let decode_for_batch: &[SequenceId] = &normal_decode_ids;
         let has_spec_work = !spec_ids.is_empty();
 
@@ -758,7 +892,6 @@ impl Engine {
         };
         let mut new_tokens = Vec::new();
 
-        // Batched forward: prefill always; decode too only when there's no draft.
         if !batch.all_token_ids.is_empty() {
             let prefill_uncached_lens: Vec<usize> =
                 prefill_infos.iter().map(|i| i.uncached_len).collect();
@@ -795,7 +928,6 @@ impl Engine {
             )?;
         }
 
-        // Greedy decode sequences go through the speculative cycle.
         if let Some(draft) = draft
             && !spec_ids.is_empty()
         {
@@ -827,22 +959,28 @@ impl Engine {
         })
     }
 
+    /// Aborts every running sequence, freeing its KV blocks; returns their
+    /// ids.
     pub fn abort_running(&mut self) -> Vec<SequenceId> {
         self.scheduler.abort_all_running()
     }
 
+    /// Aborts one sequence (running or waiting); returns whether it existed.
     pub fn abort_sequence(&mut self, seq_id: SequenceId) -> bool {
         self.scheduler.abort_sequence(seq_id)
     }
 
+    /// Aborts all running and waiting sequences; returns their ids.
     pub fn abort_all(&mut self) -> Vec<SequenceId> {
         self.scheduler.abort_all()
     }
 
+    /// True while any sequence is waiting or running.
     pub fn has_pending_work(&self) -> bool {
         self.scheduler.has_pending_work()
     }
 
+    /// Number of sequences currently waiting or running.
     pub fn queue_depth(&self) -> usize {
         self.scheduler.queue_depth()
     }

@@ -1,3 +1,21 @@
+//! OpenAI-compatible `POST /v1/chat/completions` handler and its helpers.
+//!
+//! [`chat_completions`] validates the request, resolves the model through the
+//! [`ModelManager`](crate::models::manager::ModelManager), renders the chat
+//! template ([`apply_chat_template`]), and fans out `n` sequences to the
+//! engine. Around it live:
+//!
+//! - Tool calling: [`build_tool_config`] validates `tools`/`tool_choice`,
+//!   [`tools_system_instruction`] injects the calling convention into the
+//!   system prompt, and [`try_parse_tool_calls`] recovers calls from model
+//!   output in both tag-block and bare-JSON shapes.
+//! - Structured output: [`validate_schema_shape`] checks request-supplied
+//!   schemas (including OpenAI strict-mode rules) and
+//!   [`validate_against_schema`] post-validates model output against a JSON
+//!   Schema subset.
+//! - Serde types mirroring the OpenAI response and streaming-chunk wire
+//!   shapes.
+
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
@@ -22,6 +40,7 @@ use crate::models::manager::GetResult;
 use crate::sampling::SamplingParams;
 use crate::tokenizer::Tokenizer;
 
+/// One top-k alternative inside a logprobs entry (OpenAI wire shape).
 #[derive(Serialize, Clone)]
 struct TopLogprobItem {
     token: String,
@@ -29,6 +48,7 @@ struct TopLogprobItem {
     bytes: Option<Vec<u8>>,
 }
 
+/// Logprob record for one emitted token, with its top-k alternatives.
 #[derive(Serialize, Clone)]
 struct TokenLogprob {
     token: String,
@@ -37,13 +57,16 @@ struct TokenLogprob {
     top_logprobs: Vec<TopLogprobItem>,
 }
 
+/// The `logprobs` object attached to a choice or streaming chunk.
 #[derive(Serialize, Clone)]
 struct Logprobs {
     content: Vec<TokenLogprob>,
     refusal: Option<String>,
 }
 
-// Separate from ChatMessage so `content` serializes as explicit `null` when tool_calls present.
+/// Assistant message in a non-streaming response. Kept separate from
+/// [`ChatMessage`] so `content` serializes as an explicit `null` when
+/// `tool_calls` is present, as the OpenAI API requires.
 #[derive(Serialize)]
 struct ResponseMessage {
     role: String,
@@ -54,6 +77,7 @@ struct ResponseMessage {
     tool_calls: Option<Vec<ToolCall>>,
 }
 
+/// Top-level non-streaming response body (`object: "chat.completion"`).
 #[derive(Serialize)]
 struct ChatCompletionResponse {
     id: String,
@@ -65,6 +89,7 @@ struct ChatCompletionResponse {
     system_fingerprint: Option<String>,
 }
 
+/// One completion choice in a non-streaming response.
 #[derive(Serialize)]
 struct Choice {
     index: usize,
@@ -73,11 +98,14 @@ struct Choice {
     logprobs: Option<Logprobs>,
 }
 
+/// The `completion_tokens_details` usage object, reporting reasoning tokens.
 #[derive(Serialize)]
 struct CompletionTokensDetails {
     reasoning_tokens: usize,
 }
 
+/// Token accounting for a response; `completion_tokens_details` appears only
+/// when reasoning tokens were produced.
 #[derive(Serialize)]
 struct Usage {
     prompt_tokens: usize,
@@ -87,6 +115,7 @@ struct Usage {
     completion_tokens_details: Option<CompletionTokensDetails>,
 }
 
+/// One SSE event in a streaming response (`object: "chat.completion.chunk"`).
 #[derive(Serialize)]
 struct ChatCompletionChunk {
     id: String,
@@ -99,6 +128,7 @@ struct ChatCompletionChunk {
     system_fingerprint: Option<String>,
 }
 
+/// One choice delta within a streaming chunk.
 #[derive(Serialize)]
 struct ChunkChoice {
     index: usize,
@@ -107,6 +137,7 @@ struct ChunkChoice {
     logprobs: Option<Logprobs>,
 }
 
+/// Function name/arguments fragment inside a streamed tool-call delta.
 #[derive(Serialize)]
 struct ToolCallFunctionDelta {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -114,6 +145,8 @@ struct ToolCallFunctionDelta {
     arguments: String,
 }
 
+/// Streamed tool-call fragment: the first chunk carries `id`, `type`, and
+/// the function name; later chunks append arguments.
 #[derive(Serialize)]
 struct ToolCallDelta {
     index: usize,
@@ -125,6 +158,7 @@ struct ToolCallDelta {
     function: ToolCallFunctionDelta,
 }
 
+/// Message delta within a chunk; only populated fields are serialized.
 #[derive(Serialize)]
 struct Delta {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -137,6 +171,9 @@ struct Delta {
     tool_calls: Option<Vec<ToolCallDelta>>,
 }
 
+/// Requested tool-selection behavior from the `tool_choice` parameter:
+/// `None` disables tools, `Auto` lets the model decide, `Required` forces at
+/// least one call, and `ForcedFunction` forces exactly the named function.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum ToolChoiceMode {
     None,
@@ -145,6 +182,9 @@ enum ToolChoiceMode {
     ForcedFunction { name: String },
 }
 
+/// Validated tool setup for one request: the effective tool list (already
+/// filtered down by `tool_choice`), the choice mode, and whether parallel
+/// calls are allowed.
 #[derive(Clone, Debug)]
 struct ToolConfig {
     tools: Vec<ToolDefinition>,
@@ -152,6 +192,9 @@ struct ToolConfig {
     parallel_tool_calls: bool,
 }
 
+/// Schema validation level: `Strict` applies the OpenAI strict-mode rules
+/// (every object closed with `additionalProperties: false` and `required`
+/// covering all properties), `BestEffort` checks structure only.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SchemaStrictness {
     BestEffort,
@@ -165,6 +208,8 @@ fn unix_timestamp() -> u64 {
         .as_secs()
 }
 
+/// Stable `system_fingerprint` value derived from the model id and the crate
+/// version.
 fn system_fingerprint(model_id: &str) -> String {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
@@ -174,6 +219,8 @@ fn system_fingerprint(model_id: &str) -> String {
     format!("fp_{:012x}", h.finish() & 0xFFFF_FFFF_FFFF)
 }
 
+/// Generates a unique `chatcmpl-` id from the current time and a
+/// process-wide counter.
 fn make_chat_id() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -185,6 +232,8 @@ fn make_chat_id() -> String {
     format!("chatcmpl-{:x}{:x}-{}", t.as_secs(), t.subsec_nanos(), seq)
 }
 
+/// Strips a wrapping Markdown code fence (with an optional `json` tag) that
+/// models often emit around JSON output, returning the inner text.
 fn strip_json_fences(s: &str) -> &str {
     let s = s.trim();
     let inner = s
@@ -196,6 +245,7 @@ fn strip_json_fences(s: &str) -> &str {
     inner.unwrap_or(s)
 }
 
+/// Generates a unique `call_` id for a synthesized tool call.
 fn make_tool_call_id() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -203,6 +253,8 @@ fn make_tool_call_id() -> String {
     format!("call_{:012x}", seq)
 }
 
+/// Checks the OpenAI function-name rule: 1 to 64 characters, each ASCII
+/// alphanumeric, `_`, or `-`.
 fn is_valid_function_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 64
@@ -211,6 +263,8 @@ fn is_valid_function_name(name: &str) -> bool {
             .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
 }
 
+/// Resolves a local `$ref` (`#` or a `#/...` pointer) against the root
+/// schema; `None` when there is no `$ref` or it points outside the document.
 fn resolve_schema_ref<'a>(
     schema: &'a serde_json::Value,
     root: &'a serde_json::Value,
@@ -225,6 +279,8 @@ fn resolve_schema_ref<'a>(
     }
 }
 
+/// Whether the schema describes an object, by `type` or implicitly through
+/// object keywords (`properties`, `required`, `additionalProperties`).
 fn is_object_schema(schema_obj: &serde_json::Map<String, serde_json::Value>) -> bool {
     match schema_obj.get("type") {
         Some(serde_json::Value::String(t)) => t == "object",
@@ -237,6 +293,7 @@ fn is_object_schema(schema_obj: &serde_json::Map<String, serde_json::Value>) -> 
     }
 }
 
+/// Whether the schema describes an array, by `type` or an `items` keyword.
 fn is_array_schema(schema_obj: &serde_json::Map<String, serde_json::Value>) -> bool {
     match schema_obj.get("type") {
         Some(serde_json::Value::String(t)) => t == "array",
@@ -245,6 +302,13 @@ fn is_array_schema(schema_obj: &serde_json::Map<String, serde_json::Value>) -> b
     }
 }
 
+/// Validates a `type` keyword: a known type name or a non-empty array of
+/// them.
+///
+/// ## Errors
+///
+/// Returns a message naming `path` when the keyword is malformed or contains
+/// an unsupported type name.
 fn validate_schema_type_keyword(ty: &serde_json::Value, path: &str) -> Result<(), String> {
     let valid_type = |name: &str| {
         matches!(
@@ -274,6 +338,13 @@ fn validate_schema_type_keyword(ty: &serde_json::Value, path: &str) -> Result<()
     }
 }
 
+/// Recursive worker for [`validate_schema_shape`]; `path` locates errors and
+/// `depth` caps `$ref` and nesting recursion at 64 levels.
+///
+/// ## Errors
+///
+/// Returns the first structural violation found, prefixed with the JSON path
+/// of the offending keyword.
 fn validate_schema_shape_inner(
     schema: &serde_json::Value,
     root: &serde_json::Value,
@@ -418,6 +489,17 @@ fn validate_schema_shape_inner(
     Ok(())
 }
 
+/// Validates that a request-supplied JSON Schema uses only the supported
+/// subset, applying strict-mode rules when requested.
+///
+/// ## Errors
+///
+/// Returns a human-readable message with the JSON path of the first invalid
+/// keyword: an unsupported `type`, malformed `required`/`enum`/`anyOf`/
+/// `properties`/`items`/`additionalProperties`/`$defs`, nesting deeper than
+/// 64 levels, or a strict-mode violation (an object without
+/// `additionalProperties: false`, or `required` not covering every
+/// property).
 fn validate_schema_shape(
     schema: &serde_json::Value,
     strictness: SchemaStrictness,
@@ -426,6 +508,8 @@ fn validate_schema_shape(
     validate_schema_shape_inner(schema, schema, path, strictness, 0)
 }
 
+/// Whether `value` matches a JSON Schema `type` name; unknown names match
+/// anything.
 fn matches_json_type(value: &serde_json::Value, ty: &str) -> bool {
     match ty {
         "object" => value.is_object(),
@@ -439,6 +523,8 @@ fn matches_json_type(value: &serde_json::Value, ty: &str) -> bool {
     }
 }
 
+/// Recursive worker for [`validate_against_schema`]; fails closed on
+/// non-object schemas and on nesting deeper than 64 levels.
 fn validate_against_schema_inner(
     value: &serde_json::Value,
     schema: &serde_json::Value,
@@ -554,6 +640,9 @@ fn validate_against_schema_inner(
     true
 }
 
+/// Builds the system-prompt block that teaches a model without native tool
+/// support the JSON calling convention, including the choice-mode and
+/// parallel-call instructions.
 fn tools_system_instruction(tools: &[ToolDefinition], config: &ToolConfig) -> String {
     let tools_json = serde_json::to_string_pretty(tools).unwrap_or_default();
     let choice_instruction = match &config.choice_mode {
@@ -586,6 +675,9 @@ fn tools_system_instruction(tools: &[ToolDefinition], config: &ToolConfig) -> St
     )
 }
 
+/// Parses one tool-call object in either the OpenAI nested shape
+/// (`function.name`/`function.arguments`) or the flat `name`/`arguments`
+/// shape, generating an id when absent.
 fn parse_tool_call_entry(call: &serde_json::Value) -> Option<ToolCall> {
     let call_obj = call.as_object()?;
     let name = call_obj
@@ -696,6 +788,15 @@ fn parse_tool_call_tag_blocks(raw: &str) -> Option<Vec<ToolCall>> {
     if calls.is_empty() { None } else { Some(calls) }
 }
 
+/// Extracts tool calls from raw model output, or `None` when it is a plain
+/// text response.
+///
+/// Tries `<tool_call>` tag blocks first ([`parse_tool_call_tag_blocks`]),
+/// then the whole output as bare JSON: a `{"tool_calls": [...]}` object or a
+/// single call object. Under `ForcedFunction`, and under `Required` with
+/// exactly one tool, a bare JSON object is wrapped as that tool's arguments.
+/// Calls naming unknown tools are dropped, serial mode truncates to one
+/// call, and a forced function keeps only matching calls.
 fn try_parse_tool_calls(raw: &str, config: &ToolConfig) -> Option<Vec<ToolCall>> {
     if let Some(mut result) = parse_tool_call_tag_blocks(raw) {
         result.retain(|call| tool_exists(&config.tools, &call.function.name));
@@ -777,10 +878,21 @@ fn try_parse_tool_calls(raw: &str, config: &ToolConfig) -> Option<Vec<ToolCall>>
     }
 }
 
+/// Validates parsed model output against the supported JSON Schema subset:
+/// `type`, `required`, `properties`, `items`, `enum`, `const`, `anyOf`,
+/// `additionalProperties`, and local `$ref`.
 fn validate_against_schema(value: &serde_json::Value, schema: &serde_json::Value) -> bool {
     validate_against_schema_inner(value, schema, schema, 0)
 }
 
+/// Validates one entry of the request `tools` array.
+///
+/// ## Errors
+///
+/// Returns a message naming `tools[index]` when the type is not `function`,
+/// the name violates the OpenAI pattern, or the parameter schema fails
+/// [`validate_schema_shape`] (strict rules apply when `strict` is set; a
+/// strict tool without parameters is checked as an empty closed object).
 fn validate_tool_definition(tool: &ToolDefinition, index: usize) -> Result<(), String> {
     if tool.tool_type != "function" {
         return Err(format!(
@@ -820,6 +932,8 @@ fn validate_tool_definition(tool: &ToolDefinition, index: usize) -> Result<(), S
     Ok(())
 }
 
+/// Extracts the function name from a tool reference in either the nested
+/// (`function.name`) or flat (`name`) shape.
 fn parse_tool_reference_name(tool_ref: &serde_json::Value) -> Option<String> {
     tool_ref
         .get("function")
@@ -829,6 +943,14 @@ fn parse_tool_reference_name(tool_ref: &serde_json::Value) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Validates `tools`, `tool_choice`, and `parallel_tool_calls` into a
+/// [`ToolConfig`], filtering the tool list down to what the choice allows.
+///
+/// ## Errors
+///
+/// Returns an `invalid_request_error` message when a tool definition is
+/// malformed, `tool_choice` has an unknown mode or shape, it references an
+/// unknown function, or it leaves no usable tools.
 fn build_tool_config(
     tools: Option<&[ToolDefinition]>,
     tool_choice: Option<&serde_json::Value>,
@@ -954,6 +1076,9 @@ fn build_tool_config(
     Ok(config)
 }
 
+/// Builds the system-prompt instruction for `response_format`: JSON-only
+/// output, plus the schema, name, and description when `json_schema` is
+/// requested.
 fn json_system_instruction(rf: &ResponseFormat) -> String {
     match rf.format_type.as_str() {
         "json_schema" => {
@@ -1001,7 +1126,12 @@ fn json_system_instruction(rf: &ResponseFormat) -> String {
     }
 }
 
-// Mirrors OpenAI Chat Completions ranges; out-of-range becomes invalid_request_error.
+/// Validates sampling parameters against the OpenAI Chat Completions ranges.
+///
+/// ## Errors
+///
+/// Returns an `invalid_request_error` message when a value is out of range,
+/// non-finite, or zero where at least 1 is required.
 fn validate_sampling_params(body: &ChatCompletionRequest) -> Result<(), String> {
     fn check_range_inclusive(
         value: Option<f32>,
@@ -1055,6 +1185,13 @@ fn validate_sampling_params(body: &ChatCompletionRequest) -> Result<(), String> 
     Ok(())
 }
 
+/// Validates the `response_format` parameter.
+///
+/// ## Errors
+///
+/// Returns a message when the type is neither `json_object` nor
+/// `json_schema`, the schema payload is missing, or the schema fails
+/// [`validate_schema_shape`].
 fn validate_response_format_request(response_format: &ResponseFormat) -> Result<(), String> {
     match response_format.format_type.as_str() {
         "json_object" => Ok(()),
@@ -1084,6 +1221,18 @@ fn validate_response_format_request(response_format: &ResponseFormat) -> Result<
     }
 }
 
+/// Renders the final prompt for a conversation, via the tokenizer's Jinja
+/// chat template when present, else a family-specific fallback format (turn
+/// tokens, Gemma turns, Mistral `[INST]`), else plain text.
+///
+/// When the template rejects the conversation and it contains a system
+/// message, rendering is retried without it (some templates do not support
+/// the system role).
+///
+/// ## Errors
+///
+/// Returns the template engine's error when rendering fails even after the
+/// system-message retry.
 pub fn apply_chat_template(
     tokenizer: &Tokenizer,
     messages: &[ChatMessage],
@@ -1169,6 +1318,8 @@ pub fn apply_chat_template(
     }
 }
 
+/// Converts engine logprob entries into the response `logprobs` object,
+/// truncating alternatives to the requested `top_logprobs` count.
 fn build_logprobs_content(entries: &[EngineLogprobEntry], req_top_n: usize) -> Logprobs {
     Logprobs {
         content: entries
@@ -1193,6 +1344,8 @@ fn build_logprobs_content(entries: &[EngineLogprobEntry], req_top_n: usize) -> L
     }
 }
 
+/// Fully collected output of one sequence: content and reasoning text,
+/// token counts, finish reason, and raw logprob entries.
 struct CompletionData {
     content: String,
     reasoning_content: String,
@@ -1202,8 +1355,11 @@ struct CompletionData {
     logprob_entries: Vec<EngineLogprobEntry>,
 }
 
-// On timeout: cancel inner (drops sse_tx/rx, engine aborts the sequence) and
-// emit error chunk + [DONE] on the retained sse_tx clone.
+/// Runs a streaming task with an optional wall-clock timeout.
+///
+/// On timeout the inner future is cancelled, dropping its channel ends so
+/// the engine aborts the sequence, and an error chunk plus `[DONE]` are
+/// emitted on the retained watchdog sender.
 async fn run_streaming_with_timeout<F>(
     inner: F,
     sse_tx_watchdog: tokio_mpsc::UnboundedSender<Result<Event, std::convert::Infallible>>,
@@ -1236,8 +1392,14 @@ async fn run_streaming_with_timeout<F>(
     }
 }
 
-// On timeout expiry: returns 408 and drops the receiver, which triggers the
-// engine loop to abort the sequence via tracker.tx.is_closed().
+/// Collects one sequence's events into a [`CompletionData`], subject to the
+/// request timeout.
+///
+/// ## Errors
+///
+/// Returns 408 on timeout expiry (dropping the receiver, which makes the
+/// engine loop abort the sequence via its closed-channel check) or 500 when
+/// the engine reports an error.
 async fn collect_one_completion(
     rx: tokio_mpsc::UnboundedReceiver<EngineEvent>,
     timeout: Option<Duration>,
@@ -1256,6 +1418,11 @@ async fn collect_one_completion(
     }
 }
 
+/// Accumulates engine events for one sequence until `StreamEnd`.
+///
+/// ## Errors
+///
+/// Returns a 500 response when the engine emits [`EngineEvent::Error`].
 async fn collect_one_completion_inner(
     mut rx: tokio_mpsc::UnboundedReceiver<EngineEvent>,
 ) -> Result<CompletionData, (StatusCode, Json<serde_json::Value>)> {
@@ -1300,6 +1467,27 @@ async fn collect_one_completion_inner(
     Ok(data)
 }
 
+/// `POST /v1/chat/completions`: the OpenAI-compatible chat completion
+/// handler.
+///
+/// Validates the request, loads the model on demand (waiting if a load is
+/// already in flight), injects tool and JSON instructions into the system
+/// message, renders and encodes the prompt, then enqueues `n` sequences with
+/// per-completion seeds. Non-streaming responses collect every sequence and
+/// apply tool-call parsing (which takes priority over JSON mode) and schema
+/// validation; streaming responses emit SSE chunks as tokens arrive, except
+/// that requests with tools buffer each full completion first so tool calls
+/// can be parsed before deltas are emitted. The whole request runs under an
+/// `http.request` span parented to any upstream `traceparent` header and
+/// cloned into each engine request, so engine spans join the caller's
+/// distributed trace.
+///
+/// ## Errors
+///
+/// Returns 400 for invalid parameters, tools, or response formats; 404 when
+/// the model is not found; 408 on non-streaming request timeout; 429 when
+/// the request queue is full; 500 for template, tokenizer, engine, or load
+/// failures; 503 when the engine channel is closed.
 pub(super) async fn chat_completions(
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
@@ -1388,9 +1576,6 @@ pub(super) async fn chat_completions(
     let request_id = uuid::Uuid::new_v4().to_string();
     let t_request = std::time::Instant::now();
 
-    // HTTP-boundary span. Parented to any upstream `traceparent` so the request's
-    // engine spans join the caller's distributed trace; cloned into each
-    // IncomingRequest below so the engine's per-request span nests under it.
     let http_span = tracing::info_span!(
         "http.request",
         request_id = %request_id,
@@ -2385,7 +2570,6 @@ pub(super) async fn chat_completions(
                 None
             };
 
-            // Tool call detection takes priority over JSON mode.
             let (response_msg, finish_reason) = if has_tools {
                 let raw = strip_json_fences(data.content.trim());
                 if let Some(tool_calls) = try_parse_tool_calls(raw, &tool_config) {

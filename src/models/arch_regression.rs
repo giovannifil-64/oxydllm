@@ -1,21 +1,19 @@
-//
-// arch_regression.rs: Architecture regression test matrix
-//
-// Each test builds a tiny StandardTransformer (hidden=32, 2 layers, 4 heads)
-// with random weights matching a specific architecture's feature combination,
-// runs a prefill + decode forward pass, and verifies:
-//   1. Output shape is correct
-//   2. No NaN/Inf in logits
-//   3. Decode after prefill doesn't crash
-//
-// This catches regressions when modifying shared code paths (attention, FFN,
-// block, norm): if adding Qwen5 breaks Gemma2's softcap+sliding window
-// path, the test fails immediately.
-//
-// Usage in `src/models/mod.rs`:
-//   #[cfg(test)]
-//   mod arch_regression;
-//
+//! Architecture regression test matrix (compiled only under `cfg(test)`).
+//!
+//! Each `arch_*` test builds a tiny
+//! [`crate::models::gguf_model::StandardTransformer`] (hidden=32, 2 layers,
+//! 4 heads) with random weights matching one architecture's feature
+//! combination, runs a prefill plus a few decode steps on CPU, and verifies:
+//!
+//! 1. Output shape is correct.
+//! 2. No NaN/Inf in logits (and not all zeros).
+//! 3. Decode after prefill does not crash.
+//!
+//! This catches regressions when modifying shared code paths (attention,
+//! FFN, block, norm): if adding a new architecture breaks Gemma2's
+//! softcap+sliding-window path, the matching test fails immediately. The
+//! remaining tests pin sharper contracts: Granite logits scaling, KV-cache
+//! quantization error bounds, and chunked-vs-packed forward parity.
 
 #[cfg(test)]
 mod tests {
@@ -41,6 +39,13 @@ mod tests {
     const MAX_SEQ: usize = 64;
     const KV_BLOCKS: usize = 32;
 
+    /// One architecture's feature combination, mirroring the
+    /// [`BlockConfig`] and model-level knobs a real checkpoint would set.
+    ///
+    /// `name` labels assertion messages; the rest toggle the mechanisms
+    /// under test (activation, norm variant, qk/v norms, softcaps, sliding
+    /// window, Granite multipliers, tied embeddings, rope base). Defaults
+    /// are the plain Llama-style transformer.
     struct ArchSpec {
         name: &'static str,
         activation: Activation,
@@ -89,6 +94,10 @@ mod tests {
         Tensor::ones(&[dim], DType::F32, dev).unwrap()
     }
 
+    /// Random weights in the safetensors naming scheme for `spec`'s feature
+    /// set: norm weights are ones, projections N(0, 0.02), and the optional
+    /// tensors (qk norms, FFN norms, untied lm_head) appear only when the
+    /// spec asks for them.
     fn build_weights(spec: &ArchSpec, dev: &Device) -> FxHashMap<String, Tensor> {
         let mut t = FxHashMap::default();
         let h = HIDDEN;
@@ -163,12 +172,17 @@ mod tests {
         t
     }
 
+    /// Fresh random-weight model for `spec` on CPU.
     fn build_model(spec: ArchSpec) -> Result<StandardTransformer> {
         let dev = Device::Cpu;
         let tensors = build_weights(&spec, &dev);
         build_model_from_tensors(&spec, tensors, None)
     }
 
+    /// Assembles a [`StandardTransformer`] from explicit tensors, exactly as
+    /// the safetensors loader would; a shared tensor map lets two model
+    /// variants (e.g. quantized vs. unquantized KV) run on identical
+    /// weights.
     fn build_model_from_tensors(
         spec: &ArchSpec,
         tensors: rustc_hash::FxHashMap<String, Tensor>,
@@ -255,6 +269,8 @@ mod tests {
         })
     }
 
+    /// Prefills tokens `1..=seq_len` at positions `0..seq_len`, flushing the
+    /// KV caches; returns logits of shape `[1, seq_len, VOCAB]`.
     fn run_prefill(
         model: &StandardTransformer,
         caches: &mut Vec<PagedKvCache>,
@@ -272,6 +288,8 @@ mod tests {
         Ok(logits)
     }
 
+    /// Decodes one deterministic token at `position` against the existing
+    /// caches; returns logits of shape `[1, 1, VOCAB]`.
     fn run_decode(
         model: &StandardTransformer,
         caches: &mut Vec<PagedKvCache>,
@@ -286,6 +304,8 @@ mod tests {
         model.forward_batch(&input, &pos, &mut slices, &[1])
     }
 
+    /// One empty [`PagedKvCache`] per layer, backed by the model's
+    /// allocators.
     fn make_caches(model: &StandardTransformer) -> Vec<PagedKvCache> {
         model
             .allocators()
@@ -300,6 +320,8 @@ mod tests {
         }
     }
 
+    /// Core matrix assertions: logits are `[1, seq_len, VOCAB]`, all finite,
+    /// and not all zeros (which would indicate a weight-loading bug).
     fn assert_logits_ok(logits: &Tensor, seq_len: usize, arch_name: &str) {
         let dims = logits.dims();
         assert_eq!(
@@ -317,10 +339,12 @@ mod tests {
         let any_nonzero = flat.iter().any(|v| v.abs() > 1e-10);
         assert!(
             any_nonzero,
-            "[{arch_name}] logits are all zeros — likely a weight loading bug"
+            "[{arch_name}] logits are all zeros: likely a weight loading bug"
         );
     }
 
+    /// Full matrix pass for one [`ArchSpec`]: build the model, prefill 8
+    /// tokens, decode 3 more, asserting [`assert_logits_ok`] at every step.
     fn run_arch_test(spec: ArchSpec) {
         let name = spec.name;
         let model =
@@ -555,6 +579,8 @@ mod tests {
         e.iter().map(|x| x / s).collect()
     }
 
+    /// L1 distance between the softmax distributions of two logit vectors;
+    /// the KV-quant tests bound this rather than raw logit error.
     fn softmax_l1(a: &[f32], b: &[f32]) -> f32 {
         softmax(a)
             .iter()
@@ -563,6 +589,7 @@ mod tests {
             .sum()
     }
 
+    /// L2 distance between the softmax distributions of two logit vectors.
     fn softmax_l2(a: &[f32], b: &[f32]) -> f32 {
         softmax(a)
             .iter()
@@ -572,6 +599,9 @@ mod tests {
             .sqrt()
     }
 
+    /// Contract: 4-bit QJL KV quantization ("lossless" mode) keeps the
+    /// decode softmax within L1 < 0.5 and L2 < 0.35 of the unquantized
+    /// model on identical weights.
     #[test]
     fn kv_quant_lossless_finite_and_close() {
         use crate::common::kv_quant::KvQuantizer;
@@ -617,16 +647,19 @@ mod tests {
 
         assert!(
             l1 < 0.5,
-            "kv_quant/lossless: softmax L1 distance {l1:.4} exceeds threshold 0.5 — \
+            "kv_quant/lossless: softmax L1 distance {l1:.4} exceeds threshold 0.5; \
              quantization is introducing excessive error in the KV read-back path"
         );
         assert!(
             l2 < 0.35,
-            "kv_quant/lossless: softmax L2 distance {l2:.4} exceeds threshold 0.35 — \
+            "kv_quant/lossless: softmax L2 distance {l2:.4} exceeds threshold 0.35; \
              quantization is introducing large per-token error in the KV read-back path"
         );
     }
 
+    /// Contract: 3-bit QJL KV quantization ("balanced" mode) stays within
+    /// the looser L1 < 0.7 and L2 < 0.5 softmax bounds after three decode
+    /// steps.
     #[test]
     fn kv_quant_balanced_vs_off() {
         use crate::common::kv_quant::KvQuantizer;
@@ -685,12 +718,12 @@ mod tests {
 
         assert!(
             l1 < 0.7,
-            "kv_quant/balanced: softmax L1 distance {l1:.4} exceeds threshold 0.7 — \
+            "kv_quant/balanced: softmax L1 distance {l1:.4} exceeds threshold 0.7; \
              3-bit quantization is introducing excessive error in the KV read-back path"
         );
         assert!(
             l2 < 0.5,
-            "kv_quant/balanced: softmax L2 distance {l2:.4} exceeds threshold 0.5 — \
+            "kv_quant/balanced: softmax L2 distance {l2:.4} exceeds threshold 0.5; \
              3-bit quantization is introducing large per-token error in the KV read-back path"
         );
     }

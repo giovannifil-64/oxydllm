@@ -1,3 +1,17 @@
+//! Model lifecycle manager: on-demand loading, eviction, and the registry.
+//!
+//! [`ModelManager`] tracks one slot per decoder model.
+//! [`ModelManager::get_or_load`] returns a ready handle, joins an in-flight
+//! load, or spawns a fresh one ([`spawn_load`]: an OS thread loads and warms
+//! the model, then runs the engine loop; a companion tokio task installs the
+//! slot and notifies waiters). Eviction is two-fold: idle models past their
+//! keep-alive are dropped by [`spawn_eviction_task`], and
+//! [`ModelManager::evict_lru_for_bytes`] frees least-recently-used models
+//! when a `--memory-budget` would be exceeded. Loaded-model metadata
+//! persists in the on-disk registry ([`RegistryEntry`]) so later loads can
+//! project memory needs; encoder (embedding) models live in a separate
+//! always-resident cache ([`EncoderHandle`]).
+
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -24,6 +38,8 @@ use crate::scheduler::SchedulerConfig;
 use crate::server::{IncomingRequest, engine_loop};
 use crate::tokenizer::Tokenizer;
 
+/// Per-request handle to a loaded model: the channel into its engine loop,
+/// its tokenizer, and the context-length limit.
 #[derive(Clone)]
 pub struct ReadyHandle {
     pub request_tx: tokio_mpsc::Sender<IncomingRequest>,
@@ -31,6 +47,14 @@ pub struct ReadyHandle {
     pub max_seq_len: usize,
 }
 
+/// Lifecycle state of one model slot.
+///
+/// `Loading` queues the waiters to notify when the load resolves. `Ready`
+/// holds the engine-loop channel plus the metadata reported for running
+/// models and the eviction inputs: `last_used` and `effective_keep_alive`
+/// drive both keep-alive expiry and LRU selection, the size fields count
+/// against the memory budget, and setting `shutdown` makes the engine-loop
+/// thread exit and drop the model.
 enum SlotState {
     Loading {
         waiters: Vec<oneshot::Sender<Result<ReadyHandle, String>>>,
@@ -50,6 +74,7 @@ enum SlotState {
     },
 }
 
+/// Snapshot of one loaded model as returned by the running-models listing.
 pub struct RunningModelInfo {
     pub id: String,
     pub architecture: String,
@@ -60,6 +85,11 @@ pub struct RunningModelInfo {
     pub kv_cache_bytes: usize,
 }
 
+/// Persisted per-model metadata in the on-disk registry
+/// (`.oxydllm_registry.json`).
+///
+/// Written only when a model is loaded through the HTTP server; the recorded
+/// sizes give later loads an exact memory projection for eviction decisions.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct RegistryEntry {
     pub architecture: String,
@@ -78,6 +108,20 @@ pub struct EncoderHandle {
     pub tokenizer: Arc<Tokenizer>,
 }
 
+/// Owns every loaded model and decides what loads, stays, and gets evicted.
+///
+/// Holds the decoder slots ([`SlotState`]), the always-resident encoder
+/// cache, the persistent registry, and the load-time configuration shared by
+/// all models (device selection, KV budget and quantization, scheduler
+/// limits, optional speculative draft). Wrapped in [`SharedModelManager`]
+/// and locked briefly around slot bookkeeping; actual model loads run
+/// outside the lock.
+///
+/// Eviction rules: models idle past their effective keep-alive are always
+/// evicted; when `memory_budget_bytes` is set, loading a new model first
+/// evicts least-recently-used models until the projected total fits, and a
+/// load whose real size still exceeds the budget is unloaded immediately
+/// after completing.
 pub struct ModelManager {
     models_dir: PathBuf,
     slots: HashMap<String, SlotState>,
@@ -98,6 +142,7 @@ pub struct ModelManager {
     discovery_cache: Option<DiscoveryCache>,
 }
 
+/// Cached filesystem discovery result, valid for [`DISCOVERY_CACHE_TTL`].
 struct DiscoveryCache {
     discovered: Vec<loader::DiscoveredModel>,
     refreshed_at: Instant,
@@ -105,17 +150,24 @@ struct DiscoveryCache {
 
 const DISCOVERY_CACHE_TTL: Duration = Duration::from_secs(5);
 
+/// Shared, async-locked handle to the [`ModelManager`] used by all routes.
 pub type SharedModelManager = Arc<tokio::sync::Mutex<ModelManager>>;
 
+/// Outcome of [`ModelManager::get_or_load`]: `Ready` carries an immediately
+/// usable handle, `Wait` a receiver that resolves when the (possibly already
+/// in-flight) load completes or fails.
 pub enum GetResult {
     Ready(ReadyHandle),
     Wait(oneshot::Receiver<Result<ReadyHandle, String>>),
 }
 
+/// Path of the registry file inside the models directory.
 pub fn registry_path(models_dir: &Path) -> PathBuf {
     models_dir.join(".oxydllm_registry.json")
 }
 
+/// Loads the registry from disk; a missing or malformed file yields an
+/// empty registry (malformed JSON is logged and discarded).
 pub fn load_registry(models_dir: &Path) -> BTreeMap<String, RegistryEntry> {
     let path = registry_path(models_dir);
     let raw = match std::fs::read_to_string(&path) {
@@ -131,6 +183,8 @@ pub fn load_registry(models_dir: &Path) -> BTreeMap<String, RegistryEntry> {
     }
 }
 
+/// Persists the registry atomically (write to a temp file, then rename);
+/// failures are logged, never propagated.
 pub fn save_registry(models_dir: &Path, registry: &BTreeMap<String, RegistryEntry>) {
     let path = registry_path(models_dir);
     let Ok(json) = serde_json::to_string_pretty(registry) else {
@@ -173,6 +227,7 @@ fn round_1(v: f64) -> f64 {
     (v * 10.0).round() / 10.0
 }
 
+/// Sums the on-disk bytes of a model directory's safetensors and GGUF files.
 pub fn estimate_model_size(model_dir: &Path) -> usize {
     std::fs::read_dir(model_dir)
         .into_iter()
@@ -189,6 +244,15 @@ pub fn estimate_model_size(model_dir: &Path) -> usize {
         .sum()
 }
 
+/// Startup configuration for the [`ModelManager`], mirroring the server CLI
+/// flags.
+///
+/// `memory_budget_bytes` enables LRU eviction and sizes the KV budget
+/// deterministically; `keep_alive` is the default idle-eviction window
+/// (overridable per request); `max_queued_requests` bounds each model's
+/// request channel; `draft_model` names an optional speculative-decoding
+/// draft; `expert_stream_mb` overrides the automatic streamed-expert cache
+/// size for MoE models.
 pub struct ModelManagerConfig {
     pub models_dir: PathBuf,
     pub keep_alive: Duration,
@@ -205,6 +269,13 @@ pub struct ModelManagerConfig {
 }
 
 impl ModelManager {
+    /// Builds the manager: loads the registry, prunes entries whose models no
+    /// longer exist on disk, and sizes the global KV budget.
+    ///
+    /// Without `--memory-budget` the KV budget derives from the memory free
+    /// at startup; under system memory pressure it can start near zero and
+    /// every model load then fails with "KV cache budget exhausted", so a
+    /// very low budget is warned about explicitly.
     pub fn new(config: ModelManagerConfig) -> Self {
         let ModelManagerConfig {
             models_dir,
@@ -240,9 +311,6 @@ impl ModelManager {
             kv_cache_budget_gb = round_2(gb(kv_total)),
             "global KV cache budget configured"
         );
-        // Without --memory-budget the budget derives from the memory that is
-        // free RIGHT NOW; under system memory pressure it can start near zero
-        // and every model load then fails with "KV cache budget exhausted".
         if memory_budget_bytes.is_none() && kv_total < 1024 * 1024 * 1024 {
             tracing::warn!(
                 kv_cache_budget_gb = round_2(gb(kv_total)),
@@ -287,6 +355,8 @@ impl ModelManager {
         self.memory_budget_bytes
     }
 
+    /// Total weights plus KV bytes of all `Ready` slots, as counted against
+    /// the memory budget.
     pub fn total_loaded_bytes(&self) -> usize {
         self.slots
             .values()
@@ -301,6 +371,7 @@ impl ModelManager {
             .sum()
     }
 
+    /// Snapshot of every `Ready` model for the running-models listing.
     pub fn list_running(&self) -> Vec<RunningModelInfo> {
         let now = Instant::now();
         self.slots
@@ -363,9 +434,6 @@ impl ModelManager {
         self.discovery_cache = None;
     }
 
-    /// Best pre-load size estimate (weights + KV) for eviction decisions.
-    /// Uses registry data when available; otherwise estimates from disk with
-    /// dtype correction (CPU=F32 doubles BF16, AWQ keeps packed 4-bit).
     /// The cached encoder for `model_id`, if one is already loaded.
     pub fn encoder_cached(&self, model_id: &str) -> Option<EncoderHandle> {
         self.encoders.get(model_id).cloned()
@@ -380,6 +448,11 @@ impl ModelManager {
 
     /// Resolves the on-disk directory and device parameters an encoder load
     /// needs, without holding anything locked during the load itself.
+    ///
+    /// ## Errors
+    ///
+    /// Returns a message when `model_id` does not resolve to a directory in
+    /// the models dir.
     pub fn encoder_load_info(
         &self,
         model_id: &str,
@@ -393,6 +466,9 @@ impl ModelManager {
         ))
     }
 
+    /// Best pre-load size estimate (weights + KV) for eviction decisions.
+    /// Uses registry data when available; otherwise estimates from disk with
+    /// dtype correction (CPU=F32 doubles BF16, AWQ keeps packed 4-bit).
     fn projected_size_bytes(&self, model_id: &str, model_path: &Path) -> usize {
         if let Some(entry) = self.registry.get(model_id)
             && entry.size_bytes > 0
@@ -437,6 +513,13 @@ impl ModelManager {
         corrected
     }
 
+    /// Evicts least-recently-used `Ready` models until `needed_bytes` fits
+    /// in the memory budget, returning how many were evicted.
+    ///
+    /// A no-op (returns 0) when no memory budget is configured. Each
+    /// eviction releases the model's KV budget reservation and sets its
+    /// shutdown flag, which makes the engine-loop thread exit and drop the
+    /// weights.
     pub fn evict_lru_for_bytes(&mut self, needed_bytes: usize) -> usize {
         let budget = match self.memory_budget_bytes {
             Some(b) => b,
@@ -493,6 +576,14 @@ impl ModelManager {
         evicted
     }
 
+    /// Returns a handle to `model_id`, loading the model on demand.
+    ///
+    /// A `Ready` slot is returned immediately (bumping `last_used` and
+    /// applying any per-request keep-alive override); a `Loading` slot
+    /// registers the caller as a waiter. Otherwise LRU eviction makes room
+    /// for the projected model size and a background load is spawned; load
+    /// failures (including "model not found") are delivered through the
+    /// returned [`GetResult::Wait`] receiver.
     pub fn get_or_load(
         &mut self,
         model_id: &str,
@@ -576,6 +667,9 @@ impl ModelManager {
         GetResult::Wait(rx)
     }
 
+    /// Evicts every `Ready` model idle for longer than its effective
+    /// keep-alive, releasing its KV budget and signalling its engine loop to
+    /// shut down.
     pub fn evict_expired(&mut self) {
         let now = Instant::now();
         let expired: Vec<String> = self
@@ -680,6 +774,8 @@ impl ModelManager {
         );
     }
 
+    /// Upserts a model's registry entry with its measured sizes and persists
+    /// the registry to disk.
     pub fn update_registry(
         &mut self,
         model_id: &str,
@@ -700,6 +796,8 @@ impl ModelManager {
     }
 }
 
+/// Everything a completed load hands back to the manager task that installs
+/// the `Ready` slot.
 struct LoadResult {
     request_tx: tokio_mpsc::Sender<IncomingRequest>,
     tokenizer: Arc<Tokenizer>,
@@ -712,6 +810,10 @@ struct LoadResult {
     shutdown: Arc<AtomicBool>,
 }
 
+/// Arguments for [`spawn_load`]: the model's identity and path, the shared
+/// manager to install the result into, and a snapshot of the load-time
+/// configuration. `draft_model` is the optional speculative-decoding draft
+/// as `(resolved_path, id)`.
 struct SpawnLoadParams {
     model_id: String,
     model_path: PathBuf,
@@ -725,7 +827,6 @@ struct SpawnLoadParams {
     require_gpu: bool,
     max_num_seqs: Option<usize>,
     max_queued_requests: usize,
-    /// Optional draft model as (resolved_path, id) for speculative decoding.
     draft_model: Option<(PathBuf, String)>,
     expert_stream_mb: Option<usize>,
     memory_budget_bytes: Option<usize>,
@@ -841,6 +942,17 @@ fn warm_up_model(model: &dyn BatchModel) {
     }
 }
 
+/// Spawns the two halves of a model load.
+///
+/// A dedicated OS thread loads the tokenizer and weights, warms up the model
+/// ([`warm_up_model`]), optionally loads the speculative draft on the same
+/// device (sharing the KV budget; a load failure or vocab mismatch disables
+/// speculation instead of failing the load), and then runs the engine loop
+/// until shutdown; load and warmup are traced under a standalone
+/// `model.load` root span since the thread is decoupled from the triggering
+/// request. A companion tokio task awaits the result, installs the `Ready`
+/// slot, updates the registry, notifies waiters, and unloads the model again
+/// if its real size exceeds the memory budget.
 fn spawn_load(params: SpawnLoadParams) {
     let SpawnLoadParams {
         model_id,
@@ -869,8 +981,6 @@ fn spawn_load(params: SpawnLoadParams) {
     std::thread::spawn(move || {
         let model_dir = model_path_thread.to_string_lossy().to_string();
 
-        // Standalone span covering load + warmup of this model (a root trace, since
-        // the load runs on its own thread, decoupled from the triggering request).
         let load_span = tracing::info_span!(
             "model.load",
             model_id = %model_id_thread,
@@ -1043,9 +1153,6 @@ fn spawn_load(params: SpawnLoadParams) {
             kv_budget.release(reserved);
         }
 
-        // Load the speculative draft model on the same device (shares the KV
-        // budget). Disable speculation for this model if it fails to load or its
-        // vocab doesn't match the target.
         let draft = draft_model.as_ref().and_then(|(draft_path, draft_id)| {
             let draft_dir = draft_path.to_string_lossy().to_string();
             match loader::load_batch_model(
@@ -1161,7 +1268,7 @@ fn spawn_load(params: SpawnLoadParams) {
                             s.store(true, Ordering::Release);
                         }
                         let err = format!(
-                            "model '{}' ({:.2} GB) exceeds memory budget ({:.2} GB) — \
+                            "model '{}' ({:.2} GB) exceeds memory budget ({:.2} GB): \
                              use --memory-budget to increase the limit or --max-context-len \
                              to reduce KV cache size",
                             model_id,
@@ -1215,6 +1322,8 @@ fn spawn_load(params: SpawnLoadParams) {
     });
 }
 
+/// Background task that runs [`ModelManager::evict_expired`] every 30
+/// seconds.
 pub fn spawn_eviction_task(manager: SharedModelManager) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(30));

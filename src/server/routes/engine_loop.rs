@@ -1,3 +1,25 @@
+//! Blocking per-model engine loop: queued requests in, streamed tokens out.
+//!
+//! Each loaded model runs one [`engine_loop`] on its own OS thread. The loop
+//! owns the [`Engine`], pulls [`IncomingRequest`]s from an mpsc channel,
+//! steps the engine, and forwards [`EngineEvent`]s to each request's response
+//! channel through a per-sequence [`SeqTracker`].
+//!
+//! Two decoding concerns live here:
+//!
+//! - Prefix decode: tokenizers with a `Strip` decoder (LLaMA/Phi BPE) lose
+//!   inter-word spaces when tokens are decoded one at a time, so
+//!   [`prefix_decode_incremental`] re-decodes the accumulated sequence and
+//!   emits only the new text suffix.
+//! - Channel routing: `<think>` blocks and the GPT-OSS harmony protocol
+//!   ([`HarmonyState`]) split tokens between reasoning and content streams.
+//!
+//! GPU serialization contract: every `engine.step()` runs while holding the
+//! per-device lock from [`crate::gpu_lock::gpu_lock_for`], serializing the
+//! forward pass against concurrent model loads and other engine loops on the
+//! same device; candle's Metal backend has no cross-thread hazard tracking,
+//! so data-dependent ops encoded concurrently from two threads can race.
+
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -13,12 +35,18 @@ use crate::tokenizer::Tokenizer;
 
 const TOKEN_DECODE_CACHE_CAP: usize = 8192;
 
+/// Decoded form of a single token id: its text and the raw UTF-8 bytes.
 #[derive(Clone)]
 struct DecodedToken {
     text: String,
     bytes: Vec<u8>,
 }
 
+/// LRU cache of single-token decodes, used when building logprob entries.
+///
+/// Logprob responses decode the chosen token plus every top-k alternative on
+/// each step; caching per-token decodes (up to `TOKEN_DECODE_CACHE_CAP`
+/// entries) avoids re-running the tokenizer for the same ids repeatedly.
 struct TokenDecodeCache {
     entries: LruCache<u32, DecodedToken>,
 }
@@ -30,6 +58,7 @@ impl TokenDecodeCache {
         }
     }
 
+    /// Returns the cached decode for `token_id`, decoding and caching on miss.
     fn decode_token(&mut self, tokenizer: &Tokenizer, token_id: u32) -> DecodedToken {
         if let Some(hit) = self.entries.get(&token_id) {
             return hit.clone();
@@ -44,6 +73,8 @@ impl TokenDecodeCache {
     }
 }
 
+/// Builds one [`EngineLogprobEntry`] from a sampled token and its top-k
+/// alternatives, decoding token text through `decode_cache`.
 fn build_logprob_entry(
     tokenizer: &Tokenizer,
     decode_cache: &mut TokenDecodeCache,
@@ -69,26 +100,34 @@ fn build_logprob_entry(
     }
 }
 
+/// Top-k alternatives for one sampled token, as `(token_id, logprob)` pairs.
 type RawTopLogprobs = Vec<(u32, f32)>;
+
+/// A sampled token's `(token_id, logprob, top_k)` held back until its text is
+/// emitted, so logprob entries stay aligned with emitted text chunks.
 type PendingRawLogprob = (u32, f32, RawTopLogprobs);
 
 /// GPT-OSS harmony channel protocol: the model emits
 /// `<|channel|>NAME<|message|>BODY<|end|>` sequences; analysis/commentary
 /// bodies are reasoning, the final channel is user-visible content. Activated
 /// only when the tokenizer has the harmony marker tokens.
+///
+/// States: `Markers` sits between messages expecting marker tokens; `Role`
+/// (after `<|start|>`) consumes plain role-name tokens as protocol framing
+/// until the next marker; `Header` (after `<|channel|>`) collects the channel
+/// name until `<|message|>`; `Body` carries whether the current channel is
+/// the final (user-visible) one.
 #[derive(Clone, Copy, PartialEq)]
 enum HarmonyState {
-    /// Between messages: expecting marker tokens.
     Markers,
-    /// After `<|start|>`: plain role-name tokens until the next marker.
     Role,
-    /// After `<|channel|>`: collecting the channel name until `<|message|>`.
     Header,
-    Body {
-        final_channel: bool,
-    },
+    Body { final_channel: bool },
 }
 
+/// Special-token ids for the harmony protocol markers. `channel` and
+/// `message` are required for activation; `end` and `start` are optional in
+/// some tokenizer variants.
 struct HarmonyIds {
     channel: u32,
     message: u32,
@@ -127,7 +166,6 @@ fn harmony_route(
                 };
                 return None;
             }
-            // Plain token where a marker was expected: content.
             *state = HarmonyState::Body {
                 final_channel: true,
             };
@@ -144,7 +182,6 @@ fn harmony_route(
             } else if ids.end == Some(tok) {
                 *state = HarmonyState::Markers;
             }
-            // Plain tokens here are the role name: protocol framing, skip.
             None
         }
         HarmonyState::Header => {
@@ -175,6 +212,21 @@ fn harmony_route(
     }
 }
 
+/// Per-sequence streaming state, mapping engine tokens to one request's
+/// response channel.
+///
+/// Output and reasoning token ids are accumulated (`output_ids`,
+/// `thinking_ids`) and re-decoded incrementally via
+/// [`prefix_decode_incremental`], because decoding tokens one at a time loses
+/// inter-word spaces on tokenizers with a `Strip` decoder; `decoded_len`, the
+/// `*_stable_end` offsets, and the `*_stable_text` buffers carry that decoder
+/// state per channel. Raw logprobs wait in `pending_raw_lps` until text is
+/// emitted so entries stay aligned with chunks. `span` is the per-request
+/// OpenTelemetry span covering the whole lifecycle and `decode_span` its
+/// child covering first token to completion (its start offset from the
+/// parent visualizes the TTFT); both close on drop, and `decode_span` is
+/// dropped explicitly at completion so it ends before the request span
+/// records its outcome fields.
 struct SeqTracker {
     tx: tokio_mpsc::UnboundedSender<EngineEvent>,
     request_id: String,
@@ -194,12 +246,12 @@ struct SeqTracker {
     think_stable_text: String,
     harmony_state: HarmonyState,
     harmony_header_ids: Vec<u32>,
-    // Per-request OpenTelemetry span (whole lifecycle) and the child `decode`
-    // span (first token to completion). Closed when this tracker is dropped.
     span: tracing::Span,
     decode_span: Option<tracing::Span>,
 }
 
+/// Aborts the given sequences in the engine and drops their trackers,
+/// logging each abort with the given reason.
 fn abort_sequences(
     engine: &mut Engine,
     trackers: &mut HashMap<SequenceId, SeqTracker>,
@@ -228,6 +280,14 @@ fn abort_sequences(
     }
 }
 
+/// Registers `req` with the engine and inserts its [`SeqTracker`].
+///
+/// The sequence is JSON-constrained when the request asks for it, a token
+/// byte table is available, and neither thinking nor harmony is active
+/// (those channels would break the byte-level automaton). Also opens the
+/// request's lifecycle span, nested under the HTTP-handler span so the trace
+/// crosses the HTTP boundary; its empty fields (TTFT, completion tokens,
+/// outcome) are recorded as the request progresses.
 fn enqueue_request(
     req: IncomingRequest,
     engine: &mut Engine,
@@ -271,9 +331,6 @@ fn enqueue_request(
         seq_id,
         "request enqueued"
     );
-    // Lifecycle span for this request, nested under the HTTP-handler span so the
-    // trace spans the HTTP boundary. The Empty fields are filled in via `record`
-    // as the request reaches first token and completion.
     let span = tracing::info_span!(
         parent: &req.parent_span,
         "inference.request",
@@ -315,6 +372,7 @@ fn enqueue_request(
     );
 }
 
+/// Clamps `idx` down to the nearest UTF-8 character boundary in `s`.
 fn clamp_to_char_boundary(s: &str, idx: usize) -> usize {
     let mut i = idx.min(s.len());
     while i > 0 && !s.is_char_boundary(i) {
@@ -323,8 +381,10 @@ fn clamp_to_char_boundary(s: &str, idx: usize) -> usize {
     i
 }
 
-// Trailing `U+FFFD` is held back so multi-byte UTF-8 split across tokens is
-// buffered until the continuation token arrives.
+/// Emits the not-yet-sent suffix of `full`, advancing `decoded_len`.
+///
+/// A trailing `U+FFFD` is held back so multi-byte UTF-8 split across tokens
+/// is buffered until the continuation token arrives.
 fn emit_suffix(full: &str, decoded_len: &mut usize) -> Option<String> {
     let start = clamp_to_char_boundary(full, *decoded_len);
     let new_text = &full[start..];
@@ -338,8 +398,13 @@ fn emit_suffix(full: &str, decoded_len: &mut usize) -> Option<String> {
     }
 }
 
+/// Number of trailing tokens re-decoded every step; anything older is frozen
+/// into the stable prefix because the decoder can no longer change its text.
 const DECODE_STABLE_LOOKBACK: usize = 4;
 
+/// Decodes `ids` as a mid-sequence fragment by prefixing a neutral token and
+/// stripping its text, preserving the leading space that a `Strip`/BPE
+/// decoder would otherwise drop from a standalone decode.
 fn decode_with_neutral_prefix(
     tokenizer: &Tokenizer,
     ids: &[u32],
@@ -359,6 +424,8 @@ fn decode_with_neutral_prefix(
         .unwrap_or_else(|| tokenizer.decode(ids).unwrap_or_default())
 }
 
+/// Freezes tokens older than [`DECODE_STABLE_LOOKBACK`] into `stable_text`,
+/// appending their decoded delta so each step re-decodes only the tail.
 fn advance_stable_window(
     tokenizer: &Tokenizer,
     all_ids: &[u32],
@@ -383,6 +450,15 @@ fn advance_stable_window(
     *stable_end = new_stable_end;
 }
 
+/// Incrementally decodes the accumulated `all_ids` and returns the new text
+/// suffix to emit, if any.
+///
+/// Decoding one token at a time is wrong for tokenizers with a `Strip`
+/// decoder (each token loses its leading space), and re-decoding the full
+/// sequence every step is quadratic. Instead the stable prefix (everything
+/// older than the lookback window) is decoded once and cached; each step
+/// re-decodes only the tail window and emits `full[decoded_len..]` via
+/// [`emit_suffix`].
 fn prefix_decode_incremental(
     tokenizer: &Tokenizer,
     all_ids: &[u32],
@@ -486,6 +562,26 @@ mod streaming_decode_tests {
     }
 }
 
+/// Runs a model's blocking request-to-token loop until shutdown, owning the
+/// [`Engine`] for the model's whole residency.
+///
+/// Each iteration drains queued [`IncomingRequest`]s (blocking for the next
+/// request when idle), aborts sequences whose response channel closed, then
+/// steps the engine and routes every new token through its [`SeqTracker`]:
+/// harmony and `<think>` handling split reasoning from content, and prefix
+/// decoding turns token ids into text deltas. Completed sequences flush any
+/// remaining text and logprobs, record metrics and span fields, and emit
+/// `Finish` plus `StreamEnd`.
+///
+/// `engine.step()` executes under the per-device gpu lock, which serializes
+/// the forward pass against concurrent model loads and other engine loops on
+/// the same device (candle Metal has no cross-thread hazard tracking for
+/// concurrently encoded, data-dependent ops).
+///
+/// Reaching three consecutive step errors aborts all sequences; fewer abort
+/// only the running batch. When `shutdown` is set (model eviction) or the
+/// request channel closes, the loop exits and drains remaining trackers with
+/// a "Model unloaded" error, dropping the engine and freeing the model.
 pub fn engine_loop(
     mut engine: Engine,
     tokenizer: Arc<Tokenizer>,
@@ -599,8 +695,6 @@ pub fn engine_loop(
                                 metrics::TTFT_HISTOGRAM
                                     .with_label_values(&[&tracker.model_id])
                                     .observe(ttft_ms);
-                                // Child span covering the decode phase (first token to completion);
-                                // its start offset from the parent visualises the TTFT.
                                 tracker.decode_span =
                                     Some(tracing::info_span!(parent: &tracker.span, "decode"));
                                 tracker.first_token_at = Some(std::time::Instant::now());
@@ -778,8 +872,6 @@ pub fn engine_loop(
                             let tps = (tps * 100.0).round() / 100.0;
                             let finish_reason =
                                 completed.finish_reason.as_deref().unwrap_or("stop");
-                            // Close the decode child span at completion, then fill in the
-                            // request span's outcome fields before it closes on drop.
                             tracker.decode_span = None;
                             tracker
                                 .span

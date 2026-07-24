@@ -502,7 +502,7 @@ fn run_update_stable(include_pre: bool) -> anyhow::Result<()> {
     }
 
     println!(
-        "Update available: {} → {remote_tag}",
+        "Update available: {} to {remote_tag}",
         env!("CARGO_PKG_VERSION")
     );
     run_install_sh("stable", &remote_tag)
@@ -516,7 +516,7 @@ fn run_update_nightly() -> anyhow::Result<()> {
         .send()?;
 
     if response.status() == reqwest::StatusCode::NOT_FOUND {
-        println!("Nightly release temporarily unavailable — the build may be in progress.");
+        println!("Nightly release temporarily unavailable: the build may be in progress.");
         println!("Try again in a few minutes.");
         return Ok(());
     }
@@ -593,7 +593,7 @@ fn run_uninstall_impl(args: &UninstallArgs) -> anyhow::Result<()> {
     }
     if args.purge {
         println!(
-            "  Data dir : {}  (including all downloaded models — cannot be undone)",
+            "  Data dir : {}  (including all downloaded models, cannot be undone)",
             data_dir.display()
         );
     } else {
@@ -1120,12 +1120,12 @@ fn run_interactive(args: &RunArgs) -> anyhow::Result<()> {
         )?;
         if draft.vocab_size() != batch_model.vocab_size() {
             anyhow::bail!(
-                "draft vocab_size {} != target vocab_size {} — draft and target must share a tokenizer",
+                "draft vocab_size {} != target vocab_size {}: draft and target must share a tokenizer",
                 draft.vocab_size(),
                 batch_model.vocab_size()
             );
         }
-        println!("Draft model loaded — speculative decoding enabled.");
+        println!("Draft model loaded: speculative decoding enabled.");
         Some(draft)
     } else {
         None

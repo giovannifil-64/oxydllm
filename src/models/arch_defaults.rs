@@ -1,5 +1,42 @@
+//! Per-architecture mechanism defaults, keyed by architecture name.
+//!
+//! [`arch_defaults`] is the single lookup consulted by both checkpoint
+//! frontends: [`crate::models::parsers::hf_parser`] passes the HF
+//! `architectures[0]` string, the GGUF loader
+//! ([`crate::models::gguf_model::StandardTransformer::load_gguf`]) passes the
+//! `general.architecture` metadata string. Each entry encodes the mechanisms a
+//! family uses (activation, norm variant, qk-norm, softcaps, RoPE base, ...)
+//! that its checkpoints do not spell out themselves; values the checkpoint
+//! does publish override these defaults in the respective loader.
+//! [`known_unsupported_reason`] rejects recognised-but-unloadable families
+//! with an actionable message instead of a missing-tensor error.
+
 use crate::common::config::{Activation, NormType};
 
+/// Mechanism defaults for one architecture family.
+///
+/// Most fields mirror their [`crate::common::config::BlockConfig`] or
+/// [`crate::common::config::StandardTransformerConfig`] counterparts and act
+/// only as fallbacks for values a checkpoint may omit: `activation`,
+/// `norm_type`, `qk_norm`, `v_norm`, `has_ffn_norms`, `attn_softcap`,
+/// `logit_softcap`, `default_rope_theta`, `default_sliding_window`.
+/// `embed_scale_from_hidden` scales embeddings by sqrt(hidden_size)
+/// (Gemma family); `extra_eos_ids` adds stop tokens the config omits;
+/// `alternating_sliding_window` gives odd layers global attention (Gemma2,
+/// see [`resolve_sliding_window_for_layer`](Self::resolve_sliding_window_for_layer)).
+///
+/// Three flags encode checkpoint-format quirks rather than defaults:
+///
+/// * `gpt_oss_moe`: GPT-OSS MoE layout, meaning MXFP4 stacked experts,
+///   interleaved gate/up rows, clamped swiglu, and attention sinks (the sink
+///   tensor itself is detected by presence).
+/// * `attn_output_gate`: Qwen3.5 gated attention, where `q_proj` emits
+///   per-head `[query | gate]`. Only consulted by the GGUF loader;
+///   safetensors reads `attn_output_gate` from config.json.
+/// * `gguf_qk_permuted`: GGUF q/k projections are stored with llama.cpp's
+///   per-head row interleave (Llama-family converter) and must be
+///   de-interleaved at load to match our NeoX/HF RoPE. Only consulted by the
+///   GGUF loader.
 pub struct ArchDefaults {
     pub activation: Activation,
     pub norm_type: NormType,
@@ -13,20 +50,15 @@ pub struct ArchDefaults {
     pub extra_eos_ids: &'static [u32],
     pub default_sliding_window: Option<usize>,
     pub alternating_sliding_window: bool,
-    /// GPT-OSS MoE: MXFP4 stacked experts, interleaved gate/up, clamped swiglu,
-    /// attention sinks (the sink tensor itself is detected by presence).
     pub gpt_oss_moe: bool,
-    /// Qwen3.5 gated attention (q_proj emits per-head [query | gate]). Only
-    /// consulted by the GGUF loader; safetensors reads `attn_output_gate`
-    /// from config.json.
     pub attn_output_gate: bool,
-    /// GGUF q/k projections are stored with llama.cpp's per-head row
-    /// interleave (Llama-family converter) and must be de-interleaved at load
-    /// to match our NeoX/HF RoPE. Only consulted by the GGUF loader.
     pub gguf_qk_permuted: bool,
 }
 
 impl ArchDefaults {
+    /// Sliding window for one layer under the alternating pattern: odd layers
+    /// become global (`None`) when `alternating_sliding_window` is set
+    /// (Gemma2), otherwise every layer keeps `sliding_window` as given.
     pub fn resolve_sliding_window_for_layer(
         &self,
         sliding_window: Option<usize>,
@@ -39,6 +71,10 @@ impl ArchDefaults {
         }
     }
 
+    /// Expands `sliding_window` into a per-layer vector via
+    /// [`resolve_sliding_window_for_layer`](Self::resolve_sliding_window_for_layer),
+    /// or `None` when the architecture does not alternate (the caller then
+    /// applies the window uniformly).
     pub fn per_layer_sliding_windows(
         &self,
         sliding_window: Option<usize>,
@@ -77,6 +113,9 @@ impl Default for ArchDefaults {
     }
 }
 
+/// Llama-family baseline: SiLU, standard RMSNorm, rope_theta 500k, and the
+/// Llama 3 extra EOS ids (128009 `<|eot_id|>`, 128008 `<|eom_id|>`). Most
+/// entries in [`arch_defaults`] start from this and override a few fields.
 pub fn llama_defaults() -> ArchDefaults {
     ArchDefaults {
         activation: Activation::SiLU,
@@ -97,19 +136,26 @@ pub fn llama_defaults() -> ArchDefaults {
     }
 }
 
+/// Rejection reason for architectures we recognise but cannot load, or `None`
+/// when the architecture is either supported or simply unknown.
+///
+/// The MoE loader only consumes the per-expert
+/// `mlp.experts.{e}.{gate,up,down}_proj` convention (Qwen3-MoE, OLMoE), which
+/// is why these families are rejected upfront:
+///
+/// * Mixtral and DeepSeek-V2/V3 name their experts
+///   `block_sparse_moe.experts.*` (plus shared-expert paths), and the
+///   DeepSeek variants additionally need latent (MLA) attention.
+/// * GraniteMoe stores experts as fused 3D tensors
+///   (`block_sparse_moe.input_linear.weight`, shape
+///   `[n_experts, 2*ffn, hidden]`).
+/// * Granite 4.0 hybrid additionally interleaves Mamba2 layers, which have no
+///   runtime here.
 pub fn known_unsupported_reason(arch: &str) -> Option<&'static str> {
     match arch {
-        // Mixtral + DeepSeek-V2/V3 use a different MoE tensor naming
-        // (`block_sparse_moe.experts.*` and shared-expert paths) and the
-        // DeepSeek variants add latent attention. Qwen3-MoE and OLMoE are now
-        // supported via the `mlp.experts.{e}.{gate,up,down}_proj` convention.
         "MixtralForCausalLM" | "DeepseekV2ForCausalLM" | "DeepseekV3ForCausalLM" => {
             Some("This MoE variant (Mixtral / DeepSeek) uses a tensor naming we don't load yet")
         }
-        // GraniteMoe stores experts as fused 3D tensors
-        // (`block_sparse_moe.input_linear.weight`, shape [n_experts, 2*ffn, hidden])
-        // that our per-expert `mlp.experts.{e}.*` loader cannot consume yet;
-        // the Hybrid variant additionally interleaves Mamba2 layers.
         "GraniteMoeForCausalLM" | "GraniteMoeSharedForCausalLM" => Some(
             "GraniteMoe uses fused 3D expert tensors (block_sparse_moe.input_linear) we don't load yet",
         ),
@@ -120,6 +166,13 @@ pub fn known_unsupported_reason(arch: &str) -> Option<&'static str> {
     }
 }
 
+/// [`ArchDefaults`] for a supported architecture name, or `None` if unknown.
+///
+/// Accepts both spellings of each family: the HF `architectures[0]` class
+/// name and the GGUF `general.architecture` string. The per-arm comments
+/// below record checkpoint-format facts (converter permutations, baked-in
+/// norm shifts, scale-key semantics) that exist nowhere else; keep them with
+/// their entries.
 pub fn arch_defaults(arch: &str) -> Option<ArchDefaults> {
     match arch {
         // GGUF "llama" files (Llama, Mistral, ...) come from the converter's
@@ -201,16 +254,18 @@ pub fn arch_defaults(arch: &str) -> Option<ArchDefaults> {
             extra_eos_ids: &[],
             ..llama_defaults()
         }),
-        // OLMoE (1B-7B/7B-A1B family): Llama-style attention with per-head
-        // q_norm/k_norm (qk_norm=true), MoE FFN, rope_theta=10k. `clip_qkv`
-        // (sometimes set in OLMoE configs) is currently ignored; on the
-        // 0924-Instruct checkpoint it's `null` so this is a no-op.
+        // GPT-OSS: MoE layout quirks (MXFP4 stacked experts, interleaved
+        // gate/up, clamped swiglu, sinks) ride on the gpt_oss_moe flag.
         "gpt_oss" | "GptOssForCausalLM" => Some(ArchDefaults {
             default_rope_theta: 150_000.0,
             gpt_oss_moe: true,
             ..Default::default()
         }),
 
+        // OLMoE (1B-7B/7B-A1B family): Llama-style attention with per-head
+        // q_norm/k_norm (qk_norm=true), MoE FFN, rope_theta=10k. `clip_qkv`
+        // (sometimes set in OLMoE configs) is currently ignored; on the
+        // 0924-Instruct checkpoint it's `null` so this is a no-op.
         "olmoe" | "OlmoeForCausalLM" => Some(ArchDefaults {
             qk_norm: true,
             default_rope_theta: 10_000.0,

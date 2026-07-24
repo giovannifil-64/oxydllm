@@ -1,22 +1,22 @@
-// ─────────────────────────────────────────────────────────────────────────────
-// gdn.rs, Gated DeltaNet linear attention (Qwen3.5 / Qwen3-Next family)
-//
-// Math follows transformers/models/qwen3_5/modeling_qwen3_5.py:
-//   • causal depthwise conv1d (no bias) + SiLU over the packed q|k|v stream
-//   • q,k L2-normalized (eps on the *sum* of squares), q scaled by dk^-0.5
-//   • β = σ(b·x);  g = -exp(A_log)·softplus(a·x + dt_bias)   (all F32)
-//   • recurrence  S_t = S_{t-1}·exp(g_t) + k_t ⊗ ((v_t - S_{t-1}ᵀk_t)·β_t)
-//     with output o_t = S_tᵀ q_t
-//   • gated RMSNorm (norm before gate, plain weight): rms(o)·w·silu(z)
-//
-// Prefill uses the chunked parallel scan (chunk 64). The reference inverts the
-// per-chunk unit-lower-triangular system with a sequential row loop; that is
-// O(C) kernel launches per chunk and unusable on Metal, so we use a blocked
-// inversion (see `invert_unit_lower`): doubling product on 16×16 diagonal
-// blocks + pairwise block combination, O(log C) batched matmuls with bounded
-// intermediates. Decode uses the O(1) recurrent step. Per-sequence state
-// (conv window + S) lives in PagedKvCache::recurrent_mut().
-// ─────────────────────────────────────────────────────────────────────────────
+//! Gated DeltaNet linear attention (Qwen3.5 / Qwen3-Next family).
+//!
+//! Math follows `transformers/models/qwen3_5/modeling_qwen3_5.py`:
+//!
+//! 1. Causal depthwise conv1d (no bias) + SiLU over the packed q|k|v stream.
+//! 2. q, k L2-normalized (eps on the sum of squares), q scaled by `dk^-0.5`.
+//! 3. `β = σ(b·x)`; `g = -exp(A_log)·softplus(a·x + dt_bias)`, all F32.
+//! 4. Recurrence `S_t = S_{t-1}·exp(g_t) + k_t ⊗ ((v_t - S_{t-1}ᵀk_t)·β_t)`
+//!    with output `o_t = S_tᵀq_t`.
+//! 5. Gated RMSNorm (norm before gate, plain weight): `rms(o)·w·silu(z)`.
+//!
+//! Prefill uses the chunked parallel scan ([`chunk_gated_delta_rule`], chunk
+//! size 64). The reference inverts the per-chunk unit-lower-triangular system
+//! with a sequential row loop; that is O(C) kernel launches per chunk and
+//! unusable on Metal, so [`invert_unit_lower`] uses a blocked inversion:
+//! doubling product on 16×16 diagonal blocks plus pairwise block combination,
+//! O(log C) batched matmuls with bounded intermediates. Decode uses the O(1)
+//! recurrent step ([`recurrent_delta_step`]). Per-sequence state (conv window
+//! plus S) lives in [`super::paged::PagedKvCache::recurrent_mut`].
 
 use super::config::{BlockConfig, LinearAttnConfig};
 use super::gguf_weights::GgufWeights;

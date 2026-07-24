@@ -134,7 +134,7 @@ fn estimate_local_safetensors(dir: &Path, ctx_len: usize, num_seqs: usize) -> Re
         if qi.method.eq_ignore_ascii_case("fp8") {
             (
                 weights_bytes * 2,
-                "FP8 (E4M3, block-scaled) safetensors  (Metal: dequantized to BF16 at load → 2× file size; streamed experts stay F8)".to_string(),
+                "FP8 (E4M3, block-scaled) safetensors  (Metal: dequantized to BF16 at load, 2× file size; streamed experts stay F8)".to_string(),
                 "Accuracy ~lossless  (FP8 weights, near-bf16 quality)",
             )
         } else if is_packed_int_method(&qi.method)
@@ -178,7 +178,7 @@ fn estimate_local_safetensors(dir: &Path, ctx_len: usize, num_seqs: usize) -> Re
     } else if is_fp8 {
         (
             weights_bytes * 2,
-            format!("{dtype_str} safetensors  (Metal: dequantized to BF16 at load → 2× file size)"),
+            format!("{dtype_str} safetensors  (Metal: dequantized to BF16 at load, 2× file size)"),
             "Accuracy 100%  (full-precision weights)",
         )
     } else {
@@ -379,7 +379,7 @@ fn estimate_remote(
         );
         if approx {
             println!(
-                "  (AWQ runtime weights ≈ {} — W4A16 keeps the packed 4-bit weights resident on Metal. Approximate — pull then re-estimate locally for an exact figure.)",
+                "  (AWQ runtime weights ≈ {}: W4A16 keeps the packed 4-bit weights resident on Metal. Approximate: pull then re-estimate locally for an exact figure.)",
                 fmt_bytes(runtime_weight_bytes)
             );
         }
@@ -610,13 +610,13 @@ fn quant_accuracy(quant: &str) -> Option<(&'static str, &'static str)> {
         "Q3_K_L" | "IQ3_K_M" => Some(("~97%", "compact, good quality")),
         "Q4_0" | "Q4_1" => Some(("~97.5%", "good compression")),
         "Q4_K_S" | "IQ4_XS" => Some(("~97.8%", "good balance")),
-        "Q4_K" | "Q4_K_M" | "IQ4_NL" => Some(("~98.5%", "excellent balance — recommended")),
+        "Q4_K" | "Q4_K_M" | "IQ4_NL" => Some(("~98.5%", "excellent balance, recommended")),
         "Q5_0" | "Q5_1" => Some(("~98.8%", "high quality")),
         "Q5_K" | "Q5_K_S" => Some(("~99%", "high quality")),
         "Q5_K_M" => Some(("~99.2%", "high quality")),
         "Q6_K" | "Q6_K_L" => Some(("~99.5%", "near-lossless")),
         "Q8_0" | "Q8_K" | "Q8_K_M" | "Q8_K_S" => Some(("~99.7%", "near-lossless")),
-        "F16" | "BF16" => Some(("~99.9%", "floating point — baseline")),
+        "F16" | "BF16" => Some(("~99.9%", "floating point, baseline")),
         "F32" => Some(("100%", "full precision")),
         _ => None,
     }

@@ -1,3 +1,22 @@
+//! Model discovery, path resolution, and checkpoint loading.
+//!
+//! The entry point is [`load_batch_model`], which routes a model directory to
+//! one of two paths:
+//!
+//! 1. Safetensors: [`crate::models::parsers::hf_parser::parse`] turns
+//!    config.json into a [`StandardTransformerConfig`], then
+//!    `load_standard_safetensors` builds the [`StandardTransformer`],
+//!    deciding MoE expert streaming automatically from the memory envelope.
+//! 2. GGUF: `load_batch_model_gguf` selects the right variant/shards in the
+//!    directory and defers to [`StandardTransformer::load_gguf`].
+//!
+//! Both paths size their KV pool through `compute_kv_blocks` against the
+//! server-wide [`GlobalKvBudget`]. Around that core live the filesystem
+//! helpers: [`discover_models`] scans the models dir (config.json dirs and
+//! GGUF dirs, one level of namespacing), [`resolve_model_path`] maps a
+//! user-supplied model id to a directory, and [`select_device_at`] picks the
+//! CUDA/Metal/CPU device.
+
 use crate::common::{
     block::TransformerBlock,
     config::StandardTransformerConfig,
@@ -20,6 +39,14 @@ use std::sync::{Arc, Mutex};
 
 use std::path::{Path, PathBuf};
 
+/// Listing entry produced by [`discover_models`] for the CLI and the
+/// server's model registry.
+///
+/// `id` is what the user passes to load the model (GGUF variants get their
+/// canonicalized stem, namespaced models a `namespace/name` prefix);
+/// `architecture` is the HF class name or `"{arch} (GGUF)"`; `size_bytes`
+/// sums the weight files and `created_at` is the directory mtime in Unix
+/// seconds.
 #[derive(Debug, Clone)]
 pub struct DiscoveredModel {
     pub id: String,
@@ -30,6 +57,12 @@ pub struct DiscoveredModel {
     pub created_at: u64,
 }
 
+/// Scans `models_dir` for loadable models, sorted case-insensitively by id.
+///
+/// Each direct subdirectory is scanned via [`scan_model_entry`]; directories
+/// that are neither a model nor a GGUF dir are treated as namespaces and
+/// scanned one level deeper (`namespace/name` ids). Unreadable directories
+/// are silently skipped.
 pub fn discover_models(models_dir: &Path) -> Vec<DiscoveredModel> {
     let mut models = Vec::new();
     let entries = match std::fs::read_dir(models_dir) {
@@ -71,6 +104,12 @@ pub fn discover_models(models_dir: &Path) -> Vec<DiscoveredModel> {
     models
 }
 
+/// Appends the models found in one directory to `models`, returning whether
+/// the directory was recognised (so the caller stops descending into it).
+///
+/// A config.json directory yields exactly one entry under `id`; a GGUF
+/// directory yields one entry per quant variant, grouping split shards by
+/// stem and skipping ids already discovered.
 fn scan_model_entry(
     id: &str,
     namespace: Option<&str>,
@@ -171,6 +210,13 @@ fn scan_model_entry(
     false
 }
 
+/// Normalizes a GGUF file stem into a user-facing model id by aligning its
+/// casing with the parent directory name.
+///
+/// When the stem starts with the directory name minus a `-GGUF`/`_GGUF`
+/// suffix (case-insensitively), the id becomes the directory's casing plus
+/// the stem's remainder uppercased, e.g. `qwen3-4b-q4_k_m` in `Qwen3-4B-GGUF`
+/// resolves to `Qwen3-4B-Q4_K_M`; otherwise the stem is returned unchanged.
 fn canonicalize_gguf_id(stem: &str, parent_dir: &Path) -> String {
     let dir_name = parent_dir
         .file_name()
@@ -197,6 +243,8 @@ fn canonicalize_gguf_id(stem: &str, parent_dir: &Path) -> String {
     }
 }
 
+/// Strips a sharded-GGUF suffix like `-00001-of-00003` from a file stem, so
+/// all shards of one variant share a stem; non-split stems pass through.
 fn strip_gguf_split_suffix(stem: &str) -> &str {
     let parts: Vec<&str> = stem.split('-').collect();
     let n = parts.len();
@@ -212,6 +260,9 @@ fn strip_gguf_split_suffix(stem: &str) -> &str {
     }
 }
 
+/// Ids under which a GGUF stem can be requested: the
+/// [canonicalized](canonicalize_gguf_id) id plus the raw stem when they
+/// differ.
 fn gguf_match_keys(stem: &str, parent_dir: &Path) -> Vec<String> {
     let canonical = canonicalize_gguf_id(stem, parent_dir);
     if canonical == stem {
@@ -221,6 +272,8 @@ fn gguf_match_keys(stem: &str, parent_dir: &Path) -> Vec<String> {
     }
 }
 
+/// Forms of a requested model id to match against: the full id and, for
+/// `namespace/name` ids, the bare local name.
 fn gguf_model_id_keys(model_id: &str) -> Vec<&str> {
     match model_id.split_once('/') {
         Some((_, local_id)) => vec![model_id, local_id],
@@ -228,6 +281,17 @@ fn gguf_model_id_keys(model_id: &str) -> Vec<&str> {
     }
 }
 
+/// Picks the shards of the GGUF variant matching `model_id` from a
+/// directory's .gguf files, grouped case-insensitively by
+/// [split-stripped](strip_gguf_split_suffix) stem.
+///
+/// A directory with a single variant matches any id, so `oxydllm run <dir>`
+/// works without spelling out the quant suffix.
+///
+/// ## Errors
+///
+/// Fails when the directory holds several variants and none matches,
+/// listing the available ids.
 fn select_gguf_paths(
     dir: &Path,
     model_id: &str,
@@ -283,9 +347,21 @@ fn select_gguf_paths(
     )
 }
 
+/// Maps a user-supplied model id to its directory under `models_dir`, or
+/// `None` when nothing matches.
+///
+/// Candidates are tried in order of specificity:
+///
+/// 1. The id as a literal path (`PathBuf::join` resolves `/` as a subdir, so
+///    both flat `ModelName` and nested `user/ModelName` forms work on all
+///    platforms), accepted if it holds a config.json or a .gguf file.
+/// 2. For namespaced ids, directories inside the namespace whose GGUF stems
+///    (raw or [canonicalized](canonicalize_gguf_id)) match the local name.
+/// 3. GGUF stems anywhere in `models_dir` matching the id.
+/// 4. A case-insensitive directory-name prefix match in either direction,
+///    preferring the shortest name, so `Ministral-3B` resolves to
+///    `Ministral-3B-Instruct-2512`.
 pub fn resolve_model_path(models_dir: &Path, model_id: &str) -> Option<PathBuf> {
-    // PathBuf::join resolves '/' as a subdir, handling both flat
-    // ("ModelName") and nested ("user/ModelName") forms on all platforms.
     let direct = models_dir.join(model_id);
     if direct.is_dir() {
         let ok = direct.join("config.json").exists() || find_gguf_file(&direct).is_some();
@@ -380,7 +456,6 @@ pub fn resolve_model_path(models_dir: &Path, model_id: &str) -> Option<PathBuf> 
         }
     }
 
-    // Case-insensitive prefix match: e.g. "Ministral-3B" → "Ministral-3B-Instruct-2512".
     let mut prefix_match: Option<PathBuf> = None;
     for entry in &entries {
         let path = entry.path();
@@ -411,6 +486,16 @@ pub fn resolve_model_path(models_dir: &Path, model_id: &str) -> Option<PathBuf> 
     prefix_match
 }
 
+/// Lists the safetensors files of a checkpoint: the deduplicated, sorted
+/// `weight_map` targets when `model.safetensors.index.json` exists, otherwise
+/// the single-file layout. Some repos (e.g. Mistral-7B-Instruct-v0.3) ship
+/// `consolidated.safetensors` instead of `model.safetensors`; both names are
+/// probed.
+///
+/// ## Errors
+///
+/// Fails when the index file exists but cannot be read or lacks a
+/// well-formed `weight_map`.
 fn resolve_weight_paths(model_dir: &str) -> anyhow::Result<Vec<String>> {
     let index_path = format!("{}/model.safetensors.index.json", model_dir);
 
@@ -439,8 +524,6 @@ fn resolve_weight_paths(model_dir: &str) -> anyhow::Result<Vec<String>> {
         );
         Ok(files)
     } else {
-        // Some repos (e.g. Mistral-7B-Instruct-v0.3) ship consolidated.safetensors
-        // instead of the sharded layout.
         for name in &["model.safetensors", "consolidated.safetensors"] {
             let path = format!("{}/{}", model_dir, name);
             if std::path::Path::new(&path).exists() {
@@ -451,6 +534,12 @@ fn resolve_weight_paths(model_dir: &str) -> anyhow::Result<Vec<String>> {
     }
 }
 
+/// All .gguf files in `dir`, or `None` when there are none.
+///
+/// A `gguf.index` file (one filename per line, `#` comments) takes
+/// precedence; otherwise every .gguf in the directory is returned sorted, so
+/// multi-variant dirs (e.g. Q4_K_M + f16 side by side) resolve by stem
+/// instead of whichever file lists first.
 pub fn find_gguf_files(dir: &Path) -> Option<Vec<std::path::PathBuf>> {
     let index_path = dir.join("gguf.index");
     if index_path.exists()
@@ -466,8 +555,6 @@ pub fn find_gguf_files(dir: &Path) -> Option<Vec<std::path::PathBuf>> {
             return Some(files);
         }
     }
-    // All .gguf files in the directory, so multi-variant dirs (e.g. Q4_K_M +
-    // f16 side by side) resolve by stem instead of whichever file lists first.
     let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
         .ok()?
         .flatten()
@@ -482,6 +569,8 @@ pub fn find_gguf_files(dir: &Path) -> Option<Vec<std::path::PathBuf>> {
     }
 }
 
+/// First .gguf file in `dir` (honouring `gguf.index` like
+/// [`find_gguf_files`]); used as a cheap "is this a GGUF dir" probe.
 pub fn find_gguf_file(dir: &Path) -> Option<std::path::PathBuf> {
     let index_path = dir.join("gguf.index");
     if index_path.exists()
@@ -503,6 +592,10 @@ pub fn find_gguf_file(dir: &Path) -> Option<std::path::PathBuf> {
     None
 }
 
+/// Builds a [`DiscoveredModel`] from one GGUF file's metadata (architecture,
+/// layer count, vocab from the embedding shape); `size_bytes` is left 0 for
+/// the caller to fill with the whole shard group. Returns `None` when the
+/// file cannot be read as GGUF.
 fn discover_gguf_model(id: &str, gguf_path: &Path) -> Option<DiscoveredModel> {
     use candle_core::quantized::gguf_file;
     let mut file = std::fs::File::open(gguf_path).ok()?;
@@ -553,6 +646,8 @@ fn discover_gguf_model(id: &str, gguf_path: &Path) -> Option<DiscoveredModel> {
     })
 }
 
+/// True when the directory is loaded through the GGUF path: it has a .gguf
+/// file and no config.json (config.json wins when both exist).
 pub fn is_gguf_model(model_dir: &str) -> bool {
     let dir = Path::new(model_dir);
     if dir.join("config.json").exists() {
@@ -561,6 +656,9 @@ pub fn is_gguf_model(model_dir: &str) -> bool {
     find_gguf_file(dir).is_some()
 }
 
+/// Logs whether the CUDA device meets the minimum supported compute
+/// capability (8.9, Ada Lovelace) and warns when the binary was compiled for
+/// an older `sm_` than the hardware; never fails the load.
 #[cfg(feature = "cuda")]
 fn check_cuda_compute_capability(device: &Device, ordinal: usize) {
     let Ok(cuda_dev) = device.as_cuda_device() else {
@@ -605,6 +703,13 @@ fn check_cuda_compute_capability(device: &Device, ordinal: usize) {
     }
 }
 
+/// Selects the inference [`Device`]: CUDA at `_cuda_idx` when compiled in
+/// and available, then Metal, then CPU.
+///
+/// ## Errors
+///
+/// Fails when no GPU is available and `require_gpu` is set (the default;
+/// `--allow-cpu` clears it and falls back to CPU with a warning).
 pub fn select_device_at(_cuda_idx: usize, require_gpu: bool) -> anyhow::Result<Device> {
     #[cfg(feature = "cuda")]
     match Device::new_cuda(_cuda_idx) {
@@ -639,6 +744,15 @@ pub fn select_device_at(_cuda_idx: usize, require_gpu: bool) -> anyhow::Result<D
     Ok(Device::Cpu)
 }
 
+/// Sizing and quantization options for [`load_batch_model`].
+///
+/// `max_context_len` and `max_num_sequences` size the desired KV pool, drawn
+/// from the shared `kv_budget`; `kv_quant` and `qjl_quantization` select KV
+/// cache quantization. `expert_stream_mb`, when set, forces MoE expert
+/// weights to stream from the checkpoint mmap through an LRU pool of that
+/// many megabytes instead of loading resident. `memory_budget_bytes` is the
+/// operator's `--memory-budget`, used as the memory envelope for the
+/// automatic expert-streaming decision; free memory at load time when unset.
 #[derive(Clone, Copy)]
 pub struct LoadBatchOptions<'a> {
     pub max_context_len: usize,
@@ -646,15 +760,23 @@ pub struct LoadBatchOptions<'a> {
     pub kv_budget: &'a SharedGlobalKvBudget,
     pub kv_quant: KvQuantMode,
     pub qjl_quantization: bool,
-    /// When set, MoE expert weights are streamed from the checkpoint mmap
-    /// through an LRU pool of this many megabytes instead of loaded resident.
     pub expert_stream_mb: Option<usize>,
-    /// The operator's `--memory-budget`, used as the memory envelope for the
-    /// automatic expert-streaming decision; free memory at load time when
-    /// unset.
     pub memory_budget_bytes: Option<usize>,
 }
 
+/// Loads the model in `model_dir` as a [`BatchModel`], returning it together
+/// with its weight footprint in bytes (used by the manager's memory
+/// accounting).
+///
+/// GGUF directories (per [`is_gguf_model`]) go through the GGUF path, where
+/// `model_id` selects the quant variant; everything else parses config.json
+/// and loads safetensors. Runtime dtype is BF16 on GPU, F32 on CPU.
+///
+/// ## Errors
+///
+/// Fails when the architecture is unsupported, weight files are missing or
+/// malformed, the KV budget cannot grant a minimum pool, or a MoE model
+/// cannot fit even with expert streaming.
 pub fn load_batch_model(
     model_dir: &str,
     model_id: &str,
@@ -678,6 +800,11 @@ pub fn load_batch_model(
 /// streamable experts and everything else. Reads only the safetensors
 /// headers; float tensors are scaled by `runtime dtype size / file dtype
 /// size` (an FP8 file doubles into BF16), integer tensors keep their size.
+///
+/// ## Errors
+///
+/// Fails when the weight files cannot be memory-mapped or parsed as
+/// safetensors.
 fn expert_split_runtime_bytes(paths: &[&str], dtype: DType) -> anyhow::Result<(usize, usize)> {
     // SAFETY: same exclusive-ownership argument as ModelWeights::load.
     let mmap = unsafe {
@@ -716,10 +843,15 @@ const STREAM_HEADROOM: usize = 2 << 30;
 const MIN_EXPERT_CACHE: usize = 1 << 30;
 
 /// Decides expert streaming for a MoE checkpoint: `None` when everything fits
-/// resident (fastest), `Some(cache_bytes)` when streaming makes it fit, and an
-/// error when not even the non-expert weights plus a minimum cache fit. The
+/// resident (fastest), `Some(cache_bytes)` when streaming makes it fit. The
 /// returned cache is always smaller than the expert bytes: a remainder that
 /// covered every expert would have taken the resident branch.
+///
+/// ## Errors
+///
+/// Fails when not even the non-expert weights plus [`MIN_EXPERT_CACHE`] and
+/// [`STREAM_HEADROOM`] fit in `available_bytes`: below that cache size
+/// streaming would thrash, so the model is rejected with a clear message.
 fn auto_expert_stream_budget(
     expert_bytes: usize,
     non_expert_bytes: usize,
@@ -749,6 +881,14 @@ fn auto_expert_stream_budget(
 /// CLI flags only override that decision. The returned weight size counts a
 /// streamed model as its resident tensors plus the expert-cache budget, so
 /// the manager's memory accounting holds either way.
+///
+/// ## Errors
+///
+/// Fails on missing or misshapen tensors, `--stream-experts` on a dense
+/// model, a MoE model too large even for streaming, an exhausted KV budget,
+/// or a hybrid config whose `layer_types` length disagrees with the layer
+/// count (or lists no full-attention layer). Any KV bytes acquired are
+/// released before the error propagates.
 fn load_standard_safetensors(
     cfg: StandardTransformerConfig,
     model_dir: &str,
@@ -1115,6 +1255,15 @@ fn load_standard_safetensors(
     result
 }
 
+/// GGUF branch of [`load_batch_model`]: selects the variant's shards
+/// ([`select_gguf_paths`]), sizes the KV pool, and defers to
+/// [`StandardTransformer::load_gguf`].
+///
+/// ## Errors
+///
+/// Fails when no .gguf file exists, the requested variant is not in the
+/// directory, the KV budget cannot grant a minimum pool, or the GGUF loader
+/// itself fails; acquired KV bytes are released on failure.
 fn load_batch_model_gguf(
     model_dir: &str,
     model_id: &str,
@@ -1195,6 +1344,10 @@ fn load_batch_model_gguf(
     Ok((Box::new(model), weights_size))
 }
 
+/// Inputs to [`compute_kv_blocks`]: `layer_kv_specs` lists
+/// `(n_kv_heads, head_dim)` for each KV-carrying layer (linear-attention
+/// layers excluded), the rest describe the desired capacity and KV
+/// quantization mode.
 struct KvBlockParams {
     layer_kv_specs: Vec<(usize, usize)>,
     max_context_len: usize,
@@ -1204,6 +1357,18 @@ struct KvBlockParams {
     qjl_quantization: bool,
 }
 
+/// Sizes the model's KV pool against the global budget, returning
+/// `(num_blocks, acquired_bytes)`; the caller must release the bytes if the
+/// load fails afterwards.
+///
+/// The desired capacity is `max_num_sequences × max_context_len` slots; the
+/// grant is capped by what [`GlobalKvBudget::acquire`] returns (a warning is
+/// logged when capped) and floored at 256 blocks.
+///
+/// ## Errors
+///
+/// Fails when the budget cannot grant even the 256-block minimum; the
+/// partial grant is released first.
 fn compute_kv_blocks(
     p: &KvBlockParams,
     kv_budget: &GlobalKvBudget,

@@ -2591,7 +2591,7 @@ inline void gguf_q2k_dequant_strip_into(
     }
 }
 
-// Q3_K signed 6-bit scale for sub-block 0..15 (offset −32 applied).
+// Q3_K signed 6-bit scale for sub-block 0..15 (offset -32 applied).
 inline int gguf_q3k_get_scale(uint sub_idx, device const uint8_t *scales) {
     const uint k          = sub_idx % 4u;
     const uint group      = sub_idx / 4u;

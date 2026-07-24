@@ -1,5 +1,26 @@
+//! Per-token sampling: penalties, temperature softmax, distribution filters,
+//! and the final categorical draw.
+//!
+//! [`sample`] consumes one logit row and a [`SamplingParams`], applying in
+//! order: the optional constrained-decoding mask, repetition and
+//! frequency/presence penalties, logit bias, temperature softmax, then
+//! min-p, top-k, and top-p filtering before drawing a token. Seeded requests
+//! are deterministic: all randomness derives from splitmix64 over
+//! `seed + step`, including top-k tie breaking.
+
 use candle_core::{D, Result, Tensor};
 
+/// Per-request sampling configuration, OpenAI-style.
+///
+/// `temperature == 0.0` selects greedy argmax. `top_k`, `top_p`, and `min_p`
+/// filter the softmax distribution (0, 1.0, and 0.0 respectively disable
+/// them). `repetition_penalty` divides positive and multiplies negative
+/// seen-token logits, over the last `repetition_window` tokens (0 means full
+/// history); `frequency_penalty` and `presence_penalty` subtract
+/// count-scaled and flat offsets. `seed` makes sampling deterministic per
+/// step, `logit_bias` adds per-token offsets before selection, and
+/// `top_logprobs_k` requests that many top logprobs alongside the sampled
+/// token.
 #[derive(Debug, Clone)]
 pub struct SamplingParams {
     pub temperature: f32,
@@ -7,8 +28,6 @@ pub struct SamplingParams {
     pub top_p: f32,
     pub min_p: f32,
     pub repetition_penalty: f32,
-    /// Number of trailing tokens considered for repetition penalty.
-    /// 0 means full history (current default behavior).
     pub repetition_window: usize,
     pub frequency_penalty: f32,
     pub presence_penalty: f32,
@@ -49,12 +68,32 @@ impl SamplingParams {
     }
 }
 
+/// A sampled token plus its logprob and the top-k logprobs when
+/// [`SamplingParams`] requested them via `top_logprobs_k`.
 pub struct SampleOutput {
     pub token: u32,
     pub logprob: Option<f32>,
     pub top_logprobs: Vec<(u32, f32)>,
 }
 
+/// Samples the next token from a single logit row `[vocab]`.
+///
+/// `allowed` is the constrained-decoding mask: when present,
+/// `allowed[i] == false` forces logit `i` to negative infinity before any
+/// penalty or filter, so only mask-legal tokens can ever be drawn; because
+/// the mask changes the distribution, the GPU-side greedy fast path is
+/// skipped whenever a mask is present. Plain greedy without a mask stays on
+/// the GPU: an argmax plus a native-dtype NaN-guard sum, avoiding a
+/// full-vocab F32 cast per token.
+///
+/// Reported logprobs always reflect the pre-filter distribution (after
+/// penalties and temperature, before min-p/top-k/top-p); the full-vocab ln
+/// pass is skipped when logprobs are not requested.
+///
+/// ## Errors
+///
+/// Fails when the model produced NaN logits or when filtering zeroed the
+/// whole distribution.
 pub fn sample(
     logits: &Tensor,
     params: &SamplingParams,
@@ -64,13 +103,12 @@ pub fn sample(
 ) -> Result<SampleOutput> {
     if params.is_plain_greedy() && allowed.is_none() {
         let token = logits.argmax(D::Minus1)?.to_scalar::<u32>()?;
-        // NaN guard reduced in native dtype (no full-vocab F32 cast per token).
         let sum: f32 = logits
             .sum_all()?
             .to_dtype(candle_core::DType::F32)?
             .to_scalar()?;
         if sum.is_nan() {
-            candle_core::bail!("model returned NaN logits — numerical instability detected");
+            candle_core::bail!("model returned NaN logits: numerical instability detected");
         }
         return Ok(SampleOutput {
             token,
@@ -82,7 +120,7 @@ pub fn sample(
     let mut logits_vec: Vec<f32> = logits.to_dtype(candle_core::DType::F32)?.to_vec1()?;
 
     if logits_vec.iter().any(|l| l.is_nan()) {
-        candle_core::bail!("model returned NaN logits — numerical instability detected");
+        candle_core::bail!("model returned NaN logits: numerical instability detected");
     }
 
     if let Some(allowed) = allowed {
@@ -186,8 +224,6 @@ pub fn sample(
         }
     } else {
         let mut probs_vec = softmax_probs(&logits_vec, params.temperature);
-        // Log-probs must reflect the PRE-filter distribution; computed lazily;
-        // skipping the full-vocab ln pass when logprobs aren't requested.
         let log_probs: Option<Vec<f32>> =
             (params.top_logprobs_k > 0).then(|| log_probs_from(&probs_vec));
 
@@ -229,6 +265,8 @@ pub fn sample(
     }
 }
 
+/// The trailing `repetition_window` tokens of `prev_tokens`, or all of them
+/// when the window is 0 or larger than the history.
 fn repetition_window_slice(prev_tokens: &[u32], repetition_window: usize) -> &[u32] {
     if repetition_window == 0 || repetition_window >= prev_tokens.len() {
         prev_tokens
@@ -237,6 +275,8 @@ fn repetition_window_slice(prev_tokens: &[u32], repetition_window: usize) -> &[u
     }
 }
 
+/// Max-subtracted softmax of `logits` at `temperature` (clamped to at least
+/// 1e-8), returning normalized probabilities.
 fn softmax_probs(logits: &[f32], temperature: f32) -> Vec<f32> {
     let temp = temperature.max(1e-8_f32);
     let max_logit = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
@@ -252,15 +292,19 @@ fn softmax_probs(logits: &[f32], temperature: f32) -> Vec<f32> {
     probs
 }
 
+/// Natural log of each probability, floored at -100.
 fn log_probs_from(probs: &[f32]) -> Vec<f32> {
     probs.iter().map(|&p| p.ln().max(-100.0_f32)).collect()
 }
 
+/// Softmax at `temperature`, returning both log-probs and probs.
 fn compute_log_probs(logits: &[f32], temperature: f32) -> (Vec<f32>, Vec<f32>) {
     let probs = softmax_probs(logits, temperature);
     (log_probs_from(&probs), probs)
 }
 
+/// The `k` highest logprobs as `(token, logprob)` pairs, sorted descending;
+/// selection is O(n) via `select_nth_unstable_by`.
 fn top_k_by_logprob(log_probs: &[f32], k: usize) -> Vec<(u32, f32)> {
     if k == 0 {
         return Vec::new();
@@ -280,6 +324,8 @@ fn top_k_by_logprob(log_probs: &[f32], k: usize) -> Vec<(u32, f32)> {
     indexed
 }
 
+/// Applies the classic repetition penalty per occurrence in `prev_tokens`:
+/// positive logits divided by `penalty`, negative multiplied.
 fn apply_repetition_penalty_cpu(logits: &mut [f32], prev_tokens: &[u32], penalty: f32) {
     for &tok in prev_tokens {
         let idx = tok as usize;
@@ -290,6 +336,8 @@ fn apply_repetition_penalty_cpu(logits: &mut [f32], prev_tokens: &[u32], penalty
     }
 }
 
+/// Count-based fast path equivalent to [`apply_repetition_penalty_cpu`]: a
+/// token seen `count` times is penalized by `penalty^count` in one step.
 fn apply_repetition_penalty_with_counts(
     logits: &mut [f32],
     token_counts: &std::collections::HashMap<u32, u32>,
@@ -305,6 +353,8 @@ fn apply_repetition_penalty_with_counts(
     }
 }
 
+/// Builds token counts from `prev_tokens` and delegates to
+/// [`apply_frequency_presence_penalty_with_counts`].
 fn apply_frequency_presence_penalty(
     logits: &mut [f32],
     prev_tokens: &[u32],
@@ -323,6 +373,8 @@ fn apply_frequency_presence_penalty(
     );
 }
 
+/// Subtracts `frequency_penalty * count + presence_penalty` from each seen
+/// token's logit.
 fn apply_frequency_presence_penalty_with_counts(
     logits: &mut [f32],
     counts: &std::collections::HashMap<u32, u32>,
@@ -338,13 +390,22 @@ fn apply_frequency_presence_penalty_with_counts(
 }
 
 thread_local! {
+    /// Per-thread prob-copy scratch for [`apply_top_k`], avoiding a
+    /// full-vocab allocation per sampled token.
     static F32_SCRATCH: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
+
+    /// Per-thread `(index, prob)` candidate scratch for [`apply_top_p`].
     static IDX_SCRATCH: std::cell::RefCell<Vec<(usize, f32)>> = const { std::cell::RefCell::new(Vec::new()) };
+
+    /// Per-thread scratch for indices tied at the top-k threshold.
     static TIE_IDX_SCRATCH: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
+/// Mixed into the tie-break seed so top-k tie selection decorrelates from the
+/// categorical draw at the same `seed + step`.
 const TIE_BREAK_NAMESPACE: u64 = 0xa55a_a55a_1234_5678;
 
+/// Divides every probability by `sum` (no-op when `sum` is not positive).
 fn renormalize_in_place(probs: &mut [f32], sum: f32) {
     if sum > 0.0 {
         for p in probs.iter_mut() {
@@ -353,6 +414,8 @@ fn renormalize_in_place(probs: &mut [f32], sum: f32) {
     }
 }
 
+/// Zeroes probabilities below `min_p` times the max probability and
+/// renormalizes.
 fn apply_min_p(probs: &mut [f32], min_p: f32) {
     let max_prob = probs.iter().cloned().fold(0.0_f32, f32::max);
     let threshold = min_p * max_prob;
@@ -367,6 +430,12 @@ fn apply_min_p(probs: &mut [f32], min_p: f32) {
     renormalize_in_place(probs, sum);
 }
 
+/// Keeps the `k` most probable tokens and renormalizes.
+///
+/// Tokens strictly above the k-th value always survive; when several tokens
+/// tie exactly at the threshold, the seeded splitmix64 tie-break keeps just
+/// enough of them to reach `k`, unbiased across ties and reproducible for
+/// the same `seed + step`.
 fn apply_top_k(probs: &mut [f32], k: usize, seed: Option<u64>, step: u64) {
     if k >= probs.len() {
         return;
@@ -406,7 +475,6 @@ fn apply_top_k(probs: &mut [f32], k: usize, seed: Option<u64>, step: u64) {
             }
 
             if tied.len() <= need_ties {
-                // Trivial case: every tied position is kept anyway.
                 let mut sum = 0.0;
                 for p in probs.iter_mut() {
                     if *p >= threshold && *p > 0.0 {
@@ -443,13 +511,16 @@ fn apply_top_k(probs: &mut [f32], k: usize, seed: Option<u64>, step: u64) {
     });
 }
 
+/// Seed for top-k tie breaking: the request seed (or thread RNG) advanced by
+/// `step` and namespaced with [`TIE_BREAK_NAMESPACE`].
 fn tie_break_seed(seed: Option<u64>, step: u64) -> u64 {
     let base = seed.unwrap_or_else(thread_rand_u64);
     base.wrapping_add(step) ^ TIE_BREAK_NAMESPACE
 }
 
-// Given the candidate list sorted descending by prob, keep the smallest prefix
-// whose cumulative mass reaches top_p; zero everything else and renormalize.
+/// Given the candidate list sorted descending by prob, keeps the smallest
+/// prefix whose cumulative mass reaches `top_p`, zeroes everything else, and
+/// renormalizes.
 fn keep_top_p_prefix(probs: &mut [f32], sorted: &[(usize, f32)], top_p: f32) {
     let mut cumulative = 0.0;
     let mut keep_count = 0;
@@ -472,17 +543,21 @@ fn keep_top_p_prefix(probs: &mut [f32], sorted: &[(usize, f32)], top_p: f32) {
     renormalize_in_place(probs, sum);
 }
 
+/// Nucleus (top-p) filtering with a threshold fast path.
+///
+/// LLM decode distributions are concentrated, so the tokens above a
+/// max-relative threshold (`max_prob * 1e-4`, typically hundreds of
+/// candidates rather than the full vocab) almost always carry at least
+/// `top_p` mass. Every candidate prob >= threshold > every non-candidate
+/// prob, so when the candidate mass covers `top_p` the global
+/// descending-order prefix is provably contained in the candidates and the
+/// full-vocab sort reduces to sorting just the candidates; near-flat
+/// distributions whose candidates fall short fall back to the full sort.
 fn apply_top_p(probs: &mut [f32], top_p: f32) {
     IDX_SCRATCH.with(|s| {
         let mut indexed = s.borrow_mut();
         indexed.clear();
 
-        // Fast path: LLM distributions are concentrated, so the tokens above a
-        // max-relative threshold (typically hundreds, not the full vocab) almost
-        // always carry >= top_p mass. Every candidate prob >= threshold > every
-        // non-candidate prob, so when the candidate mass covers top_p the global
-        // descending-order prefix is provably contained in the candidates; the
-        // full-vocab sort reduces to sorting just the candidates.
         let max_prob = probs.iter().cloned().fold(0.0_f32, f32::max);
         let threshold = max_prob * 1e-4;
         let mut candidate_mass = 0.0_f32;
@@ -494,7 +569,6 @@ fn apply_top_p(probs: &mut [f32], top_p: f32) {
         }
         let fast_hit = candidate_mass >= top_p;
         if !fast_hit {
-            // Flat distribution: candidates don't cover top_p: full sort.
             indexed.clear();
             indexed.extend(probs.iter().enumerate().map(|(i, &p)| (i, p)));
         }
@@ -504,8 +578,8 @@ fn apply_top_p(probs: &mut [f32], top_p: f32) {
     });
 }
 
-// Gated diagnostics (OXYDLLM_PROFILE_DECODE=1): fast-path hit rate + candidate
-// count for apply_top_p on real model logits, reported every 256 calls.
+/// Gated diagnostics (`OXYDLLM_PROFILE_DECODE=1`): reports [`apply_top_p`]'s
+/// fast-path hit rate and average candidate count every 256 calls.
 fn top_p_probe(fast_hit: bool, candidates: usize) {
     use std::sync::OnceLock;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -530,6 +604,17 @@ fn top_p_probe(fast_hit: bool, candidates: usize) {
     }
 }
 
+/// Draws a token index from `probs` via inverse-CDF sampling.
+///
+/// Seeded draws use splitmix64 over `seed + step` so a request replays
+/// identically; unseeded draws use the thread-local RNG. When floating-point
+/// rounding leaves the draw past the cumulative sum, the last
+/// nonzero-probability token is returned.
+///
+/// ## Errors
+///
+/// Fails when every probability is zero (the distribution was fully filtered
+/// out).
 fn categorical_sample(probs: &[f32], seed: Option<u64>, step: u64) -> Result<u32> {
     let r: f32 = match seed {
         Some(s) => splitmix64_f32(s.wrapping_add(step)),
@@ -550,6 +635,8 @@ fn categorical_sample(probs: &[f32], seed: Option<u64>, step: u64) -> Result<u32
     candle_core::bail!("sampling distribution is empty after filtering (all probs zero)")
 }
 
+/// One round of the splitmix64 mixer: a stateless, well-distributed 64-bit
+/// hash.
 fn splitmix64_u64(x: u64) -> u64 {
     let mut z = x.wrapping_add(0x9e3779b97f4a7c15);
     z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
@@ -557,11 +644,14 @@ fn splitmix64_u64(x: u64) -> u64 {
     z ^ (z >> 31)
 }
 
+/// Uniform f32 in `[0, 1)` from the top 24 bits of [`splitmix64_u64`].
 fn splitmix64_f32(x: u64) -> f32 {
     (splitmix64_u64(x) >> 40) as f32 / ((1u64 << 24) as f32)
 }
 
 thread_local! {
+    /// Per-thread xorshift64 state, seeded from time and thread id (never
+    /// zero).
     static THREAD_RNG_STATE: std::cell::Cell<u64> = std::cell::Cell::new({
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
@@ -574,10 +664,11 @@ thread_local! {
     });
 }
 
+/// Next value from the thread-local xorshift64 generator; not cryptographic,
+/// which sampling does not need.
 fn thread_rand_u64() -> u64 {
     THREAD_RNG_STATE.with(|s| {
         let mut x = s.get();
-        // xorshift64: fine here; we don't need cryptographic quality.
         x ^= x << 13;
         x ^= x >> 7;
         x ^= x << 17;
@@ -586,6 +677,7 @@ fn thread_rand_u64() -> u64 {
     })
 }
 
+/// Uniform f32 in `[0, 1)` from [`thread_rand_u64`].
 fn thread_rand_f32() -> f32 {
     (thread_rand_u64() >> 40) as f32 / ((1u64 << 24) as f32)
 }

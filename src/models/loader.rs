@@ -841,17 +841,44 @@ fn expert_split_runtime_bytes(paths: &[&str], dtype: DType) -> anyhow::Result<(u
 const STREAM_HEADROOM: usize = 2 << 30;
 /// Below this expert-cache size streaming would thrash; the model is rejected.
 const MIN_EXPERT_CACHE: usize = 1 << 30;
+/// Fraction of the detected envelope a *streamed* expert cache may commit.
+///
+/// Applies to streaming only: a resident load allocates once, up front, at a
+/// size known exactly from the tensor index, whereas streaming keeps churning
+/// buffers for the life of the process (every token fetches and evicts
+/// experts, and candle's Metal pool retains freed buffers until a sweep). That
+/// churn needs real slack, and the envelope it is measured against is a
+/// volatile snapshot: `kern.memorystatus_level` is a pressure indicator rather
+/// than an allocatable budget, and the `inactive` pages counted as reclaimable
+/// may not be reclaimable in time to satisfy a GPU allocation. On unified
+/// memory the same pool also backs the OS, the window server, and the Metal
+/// driver's working set.
+///
+/// Measured on a 24 GB M5 with Qwen3.6-35B-A3B-FP8: a cache sized from the raw
+/// envelope (14 GB, 19 GB committed in total) fails the command buffer with
+/// `kIOGPUCommandBufferCallbackErrorOutOfMemory`, or silently hands back
+/// recycled buffers whose contents surface as out-of-range router indices.
+/// Half the envelope yields ~3.5 GB, reproducing the configuration verified to
+/// decode correctly and deterministically.
+const SAFE_ENVELOPE_FRACTION: f64 = 0.5;
 
 /// Decides expert streaming for a MoE checkpoint: `None` when everything fits
 /// resident (fastest), `Some(cache_bytes)` when streaming makes it fit. The
 /// returned cache is always smaller than the expert bytes: a remainder that
 /// covered every expert would have taken the resident branch.
 ///
+/// The resident decision uses the full envelope, since that allocation is
+/// one-shot and exactly sized. The streamed cache instead gets
+/// [`SAFE_ENVELOPE_FRACTION`] of it, minus the eviction graveyard
+/// ([`GRAVEYARD_DRAIN_BYTES`](crate::common::expert_stream::GRAVEYARD_DRAIN_BYTES)),
+/// which stays resident on top of the cache until the next drain.
+///
 /// ## Errors
 ///
-/// Fails when not even the non-expert weights plus [`MIN_EXPERT_CACHE`] and
-/// [`STREAM_HEADROOM`] fit in `available_bytes`: below that cache size
-/// streaming would thrash, so the model is rejected with a clear message.
+/// Fails when the non-expert weights plus [`MIN_EXPERT_CACHE`], the graveyard,
+/// and [`STREAM_HEADROOM`] do not fit in the usable envelope: below that cache
+/// size streaming would thrash, so the model is rejected with a clear message
+/// rather than loaded into an allocation failure.
 fn auto_expert_stream_budget(
     expert_bytes: usize,
     non_expert_bytes: usize,
@@ -860,14 +887,18 @@ fn auto_expert_stream_budget(
     if expert_bytes + non_expert_bytes + STREAM_HEADROOM <= available_bytes {
         return Ok(None);
     }
-    let cache = available_bytes
-        .saturating_sub(non_expert_bytes)
-        .saturating_sub(STREAM_HEADROOM);
+    let usable = (available_bytes as f64 * SAFE_ENVELOPE_FRACTION) as usize;
+    let reserved = non_expert_bytes
+        .saturating_add(crate::common::expert_stream::GRAVEYARD_DRAIN_BYTES)
+        .saturating_add(STREAM_HEADROOM);
+    let cache = usable.saturating_sub(reserved);
     if cache < MIN_EXPERT_CACHE {
         anyhow::bail!(
             "model needs {:.1} GB resident plus a streamed-expert cache, but only \
-             {:.1} GB of memory is available; free memory or use a smaller quant",
-            (non_expert_bytes + MIN_EXPERT_CACHE + STREAM_HEADROOM) as f64 / 1_073_741_824.0,
+             {:.1} GB of the {:.1} GB detected envelope is safely usable; free memory, \
+             pin a larger budget with --memory-budget, or use a smaller quant",
+            (reserved + MIN_EXPERT_CACHE) as f64 / 1_073_741_824.0,
+            usable as f64 / 1_073_741_824.0,
             available_bytes as f64 / 1_073_741_824.0,
         );
     }
@@ -1449,6 +1480,7 @@ fn compute_kv_blocks(
 #[cfg(test)]
 mod expert_stream_decision_tests {
     use super::*;
+    use crate::common::expert_stream::GRAVEYARD_DRAIN_BYTES;
 
     const GB: usize = 1 << 30;
 
@@ -1459,12 +1491,26 @@ mod expert_stream_decision_tests {
         assert!(d.is_none());
     }
 
+    /// Contract: the streaming safety margin must not demote a model that fits
+    /// resident. gpt-oss-20b (~12 GB of experts over ~1 GB resident) is
+    /// verified to run resident on a 24 GB machine at 12.3 tok/s; sizing the
+    /// resident decision off the reduced envelope would push it onto the much
+    /// slower streamed path for no reason.
+    #[test]
+    fn resident_decision_uses_the_full_envelope() {
+        let d = auto_expert_stream_budget(12 * GB, GB, 20 * GB).unwrap();
+        assert!(d.is_none(), "gpt-oss-20b-sized model must stay resident");
+    }
+
     /// Contract: a model over the envelope streams, with the cache sized to
-    /// what remains after resident weights and headroom.
+    /// what remains of the *usable* envelope after resident weights, the
+    /// eviction graveyard, and headroom.
     #[test]
     fn oversized_model_streams_with_remaining_cache() {
         let d = auto_expert_stream_budget(64 * GB, 5 * GB, 20 * GB).unwrap();
-        assert_eq!(d, Some(13 * GB));
+        let usable = 10 * GB;
+        let expected = usable - 5 * GB - GRAVEYARD_DRAIN_BYTES - 2 * GB;
+        assert_eq!(d, Some(expected));
     }
 
     /// Contract: when the non-expert weights plus a minimum cache do not fit,
@@ -1472,6 +1518,46 @@ mod expert_stream_decision_tests {
     #[test]
     fn hopeless_model_is_rejected() {
         let err = auto_expert_stream_budget(64 * GB, 10 * GB, 12 * GB).unwrap_err();
-        assert!(err.to_string().contains("available"), "{err}");
+        assert!(err.to_string().contains("usable"), "{err}");
+    }
+
+    /// Regression: the 24 GB M5 case that crashed the machine. The detected
+    /// envelope was 20 GB (83% of physical via `kern.memorystatus_level`) and
+    /// Qwen3.6-35B-A3B-FP8 reports ~60 GB of experts over ~4 GB of resident
+    /// weights. Sizing the cache from the raw envelope committed 18 GB+ of a
+    /// 24 GB machine and produced `kIOGPUCommandBufferCallbackErrorOutOfMemory`
+    /// or recycled buffers surfacing as garbage router indices; the cache must
+    /// now land in the band measured to run correctly (<= 4 GB).
+    #[test]
+    fn does_not_oversubscribe_unified_memory() {
+        let cache = auto_expert_stream_budget(60 * GB, 4 * GB, 20 * GB)
+            .unwrap()
+            .expect("a 60 GB expert set must stream on a 24 GB machine");
+        assert!(
+            cache <= 4 * GB,
+            "cache {cache} bytes oversubscribes a 24 GB machine"
+        );
+    }
+
+    /// Contract: whatever the inputs, the proposed configuration (resident
+    /// weights + cache + graveyard) never exceeds the usable envelope, so the
+    /// loader cannot commit memory the allocator will refuse.
+    #[test]
+    fn proposed_commitment_never_exceeds_usable_envelope() {
+        for &available in &[8 * GB, 16 * GB, 20 * GB, 64 * GB, 128 * GB] {
+            for &non_expert in &[GB, 4 * GB, 10 * GB] {
+                let Ok(Some(cache)) = auto_expert_stream_budget(512 * GB, non_expert, available)
+                else {
+                    continue;
+                };
+                let usable = (available as f64 * SAFE_ENVELOPE_FRACTION) as usize;
+                let committed = non_expert + cache + GRAVEYARD_DRAIN_BYTES;
+                assert!(
+                    committed <= usable,
+                    "committed {committed} > usable {usable} \
+                     (available {available}, non_expert {non_expert})"
+                );
+            }
+        }
     }
 }

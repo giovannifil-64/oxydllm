@@ -91,7 +91,7 @@ struct LruState {
 /// single drain once this many bytes accumulate. The transient memory peak is
 /// the cache budget plus this threshold, covered by the auto-sizer's
 /// headroom.
-const GRAVEYARD_DRAIN_BYTES: usize = 512 << 20;
+pub(crate) const GRAVEYARD_DRAIN_BYTES: usize = 512 << 20;
 
 /// One tensor as read from disk: typing plus its raw bytes.
 struct RawRead {

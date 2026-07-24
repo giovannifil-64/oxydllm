@@ -67,7 +67,7 @@ pub fn discover_models(models_dir: &Path) -> Vec<DiscoveredModel> {
             }
         }
     }
-    models.sort_by(|a, b| a.id.to_ascii_lowercase().cmp(&b.id.to_ascii_lowercase()));
+    models.sort_by_key(|m| m.id.to_ascii_lowercase());
     models
 }
 

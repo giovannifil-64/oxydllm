@@ -93,7 +93,7 @@ fn report() {
         total_ns as f64 / 1e6 / fwds
     );
     let mut items: Vec<_> = acc.iter().collect();
-    items.sort_by(|a, b| b.1.1.cmp(&a.1.1));
+    items.sort_by_key(|item| std::cmp::Reverse(item.1.1));
     for (name, (cnt, ns)) in items {
         let pct = if total_ns > 0 {
             *ns as f64 / total_ns as f64 * 100.0

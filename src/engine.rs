@@ -526,12 +526,10 @@ fn run_speculative_decode(
         let last = seq.all_tokens[l - 1];
         let mut drafts: Vec<u32> = Vec::with_capacity(SPEC_DRAFT_K);
         let mut cur = last;
-        let mut pos = (l - 1) as u32;
-        for _ in 0..SPEC_DRAFT_K {
+        for pos in ((l - 1) as u32..).take(SPEC_DRAFT_K) {
             let out = greedy_forward(draft, device, &mut seq.draft_caches, &[cur], &[pos])?;
             cur = out[0];
             drafts.push(cur);
-            pos += 1;
         }
 
         // Target verifies [last, d_1..d_K] in one forward -> K+1 argmaxes:

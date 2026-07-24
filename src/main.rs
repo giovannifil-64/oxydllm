@@ -983,7 +983,7 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
 
 fn run_list(models_dir: &std::path::Path) {
     let mut models = models::loader::discover_models(models_dir);
-    models.sort_by(|a, b| a.id.to_lowercase().cmp(&b.id.to_lowercase()));
+    models.sort_by_key(|m| m.id.to_lowercase());
 
     if models.is_empty() {
         println!("No models found in {}", models_dir.display());

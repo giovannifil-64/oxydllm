@@ -60,6 +60,51 @@ jobs:
           tool: cargo-audit
       - run: cargo audit
 
+  # ── MSRV: the declared minimum toolchain must still build the locked tree ──
+  # arm64 runner on purpose: the 1.94 floor comes from candle's aarch64 NEON
+  # f16 intrinsics, which x86 runners would never compile.
+  msrv:
+    name: MSRV (1.94.0, arm64)
+    needs: fmt
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.94.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: msrv-arm64
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Install system deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends pkg-config libssl-dev
+      - name: Check (locked, CPU-only)
+        run: cargo check --locked --no-default-features
+
+  # ── Latest stable: early warning for new rustc/clippy lints (non-blocking) ──
+  rust-latest:
+    name: Latest stable (informational)
+    needs: fmt
+    runs-on: ubuntu-24.04-arm
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: rust-latest-arm64
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Install system deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends pkg-config libssl-dev
+      - name: Clippy (latest stable)
+        run: cargo clippy --release --no-default-features -- -D warnings
+      - name: Unit tests (latest stable)
+        run: cargo test --release --no-default-features -- --test-threads=4
+
   # ── macOS: check + clippy + test with Metal feature ─────────────────────────
   check-macos:
     name: Check · macOS arm64 (Metal)
@@ -256,6 +301,7 @@ jobs:
     needs:
       - fmt
       - audit
+      - msrv
       - check-macos
       - check-linux-cpu
       - check-linux-cuda

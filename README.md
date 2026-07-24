@@ -78,20 +78,37 @@ KV cache quantization uses TurboQuant with MSE-based quantization during the dec
 > Note on `--kv-quant`: the quantization step currently runs on CPU, each KV write transfers the new K/V tensors from GPU to CPU and casts them to F32 before packing. On unified-memory Apple Silicon the transfer is cheap, but on discrete CUDA GPUs the per-step roundtrip can dominate. Enable `--kv-quant` for memory-constrained deployments; leave it `off` when throughput matters and KV memory is not the bottleneck. On-device kernels are on the roadmap.
 
 ## Supported Models
-These architecture classes are covered by the regression suite, each with at least one tested checkpoint. See [Benchmarks](#benchmarks) for the exact checkpoints, formats, and measured throughput.
+Support is per architecture (the `architectures` field in a checkpoint's `config.json`): every checkpoint of a supported architecture loads through the same code path. "Verified" marks the checkpoints that are part of the E2E regression sweep on Apple Silicon; other sizes and finetunes of the same architecture are expected to work but are not regularly tested. See [Benchmarks](#benchmarks) for formats and measured throughput.
 
-- `LlamaForCausalLM`
-- `Qwen2ForCausalLM`, `Qwen3ForCausalLM`
-- `Qwen3_5ForConditionalGeneration` (hybrid linear attention, text-only): Gated DeltaNet plus gated full attention
-- `GemmaForCausalLM`, `Gemma2ForCausalLM`, `Gemma3ForCausalLM`, `Gemma4ForConditionalGeneration`
-- `Mistral3ForConditionalGeneration`
-- `Phi3ForCausalLM` (Phi-3 / Phi-3.5)
-- `GraniteForCausalLM` (Granite 3.x dense)
-- `OlmoeForCausalLM` and `GptOssForCausalLM` (Mixture-of-Experts)
-- `Qwen3_5MoeForConditionalGeneration` (Qwen3.6 MoE hybrid; 35B-A3B runs on 24 GB via automatic SSD expert streaming)
-- `RobertaModel` / `BertModel` encoders and `qwen3` last-token-pooling embedders for `/v1/embeddings` (granite-embedding r1, Qwen3-Embedding)
+### Text generation
 
-Formats span BF16 safetensors, GGUF, AWQ/GPTQ, compressed-tensors INT4, FP8, and MXFP4, auto-detected per checkpoint. Other checkpoints in the same families and sizes (e.g. other Llama 3.2, Gemma 3, or Qwen2.5 variants) are likely to work but are not regularly tested.
+| Architecture | Example models | Verified checkpoint |
+|---|---|---|
+| `LlamaForCausalLM` | Llama 3.x, TinyLlama | meta-llama/Llama-3.2-1B-Instruct (BF16 + GGUF) |
+| `MistralForCausalLM` | Mistral 7B v0.x | same code path as Ministral, unverified |
+| `Mistral3ForConditionalGeneration` | Ministral 3 | mistralai/Ministral-3-3B-Instruct-2512 |
+| `Qwen2ForCausalLM` | Qwen2, Qwen2.5 | Qwen/Qwen2.5-1.5B and 3B-Instruct (BF16 + GGUF) |
+| `Qwen3ForCausalLM` | Qwen3 dense | Qwen/Qwen3-0.6B, 1.7B, 4B (BF16, GGUF, AWQ, GPTQ, FP8) |
+| `Qwen3MoeForCausalLM` | Qwen3-30B-A3B | same MoE runtime as OLMoE/Qwen3.6, unverified |
+| `Qwen3_5ForConditionalGeneration` | Qwen3.5 (hybrid GDN + gated attention, text-only) | Qwen/Qwen3.5-4B (BF16, INT4, GGUF) |
+| `Qwen3_5MoeForConditionalGeneration` | Qwen3.6 MoE hybrid | Qwen/Qwen3.6-35B-A3B-FP8 (24 GB via automatic SSD expert streaming) |
+| `GemmaForCausalLM` | Gemma 1 | google/gemma-2b-it |
+| `Gemma2ForCausalLM` | Gemma 2 | google/gemma-2-2b-it |
+| `Gemma3ForCausalLM` | Gemma 3 | google/gemma-3-1b-it |
+| `Gemma4ForConditionalGeneration` | Gemma 4 (text) | google/gemma-4-E2B-it |
+| `Phi3ForCausalLM` | Phi-3, Phi-3.5 | microsoft/Phi-3.5-mini-instruct + Phi-3-mini GGUF |
+| `GraniteForCausalLM` | Granite 3.x dense | ibm-granite/granite-3.3-2b-instruct (BF16 + GGUF) |
+| `OlmoeForCausalLM` | OLMoE | allenai/OLMoE-1B-7B-0924-Instruct |
+| `GptOssForCausalLM` | gpt-oss | openai/gpt-oss-20b (MXFP4, harmony channels) |
+
+### Embeddings (`/v1/embeddings`)
+
+| Architecture | Example models | Verified checkpoint |
+|---|---|---|
+| `RobertaModel` / `BertModel` | granite-embedding r1, BERT-family sentence encoders | ibm-granite/granite-embedding-125m-english |
+| `qwen3` (causal, last-token pooling) | Qwen3-Embedding | Qwen/Qwen3-Embedding-0.6B |
+
+Formats span BF16 safetensors, GGUF, AWQ/GPTQ, compressed-tensors INT4, FP8, and MXFP4, auto-detected per checkpoint.
 
 > [!NOTE]
 > All Qwen3 and Qwen3.5 models have been tested with and without thinking enabled, with reasoning separated into `reasoning_content` in both streaming and non-streaming responses.
@@ -114,7 +131,7 @@ git clone https://github.com/giovannifil-64/oxydllm
 cd oxydllm
 ```
 
-Requires Rust 1.94 or newer (candle's NEON f16 intrinsics stabilized there). rustup installs are always current; package-manager installs such as Homebrew can lag, so run `brew upgrade rust` or switch to rustup if the build reports an unsupported rustc.
+Requires Rust 1.94 or newer (candle's NEON f16 intrinsics stabilized there). rustup installs are always current; package-manager installs such as Homebrew can lag, so run `brew upgrade rust` or switch to rustup if the build reports an unsupported rustc. CI enforces the 1.94 floor on every push and runs the full test suite across every supported stable toolchain weekly.
 
 #### Apple Silicon
 ```bash

@@ -1451,7 +1451,15 @@ fn main() -> anyhow::Result<()> {
             print_usage();
         }
         "--version" | "-v" => {
-            println!("oxydllm {}", env!("CARGO_PKG_VERSION"));
+            let build_ts: i64 = option_env!("OXYDLLM_BUILD_TS")
+                .unwrap_or("0")
+                .parse()
+                .unwrap_or(0);
+            let meta = chrono::DateTime::from_timestamp(build_ts, 0)
+                .filter(|_| build_ts > 0)
+                .map(|d| format!("+{}", d.format("%Y%m%d")))
+                .unwrap_or_default();
+            println!("oxydllm {}{meta}", env!("CARGO_PKG_VERSION"));
         }
         _ => {
             eprintln!("Unknown command: {}", args[1]);

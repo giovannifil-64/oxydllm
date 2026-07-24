@@ -19,11 +19,17 @@ Outputs a live table to stdout, plus:
     test-results/stress-baseline/<timestamp>/results.json
     test-results/stress-baseline/<timestamp>/server-*.log
 
+Embedding models (`/v1/embeddings`) run a separate, shorter measurement:
+cold/warm load, RSS, embed latency, determinism (repeat call, cosine must be
+~1.0), and a semantic sanity check (a related pair must score higher than an
+unrelated one).
+
 Run:
-    ./scripts/stress_baseline.py                  # default suite
-    ./scripts/stress_baseline.py --models MODELS  # comma-separated override
-    ./scripts/stress_baseline.py --quick          # fewer runs / shorter outputs
-    ./scripts/stress_baseline.py --include-slow   # include Phi-3.5 (~8 tok/s)
+    ./scripts/stress_baseline.py                    # default suite
+    ./scripts/stress_baseline.py --models MODELS     # comma-separated override
+    ./scripts/stress_baseline.py --quick             # fewer runs / shorter outputs
+    ./scripts/stress_baseline.py --include-slow      # include Phi-3.5, gpt-oss-20b, Qwen3.6-35B-A3B
+    ./scripts/stress_baseline.py --include-embeddings  # include the embedding models
 
 Compare two runs with `diff` on the CSVs.
 """
@@ -87,11 +93,21 @@ CORE_MODELS = [
     "allenai/OLMoE-1B-7B-0924-Instruct",
     # FP8.
     "Qwen/Qwen3-4B-Instruct-2507-FP8",
+    # Granite family.
+    "ibm-granite/granite-3.3-2b-instruct",
+    "microsoft/Phi-3-mini-4k-instruct-Q4",
 ]
 
 SLOW_MODELS = [
     "microsoft/Phi-3.5-mini-instruct",  # ~8 tok/s on Metal (no Q4_K fast path for Phi-3)
     "openai/gpt-oss-20b",
+    "Qwen/Qwen3.6-35B-A3B-FP8",  # MoE hybrid, SSD expert streaming, ~2-4 tok/s
+]
+
+# `/v1/embeddings` models — measured separately (see measure_embedding_model).
+EMBEDDING_MODELS = [
+    "ibm-granite/granite-embedding-125m-english",
+    "Qwen/Qwen3-Embedding-0.6B",
 ]
 
 WARMUP_PROMPT = "Reply with the single word ready."
@@ -112,6 +128,12 @@ TTFT_PROMPT = " ".join(
 ).split()
 TTFT_PROMPT = " ".join(TTFT_PROMPT[:TTFT_PROMPT_WORDS])
 
+# Semantic sanity pair for embedding models: a related pair must score higher
+# than an unrelated one, or the model isn't distinguishing meaning at all.
+EMBED_ANCHOR = "The king wore a golden crown."
+EMBED_RELATED = "The queen wore a golden crown."
+EMBED_UNRELATED = "The stock market fell sharply today."
+
 
 @dataclass
 class ModelResult:
@@ -124,6 +146,19 @@ class ModelResult:
     rss_mb: Optional[float] = None
     coherence_pass: Optional[bool] = None
     coherence_output: str = ""
+    error: Optional[str] = None
+
+
+@dataclass
+class EmbeddingResult:
+    model: str
+    cold_load_ms: Optional[float] = None
+    warm_load_ms: Optional[float] = None
+    embed_ms: Optional[float] = None
+    dimensions: Optional[int] = None
+    rss_mb: Optional[float] = None
+    determinism_cosine: Optional[float] = None
+    semantic_pass: Optional[bool] = None
     error: Optional[str] = None
 
 
@@ -250,6 +285,32 @@ def chat_stream_ttft(
     return None
 
 
+def embed(port: int, model: str, inputs: list[str], *, timeout: float = 60.0) -> Optional[list[list[float]]]:
+    payload = {"model": model, "input": inputs}
+    req = urlrequest.Request(
+        f"http://127.0.0.1:{port}/v1/embeddings",
+        data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urlrequest.urlopen(req, timeout=timeout) as resp:
+            body = json.loads(resp.read().decode())
+        return [d["embedding"] for d in body["data"]]
+    except (urlerror.URLError, TimeoutError) as e:
+        print(f"  {color('embed error: ' + str(e), 'red')}")
+        return None
+    except (json.JSONDecodeError, KeyError) as e:
+        print(f"  {color('embed decode error: ' + str(e), 'red')}")
+        return None
+
+
+def cosine(a: list[float], b: list[float]) -> float:
+    dot = sum(x * y for x, y in zip(a, b))
+    na = sum(x * x for x in a) ** 0.5
+    nb = sum(y * y for y in b) ** 0.5
+    return dot / (na * nb) if na > 0 and nb > 0 else 0.0
+
+
 def server_rss_mb(pid: int) -> Optional[float]:
     """Resident memory of the server process in MB (macOS `ps -o rss=` is in KB)."""
     try:
@@ -363,6 +424,73 @@ def measure_model(
     return res
 
 
+def measure_embedding_model(
+    bin_path: Path,
+    model: str,
+    port: int,
+    log_path: Path,
+) -> EmbeddingResult:
+    res = EmbeddingResult(model=model)
+
+    proc = start_server(bin_path, port, log_path)
+    try:
+        if not wait_ready(port, timeout=20.0):
+            res.error = "server did not become ready"
+            return res
+
+        # Cold load — first request, includes weight load + kernel compile.
+        t0 = time.monotonic()
+        warmup = embed(port, model, [EMBED_ANCHOR], timeout=120.0)
+        res.cold_load_ms = (time.monotonic() - t0) * 1000.0
+        if warmup is None:
+            res.error = "warmup request failed"
+            return res
+        res.dimensions = len(warmup[0])
+
+        # Warm load — second request, model is now loaded.
+        t1 = time.monotonic()
+        warm = embed(port, model, [EMBED_ANCHOR])
+        res.warm_load_ms = (time.monotonic() - t1) * 1000.0
+        if warm is None:
+            res.error = "warm request failed"
+            return res
+
+        res.rss_mb = server_rss_mb(proc.pid)
+
+        # Embed latency — median of 5 single-string calls.
+        latencies = []
+        for _ in range(5):
+            t = time.monotonic()
+            if embed(port, model, [EMBED_ANCHOR]) is None:
+                continue
+            latencies.append((time.monotonic() - t) * 1000.0)
+        if latencies:
+            res.embed_ms = statistics.median(latencies)
+
+        # Determinism: same input twice must yield (near-)identical vectors.
+        # Encoders are a pure forward pass (no sampling), so this should be a
+        # tight bound; a large drop here would flag nondeterministic reduction
+        # order creeping into the Metal kernels.
+        pair = embed(port, model, [EMBED_ANCHOR, EMBED_ANCHOR])
+        if pair and len(pair) == 2:
+            res.determinism_cosine = cosine(pair[0], pair[1])
+
+        # Semantic sanity: a related pair must score higher than an unrelated
+        # one, or the model isn't encoding meaning (e.g. broken pooling).
+        triplet = embed(port, model, [EMBED_ANCHOR, EMBED_RELATED, EMBED_UNRELATED])
+        if triplet and len(triplet) == 3:
+            sim_related = cosine(triplet[0], triplet[1])
+            sim_unrelated = cosine(triplet[0], triplet[2])
+            res.semantic_pass = sim_related > sim_unrelated
+    finally:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            pass
+        proc.wait(timeout=10)
+    return res
+
+
 def format_table(results: list[ModelResult]) -> str:
     rows = []
     header = (
@@ -397,6 +525,33 @@ def format_table(results: list[ModelResult]) -> str:
     return "\n".join(lines)
 
 
+def format_embed_table(results: list[EmbeddingResult]) -> str:
+    rows = []
+    header = ("MODEL", "COLD_LD_S", "WARM_LD_MS", "EMBED_MS", "DIM", "RSS_MB", "DET", "SEM")
+    rows.append(header)
+    for r in results:
+        cold = f"{r.cold_load_ms / 1000:.2f}" if r.cold_load_ms is not None else "-"
+        warm = f"{r.warm_load_ms:.0f}" if r.warm_load_ms is not None else "-"
+        emb = f"{r.embed_ms:.0f}" if r.embed_ms is not None else "-"
+        dim = str(r.dimensions) if r.dimensions is not None else "-"
+        rss = f"{r.rss_mb:.0f}" if r.rss_mb is not None else "-"
+        det = f"{r.determinism_cosine:.6f}" if r.determinism_cosine is not None else "-"
+        sem = "OK" if r.semantic_pass else ("FAIL" if r.semantic_pass is False else "-")
+        if r.error:
+            sem = "ERR"
+        rows.append((r.model, cold, warm, emb, dim, rss, det, sem))
+    widths = [max(len(str(r[i])) for r in rows) for i in range(len(header))]
+    lines = []
+    for idx, r in enumerate(rows):
+        line = "  ".join(str(c).ljust(widths[i]) for i, c in enumerate(r))
+        if idx == 0:
+            lines.append(color(line, "bold"))
+            lines.append(color("-" * len(line), "dim"))
+        else:
+            lines.append(line)
+    return "\n".join(lines)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--bin", default=str(DEFAULT_BIN), help=f"oxydllm binary (default: {DEFAULT_BIN})")
@@ -404,6 +559,7 @@ def main() -> int:
     ap.add_argument("--models", help="comma-separated model override (otherwise: default suite)")
     ap.add_argument("--quick", action="store_true", help="3 decode runs × 60 tokens (vs 5 × 150)")
     ap.add_argument("--include-slow", action="store_true", help="include the SLOW_MODELS list too")
+    ap.add_argument("--include-embeddings", action="store_true", help="include the EMBEDDING_MODELS list too")
     ap.add_argument("--results-dir", default=str(DEFAULT_RESULTS))
     args = ap.parse_args()
 
@@ -414,11 +570,14 @@ def main() -> int:
         return 1
 
     if args.models:
-        models = [m.strip() for m in args.models.split(",") if m.strip()]
+        requested = [m.strip() for m in args.models.split(",") if m.strip()]
+        models = [m for m in requested if m not in EMBEDDING_MODELS]
+        embed_models = [m for m in requested if m in EMBEDDING_MODELS]
     else:
         models = list(CORE_MODELS)
         if args.include_slow:
             models += SLOW_MODELS
+        embed_models = list(EMBEDDING_MODELS) if args.include_embeddings else []
 
     decode_runs = 3 if args.quick else 5
     decode_max_tokens = 60 if args.quick else 150
@@ -512,7 +671,77 @@ def main() -> int:
     )
     print(color(f"CSV : {csv_path}", "dim"))
     print(color(f"JSON: {json_path}", "dim"))
-    return 0 if n_ok == len(results) else 1
+
+    embed_results: list[EmbeddingResult] = []
+    if embed_models:
+        print()
+        print(color(f"Embeddings: {len(embed_models)} models", "cyan"))
+        for i, model in enumerate(embed_models, 1):
+            print(f"[{i}/{len(embed_models)}] {color(model, 'cyan')}")
+            log_path = out_dir / f"server-{model.replace('/', '_')}.log"
+            try:
+                r = measure_embedding_model(bin_path, model, port, log_path)
+            except KeyboardInterrupt:
+                print(color("\ninterrupted by user", "yellow"))
+                break
+            except Exception as e:  # noqa: BLE001
+                r = EmbeddingResult(model=model, error=f"exception: {e}")
+            embed_results.append(r)
+            if r.error:
+                print(f"  {color('FAIL', 'red')} {r.error}")
+            else:
+                print(
+                    f"  cold={r.cold_load_ms / 1000:.2f}s warm={r.warm_load_ms:.0f}ms "
+                    f"embed={r.embed_ms:.0f}ms dim={r.dimensions} rss={r.rss_mb:.0f}MB "
+                    f"determinism={r.determinism_cosine:.6f} "
+                    f"semantic={'OK' if r.semantic_pass else 'FAIL'}"
+                )
+            time.sleep(2)
+
+        print()
+        print(color("-" * 60, "bold"))
+        print(format_embed_table(embed_results))
+        print()
+
+        embed_csv_path = out_dir / "results_embeddings.csv"
+        with open(embed_csv_path, "w") as fh:
+            fh.write("model,cold_load_ms,warm_load_ms,embed_ms,dimensions,rss_mb,determinism_cosine,semantic_pass,error\n")
+            for r in embed_results:
+                fh.write(
+                    ",".join(
+                        [
+                            r.model,
+                            f"{r.cold_load_ms:.1f}" if r.cold_load_ms is not None else "",
+                            f"{r.warm_load_ms:.1f}" if r.warm_load_ms is not None else "",
+                            f"{r.embed_ms:.1f}" if r.embed_ms is not None else "",
+                            str(r.dimensions) if r.dimensions is not None else "",
+                            f"{r.rss_mb:.1f}" if r.rss_mb is not None else "",
+                            f"{r.determinism_cosine:.6f}" if r.determinism_cosine is not None else "",
+                            "1" if r.semantic_pass else ("0" if r.semantic_pass is False else ""),
+                            r.error or "",
+                        ]
+                    )
+                    + "\n"
+                )
+        embed_json_path = out_dir / "results_embeddings.json"
+        with open(embed_json_path, "w") as fh:
+            json.dump([asdict(r) for r in embed_results], fh, indent=2)
+
+        n_embed_ok = sum(1 for r in embed_results if r.error is None)
+        n_sem_ok = sum(1 for r in embed_results if r.semantic_pass)
+        print(
+            color(
+                f"Done. {n_embed_ok}/{len(embed_results)} embedding models loaded, "
+                f"{n_sem_ok}/{len(embed_results)} semantic-pass.",
+                "green" if n_sem_ok == len(embed_results) else "yellow",
+            )
+        )
+        print(color(f"CSV : {embed_csv_path}", "dim"))
+        print(color(f"JSON: {embed_json_path}", "dim"))
+
+    chat_all_ok = n_ok == len(results)
+    embed_all_ok = all(r.error is None and r.semantic_pass for r in embed_results)
+    return 0 if chat_all_ok and embed_all_ok else 1
 
 
 if __name__ == "__main__":

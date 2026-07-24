@@ -553,7 +553,7 @@ All numbers were measured on the Apple Silicon reference machine (M5, 24 GB unif
 | `google/gemma-3-1b-it` | Gemma3ForCausalLM | BF16 safetensors | 36.1 |
 | `google/gemma-4-E2B-it` | Gemma4ForConditionalGeneration | BF16 safetensors | 15.4 |
 | `mistralai/Ministral-3-3B-Instruct-2512` | Mistral3ForConditionalGeneration | BF16 safetensors | 12.1 |
-| `microsoft/Phi-3-mini-4k-instruct-gguf` | Phi3 (GGUF) | Q4 | 17.9 |
+| `microsoft/Phi-3-mini-4k-instruct-Q4` | Phi3 (GGUF) | Q4 | 17.9 |
 | `ibm-granite/granite-3.3-2b-instruct-Q4_K_M` | GraniteForCausalLM (GGUF) | Q4_K_M | 44.3 |
 | `allenai/OLMoE-1B-7B-0924-Instruct` | OlmoeForCausalLM (MoE) | BF16 safetensors, 64 experts × top-k 8 | 13.6 |
 | `openai/gpt-oss-20b` | GptOssForCausalLM (MoE) | MXFP4 experts + BF16, 32 experts × top-k 4 | 14.3 |

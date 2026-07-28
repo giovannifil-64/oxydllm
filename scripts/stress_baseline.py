@@ -24,12 +24,14 @@ cold/warm load, RSS, embed latency, determinism (repeat call, cosine must be
 ~1.0), and a semantic sanity check (a related pair must score higher than an
 unrelated one).
 
+The default suite runs every model this repo claims as a verified checkpoint
+(README / site), chat and embedding alike, no opt-in flags: a "verified"
+claim that only gets tested when someone remembers a flag isn't verified.
+
 Run:
-    ./scripts/stress_baseline.py                    # default suite
-    ./scripts/stress_baseline.py --models MODELS     # comma-separated override
-    ./scripts/stress_baseline.py --quick             # fewer runs / shorter outputs
-    ./scripts/stress_baseline.py --include-slow      # include Phi-3.5, gpt-oss-20b, Qwen3.6-35B-A3B
-    ./scripts/stress_baseline.py --include-embeddings  # include the embedding models
+    ./scripts/stress_baseline.py                    # full suite, every verified checkpoint
+    ./scripts/stress_baseline.py --models MODELS     # comma-separated override, for fast iteration
+    ./scripts/stress_baseline.py --quick             # fewer decode runs / shorter outputs
 
 Compare two runs with `diff` on the CSVs.
 """
@@ -59,7 +61,10 @@ DEFAULT_BIN = REPO_ROOT / "target" / "release" / "oxydllm"
 DEFAULT_PORT = 11335
 DEFAULT_RESULTS = REPO_ROOT / "test-results" / "stress-baseline"
 
-# Model lists — `core` runs by default. `slow` (Phi-3.5) is opt-in.
+# Model lists, split for readability only: every list below always runs.
+# `SLOW_MODELS` groups the ones with materially longer cold load or decode
+# (large weights, SSD expert streaming, sub-10 tok/s), so a reader scanning
+# run time can tell why a given entry is expensive without a separate flag.
 CORE_MODELS = [
     # Small dense bf16 — sanity baseline.
     "Qwen/Qwen3-0.6B",
@@ -558,8 +563,6 @@ def main() -> int:
     ap.add_argument("--port", type=int, default=DEFAULT_PORT, help=f"listen port (default: {DEFAULT_PORT})")
     ap.add_argument("--models", help="comma-separated model override (otherwise: default suite)")
     ap.add_argument("--quick", action="store_true", help="3 decode runs × 60 tokens (vs 5 × 150)")
-    ap.add_argument("--include-slow", action="store_true", help="include the SLOW_MODELS list too")
-    ap.add_argument("--include-embeddings", action="store_true", help="include the EMBEDDING_MODELS list too")
     ap.add_argument("--results-dir", default=str(DEFAULT_RESULTS))
     args = ap.parse_args()
 
@@ -574,10 +577,8 @@ def main() -> int:
         models = [m for m in requested if m not in EMBEDDING_MODELS]
         embed_models = [m for m in requested if m in EMBEDDING_MODELS]
     else:
-        models = list(CORE_MODELS)
-        if args.include_slow:
-            models += SLOW_MODELS
-        embed_models = list(EMBEDDING_MODELS) if args.include_embeddings else []
+        models = CORE_MODELS + SLOW_MODELS
+        embed_models = list(EMBEDDING_MODELS)
 
     decode_runs = 3 if args.quick else 5
     decode_max_tokens = 60 if args.quick else 150

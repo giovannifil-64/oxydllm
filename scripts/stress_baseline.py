@@ -530,6 +530,32 @@ def format_table(results: list[ModelResult]) -> str:
     return "\n".join(lines)
 
 
+def write_results(out_dir: Path, results: list[ModelResult]) -> None:
+    """Persist results so far. Called after every model, not just at the end:
+    a sweep is long enough that losing a partial run to a crash, a sleep, or a
+    reboot costs more than the rewrite does."""
+    with open(out_dir / "results.csv", "w") as fh:
+        fh.write("model,cold_load_ms,warm_load_ms,ttft_ms,decode_tps,rss_mb,coherence_pass,error\n")
+        for r in results:
+            fh.write(
+                ",".join(
+                    [
+                        r.model,
+                        f"{r.cold_load_ms:.1f}" if r.cold_load_ms is not None else "",
+                        f"{r.warm_load_ms:.1f}" if r.warm_load_ms is not None else "",
+                        f"{r.ttft_ms:.1f}" if r.ttft_ms is not None else "",
+                        f"{r.decode_tps:.2f}" if r.decode_tps is not None else "",
+                        f"{r.rss_mb:.1f}" if r.rss_mb is not None else "",
+                        "1" if r.coherence_pass else ("0" if r.coherence_pass is False else ""),
+                        r.error or "",
+                    ]
+                )
+                + "\n"
+            )
+    with open(out_dir / "results.json", "w") as fh:
+        json.dump([asdict(r) for r in results], fh, indent=2)
+
+
 def format_embed_table(results: list[EmbeddingResult]) -> str:
     rows = []
     header = ("MODEL", "COLD_LD_S", "WARM_LD_MS", "EMBED_MS", "DIM", "RSS_MB", "DET", "SEM")
@@ -619,15 +645,19 @@ def main() -> int:
         except Exception as e:  # noqa: BLE001
             r = ModelResult(model=model, error=f"exception: {e}")
         results.append(r)
+        write_results(out_dir, results)
         if r.error:
-            print(f"  {color('FAIL', 'red')} — {r.error}")
+            print(f"  {color('FAIL', 'red')} {r.error}")
         else:
+            def num(v, scale=1.0, fmt=".1f"):
+                return format(v / scale, fmt) if v is not None else "-"
+
             summary = (
-                f"cold={r.cold_load_ms / 1000:.2f}s "
-                f"warm={r.warm_load_ms:.0f}ms "
-                f"ttft={r.ttft_ms:.0f}ms "
-                f"tps={r.decode_tps:.1f} "
-                f"rss={r.rss_mb:.0f}MB "
+                f"cold={num(r.cold_load_ms, 1000, '.2f')}s "
+                f"warm={num(r.warm_load_ms, 1, '.0f')}ms "
+                f"ttft={num(r.ttft_ms, 1, '.0f')}ms "
+                f"tps={num(r.decode_tps)} "
+                f"rss={num(r.rss_mb, 1, '.0f')}MB "
                 f"coh={'OK' if r.coherence_pass else 'FAIL'}"
             )
             print(f"  {summary}")
@@ -640,27 +670,8 @@ def main() -> int:
     print()
 
     csv_path = out_dir / "results.csv"
-    with open(csv_path, "w") as fh:
-        fh.write("model,cold_load_ms,warm_load_ms,ttft_ms,decode_tps,rss_mb,coherence_pass,error\n")
-        for r in results:
-            fh.write(
-                ",".join(
-                    [
-                        r.model,
-                        f"{r.cold_load_ms:.1f}" if r.cold_load_ms is not None else "",
-                        f"{r.warm_load_ms:.1f}" if r.warm_load_ms is not None else "",
-                        f"{r.ttft_ms:.1f}" if r.ttft_ms is not None else "",
-                        f"{r.decode_tps:.2f}" if r.decode_tps is not None else "",
-                        f"{r.rss_mb:.1f}" if r.rss_mb is not None else "",
-                        "1" if r.coherence_pass else ("0" if r.coherence_pass is False else ""),
-                        r.error or "",
-                    ]
-                )
-                + "\n"
-            )
     json_path = out_dir / "results.json"
-    with open(json_path, "w") as fh:
-        json.dump([asdict(r) for r in results], fh, indent=2)
+    write_results(out_dir, results)
 
     n_ok = sum(1 for r in results if r.error is None)
     n_coh = sum(1 for r in results if r.coherence_pass)

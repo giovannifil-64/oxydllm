@@ -1038,6 +1038,7 @@ fn load_standard_safetensors(
             dtype,
             kv_quant: opts.kv_quant,
             qjl_quantization: opts.qjl_quantization,
+            weights_bytes: weights_size,
         },
         opts.kv_budget,
     )?;
@@ -1352,6 +1353,7 @@ fn load_batch_model_gguf(
             dtype,
             kv_quant: opts.kv_quant,
             qjl_quantization: opts.qjl_quantization,
+            weights_bytes: weights_size,
         },
         opts.kv_budget,
     )?;
@@ -1386,6 +1388,9 @@ struct KvBlockParams {
     dtype: DType,
     kv_quant: KvQuantMode,
     qjl_quantization: bool,
+    /// Runtime size of this model's weights, so the KV grant can be capped
+    /// against them: both come out of the same memory.
+    weights_bytes: usize,
 }
 
 /// Sizes the model's KV pool against the global budget, returning
@@ -1437,7 +1442,17 @@ fn compute_kv_blocks(
     }
 
     let desired_bytes = desired_blocks.max(min_blocks) * per_block_bytes;
-    let granted_bytes = kv_budget.acquire(desired_bytes);
+    let ceiling = crate::common::paged::safe_model_kv_ceiling(p.weights_bytes);
+    let capped_bytes = desired_bytes.min(ceiling);
+    if capped_bytes < desired_bytes {
+        tracing::info!(
+            desired_gb = desired_bytes as f64 / 1_073_741_824.0,
+            capped_gb = capped_bytes as f64 / 1_073_741_824.0,
+            weights_gb = p.weights_bytes as f64 / 1_073_741_824.0,
+            "KV request capped so weights plus KV stay inside the safe share of memory"
+        );
+    }
+    let granted_bytes = kv_budget.acquire(capped_bytes);
     let granted_blocks = granted_bytes / per_block_bytes;
 
     if granted_blocks < min_blocks {

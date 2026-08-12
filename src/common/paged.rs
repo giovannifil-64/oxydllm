@@ -52,18 +52,71 @@ impl GlobalKvBudget {
     }
 }
 
+/// Server-wide ceiling on KV bytes across every loaded model.
+///
+/// With an explicit `--memory-budget` the figure is that budget; otherwise it
+/// is a fraction of *physical* memory. Sizing it from free memory instead,
+/// as this used to, made the pool depend on whatever else the machine happened
+/// to be doing at startup: measured on a 24 GB M5 the same
+/// Phi-3-mini-4k-instruct-Q4 got anywhere from 4.6 GB to 10 GB of KV across
+/// runs, and the 10 GB grant pushed the machine into swap, costing an eightfold
+/// throughput drop (45.8 to 5.9 tok/s) and corrupt output. Physical memory does
+/// not move, so the same machine now sizes the same way every time and
+/// benchmarks are comparable across runs.
+///
+/// This is only the cross-model ceiling. A single model's share is additionally
+/// capped against its own weights by [`safe_model_kv_ceiling`], since the
+/// weights and the KV pool come out of the same memory.
 pub fn detect_system_kv_budget(memory_budget_bytes: Option<usize>, is_cpu: bool) -> usize {
-    let base = if let Some(b) = memory_budget_bytes {
-        let total = detect_system_memory_bytes().unwrap_or(usize::MAX);
-        b.min(total)
-    } else {
-        detect_available_memory_bytes()
-            .unwrap_or_else(|| detect_system_memory_bytes().unwrap_or(8 * 1024 * 1024 * 1024))
+    let physical = detect_system_memory_bytes().unwrap_or(8 * 1024 * 1024 * 1024);
+    let base = match memory_budget_bytes {
+        Some(b) => b.min(physical),
+        None => physical,
     };
-    // Leave ~40-45% for model weights + OS + activations; KV gets the rest.
     let kv_fraction: f64 = if is_cpu { 0.65 } else { 0.55 };
     let headroom: usize = 512 * 1024 * 1024;
     ((base as f64 * kv_fraction) as usize).saturating_sub(headroom)
+}
+
+/// Largest share of physical memory one model's KV pool may occupy.
+///
+/// The ceiling is on the *pool*, not on weights plus pool, because the measured
+/// failure tracks the pool alone. On a 24 GB M5, Phi-3-mini-4k-instruct-Q4
+/// (2.2 GB of weights, and only ~22 KV slots actually touched by the probe)
+/// decodes at 41 to 46 tok/s with a 3 to 6 GB pool and degenerates to 5 tok/s
+/// with byte-ramp output at 9 GB and beyond, with no error logged anywhere.
+/// Meanwhile gpt-oss-20b commits far more in total, 12.8 GB of weights next to
+/// a 1.5 GB pool, and is correct: total committed memory is not the variable,
+/// nor is the sequence count, since eight sequences over a 2048 context share
+/// the good 6 GB pool and stay correct.
+///
+/// Merely allocating the oversized pool is enough to corrupt inference that
+/// never reads it, which puts this in the same family as the streamed-expert
+/// oversubscription: candle's Metal allocator hands back buffers without asking
+/// the GPU whether earlier work on them finished. Until that is understood
+/// upstream, staying inside the measured-good band is the defence.
+const KV_POOL_FRACTION: f64 = 0.25;
+
+/// Memory that must stay free for weights, activations, and the OS when the
+/// weights-aware arm of [`safe_model_kv_ceiling`] applies.
+const KV_WEIGHTS_RESERVE: usize = 4 << 30;
+
+/// The most KV a model with `weights_bytes` of weights should pool.
+///
+/// Two guards, whichever binds first: the pool never exceeds
+/// [`KV_POOL_FRACTION`] of physical memory, and it never crowds the weights out
+/// of what is left after [`KV_WEIGHTS_RESERVE`]. The second only matters for
+/// models whose weights already fill most of the machine.
+pub fn safe_model_kv_ceiling(weights_bytes: usize) -> usize {
+    let physical = match detect_system_memory_bytes() {
+        Some(p) => p,
+        None => return usize::MAX,
+    };
+    let by_pool = (physical as f64 * KV_POOL_FRACTION) as usize;
+    let by_weights = physical
+        .saturating_sub(weights_bytes)
+        .saturating_sub(KV_WEIGHTS_RESERVE);
+    by_pool.min(by_weights)
 }
 
 #[cfg(target_os = "macos")]
@@ -1060,6 +1113,86 @@ impl PagedKvCache {
 mod tests {
     use super::*;
     use candle_core::{DType, Device};
+
+    /// Contract: the KV budget depends only on the machine, never on what the
+    /// machine happens to be doing. It used to be a fraction of free memory,
+    /// which made the same model get 4.6 GB on one run and 10 GB on the next,
+    /// the latter swapping and dropping throughput eightfold.
+    #[test]
+    fn kv_budget_is_deterministic_across_calls() {
+        let a = detect_system_kv_budget(None, false);
+        let b = detect_system_kv_budget(None, false);
+        assert_eq!(a, b, "budget must not vary with free memory");
+        assert!(a > 0, "a machine with memory must get a budget");
+    }
+
+    /// Contract: an explicit budget is honoured and never exceeds physical
+    /// memory, so `--memory-budget` stays the escape hatch it claims to be.
+    #[test]
+    fn explicit_budget_is_honoured_and_bounded() {
+        let small = detect_system_kv_budget(Some(4 << 30), false);
+        let large = detect_system_kv_budget(Some(64 << 30), false);
+        assert!(
+            small < large || large == small,
+            "larger budget cannot shrink KV"
+        );
+        let physical = detect_system_memory_bytes().unwrap_or(0);
+        if physical > 0 {
+            assert!(large <= physical, "budget cannot exceed physical memory");
+        }
+    }
+
+    /// Contract: the pool ceiling bounds every model, and the weights arm
+    /// takes over only when the weights themselves fill most of the machine.
+    /// A 2 GB model and an 8 GB model both sit under the pool ceiling on a
+    /// typical desktop; a 16 GB model does not.
+    #[test]
+    fn kv_ceiling_is_bounded_by_pool_then_by_weights() {
+        let Some(physical) = detect_system_memory_bytes() else {
+            return;
+        };
+        let by_pool = (physical as f64 * KV_POOL_FRACTION) as usize;
+
+        for weights in [1usize << 30, 8 << 30] {
+            let c = safe_model_kv_ceiling(weights);
+            assert!(c <= by_pool, "pool ceiling must bound every model");
+        }
+
+        let huge = physical.saturating_sub(KV_WEIGHTS_RESERVE / 2);
+        assert!(
+            safe_model_kv_ceiling(huge) < by_pool,
+            "a model that fills the machine must be bounded by its weights"
+        );
+    }
+
+    /// Contract: the ceiling stays inside the band measured to decode
+    /// correctly. On a 24 GB machine it must land at or below 7 GB, since a
+    /// 9 GB pool corrupts output with no error raised anywhere.
+    #[test]
+    fn kv_ceiling_stays_in_the_measured_good_band() {
+        let Some(physical) = detect_system_memory_bytes() else {
+            return;
+        };
+        if !(20 << 30..=32u64 << 30).contains(&(physical as u64)) {
+            return;
+        }
+        let ceiling = safe_model_kv_ceiling(2 << 30);
+        assert!(
+            ceiling <= 7 << 30,
+            "ceiling {ceiling} exceeds the measured-good band"
+        );
+    }
+
+    /// Contract: a model whose weights exceed the machine gets no KV, so the
+    /// caller's minimum-blocks check rejects the load with a clear message
+    /// instead of proceeding into an allocation that cannot succeed.
+    #[test]
+    fn kv_ceiling_is_zero_when_weights_exceed_the_machine() {
+        if detect_system_memory_bytes().is_none() {
+            return;
+        }
+        assert_eq!(safe_model_kv_ceiling(usize::MAX / 2), 0);
+    }
 
     fn make_allocator(num_blocks: usize, block_size: usize) -> SharedBlockAllocator {
         Arc::new(Mutex::new(

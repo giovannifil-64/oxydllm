@@ -78,45 +78,59 @@ pub fn detect_system_kv_budget(memory_budget_bytes: Option<usize>, is_cpu: bool)
     ((base as f64 * kv_fraction) as usize).saturating_sub(headroom)
 }
 
-/// Largest share of physical memory one model's KV pool may occupy.
+/// Largest share of physical memory one model's KV pool may occupy on its own.
 ///
-/// The ceiling is on the *pool*, not on weights plus pool, because the measured
-/// failure tracks the pool alone. On a 24 GB M5, Phi-3-mini-4k-instruct-Q4
-/// (2.2 GB of weights, and only ~22 KV slots actually touched by the probe)
-/// decodes at 41 to 46 tok/s with a 3 to 6 GB pool and degenerates to 5 tok/s
-/// with byte-ramp output at 9 GB and beyond, with no error logged anywhere.
-/// Meanwhile gpt-oss-20b commits far more in total, 12.8 GB of weights next to
-/// a 1.5 GB pool, and is correct: total committed memory is not the variable,
-/// nor is the sequence count, since eight sequences over a 2048 context share
-/// the good 6 GB pool and stay correct.
+/// Bounds the pool for models light enough that [`KV_TOTAL_FRACTION`] leaves
+/// them room: on a 24 GB M5, Phi-3-mini-4k-instruct-Q4 decodes at 41 to
+/// 46 tok/s with a 3 to 6 GB pool and degenerates to 5 tok/s with byte-ramp
+/// output at 9 GB, so the pool alone needs a ceiling even when the weights are
+/// small. The sequence count is not the variable: eight sequences over a 2048
+/// context share the good 6 GB pool and stay correct.
 ///
-/// Merely allocating the oversized pool is enough to corrupt inference that
-/// never reads it, which puts this in the same family as the streamed-expert
-/// oversubscription: candle's Metal allocator hands back buffers without asking
-/// the GPU whether earlier work on them finished. Until that is understood
-/// upstream, staying inside the measured-good band is the defence.
+/// Merely allocating an oversized pool is enough to corrupt a request that
+/// never reads it, and nothing is logged. That is the same observable as the
+/// streamed-expert oversubscription, and the same two upstream candidates
+/// apply: candle's Metal allocator hands back buffers without asking the GPU
+/// whether earlier work on them finished. Until that is settled upstream,
+/// staying inside the measured-good band is the defence, not the explanation.
 const KV_POOL_FRACTION: f64 = 0.25;
 
-/// Memory that must stay free for weights, activations, and the OS when the
-/// weights-aware arm of [`safe_model_kv_ceiling`] applies.
-const KV_WEIGHTS_RESERVE: usize = 4 << 30;
+/// Largest share of physical memory weights and KV pool may occupy together.
+///
+/// Measured on a 24 GB M5. Phi-3-mini-4k-instruct-Q4 is correct at 8.2 GB
+/// committed (2.2 weights, 6.0 pool) and corrupt at 11.2 GB (2.2 + 9.0);
+/// Qwen3-4B-Instruct-2507-FP8 is correct at 10.5 GB (8.2 + 2.3) and corrupt at
+/// 10.8 GB (8.2 + 2.6). Neither figure alone predicts the flip, their sum comes
+/// closest, and the FP8 band is narrow enough (15% between the last good and
+/// first bad pool) that this is a fitted safety margin, not an explanation:
+/// see the roadmap for the unresolved mechanism.
+const KV_TOTAL_FRACTION: f64 = 0.42;
+
+/// Pool floor for models whose weights alone pass [`KV_TOTAL_FRACTION`].
+///
+/// gpt-oss-20b holds 12.8 GB of weights next to a 1.5 GB pool, over the total
+/// share, and decodes correctly: a model that large cannot be served at all
+/// without breaking the rule, so it keeps a workable pool instead of being
+/// refused. Large-weight models also run few concurrent sequences in practice,
+/// which is what this floor buys them.
+const MIN_USEFUL_KV: usize = 1 << 30;
 
 /// The most KV a model with `weights_bytes` of weights should pool.
 ///
-/// Two guards, whichever binds first: the pool never exceeds
-/// [`KV_POOL_FRACTION`] of physical memory, and it never crowds the weights out
-/// of what is left after [`KV_WEIGHTS_RESERVE`]. The second only matters for
-/// models whose weights already fill most of the machine.
+/// The pool never exceeds [`KV_POOL_FRACTION`] of physical memory, and weights
+/// plus pool never exceed [`KV_TOTAL_FRACTION`] of it, except that a model too
+/// large for the second rule still receives [`MIN_USEFUL_KV`] rather than
+/// nothing.
 pub fn safe_model_kv_ceiling(weights_bytes: usize) -> usize {
     let physical = match detect_system_memory_bytes() {
         Some(p) => p,
         None => return usize::MAX,
     };
     let by_pool = (physical as f64 * KV_POOL_FRACTION) as usize;
-    let by_weights = physical
+    let by_total = ((physical as f64 * KV_TOTAL_FRACTION) as usize)
         .saturating_sub(weights_bytes)
-        .saturating_sub(KV_WEIGHTS_RESERVE);
-    by_pool.min(by_weights)
+        .max(MIN_USEFUL_KV);
+    by_pool.min(by_total)
 }
 
 #[cfg(target_os = "macos")]
@@ -1142,27 +1156,33 @@ mod tests {
         }
     }
 
-    /// Contract: the pool ceiling bounds every model, and the weights arm
-    /// takes over only when the weights themselves fill most of the machine.
-    /// A 2 GB model and an 8 GB model both sit under the pool ceiling on a
-    /// typical desktop; a 16 GB model does not.
+    /// Contract: the pool ceiling bounds every model, the total ceiling takes
+    /// over as weights grow, and a model too large for either still receives a
+    /// workable pool instead of being refused.
     #[test]
-    fn kv_ceiling_is_bounded_by_pool_then_by_weights() {
+    fn kv_ceiling_balances_pool_total_and_floor() {
         let Some(physical) = detect_system_memory_bytes() else {
             return;
         };
         let by_pool = (physical as f64 * KV_POOL_FRACTION) as usize;
+        let total_share = (physical as f64 * KV_TOTAL_FRACTION) as usize;
 
-        for weights in [1usize << 30, 8 << 30] {
-            let c = safe_model_kv_ceiling(weights);
-            assert!(c <= by_pool, "pool ceiling must bound every model");
-        }
+        let light = safe_model_kv_ceiling(physical / 24);
+        assert!(light <= by_pool, "pool ceiling must bound a light model");
 
-        let huge = physical.saturating_sub(KV_WEIGHTS_RESERVE / 2);
+        let mid = safe_model_kv_ceiling(total_share / 2);
         assert!(
-            safe_model_kv_ceiling(huge) < by_pool,
-            "a model that fills the machine must be bounded by its weights"
+            mid <= by_pool && total_share / 2 + mid <= total_share.max(1),
+            "weights plus pool must respect the total share"
         );
+
+        let huge = safe_model_kv_ceiling(physical);
+        assert_eq!(
+            huge,
+            MIN_USEFUL_KV.min(by_pool),
+            "a huge model keeps a floor"
+        );
+        assert!(huge > 0, "a servable model must never get a zero pool");
     }
 
     /// Contract: the ceiling stays inside the band measured to decode
@@ -1181,17 +1201,6 @@ mod tests {
             ceiling <= 7 << 30,
             "ceiling {ceiling} exceeds the measured-good band"
         );
-    }
-
-    /// Contract: a model whose weights exceed the machine gets no KV, so the
-    /// caller's minimum-blocks check rejects the load with a clear message
-    /// instead of proceeding into an allocation that cannot succeed.
-    #[test]
-    fn kv_ceiling_is_zero_when_weights_exceed_the_machine() {
-        if detect_system_memory_bytes().is_none() {
-            return;
-        }
-        assert_eq!(safe_model_kv_ceiling(usize::MAX / 2), 0);
     }
 
     fn make_allocator(num_blocks: usize, block_size: usize) -> SharedBlockAllocator {

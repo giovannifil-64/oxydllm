@@ -783,17 +783,30 @@ pub fn load_batch_model(
     device: &Device,
     opts: LoadBatchOptions<'_>,
 ) -> anyhow::Result<(Box<dyn BatchModel>, usize)> {
-    if is_gguf_model(model_dir) {
-        return load_batch_model_gguf(model_dir, model_id, device, opts);
-    }
-
-    let dtype = if matches!(device, Device::Cpu) {
-        DType::F32
+    let loaded = if is_gguf_model(model_dir) {
+        load_batch_model_gguf(model_dir, model_id, device, opts)
     } else {
-        DType::BF16
+        let dtype = if matches!(device, Device::Cpu) {
+            DType::F32
+        } else {
+            DType::BF16
+        };
+        let cfg = hf_parser::parse(&format!("{}/config.json", model_dir))?;
+        load_standard_safetensors(cfg, model_dir, device, dtype, opts)
     };
-    let cfg = hf_parser::parse(&format!("{}/config.json", model_dir))?;
-    load_standard_safetensors(cfg, model_dir, device, dtype, opts)
+
+    // The weight uploads and the KV pool allocation are both still queued at
+    // this point. Reading a weight from the first forward without draining
+    // returns whatever the buffer held before the upload landed: measured on
+    // Qwen3-4B-Instruct-2507-FP8, the final norm checksummed 5_592_404_480 on
+    // the first forward against 9_073_553 on every later one, deterministically,
+    // and the request decoded a degenerate token stream. A larger KV pool
+    // widens the window, which is why the failure looked like a memory
+    // threshold. One drain closes it.
+    if loaded.is_ok() {
+        crate::common::weights::drain_metal(device, "model load")?;
+    }
+    loaded
 }
 
 /// Sums a checkpoint's tensor bytes as they will exist at runtime, split into

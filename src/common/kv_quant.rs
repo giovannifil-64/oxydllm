@@ -1,7 +1,18 @@
 use std::f32::consts::PI;
 
+/// How KV blocks are stored.
+///
+/// [`Auto`](Self::Auto) is the default and the only mode the loader resolves
+/// on its own: it keeps blocks unquantized while the pool the model wants fits
+/// the safe ceiling, and drops to [`Lossless`](Self::Lossless) when it does
+/// not, since four times the capacity at measured-neutral quality beats
+/// serving fewer sequences or a shorter context. It never escalates past
+/// lossless: [`Balanced`](Self::Balanced) and [`Aggressive`](Self::Aggressive)
+/// trade quality for space and stay opt-in, because that is a decision for
+/// whoever runs the server, not for the loader.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KvQuantMode {
+    Auto,
     Off,
     Lossless,
     Balanced,
@@ -11,7 +22,7 @@ pub enum KvQuantMode {
 impl KvQuantMode {
     pub fn bit_width(self) -> u8 {
         match self {
-            Self::Off => 0,
+            Self::Auto | Self::Off => 0,
             Self::Lossless => 4,
             Self::Balanced => 3,
             Self::Aggressive => 2,
@@ -20,12 +31,13 @@ impl KvQuantMode {
 
     pub fn parse(s: &str) -> Result<Self, String> {
         match s.to_lowercase().as_str() {
+            "auto" => Ok(Self::Auto),
             "off" => Ok(Self::Off),
             "lossless" => Ok(Self::Lossless),
             "balanced" => Ok(Self::Balanced),
             "aggressive" => Ok(Self::Aggressive),
             other => Err(format!(
-                "Unknown --kv-quant mode '{}'. Use: off, lossless, balanced, aggressive",
+                "Unknown --kv-quant mode '{}'. Use: auto, off, lossless, balanced, aggressive",
                 other
             )),
         }
@@ -33,6 +45,7 @@ impl KvQuantMode {
 
     pub fn label(self) -> &'static str {
         match self {
+            Self::Auto => "auto",
             Self::Off => "off",
             Self::Lossless => "lossless (4-bit)",
             Self::Balanced => "balanced (3-bit)",

@@ -164,7 +164,9 @@ Server options (start):
   --max-context-len <N>      Max tokens per sequence for KV cache (default: 4096, env: OXYDLLM_MAX_CONTEXT_LEN)
   --devices <IDS>            Comma-separated CUDA device indices to use (default: auto, env: OXYDLLM_DEVICES)
                              Examples: --devices 0   --devices 0,1,2
-  --kv-quant <MODE>          KV cache quantization mode (default: off, env: OXYDLLM_KV_QUANT)
+  --kv-quant <MODE>          KV cache quantization mode (default: auto, env: OXYDLLM_KV_QUANT)
+                             - auto: exact blocks while they fit memory, lossless when they do not
+                             - off: never quantize, even if that costs capacity
                              - lossless: 4-bit, quality-neutral
                              - balanced: 3-bit, near-identical quality
                              - aggressive: 2-bit, maximum compression
@@ -186,7 +188,7 @@ Chat options (run):
   --models-dir <DIR>         Models directory (default: ~/.oxydllm/models/)
   --devices <ID>             CUDA device index to use (default: auto, env: OXYDLLM_DEVICES)
   --max-context-len <N>      Max tokens per sequence for KV cache (default: 4096)
-  --kv-quant <MODE>          KV cache quantization: off, lossless, balanced, aggressive
+  --kv-quant <MODE>          KV cache quantization: auto, off, lossless, balanced, aggressive
   --qjl-quantization         Enable Stage-2 QJL key residual quantization (default: disabled)
   --allow-cpu                Allow CPU fallback when no GPU is available (default: GPU required, env: OXYDLLM_ALLOW_CPU)
   --draft-model <NAME>       Enable greedy speculative decoding with this draft model
@@ -706,7 +708,7 @@ fn parse_start_args(args: &[String]) -> Result<StartArgs, String> {
         .ok()
         .map(|v| common::kv_quant::KvQuantMode::parse(&v))
         .transpose()?
-        .unwrap_or(common::kv_quant::KvQuantMode::Off);
+        .unwrap_or(common::kv_quant::KvQuantMode::Auto);
     let mut qjl_quantization = false;
     let env_allow_cpu = std::env::var("OXYDLLM_ALLOW_CPU")
         .ok()
@@ -857,7 +859,7 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
     let mut models_dir: Option<PathBuf> = None;
     let mut devices_raw: Option<Vec<usize>> = None;
     let mut max_context_len: usize = 4096;
-    let mut kv_quant = common::kv_quant::KvQuantMode::Off;
+    let mut kv_quant = common::kv_quant::KvQuantMode::Auto;
     let mut qjl_quantization = false;
     let env_allow_cpu = std::env::var("OXYDLLM_ALLOW_CPU")
         .ok()

@@ -1043,7 +1043,7 @@ fn load_standard_safetensors(
         .collect();
 
     let ctx = opts.max_context_len.min(cfg.max_position_embeddings);
-    let (num_blocks, acquired_kv_bytes) = compute_kv_blocks(
+    let (num_blocks, acquired_kv_bytes, kv_mode) = compute_kv_blocks(
         &KvBlockParams {
             layer_kv_specs: layer_kv_specs.clone(),
             max_context_len: ctx,
@@ -1052,12 +1052,13 @@ fn load_standard_safetensors(
             kv_quant: opts.kv_quant,
             qjl_quantization: opts.qjl_quantization,
             weights_bytes: weights_size,
+            unified_memory: !device.is_cuda(),
         },
         opts.kv_budget,
     )?;
 
-    let layer_quantizers: Vec<Option<Arc<KvQuantizer>>> = match opts.kv_quant {
-        KvQuantMode::Off => vec![None; num_layers],
+    let layer_quantizers: Vec<Option<Arc<KvQuantizer>>> = match kv_mode {
+        KvQuantMode::Auto | KvQuantMode::Off => vec![None; num_layers],
         mode => per_layer_head_dims
             .iter()
             .map(|&hd| {
@@ -1358,7 +1359,7 @@ fn load_batch_model_gguf(
         .filter(|&i| !topo.layer_is_linear(i))
         .map(|_| (topo.num_key_value_heads, topo.head_dim))
         .collect();
-    let (num_blocks, acquired_kv_bytes) = compute_kv_blocks(
+    let (num_blocks, acquired_kv_bytes, kv_mode) = compute_kv_blocks(
         &KvBlockParams {
             layer_kv_specs,
             max_context_len: ctx,
@@ -1367,12 +1368,13 @@ fn load_batch_model_gguf(
             kv_quant: opts.kv_quant,
             qjl_quantization: opts.qjl_quantization,
             weights_bytes: weights_size,
+            unified_memory: !device.is_cuda(),
         },
         opts.kv_budget,
     )?;
 
-    let quantizer: Option<Arc<KvQuantizer>> = match opts.kv_quant {
-        KvQuantMode::Off => None,
+    let quantizer: Option<Arc<KvQuantizer>> = match kv_mode {
+        KvQuantMode::Auto | KvQuantMode::Off => None,
         mode => Some(Arc::new(KvQuantizer::new_with_qjl(
             mode.bit_width(),
             topo.head_dim,
@@ -1404,6 +1406,9 @@ struct KvBlockParams {
     /// Runtime size of this model's weights, so the KV grant can be capped
     /// against them: both come out of the same memory.
     weights_bytes: usize,
+    /// Whether the device shares memory with the CPU, which decides if
+    /// automatic quantization is cheap enough to choose unprompted.
+    unified_memory: bool,
 }
 
 /// Sizes the model's KV pool against the global budget, returning
@@ -1418,22 +1423,15 @@ struct KvBlockParams {
 ///
 /// Fails when the budget cannot grant even the 256-block minimum; the
 /// partial grant is released first.
-fn compute_kv_blocks(
-    p: &KvBlockParams,
-    kv_budget: &GlobalKvBudget,
-) -> anyhow::Result<(usize, usize)> {
-    let total_slots = p.max_num_sequences * p.max_context_len;
-    let desired_blocks = total_slots.div_ceil(DEFAULT_BLOCK_SIZE);
-    let min_blocks: usize = 256;
-
-    let per_block_bytes = match p.kv_quant {
-        KvQuantMode::Off => p
+fn kv_bytes_per_block(p: &KvBlockParams, mode: KvQuantMode) -> usize {
+    match mode {
+        KvQuantMode::Auto | KvQuantMode::Off => p
             .layer_kv_specs
             .iter()
             .map(|(n_kv_heads, head_dim)| {
                 DEFAULT_BLOCK_SIZE * (*n_kv_heads) * (*head_dim) * p.dtype.size_in_bytes() * 2
             })
-            .sum::<usize>(),
+            .sum(),
         mode => p
             .layer_kv_specs
             .iter()
@@ -1447,15 +1445,65 @@ fn compute_kv_blocks(
                     kv_quant::quantized_value_bytes_per_head(*head_dim, mode.bit_width());
                 DEFAULT_BLOCK_SIZE * (*n_kv_heads) * (key_bph + value_bph)
             })
-            .sum::<usize>(),
-    };
+            .sum(),
+    }
+}
+
+/// Picks the storage mode for this model's KV blocks.
+///
+/// An explicit mode is honoured as given. On [`KvQuantMode::Auto`] the pool
+/// stays unquantized whenever the capacity the model asks for already fits the
+/// safe ceiling, since exact blocks are both faster and simpler; when it does
+/// not fit, quantizing to [`KvQuantMode::Lossless`] buys roughly four times
+/// the capacity at quality the regression tests bound (softmax L1 and L2
+/// distance against the unquantized reference), which is a better trade than
+/// silently serving fewer sequences or truncating the context. It never
+/// escalates further on its own.
+fn resolve_kv_quant(p: &KvBlockParams, desired_blocks: usize, ceiling: usize) -> KvQuantMode {
+    if p.kv_quant != KvQuantMode::Auto {
+        return p.kv_quant;
+    }
+    // Quantized blocks are packed on the CPU. On unified memory that costs
+    // about 1% of decode throughput (32.6 vs 32.9 tok/s on Phi-3-mini), which
+    // is a bargain for four times the capacity; across a discrete GPU's bus it
+    // is a real transfer per write and nobody has measured it. Choosing it
+    // unprompted there would trade an unmeasured amount of speed for capacity,
+    // so that platform keeps exact blocks and a smaller pool until someone
+    // runs the numbers.
+    if !p.unified_memory {
+        return KvQuantMode::Off;
+    }
+    let exact = kv_bytes_per_block(p, KvQuantMode::Off);
+    if exact == 0 || desired_blocks.saturating_mul(exact) <= ceiling {
+        return KvQuantMode::Off;
+    }
+    KvQuantMode::Lossless
+}
+
+fn compute_kv_blocks(
+    p: &KvBlockParams,
+    kv_budget: &GlobalKvBudget,
+) -> anyhow::Result<(usize, usize, KvQuantMode)> {
+    let total_slots = p.max_num_sequences * p.max_context_len;
+    let desired_blocks = total_slots.div_ceil(DEFAULT_BLOCK_SIZE);
+    let min_blocks: usize = 256;
+
+    let ceiling = crate::common::paged::safe_model_kv_ceiling(p.weights_bytes);
+    let mode = resolve_kv_quant(p, desired_blocks.max(min_blocks), ceiling);
+    let per_block_bytes = kv_bytes_per_block(p, mode);
 
     if per_block_bytes == 0 {
-        return Ok((desired_blocks, 0));
+        return Ok((desired_blocks, 0, mode));
+    }
+
+    if p.kv_quant == KvQuantMode::Auto && mode != KvQuantMode::Off {
+        tracing::info!(
+            mode = mode.label(),
+            "KV blocks quantized automatically: the capacity this model asks for does not fit the safe memory share unquantized"
+        );
     }
 
     let desired_bytes = desired_blocks.max(min_blocks) * per_block_bytes;
-    let ceiling = crate::common::paged::safe_model_kv_ceiling(p.weights_bytes);
     let capped_bytes = desired_bytes.min(ceiling);
     if capped_bytes < desired_bytes {
         tracing::info!(
@@ -1502,7 +1550,89 @@ fn compute_kv_blocks(
         );
     }
 
-    Ok((granted_blocks, granted_bytes))
+    Ok((granted_blocks, granted_bytes, mode))
+}
+
+#[cfg(test)]
+mod kv_quant_decision_tests {
+    use super::*;
+
+    fn params(kv_quant: KvQuantMode, layers: usize, weights_bytes: usize) -> KvBlockParams {
+        KvBlockParams {
+            layer_kv_specs: vec![(8, 128); layers],
+            max_context_len: 4096,
+            max_num_sequences: 8,
+            dtype: DType::BF16,
+            kv_quant,
+            qjl_quantization: false,
+            weights_bytes,
+            unified_memory: true,
+        }
+    }
+
+    /// Contract: an explicit mode is never second-guessed, including `off`,
+    /// which is how an operator says "cost me capacity, not exactness".
+    #[test]
+    fn explicit_mode_is_honoured() {
+        let p = params(KvQuantMode::Off, 36, 8 << 30);
+        assert_eq!(resolve_kv_quant(&p, 1 << 20, 0), KvQuantMode::Off);
+        let p = params(KvQuantMode::Aggressive, 36, 0);
+        assert_eq!(resolve_kv_quant(&p, 1, usize::MAX), KvQuantMode::Aggressive);
+    }
+
+    /// Contract: while the capacity the model wants fits the ceiling, blocks
+    /// stay exact. Quantizing when there is room would cost accuracy and
+    /// decode speed for nothing.
+    #[test]
+    fn auto_stays_exact_when_capacity_fits() {
+        let p = params(KvQuantMode::Auto, 36, 0);
+        assert_eq!(resolve_kv_quant(&p, 1024, usize::MAX), KvQuantMode::Off);
+    }
+
+    /// Contract: when it does not fit, auto quantizes instead of letting the
+    /// pool be capped, since lossless buys roughly four times the capacity at
+    /// quality the regression tests bound.
+    #[test]
+    fn auto_quantizes_rather_than_losing_capacity() {
+        let p = params(KvQuantMode::Auto, 36, 0);
+        let exact = kv_bytes_per_block(&p, KvQuantMode::Off);
+        let blocks = 1024;
+        let tight = blocks * exact / 2;
+        assert_eq!(resolve_kv_quant(&p, blocks, tight), KvQuantMode::Lossless);
+    }
+
+    /// Contract: auto never trades quality on its own. Even when lossless
+    /// still does not fit, it stops there and lets the pool be capped rather
+    /// than silently selecting a lossy mode.
+    #[test]
+    fn auto_never_escalates_past_lossless() {
+        let p = params(KvQuantMode::Auto, 36, 0);
+        assert_eq!(resolve_kv_quant(&p, 1 << 20, 1), KvQuantMode::Lossless);
+    }
+
+    /// Contract: a discrete GPU keeps exact blocks even when the pool is
+    /// tight. Packing runs on the CPU, so on that side of a bus it is a real
+    /// transfer per write and its cost has never been measured; choosing it
+    /// unprompted would trade an unknown amount of speed for capacity.
+    #[test]
+    fn auto_does_not_quantize_across_a_device_bus() {
+        let mut p = params(KvQuantMode::Auto, 36, 0);
+        p.unified_memory = false;
+        assert_eq!(resolve_kv_quant(&p, 1 << 20, 1), KvQuantMode::Off);
+    }
+
+    /// Contract: quantizing actually buys capacity, which is the whole reason
+    /// the automatic path exists.
+    #[test]
+    fn lossless_blocks_are_much_smaller() {
+        let p = params(KvQuantMode::Auto, 36, 0);
+        let exact = kv_bytes_per_block(&p, KvQuantMode::Off);
+        let lossless = kv_bytes_per_block(&p, KvQuantMode::Lossless);
+        assert!(
+            lossless * 2 < exact,
+            "lossless {lossless} should be far below exact {exact}"
+        );
+    }
 }
 
 #[cfg(test)]

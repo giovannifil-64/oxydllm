@@ -320,7 +320,7 @@ impl ModelManager {
             );
         }
         let kv_budget = Arc::new(GlobalKvBudget::new(kv_total));
-        if kv_quant != KvQuantMode::Off {
+        if !matches!(kv_quant, KvQuantMode::Off | KvQuantMode::Auto) {
             tracing::info!(mode = %kv_quant.label(), "KV cache quantization enabled");
             tracing::info!(qjl_quantization, "QJL key quantization configuration");
             tracing::warn!(

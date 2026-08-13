@@ -75,7 +75,7 @@ oxydLLM is built on top of the Candle tensor library. The model layer implements
 
 KV cache quantization uses TurboQuant with MSE-based quantization during the decode phase, reducing memory overhead without significant quality loss. Metal kernels provide fused operations for attention, normalization, and positional embeddings on Apple Silicon.
 
-> Note on `--kv-quant`: the quantization step currently runs on CPU, each KV write transfers the new K/V tensors from GPU to CPU and casts them to F32 before packing. On unified-memory Apple Silicon the transfer is cheap, but on discrete CUDA GPUs the per-step roundtrip can dominate. Enable `--kv-quant` for memory-constrained deployments; leave it `off` when throughput matters and KV memory is not the bottleneck. On-device kernels are on the roadmap.
+> Note on `--kv-quant`: the default is `auto`. Blocks stay unquantized while the capacity a model asks for fits the memory it may safely use, and drop to `lossless` when it does not, which buys roughly four times the capacity rather than serving fewer sequences. Packing runs on the CPU: on unified-memory Apple Silicon that costs about 1 percent of decode throughput (measured 32.6 vs 32.9 tok/s on Phi-3-mini), so `auto` chooses it freely there; across a discrete GPU's bus the per-write transfer is unmeasured, so `auto` never chooses it and blocks stay exact. Set the mode explicitly to override either way. On-device packing kernels are on the roadmap.
 
 ## Supported Models
 Support is per architecture (the `architectures` field in a checkpoint's `config.json`): every checkpoint of a supported architecture loads through the same code path. "Verified" marks the checkpoints that are part of the E2E regression sweep on Apple Silicon; other sizes and finetunes of the same architecture are expected to work but are not regularly tested. See [Benchmarks](#benchmarks) for formats and measured throughput.
@@ -404,11 +404,10 @@ Every option can be set via a CLI flag or an environment variable. CLI flags tak
 | `--max-num-seqs <N>` | `OXYDLLM_MAX_NUM_SEQS` | auto | Max concurrent sequences per model (auto-computed from KV block budget at load time) |
 | `--max-queued-requests <N>` | `OXYDLLM_MAX_QUEUED_REQUESTS` | `200` | Request queue depth; returns HTTP 429 when full |
 | `--devices <IDS>` | `OXYDLLM_DEVICES` | auto | Comma-separated CUDA device indices |
-| `--kv-quant <MODE>` | `OXYDLLM_KV_QUANT` | `off` | KV cache quantization: `off`, `lossless`, `balanced`, `aggressive` |
+| `--kv-quant <MODE>` | `OXYDLLM_KV_QUANT` | `auto` | KV cache storage: `auto` (exact while it fits, lossless when it does not), `off`, `lossless`, `balanced`, `aggressive` |
 | `--stream-experts` | - | automatic | Force SSD expert streaming on a MoE model. By default streaming engages only when the model does not fit in available memory. |
 | `--expert-cache-mb <MB>` | `OXYDLLM_EXPERT_CACHE_MB` | automatic | Override the LRU byte budget for streamed experts; implies `--stream-experts`. |
 | `--shutdown-timeout <SECS>` | `OXYDLLM_SHUTDOWN_TIMEOUT` | `30` | Grace period for in-flight requests on shutdown |
-| `--qjl-quantization` | - | disabled | Enable Stage-2 QJL key residual quantization |
 | `--allow-cpu` | `OXYDLLM_ALLOW_CPU` | disabled | Permit CPU fallback when no GPU is available. By default startup fails fast on a GPU-less host. |
 | `--api-key <KEY>` | `OXYDLLM_API_KEY` | disabled | Require an API key on `/v1/*` and `/metrics` (see [Security](#security)). |
 | `--request-timeout <SECS>` | `OXYDLLM_REQUEST_TIMEOUT` | `300` | Wall-clock timeout per `/v1/chat/completions` request. Non-streaming responses are returned as `408 Request Timeout`; streaming responses emit a final `request_timeout` error chunk followed by `[DONE]`. Set to `0` to disable. |
@@ -473,7 +472,7 @@ Options specific to the `oxydllm run` interactive chat command (not available in
 ```
 
 The following options are shared between `start` and `run`:
-`--models-dir`, `--devices`, `--max-context-len`, `--kv-quant`, `--qjl-quantization`, `--allow-cpu`.
+`--models-dir`, `--devices`, `--max-context-len`, `--kv-quant`, `--allow-cpu`.
 
 ## Known Limitations and Work in Progress
 - GGUF compatibility: i-quants (`IQ*`) and ternary (`TQ*`) types fall back to candle's F32 path instead of the resident Metal fast path (see Features for the supported quants); MoE GGUFs are not yet wired.

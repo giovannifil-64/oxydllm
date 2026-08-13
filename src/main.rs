@@ -170,7 +170,6 @@ Server options (start):
                              - lossless: 4-bit, quality-neutral
                              - balanced: 3-bit, near-identical quality
                              - aggressive: 2-bit, maximum compression
-  --qjl-quantization         Enable Stage-2 QJL key residual quantization (default: disabled)
   --allow-cpu                Allow CPU fallback when no GPU is available (default: GPU required, env: OXYDLLM_ALLOW_CPU)
   --max-num-seqs <N>         Max concurrent sequences per model (default: auto from KV budget, env: OXYDLLM_MAX_NUM_SEQS)
   --max-queued-requests <N>  Max requests queued per model before returning 429 (default: 200, env: OXYDLLM_MAX_QUEUED_REQUESTS)
@@ -189,7 +188,6 @@ Chat options (run):
   --devices <ID>             CUDA device index to use (default: auto, env: OXYDLLM_DEVICES)
   --max-context-len <N>      Max tokens per sequence for KV cache (default: 4096)
   --kv-quant <MODE>          KV cache quantization: auto, off, lossless, balanced, aggressive
-  --qjl-quantization         Enable Stage-2 QJL key residual quantization (default: disabled)
   --allow-cpu                Allow CPU fallback when no GPU is available (default: GPU required, env: OXYDLLM_ALLOW_CPU)
   --draft-model <NAME>       Enable greedy speculative decoding with this draft model
   --stream-experts           Force SSD expert streaming on a MoE model (default: automatic)
@@ -709,7 +707,7 @@ fn parse_start_args(args: &[String]) -> Result<StartArgs, String> {
         .map(|v| common::kv_quant::KvQuantMode::parse(&v))
         .transpose()?
         .unwrap_or(common::kv_quant::KvQuantMode::Auto);
-    let mut qjl_quantization = false;
+    let qjl_quantization = false;
     let env_allow_cpu = std::env::var("OXYDLLM_ALLOW_CPU")
         .ok()
         .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE"))
@@ -764,9 +762,6 @@ fn parse_start_args(args: &[String]) -> Result<StartArgs, String> {
                 shutdown_timeout_secs = next_arg(args, &mut i, "--shutdown-timeout")?
                     .parse()
                     .map_err(|_| "Invalid shutdown-timeout value (expected integer seconds)")?;
-            }
-            "--qjl-quantization" => {
-                qjl_quantization = true;
             }
             "--allow-cpu" => {
                 require_gpu = false;
@@ -860,7 +855,7 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
     let mut devices_raw: Option<Vec<usize>> = None;
     let mut max_context_len: usize = 4096;
     let mut kv_quant = common::kv_quant::KvQuantMode::Auto;
-    let mut qjl_quantization = false;
+    let qjl_quantization = false;
     let env_allow_cpu = std::env::var("OXYDLLM_ALLOW_CPU")
         .ok()
         .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE"))
@@ -933,9 +928,6 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
             "--kv-quant" => {
                 kv_quant =
                     common::kv_quant::KvQuantMode::parse(next_arg(args, &mut i, "--kv-quant")?)?;
-            }
-            "--qjl-quantization" => {
-                qjl_quantization = true;
             }
             "--draft-model" => {
                 draft_name = Some(next_arg(args, &mut i, "--draft-model")?.to_string());

@@ -115,6 +115,22 @@ const KV_TOTAL_FRACTION: f64 = 0.42;
 /// which is what this floor buys them.
 const MIN_USEFUL_KV: usize = 1 << 30;
 
+/// How much memory all loaded models together may occupy before the manager
+/// starts evicting to make room.
+///
+/// This is the implicit default behind LRU eviction when no `--memory-budget`
+/// is given. Without it eviction never ran unprompted: models accumulated
+/// until their keep-alive expired, and a new one that did not fit was refused
+/// while older idle models kept their memory. Making room is what an operator
+/// expects, and it is the same share of physical memory the per-model ceiling
+/// is measured against, so the two agree by construction.
+pub fn safe_total_commitment_bytes() -> usize {
+    match detect_system_memory_bytes() {
+        Some(p) => (p as f64 * KV_TOTAL_FRACTION) as usize,
+        None => usize::MAX,
+    }
+}
+
 /// The most KV a model with `weights_bytes` of weights should pool.
 ///
 /// The pool never exceeds [`KV_POOL_FRACTION`] of physical memory, and weights

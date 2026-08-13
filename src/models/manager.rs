@@ -118,10 +118,15 @@ pub struct EncoderHandle {
 /// outside the lock.
 ///
 /// Eviction rules: models idle past their effective keep-alive are always
-/// evicted; when `memory_budget_bytes` is set, loading a new model first
-/// evicts least-recently-used models until the projected total fits, and a
-/// load whose real size still exceeds the budget is unloaded immediately
-/// after completing.
+/// evicted, and loading a new model first evicts least-recently-used models
+/// until the projected total fits. The ceiling for that is
+/// `memory_budget_bytes` when the operator set one, otherwise the share of
+/// physical memory models may collectively hold
+/// ([`safe_total_commitment_bytes`](crate::common::paged::safe_total_commitment_bytes)),
+/// so room is made without anyone having to know a flag exists. Only an
+/// explicit budget also unloads a model whose real size exceeds it after the
+/// load completes: doing that against an implicit ceiling would throw away the
+/// very model the request asked for.
 pub struct ModelManager {
     models_dir: PathBuf,
     slots: HashMap<String, SlotState>,
@@ -521,10 +526,9 @@ impl ModelManager {
     /// shutdown flag, which makes the engine-loop thread exit and drop the
     /// weights.
     pub fn evict_lru_for_bytes(&mut self, needed_bytes: usize) -> usize {
-        let budget = match self.memory_budget_bytes {
-            Some(b) => b,
-            None => return 0,
-        };
+        let budget = self
+            .memory_budget_bytes
+            .unwrap_or_else(crate::common::paged::safe_total_commitment_bytes);
         let mut evicted = 0;
         loop {
             let used = self.total_loaded_bytes();
@@ -1623,10 +1627,31 @@ mod tests {
     }
 
     #[test]
-    fn evict_lru_returns_zero_when_no_budget() {
+    fn evict_lru_leaves_small_models_alone_without_a_budget() {
         let tmp = tempfile::tempdir().unwrap();
         let mut mgr = build_test_manager(&tmp, Duration::from_secs(60), None);
         assert_eq!(mgr.evict_lru_for_bytes(1_000_000), 0);
+    }
+
+    /// Contract: with no `--memory-budget` the manager still makes room, using
+    /// the share of physical memory models may collectively hold. Before this
+    /// a new model that did not fit was refused while older idle models kept
+    /// their memory, which is not what an operator expects.
+    #[test]
+    fn evict_lru_makes_room_without_an_explicit_budget() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut mgr = build_test_manager(&tmp, Duration::from_secs(60), None);
+        let share = crate::common::paged::safe_total_commitment_bytes();
+        if share == usize::MAX {
+            return;
+        }
+
+        mgr.insert_ready_with_size_for_tests("idle-model", build_dummy_handle(), share, 0);
+        assert_eq!(mgr.list_running().len(), 1);
+
+        let evicted = mgr.evict_lru_for_bytes(share / 2);
+        assert_eq!(evicted, 1, "the idle model must be evicted to make room");
+        assert!(mgr.list_running().is_empty());
     }
 
     #[test]

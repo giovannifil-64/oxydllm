@@ -2,6 +2,32 @@
 
 All notable changes to this project will be documented in this file.
 
+## 0.0.0-alpha.15
+
+- Three memory-sizing defects that silently corrupted output are fixed. Any checkpoint whose weights and KV cache together crowded the GPU could produce a stream of unrelated tokens with nothing logged: on this machine Phi-3-mini-4k-instruct-Q4 emitted a ramp of consecutive byte tokens at 3.5 tok/s and now answers correctly at 29.8, Phi-3.5-mini-instruct went from timing out at 2.6 tok/s to 14.3, and Qwen3-4B-Instruct-2507-FP8 stopped emitting a degenerate token stream. Nothing needs to be configured; the sizing changed underneath.
+- Text embeddings arrive at `POST /v1/embeddings`, covering both encoder-only models (BERT and RoBERTa families) and causal last-token-pooling embedders (Qwen3-Embedding), verified against sentence-transformers rather than by eye.
+- Structured output is now guaranteed rather than validated after the fact: with `response_format` set, the sampler masks any token that would break the JSON, so a completion that stops on its own is always parsable and always matches the schema.
+
+### New Features
+- `POST /v1/embeddings` (`src/models/encoder.rs`, `src/server/routes/embeddings.rs`): a self-contained encoder runtime with bidirectional attention, LayerNorm with bias computed in F32, the exact erf GELU rather than the tanh approximation, RoBERTa's pad-offset position ids, CLS or mean pooling read from `1_Pooling/config.json`, and L2 normalisation. Causal embedders share the decoder's RMSNorm, RoPE and per-head qk-norm, append the EOS the pooling expects, and auto-detect the prefix-less tensor naming that sentence-transformers exports. Encoders stay resident in the manager cache.
+- Grammar-constrained decoding (`src/constrain.rs`): a byte-level JSON automaton drives a per-token mask, so `json_object` and `json_schema` requests cannot emit invalid JSON. Schema guidance covers object keys, types, enums, integers, and `required`, resolves `$ref` through `$defs`, and falls back to syntax-only masking (which stays sound) for constructs it cannot compile. EOS is only allowed at an accepting state. Constrained sequences opt out of speculative decoding, and the constraint is skipped, leaving post-hoc validation, when thinking or harmony channels are active.
+
+### Reliability and Correctness
+- KV pools are sized from physical memory and capped per model (`src/common/paged.rs`). The budget used to be 55 percent of a free-memory snapshot taken before any model was known, with concurrency then derived from the result: supply-driven and circular, so the same model got 4.6 GB on one run and 10 GB on the next depending on what else the machine was doing. Weights and pool are now bounded together, with a floor that keeps models too large for the rule servable.
+- The device is drained once the model has loaded (`src/models/loader.rs`). A Metal command buffer that fails while uploading weights reports the failure only at a synchronization point; without the drain the load reported success and the first forward read buffers the writes had never reached. It now surfaces as a load error instead of a corrupt model. Reproduced deterministically: the final norm checksummed 5,592,404,480 on the first forward against 9,073,553 on every later one.
+- The streamed-expert cache no longer commits the whole memory envelope (`src/models/loader.rs`). It took `available - non_expert - 2 GB` from a kernel pressure metric, which on a 24 GB machine meant a 14 GB cache and 19 GB committed, surfacing as Metal out-of-memory or as recycled buffers reappearing as out-of-range router indices. Models that fit resident are still never demoted to streaming.
+- Router indices read back from the device are validated before they index the per-expert tables: out of range, or repeated within one top-k row, now fails the request instead of panicking the engine loop or silently routing to the wrong experts. Measured at 0.6 us per token across 40 layers.
+- A panicking engine loop no longer leaves a model permanently unusable: a drop guard on the engine thread removes the stale slot and releases its KV budget, so the next request reloads the model instead of receiving 503 forever.
+
+### Build and Tooling
+- Rust 1.94 is declared as the minimum supported version, so older toolchains fail immediately with a clear message instead of a misleading error from a transitive dependency. The full test suite was executed green on every stable release from 1.94.1 through 1.97.1.
+- CI gained a blocking MSRV job and a non-blocking latest-stable job, plus a weekly workflow that runs the suite across every supported toolchain.
+- The regression sweep runs every verified checkpoint by default, with no opt-in flags, and persists results after each model so an interrupted run keeps its measurements.
+
+### Tests
+- 344 unit tests green, including contract tests for the KV ceiling, the router-index validation, and the engine-loop self-heal.
+- Full regression sweep over all 32 verified checkpoints: 30/30 coherence (up from 27/30) and 2/2 embedding models with bitwise-deterministic vectors. No model regressed. Four small models measured 7 to 8 percent slower than the previous sweep, but three of them receive an identical KV pool before and after the change, so the difference is run-to-run variance across two weeks rather than an effect of it; measured again within a single session the same model varies by about 1 percent.
+
 ## 0.0.0-alpha.14
 
 - SSD expert streaming: Mixture-of-Experts checkpoints larger than memory now run by keeping only the router-selected experts resident. The decision is automatic: at load the checkpoint's expert and non-expert tensor sizes are compared against the memory envelope (the operator's `--memory-budget`, or the kernel's own availability metric), and streaming engages only when the model does not fit; models that fit keep loading fully resident, which is always fastest. Dense checkpoints are rejected for streaming with an explicit message: dense decode is capped at SSD bandwidth divided by model size, well below one token per second for any model that would need it.

@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## Unreleased
+
+- The server sizes itself. KV blocks stay exact while the capacity a model asks for fits the memory it may safely use and quantize losslessly when it does not, so Phi-3-mini serves eight concurrent sequences in 3.25 GB where it served four in 6.0. Loading a model that does not fit now evicts idle ones to make room instead of failing, which previously required knowing that `--memory-budget` existed.
+
+### New Features
+- KV block storage is chosen per model (`--kv-quant auto`, the new default). Exact blocks are kept while the capacity a model asks for fits its share of memory; beyond that, quantizing losslessly buys roughly four times the capacity, which beats serving fewer sequences or truncating context. Packing runs on the CPU, so the automatic choice is made only on unified memory, where it costs about 1 percent of decode throughput (32.6 vs 32.9 tok/s on Phi-3-mini); across a discrete GPU's bus the cost is unmeasured and blocks stay exact until someone measures it. `balanced` and `aggressive` trade quality for space and stay opt-in.
+- LRU eviction runs without being configured. The ceiling is `--memory-budget` when set, otherwise the share of physical memory models may collectively hold, so a new model evicts idle ones rather than failing: loading gpt-oss-20b next to a resident Phi-3-mini was refused outright before and now evicts it. Only an explicit budget also unloads a model that exceeds it after loading, since doing that against an implicit ceiling would discard the very model the request asked for.
+
+### Removed
+- `--qjl-quantization` is gone from the command line. It was read only when `--kv-quant` was also given, so on its own it did nothing and nothing said so. The capability remains internally, where whether it belongs in the automatic lossless mode is a question to measure rather than delete.
+
+### Tests
+- 351 unit tests green. Full regression sweep over all 32 verified checkpoints re-run after the automatic sizing landed: 30/30 coherence held, 2/2 embedding models bitwise-deterministic, no model regressed beyond the run-to-run noise band.
+
 ## 0.0.0-alpha.15
 
 - Three memory-sizing defects that silently corrupted output are fixed. Any checkpoint whose weights and KV cache together crowded the GPU could produce a stream of unrelated tokens with nothing logged: on this machine Phi-3-mini-4k-instruct-Q4 emitted a ramp of consecutive byte tokens at 3.5 tok/s and now answers correctly at 29.8, Phi-3.5-mini-instruct went from timing out at 2.6 tok/s to 14.3, and Qwen3-4B-Instruct-2507-FP8 stopped emitting a degenerate token stream. Nothing needs to be configured; the sizing changed underneath.

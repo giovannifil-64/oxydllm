@@ -450,6 +450,10 @@ impl StandardTransformer {
 }
 
 impl BatchModel for StandardTransformer {
+    fn weight_fingerprint(&self) -> Option<f64> {
+        self.norm.fingerprint()
+    }
+
     fn forward_batch(
         &self,
         token_ids: &Tensor,

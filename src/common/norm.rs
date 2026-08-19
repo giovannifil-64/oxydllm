@@ -33,6 +33,24 @@ pub struct RMSNorm {
 }
 
 impl RMSNorm {
+    /// Folds the weight into one number, for the loader's check that a model's
+    /// weights survived the allocations made around them. Position-weighted so
+    /// a reordering or a partially written buffer moves the result.
+    pub(crate) fn fingerprint(&self) -> Option<f64> {
+        let v = self
+            .weight
+            .flatten_all()
+            .and_then(|t| t.to_dtype(candle_core::DType::F32))
+            .and_then(|t| t.to_vec1::<f32>())
+            .ok()?;
+        Some(
+            v.iter()
+                .enumerate()
+                .map(|(i, x)| (i as f64 + 1.0) * (*x as f64))
+                .sum(),
+        )
+    }
+
     /// Builds a norm from a weight tensor, folding the [`NormType`] into it.
     ///
     /// For [`NormType::Gemma`] the stored weight is centred at zero, so `1.0` is

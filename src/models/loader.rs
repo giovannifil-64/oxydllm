@@ -777,36 +777,109 @@ pub struct LoadBatchOptions<'a> {
 /// Fails when the architecture is unsupported, weight files are missing or
 /// malformed, the KV budget cannot grant a minimum pool, or a MoE model
 /// cannot fit even with expert streaming.
+/// Halvings allowed before a load gives up on finding a pool the weights
+/// survive. Four takes a 12 GB request down to 750 MB, past anything that has
+/// ever been needed, and bounds the cost of a machine that keeps failing.
+const KV_RETRY_HALVINGS: usize = 4;
+
 pub fn load_batch_model(
     model_dir: &str,
     model_id: &str,
     device: &Device,
     opts: LoadBatchOptions<'_>,
 ) -> anyhow::Result<(Box<dyn BatchModel>, usize)> {
-    let loaded = if is_gguf_model(model_dir) {
-        load_batch_model_gguf(model_dir, model_id, device, opts)
-    } else {
-        let dtype = if matches!(device, Device::Cpu) {
-            DType::F32
-        } else {
-            DType::BF16
-        };
-        let cfg = hf_parser::parse(&format!("{}/config.json", model_dir))?;
-        load_standard_safetensors(cfg, model_dir, device, dtype, opts)
-    };
+    let mut cap: Option<usize> = None;
 
-    // The weight uploads and the KV pool allocation are both still queued at
-    // this point. Reading a weight from the first forward without draining
-    // returns whatever the buffer held before the upload landed: measured on
-    // Qwen3-4B-Instruct-2507-FP8, the final norm checksummed 5_592_404_480 on
-    // the first forward against 9_073_553 on every later one, deterministically,
-    // and the request decoded a degenerate token stream. A larger KV pool
-    // widens the window, which is why the failure looked like a memory
-    // threshold. One drain closes it.
-    if loaded.is_ok() {
+    for attempt in 0..=KV_RETRY_HALVINGS {
+        let opts = LoadBatchOptions {
+            kv_budget: opts.kv_budget,
+            ..opts
+        };
+        let loaded = if is_gguf_model(model_dir) {
+            load_batch_model_gguf(model_dir, model_id, device, opts, cap)
+        } else {
+            let dtype = if matches!(device, Device::Cpu) {
+                DType::F32
+            } else {
+                DType::BF16
+            };
+            let cfg = hf_parser::parse(&format!("{}/config.json", model_dir))?;
+            load_standard_safetensors(cfg, model_dir, device, dtype, opts, cap)
+        };
+
+        let (model, weights_size) = loaded?;
+
+        // The weight uploads and the KV pool allocation are both queued work at
+        // this point. Draining reports a command buffer that failed outright;
+        // it does not report the case where a pool simply crowded the weights,
+        // which stays silent and surfaces as a first forward reading buffers
+        // the writes never reached.
         crate::common::weights::drain_metal(device, "model load")?;
+        if weights_read_consistently(model.as_ref(), device) {
+            return Ok((model, weights_size));
+        }
+
+        let pool_bytes = kv_pool_bytes(model.as_ref());
+        drop(model);
+        crate::common::weights::drain_metal(device, "failed attempt reclamation").ok();
+
+        if attempt == KV_RETRY_HALVINGS || pool_bytes == 0 {
+            anyhow::bail!(
+                "model '{model_id}' loaded but its weights did not survive the KV pool \
+                 allocation, and halving the pool {KV_RETRY_HALVINGS} times did not help; \
+                 free memory or pin a smaller --memory-budget"
+            );
+        }
+        let next = pool_bytes / 2;
+        tracing::warn!(
+            model_id,
+            pool_gb = pool_bytes as f64 / 1_073_741_824.0,
+            retry_gb = next as f64 / 1_073_741_824.0,
+            "weights did not survive this KV pool; retrying with half of it"
+        );
+        cap = Some(next);
     }
-    loaded
+    unreachable!("the loop returns or bails on the last attempt")
+}
+
+/// Bytes the model's KV pools currently hold, for halving on a retry.
+fn kv_pool_bytes(model: &dyn BatchModel) -> usize {
+    let mut seen: Vec<usize> = Vec::new();
+    let mut total = 0;
+    for a in model.allocators() {
+        let ptr = Arc::as_ptr(a) as usize;
+        if seen.contains(&ptr) {
+            continue;
+        }
+        seen.push(ptr);
+        total += a.lock().map(|g| g.pool_bytes()).unwrap_or(0);
+    }
+    total
+}
+
+/// Whether a freshly loaded model reads back the same weight twice.
+///
+/// Two reads of one small tensor, a drain apart. They agree on every load that
+/// goes on to answer correctly. They disagree exactly when the allocations made
+/// around the weights cost some of their writes: measured on
+/// Qwen3-4B-Instruct-2507-FP8 with an oversized pool, the first read returned
+/// 5_592_404_480 and every later one 9_073_553, deterministically across three
+/// runs, and that load went on to emit a degenerate token stream. The device
+/// reports nothing in that case, which is why this check exists at all.
+///
+/// `true` when the model exposes no fingerprint, since absence of a check is
+/// not evidence of a fault.
+fn weights_read_consistently(model: &dyn BatchModel, device: &Device) -> bool {
+    let Some(first) = model.weight_fingerprint() else {
+        return true;
+    };
+    if crate::common::weights::drain_metal(device, "fingerprint check").is_err() {
+        return false;
+    }
+    match model.weight_fingerprint() {
+        Some(second) => first == second,
+        None => true,
+    }
 }
 
 /// Sums a checkpoint's tensor bytes as they will exist at runtime, split into
@@ -939,6 +1012,7 @@ fn load_standard_safetensors(
     device: &Device,
     dtype: DType,
     opts: LoadBatchOptions<'_>,
+    retry_cap: Option<usize>,
 ) -> anyhow::Result<(Box<dyn BatchModel>, usize)> {
     let weight_paths = resolve_weight_paths(model_dir)?;
     let weight_path_refs: Vec<&str> = weight_paths.iter().map(|s| s.as_str()).collect();
@@ -1053,6 +1127,7 @@ fn load_standard_safetensors(
             qjl_quantization: opts.qjl_quantization,
             weights_bytes: weights_size,
             unified_memory: !device.is_cuda(),
+            retry_cap,
         },
         opts.kv_budget,
     )?;
@@ -1315,6 +1390,7 @@ fn load_batch_model_gguf(
     model_id: &str,
     device: &Device,
     opts: LoadBatchOptions<'_>,
+    retry_cap: Option<usize>,
 ) -> anyhow::Result<(Box<dyn BatchModel>, usize)> {
     let dir = Path::new(model_dir);
     let all_gguf_paths = find_gguf_files(dir)
@@ -1369,6 +1445,7 @@ fn load_batch_model_gguf(
             qjl_quantization: opts.qjl_quantization,
             weights_bytes: weights_size,
             unified_memory: !device.is_cuda(),
+            retry_cap,
         },
         opts.kv_budget,
     )?;
@@ -1409,6 +1486,9 @@ struct KvBlockParams {
     /// Whether the device shares memory with the CPU, which decides if
     /// automatic quantization is cheap enough to choose unprompted.
     unified_memory: bool,
+    /// Upper bound on pool bytes imposed by a previous attempt whose weights
+    /// did not survive; `None` on the first try.
+    retry_cap: Option<usize>,
 }
 
 /// Sizes the model's KV pool against the global budget, returning
@@ -1488,7 +1568,8 @@ fn compute_kv_blocks(
     let desired_blocks = total_slots.div_ceil(DEFAULT_BLOCK_SIZE);
     let min_blocks: usize = 256;
 
-    let ceiling = crate::common::paged::safe_model_kv_ceiling(p.weights_bytes);
+    let ceiling = crate::common::paged::safe_model_kv_ceiling(p.weights_bytes)
+        .min(p.retry_cap.unwrap_or(usize::MAX));
     let mode = resolve_kv_quant(p, desired_blocks.max(min_blocks), ceiling);
     let per_block_bytes = kv_bytes_per_block(p, mode);
 
@@ -1567,6 +1648,7 @@ mod kv_quant_decision_tests {
             qjl_quantization: false,
             weights_bytes,
             unified_memory: true,
+            retry_cap: None,
         }
     }
 

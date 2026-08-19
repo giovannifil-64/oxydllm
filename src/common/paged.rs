@@ -78,6 +78,16 @@ pub fn detect_system_kv_budget(memory_budget_bytes: Option<usize>, is_cpu: bool)
     ((base as f64 * kv_fraction) as usize).saturating_sub(headroom)
 }
 
+/// Where a model's first attempt at a KV pool starts, as a share of physical
+/// memory.
+///
+/// This is a starting point, not a guarantee. Correctness comes from the
+/// loader checking that the weights survived the allocation and halving the
+/// pool until they do, so a value that is too generous costs one extra load
+/// attempt rather than the silent output corruption it used to. It is kept
+/// near the measured-good band anyway, since paying for a retry on every
+/// startup would be its own kind of wrong.
+///
 /// Largest share of physical memory one model's KV pool may occupy on its own.
 ///
 /// Bounds the pool for models light enough that [`KV_TOTAL_FRACTION`] leaves
@@ -95,6 +105,10 @@ pub fn detect_system_kv_budget(memory_budget_bytes: Option<usize>, is_cpu: bool)
 /// staying inside the measured-good band is the defence, not the explanation.
 const KV_POOL_FRACTION: f64 = 0.25;
 
+/// Where the first attempt starts for weights and pool together, as a share of
+/// physical memory. A starting point like [`KV_POOL_FRACTION`], with the same
+/// caveat: the loader's verification is what makes the result correct.
+///
 /// Largest share of physical memory weights and KV pool may occupy together.
 ///
 /// Measured on a 24 GB M5. Phi-3-mini-4k-instruct-Q4 is correct at 8.2 GB

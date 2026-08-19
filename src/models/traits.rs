@@ -18,6 +18,20 @@ pub trait BatchModel {
 
     fn allocators(&self) -> &[SharedBlockAllocator];
 
+    /// A number folded from one small resident weight, for checking that the
+    /// weights a load produced are the weights it read.
+    ///
+    /// Weight uploads and the KV pool allocation are both queued work on the
+    /// same device, and a failure in the first is not always reported: a load
+    /// can report success while a buffer's writes never landed, after which the
+    /// first forward reads whatever the buffer held before. Comparing this
+    /// before and after the pool exists catches that, which is what lets the
+    /// loader size the pool by trying rather than by a constant fitted on one
+    /// machine. `None` when the model exposes no suitable tensor.
+    fn weight_fingerprint(&self) -> Option<f64> {
+        None
+    }
+
     /// True for hybrid models whose linear-attention layers carry per-sequence
     /// recurrent state. Such state cannot skip tokens (prefix cache) or roll
     /// back (speculative decoding), so the engine disables both.

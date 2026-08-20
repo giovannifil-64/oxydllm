@@ -227,8 +227,17 @@ impl Tokenizer {
 
         let mut file = std::fs::File::open(gguf_path)
             .with_context(|| format!("Failed to open GGUF file: {}", gguf_path))?;
-        let content = gguf_file::Content::read(&mut file)
-            .map_err(|e| anyhow::anyhow!("Failed to parse GGUF: {}", e))?;
+        let content = gguf_file::Content::read(&mut file).map_err(|e| {
+            let hint = if e.to_string().contains("unknown dtype") {
+                ": the file stores tensors in a quantization this engine cannot read. \
+                 Dynamic mixed-precision builds (unsloth's UD-* variants) use the IQ \
+                 family, which candle does not decode; pick a plain variant such as \
+                 Q4_0, Q4_K_M or Q8_0 from the same repository"
+            } else {
+                ""
+            };
+            anyhow::anyhow!("Failed to parse GGUF: {e}{hint}")
+        })?;
         Self::from_gguf_content(&content)
     }
 

@@ -52,7 +52,49 @@ fn has_split_suffix(filename: &str) -> bool {
     stem != strip_split_suffix(stem)
 }
 
+/// Drops GGUF files that are not variants of the repository's model.
+///
+/// Quantization repositories ship companions next to the model: multimodal
+/// projectors (`mmproj-BF16.gguf`), speculative-decoding modules, and whatever
+/// comes next. They are valid GGUF and would otherwise be offered as choices,
+/// so on unsloth/Qwen3.8-27B-GGUF the menu listed "BF16, 888 MB" for a 27B
+/// model whose real BF16 is 55 GB, and picking it would download something that
+/// cannot answer a request.
+///
+/// The rule names none of them: a repository's model variants share the model's
+/// name, so the most common leading name wins and everything else is a
+/// companion. Repositories with a single variant keep it either way.
+fn keep_model_variants(files: &[(String, u64)]) -> Vec<(String, u64)> {
+    let lead = |name: &str| -> String {
+        name.rsplit('/')
+            .next()
+            .unwrap_or(name)
+            .split('-')
+            .next()
+            .unwrap_or("")
+            .to_lowercase()
+    };
+
+    let mut counts: Vec<(String, usize)> = Vec::new();
+    for (name, _) in files {
+        let l = lead(name);
+        match counts.iter_mut().find(|(k, _)| *k == l) {
+            Some(c) => c.1 += 1,
+            None => counts.push((l, 1)),
+        }
+    }
+    let Some((dominant, _)) = counts.into_iter().max_by_key(|(_, n)| *n) else {
+        return files.to_vec();
+    };
+    files
+        .iter()
+        .filter(|(name, _)| lead(name) == dominant)
+        .cloned()
+        .collect()
+}
+
 fn group_gguf_variants(gguf_files: &[(String, u64)]) -> Vec<GgufVariant> {
+    let gguf_files = &keep_model_variants(gguf_files);
     let mut groups: Vec<(String, Vec<(String, u64)>)> = Vec::new();
 
     for (name, size) in gguf_files {
@@ -718,6 +760,57 @@ mod tests {
         assert!(!is_relevant_file("sub/config.json")); // nested
         assert!(!is_relevant_file(".hidden.json")); // dotfile
         assert!(!is_relevant_file("consolidated.safetensors")); // excluded by name
+    }
+
+    /// Contract: a repository's companions are not offered as models. On
+    /// unsloth/Qwen3.8-27B-GGUF the projectors are valid GGUF a tenth the size
+    /// of the smallest real variant, and picking one downloads something that
+    /// cannot answer a request.
+    #[test]
+    fn companion_files_are_not_offered_as_variants() {
+        let files = vec![
+            ("Qwen3.8-27B-UD-Q4_K_M.gguf".to_string(), 15_000u64),
+            ("Qwen3.8-27B-UD-Q6_K_XL.gguf".to_string(), 22_000u64),
+            ("Qwen3.8-27B-Q4_0.gguf".to_string(), 14_000u64),
+            ("mmproj-BF16.gguf".to_string(), 888u64),
+            ("mmproj-F16.gguf".to_string(), 885u64),
+        ];
+        let names: Vec<String> = group_gguf_variants(&files)
+            .into_iter()
+            .map(|v| v.quant_name)
+            .collect();
+        assert!(
+            !names.iter().any(|n| n == "BF16" || n == "F16"),
+            "{names:?}"
+        );
+        assert_eq!(names.len(), 3, "{names:?}");
+    }
+
+    /// Contract: a repository with only one family keeps it, whatever it is
+    /// named, so the filter cannot empty a listing.
+    #[test]
+    fn a_single_family_survives_the_companion_filter() {
+        let files = vec![("mmproj-BF16.gguf".to_string(), 888u64)];
+        assert_eq!(group_gguf_variants(&files).len(), 1);
+    }
+
+    /// Contract: suffixes publishers invent survive instead of being truncated
+    /// onto an existing label. `Q6_K`, `Q6_K_M` and `Q6_K_XL` ship side by side
+    /// and used to collapse into three entries all called `Q6_K`.
+    #[test]
+    fn invented_quant_suffixes_stay_distinct() {
+        let files = vec![
+            ("m-UD-Q6_K.gguf".to_string(), 1u64),
+            ("m-UD-Q6_K_M.gguf".to_string(), 2u64),
+            ("m-UD-Q6_K_XL.gguf".to_string(), 3u64),
+            ("m-UD-Q8_K_XL.gguf".to_string(), 4u64),
+        ];
+        let mut names: Vec<String> = group_gguf_variants(&files)
+            .into_iter()
+            .map(|v| v.quant_name)
+            .collect();
+        names.sort();
+        assert_eq!(names, ["Q6_K", "Q6_K_M", "Q6_K_XL", "Q8_K_XL"]);
     }
 
     #[test]

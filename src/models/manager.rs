@@ -1044,7 +1044,7 @@ fn spawn_load(params: SpawnLoadParams) {
         let tokenizer = match Tokenizer::from_dir(&model_dir) {
             Ok(t) => Arc::new(t),
             Err(e) => {
-                let _ = result_tx.send(Err(format!("Failed to load tokenizer: {e}")));
+                let _ = result_tx.send(Err(format!("Failed to load tokenizer: {e:#}")));
                 return;
             }
         };
@@ -1053,7 +1053,7 @@ fn spawn_load(params: SpawnLoadParams) {
         let device = match loader::select_device_at(cuda_idx, require_gpu_thread) {
             Ok(d) => d,
             Err(e) => {
-                let _ = result_tx.send(Err(format!("Failed to select device: {e}")));
+                let _ = result_tx.send(Err(format!("Failed to select device: {e:#}")));
                 return;
             }
         };
@@ -1088,7 +1088,7 @@ fn spawn_load(params: SpawnLoadParams) {
                 if let Some(reserved) = draft_kv_reservation {
                     kv_budget.release(reserved);
                 }
-                let _ = result_tx.send(Err(format!("Failed to load model: {e}")));
+                let _ = result_tx.send(Err(format!("Failed to load model: {e:#}")));
                 return;
             }
         };

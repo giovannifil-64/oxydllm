@@ -546,27 +546,44 @@ fn print_accuracy_line(quant: &str) {
     println!();
 }
 
+/// The quantization label carried by a GGUF filename, e.g. `Q4_K_M` from
+/// `Qwen3.8-27B-UD-Q4_K_M.gguf`.
+///
+/// Reads the label from the name's structure rather than matching a list of
+/// known ones, because publishers keep inventing suffixes: unsloth's dynamic
+/// quants alone add `_XL` to most of the K family, and a fixed list silently
+/// truncates `Q6_K_XL` to `Q6_K`, which then collides with the real `Q6_K` and
+/// with `Q6_K_M` in the same repository. A label is the last dash-separated
+/// segment that opens like a quantization (`Q4`, `IQ2`, `BF16`, `F16`, `F32`),
+/// taken whole, so an unfamiliar suffix survives instead of being cut off.
 pub fn extract_quant_from_filename(filename: &str) -> Option<String> {
-    const KNOWN: &[&str] = &[
-        "IQ1_S", "IQ1_M", "IQ2_XXS", "IQ2_XS", "IQ2_S", "IQ2_M", "IQ3_XXS", "IQ3_XS", "IQ3_S",
-        "IQ3_M", "IQ3_K_S", "IQ3_K_M", "IQ4_NL", "IQ4_XS", "Q2_K_S", "Q2_K", "Q3_K_S", "Q3_K_M",
-        "Q3_K_L", "Q3_K", "Q4_0", "Q4_1", "Q4_K_S", "Q4_K_M", "Q4_K", "Q5_0", "Q5_1", "Q5_K_S",
-        "Q5_K_M", "Q5_K", "Q6_K_L", "Q6_K", "Q8_0", "Q8_K_M", "Q8_K_S", "Q8_K", "BF16", "F16",
-        "F32",
-    ];
+    let stem = filename
+        .rsplit('/')
+        .next()
+        .unwrap_or(filename)
+        .strip_suffix(".gguf")
+        .unwrap_or(filename);
 
-    let upper = filename.to_uppercase();
-    for &q in KNOWN {
-        if let Some(pos) = upper.find(q) {
-            let before_ok = pos == 0 || !upper.as_bytes()[pos - 1].is_ascii_alphanumeric();
-            let end = pos + q.len();
-            let after_ok = end >= upper.len() || !upper.as_bytes()[end].is_ascii_alphanumeric();
-            if before_ok && after_ok {
-                return Some(q.to_string());
-            }
-        }
+    stem.split('-')
+        .rfind(|seg| is_quant_segment(seg))
+        .map(|seg| seg.to_uppercase())
+}
+
+/// Whether a filename segment opens like a quantization label.
+fn is_quant_segment(seg: &str) -> bool {
+    let u = seg.to_uppercase();
+    if matches!(u.as_str(), "BF16" | "F16" | "F32") {
+        return true;
     }
-    None
+    let rest = u
+        .strip_prefix("IQ")
+        .or_else(|| u.strip_prefix('Q'))
+        .unwrap_or("");
+    let mut chars = rest.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_digit() => chars.all(|c| c.is_ascii_alphanumeric() || c == '_'),
+        _ => false,
+    }
 }
 
 fn detect_quant_from_content(content: &gguf_file::Content) -> Option<String> {

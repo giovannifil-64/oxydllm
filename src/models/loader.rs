@@ -650,10 +650,28 @@ fn discover_gguf_model(id: &str, gguf_path: &Path) -> Option<DiscoveredModel> {
 /// file and no config.json (config.json wins when both exist).
 pub fn is_gguf_model(model_dir: &str) -> bool {
     let dir = Path::new(model_dir);
-    if dir.join("config.json").exists() {
+    if find_gguf_file(dir).is_none() {
         return false;
     }
-    find_gguf_file(dir).is_some()
+    // Weights decide, not metadata: GGUF repositories commonly ship a
+    // config.json next to the quantized files, and treating its presence as
+    // proof of a safetensors checkpoint sent the loader looking for a
+    // model.safetensors that was never there.
+    !has_safetensors(dir)
+}
+
+/// Whether the directory holds safetensors weights.
+fn has_safetensors(dir: &Path) -> bool {
+    std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .any(|e| {
+            e.path()
+                .extension()
+                .and_then(|x| x.to_str())
+                .is_some_and(|x| x.eq_ignore_ascii_case("safetensors"))
+        })
 }
 
 /// Logs whether the CUDA device meets the minimum supported compute
@@ -1632,6 +1650,41 @@ fn compute_kv_blocks(
     }
 
     Ok((granted_blocks, granted_bytes, mode))
+}
+
+#[cfg(test)]
+mod model_kind_tests {
+    use super::*;
+
+    /// Contract: a GGUF directory stays a GGUF directory when the publisher
+    /// also ships a config.json, which most quantization repositories do.
+    /// Treating that file as proof of a safetensors checkpoint sent the loader
+    /// after a model.safetensors that does not exist.
+    #[test]
+    fn config_json_alone_does_not_make_a_safetensors_model() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("config.json"), "{}").unwrap();
+        std::fs::write(d.path().join("m-Q4_0.gguf"), b"GGUF").unwrap();
+        assert!(is_gguf_model(d.path().to_str().unwrap()));
+    }
+
+    /// Contract: real safetensors weights win, even next to a GGUF file.
+    #[test]
+    fn safetensors_weights_take_precedence() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("config.json"), "{}").unwrap();
+        std::fs::write(d.path().join("model.safetensors"), b"x").unwrap();
+        std::fs::write(d.path().join("m-Q4_0.gguf"), b"GGUF").unwrap();
+        assert!(!is_gguf_model(d.path().to_str().unwrap()));
+    }
+
+    /// Contract: a directory with neither is not a GGUF model.
+    #[test]
+    fn a_directory_without_gguf_is_not_gguf() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("config.json"), "{}").unwrap();
+        assert!(!is_gguf_model(d.path().to_str().unwrap()));
+    }
 }
 
 #[cfg(test)]

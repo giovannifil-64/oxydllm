@@ -112,7 +112,24 @@ fn positive_f64(gguf: &GgufWeights, key: &str) -> Option<f64> {
 pub(crate) fn parse_gguf_topology(gguf: &GgufWeights) -> anyhow::Result<GgufTopology> {
     let arch = gguf.architecture()?;
     let prefix = &arch;
-    let num_hidden_layers = gguf.metadata_u32(&format!("{prefix}.block_count"))? as usize;
+    // `block_count` counts every block in the file, and some checkpoints append
+    // multi-token-prediction heads after the transformer stack: Qwen3.8-27B
+    // ships 65 blocks for a 64-layer model, the last being a NextN head with a
+    // different tensor set that the block loader cannot build. The metadata
+    // says how many trailing blocks are prediction heads, so drop them.
+    let block_count = gguf.metadata_u32(&format!("{prefix}.block_count"))? as usize;
+    let predict_layers = gguf
+        .metadata_u32(&format!("{prefix}.nextn_predict_layers"))
+        .unwrap_or(0) as usize;
+    let num_hidden_layers = block_count.saturating_sub(predict_layers).max(1);
+    if predict_layers > 0 {
+        tracing::info!(
+            block_count,
+            predict_layers,
+            num_hidden_layers,
+            "checkpoint carries multi-token-prediction heads; they are not part of the transformer stack"
+        );
+    }
     let num_attention_heads =
         gguf.metadata_u32(&format!("{prefix}.attention.head_count"))? as usize;
     let num_key_value_heads =

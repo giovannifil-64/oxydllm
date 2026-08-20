@@ -86,11 +86,26 @@ fn keep_model_variants(files: &[(String, u64)]) -> Vec<(String, u64)> {
     let Some((dominant, _)) = counts.into_iter().max_by_key(|(_, n)| *n) else {
         return files.to_vec();
     };
-    files
+    let same_family: Vec<(String, u64)> = files
         .iter()
         .filter(|(name, _)| lead(name) == dominant)
         .cloned()
-        .collect()
+        .collect();
+
+    // A variant carries a quantization in its name. Files that do not, like the
+    // importance matrix bartowski ships as `<model>-imatrix.gguf`, share the
+    // model's name and would otherwise be offered as a 10 MB choice. Only apply
+    // this when some file does carry one, so a repository publishing a single
+    // plain `model.gguf` keeps it.
+    let labelled =
+        |name: &str| crate::models::estimate::extract_quant_from_filename(name).is_some();
+    if same_family.iter().any(|(n, _)| labelled(n)) {
+        return same_family
+            .into_iter()
+            .filter(|(n, _)| labelled(n))
+            .collect();
+    }
+    same_family
 }
 
 fn group_gguf_variants(gguf_files: &[(String, u64)]) -> Vec<GgufVariant> {
@@ -784,6 +799,32 @@ mod tests {
             "{names:?}"
         );
         assert_eq!(names.len(), 3, "{names:?}");
+    }
+
+    /// Contract: files without a quantization in their name are not variants.
+    /// bartowski ships `<model>-imatrix.gguf`, which shares the model's name
+    /// and is 10 MB, and it used to be offered as something downloadable.
+    #[test]
+    fn unlabelled_files_are_not_offered_as_variants() {
+        let files = vec![
+            ("Qwen3.8-27B-Q2_K.gguf".to_string(), 11_000u64),
+            ("Qwen3.8-27B-Q3_K_M.gguf".to_string(), 13_000u64),
+            ("Qwen3.8-27B-imatrix.gguf".to_string(), 10u64),
+        ];
+        let names: Vec<String> = group_gguf_variants(&files)
+            .into_iter()
+            .map(|v| v.quant_name)
+            .collect();
+        assert_eq!(names.len(), 2, "{names:?}");
+        assert!(!names.iter().any(|n| n.contains("imatrix")), "{names:?}");
+    }
+
+    /// Contract: a repository whose only file carries no label keeps it, so the
+    /// rule cannot empty a listing.
+    #[test]
+    fn an_unlabelled_lone_file_survives() {
+        let files = vec![("model.gguf".to_string(), 500u64)];
+        assert_eq!(group_gguf_variants(&files).len(), 1);
     }
 
     /// Contract: a repository with only one family keeps it, whatever it is

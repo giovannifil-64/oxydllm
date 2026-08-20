@@ -2,6 +2,7 @@ pub mod arch_defaults;
 pub mod encoder;
 pub mod estimate;
 pub mod gguf_model;
+pub mod gguf_probe;
 pub mod hub;
 pub mod loader;
 pub mod manager;

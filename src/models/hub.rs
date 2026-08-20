@@ -411,6 +411,21 @@ pub fn pull(config: &PullConfig) -> anyhow::Result<()> {
             let variant_filenames: Vec<String> =
                 chosen.files.iter().map(|(f, _)| f.clone()).collect();
 
+            // The header states every tensor's quantization and sits at the
+            // start of the file, so a range request settles in seconds what a
+            // full download settles in half an hour. Publishers ship builds
+            // that mix a handful of undecodable tensors into an otherwise
+            // ordinary quantization, and refusing after 15 GB have arrived is
+            // the worst moment to find out.
+            if let Some(first) = variant_filenames.first() {
+                let url = format!("{}/{}/resolve/main/{}", HF_ENDPOINT, config.repo_id, first);
+                let verdict =
+                    crate::models::gguf_probe::probe_remote(&client, &url, config.token.as_deref());
+                if let Some(reason) = verdict.refusal() {
+                    anyhow::bail!("{} cannot be used: {reason}", chosen.quant_name);
+                }
+            }
+
             if dest.exists() {
                 for (f, _) in &chosen.files {
                     let _ = std::fs::remove_file(dest.join(f));

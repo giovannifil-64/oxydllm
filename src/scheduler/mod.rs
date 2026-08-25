@@ -235,6 +235,14 @@ impl Scheduler {
     /// queue to re-prefill later. Waiting prompts are then admitted FCFS
     /// while the running-set, token-budget, and free-block limits allow;
     /// admission stops at the first prompt that does not fit.
+    ///
+    /// The token budget bundles work into a step, it does not cap what a
+    /// sequence may be: a prompt longer than a whole step's budget is admitted
+    /// as the only prefill of its step rather than deferred, because admission
+    /// is first-come-first-served and deferring it would starve both it and
+    /// every request queued behind it. Running decodes still ride along, one
+    /// token each. Callers therefore see steps that exceed
+    /// [`SchedulerConfig::max_tokens_per_step`] when a single prompt does.
     pub fn schedule(&mut self, prefix_cache: Option<&PrefixCache>) -> SchedulerOutput {
         let mut scheduled = Vec::new();
         let mut budget = self.config.max_tokens_per_step;
@@ -277,6 +285,7 @@ impl Scheduler {
         }
 
         let mut free_blocks = self.num_free_blocks();
+        let mut prefill_scheduled = false;
 
         while self.running.len() < self.config.max_num_sequences && budget > 0 {
             let seq = match self.waiting.front() {
@@ -290,7 +299,7 @@ impl Scheduler {
             }
 
             let tokens_needed = seq.all_tokens.len();
-            if tokens_needed > budget {
+            if tokens_needed > budget && prefill_scheduled {
                 break;
             }
 
@@ -302,7 +311,8 @@ impl Scheduler {
                 id: seq.id,
                 phase: SequencePhase::Prefill,
             });
-            budget -= tokens_needed;
+            budget = budget.saturating_sub(tokens_needed);
+            prefill_scheduled = true;
             free_blocks = free_blocks.saturating_sub(blocks_needed);
 
             self.push_to_running(seq);
@@ -532,8 +542,16 @@ mod tests {
         assert_eq!(final_free, initial_free);
     }
 
+    /// Contract: a prompt too long for one step's token budget still runs.
+    ///
+    /// This replaces the earlier rule, that such a prompt was simply not
+    /// admitted. Because admission is first-come-first-served, that rule left
+    /// the prompt at the head of the queue for every subsequent step, so the
+    /// request hung with no error and blocked everything queued behind it.
+    /// Reachable in a supported configuration: `--max-context-len 16384`
+    /// accepts prompts far above the 4096-token step budget.
     #[test]
-    fn schedule_does_not_admit_prompt_exceeding_token_budget() {
+    fn oversized_prompt_runs_alone_rather_than_starving() {
         let allocators = make_allocators(1, 16);
         let config = SchedulerConfig {
             max_num_sequences: 4,
@@ -544,9 +562,42 @@ mod tests {
         sched.add_request(vec![1, 2, 3, 4, 5], SamplingParams::default(), 10);
 
         let out = sched.schedule(None);
-        assert_eq!(out.scheduled.len(), 0, "5-token prompt exceeds budget of 2");
-        assert_eq!(sched.num_running(), 0);
+        assert_eq!(out.scheduled.len(), 1, "5-token prompt, budget of 2");
+        assert_eq!(out.scheduled[0].phase, SequencePhase::Prefill);
+        assert_eq!(sched.num_running(), 1);
+        assert_eq!(sched.num_waiting(), 0);
+    }
+
+    /// Contract: the budget still bundles a step, so an oversized prompt does
+    /// not join a step that already carries another prefill. It is deferred by
+    /// one step, not starved: the next call admits it, alongside the decode of
+    /// the sequence ahead of it. Deferring it until the running set drained
+    /// instead would starve it under continuous traffic.
+    #[test]
+    fn oversized_prompt_waits_only_for_the_next_step() {
+        let allocators = make_allocators(1, 16);
+        let config = SchedulerConfig {
+            max_num_sequences: 4,
+            max_tokens_per_step: 4,
+        };
+        let mut sched = Scheduler::new(config, allocators, 1);
+
+        sched.add_request(vec![1, 2], SamplingParams::default(), 10);
+        sched.add_request(vec![1, 2, 3, 4, 5, 6], SamplingParams::default(), 10);
+
+        let first = sched.schedule(None);
+        assert_eq!(first.scheduled.len(), 1, "only the prompt that fits");
         assert_eq!(sched.num_waiting(), 1);
+
+        let second = sched.schedule(None);
+        assert!(
+            second
+                .scheduled
+                .iter()
+                .any(|s| s.phase == SequencePhase::Prefill),
+            "the oversized prompt is admitted on a later step"
+        );
+        assert_eq!(sched.num_waiting(), 0);
     }
 
     #[test]

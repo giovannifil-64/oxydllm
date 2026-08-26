@@ -1481,9 +1481,14 @@ fn load_batch_model_gguf(
     let topo = crate::models::gguf_model::parse_gguf_topology(&gguf)?;
     // Hybrid models budget KV only for their full-attention layers; the
     // linear layers keep O(1) recurrent state instead.
+    // A model whose layers differ in KV heads or head width must be budgeted
+    // layer by layer, or the pool is sized for a shape none of them has.
     let layer_kv_specs: Vec<(usize, usize)> = (0..topo.num_hidden_layers)
         .filter(|&i| !topo.layer_is_linear(i))
-        .map(|_| (topo.num_key_value_heads, topo.head_dim))
+        .map(|i| match topo.per_layer.as_ref() {
+            Some(g) => (g.kv_heads[i], g.head_dims[i]),
+            None => (topo.num_key_value_heads, topo.head_dim),
+        })
         .collect();
     let declared = topo.context_length;
     let plan = compute_kv_blocks(

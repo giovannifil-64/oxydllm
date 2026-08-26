@@ -80,6 +80,22 @@ pub(crate) struct GgufTopology {
     pub head_dim: usize,
     pub context_length: usize,
     pub full_attention_interval: Option<usize>,
+    /// Geometry that differs layer by layer, present only for architectures
+    /// that publish it. Gemma 4 alternates five sliding-window layers with one
+    /// global layer, and the two kinds do not merely differ in what they attend
+    /// to: the global layers carry one KV head against eight and a head twice
+    /// as wide, on a rope a hundred times slower. Reading any of these as a
+    /// single value loads the model with the wrong shape.
+    pub per_layer: Option<PerLayerGeometry>,
+}
+
+/// One entry per layer for the quantities an architecture may vary across them.
+pub(crate) struct PerLayerGeometry {
+    pub kv_heads: Vec<usize>,
+    pub head_dims: Vec<usize>,
+    pub sliding_windows: Vec<Option<usize>>,
+    pub rope_thetas: Vec<f64>,
+    pub rotary_dims: Vec<usize>,
 }
 
 impl GgufTopology {
@@ -98,6 +114,122 @@ impl GgufTopology {
 fn positive_f64(gguf: &GgufWeights, key: &str) -> Option<f64> {
     let v = gguf.metadata_f32_or(key, 0.0) as f64;
     (v > 0.0).then_some(v)
+}
+
+/// The metadata a file publishes about how its layers differ, before any of it
+/// is turned into a per-layer answer. Separated from the reading so the
+/// arithmetic can be tested against a real checkpoint's numbers.
+pub(crate) struct PerLayerSource {
+    /// Which layers use the sliding window, one entry per layer.
+    pub pattern: Option<Vec<bool>>,
+    /// KV heads per layer, when the file varies them.
+    pub kv_heads: Option<Vec<usize>>,
+    pub window: Option<usize>,
+    pub uniform_kv: Option<usize>,
+    pub full_key_length: usize,
+    pub swa_key_length: usize,
+    pub full_rope_theta: f64,
+    pub swa_rope_theta: f64,
+    pub full_rotary_dim: usize,
+    pub swa_rotary_dim: usize,
+}
+
+/// Expands what a file published into one value per layer, or `None` when it
+/// published a single value for all of them.
+///
+/// The pattern decides which of the two published values a layer takes, since
+/// an architecture that varies its geometry varies it between the sliding
+/// layers and the global ones. A quantity the file gives only once is used
+/// everywhere, and `head_dim` is the last resort.
+pub(crate) fn build_per_layer_geometry(
+    src: &PerLayerSource,
+    num_layers: usize,
+    head_dim: usize,
+) -> Option<PerLayerGeometry> {
+    if src.pattern.is_none() && src.kv_heads.is_none() {
+        return None;
+    }
+    let sliding = |i: usize| src.pattern.as_ref().is_some_and(|p| p[i]);
+    let pick = |i: usize, swa: usize, full: usize, fallback: usize| -> usize {
+        let chosen = if sliding(i) { swa } else { full };
+        if chosen > 0 {
+            chosen
+        } else if full > 0 {
+            full
+        } else {
+            fallback
+        }
+    };
+
+    let mut g = PerLayerGeometry {
+        kv_heads: Vec::with_capacity(num_layers),
+        head_dims: Vec::with_capacity(num_layers),
+        sliding_windows: Vec::with_capacity(num_layers),
+        rope_thetas: Vec::with_capacity(num_layers),
+        rotary_dims: Vec::with_capacity(num_layers),
+    };
+    for i in 0..num_layers {
+        g.kv_heads.push(match &src.kv_heads {
+            Some(v) => v[i],
+            None => src.uniform_kv.unwrap_or(1),
+        });
+        let hd = pick(i, src.swa_key_length, src.full_key_length, head_dim);
+        g.head_dims.push(hd);
+        g.sliding_windows
+            .push(if sliding(i) { src.window } else { None });
+        g.rope_thetas
+            .push(if sliding(i) && src.swa_rope_theta > 0.0 {
+                src.swa_rope_theta
+            } else {
+                src.full_rope_theta
+            });
+        g.rotary_dims
+            .push(pick(i, src.swa_rotary_dim, src.full_rotary_dim, hd));
+    }
+    Some(g)
+}
+
+/// Reads [`PerLayerSource`] from `{arch}.*` and expands it.
+fn parse_per_layer_geometry(
+    gguf: &GgufWeights,
+    prefix: &str,
+    num_layers: usize,
+    head_dim: usize,
+) -> Option<PerLayerGeometry> {
+    let src = PerLayerSource {
+        pattern: gguf
+            .metadata_bool_array(&format!("{prefix}.attention.sliding_window_pattern"))
+            .filter(|p| p.len() == num_layers),
+        kv_heads: gguf
+            .metadata_u32_array(&format!("{prefix}.attention.head_count_kv"))
+            .filter(|v| v.len() == num_layers)
+            .map(|v| v.into_iter().map(|x| x as usize).collect()),
+        window: match gguf.metadata_u32_or(&format!("{prefix}.attention.sliding_window"), 0) {
+            0 => None,
+            w => Some(w as usize),
+        },
+        uniform_kv: gguf
+            .metadata_u32(&format!("{prefix}.attention.head_count_kv"))
+            .map(|v| v as usize)
+            .ok(),
+        full_key_length: gguf.metadata_u32_or(&format!("{prefix}.attention.key_length"), 0)
+            as usize,
+        swa_key_length: gguf.metadata_u32_or(&format!("{prefix}.attention.key_length_swa"), 0)
+            as usize,
+        full_rope_theta: gguf.metadata_f32_or(&format!("{prefix}.rope.freq_base"), 0.0) as f64,
+        swa_rope_theta: gguf.metadata_f32_or(&format!("{prefix}.rope.freq_base_swa"), 0.0) as f64,
+        full_rotary_dim: gguf.metadata_u32_or(&format!("{prefix}.rope.dimension_count"), 0)
+            as usize,
+        swa_rotary_dim: gguf.metadata_u32_or(&format!("{prefix}.rope.dimension_count_swa"), 0)
+            as usize,
+    };
+    let g = build_per_layer_geometry(&src, num_layers, head_dim)?;
+    tracing::info!(
+        layers = num_layers,
+        sliding = g.sliding_windows.iter().filter(|w| w.is_some()).count(),
+        "per-layer attention geometry read from the checkpoint"
+    );
+    Some(g)
 }
 
 /// Reads a [`GgufTopology`] from `{arch}.*` metadata keys, falling back to
@@ -156,12 +288,14 @@ pub(crate) fn parse_gguf_topology(gguf: &GgufWeights) -> anyhow::Result<GgufTopo
         }
     };
     let context_length = gguf.metadata_u32_or(&format!("{prefix}.context_length"), 131072) as usize;
+    let per_layer = parse_per_layer_geometry(gguf, prefix, num_hidden_layers, head_dim);
     let full_attention_interval =
         match gguf.metadata_u32_or(&format!("{prefix}.full_attention_interval"), 0) as usize {
             0 | 1 => None,
             interval => Some(interval),
         };
     Ok(GgufTopology {
+        per_layer,
         num_hidden_layers,
         num_attention_heads,
         num_key_value_heads,
@@ -359,10 +493,11 @@ impl StandardTransformer {
 
         let blocks = (0..num_hidden_layers)
             .map(|i| {
+                let per_layer = topo.per_layer.as_ref();
                 let block_cfg = BlockConfig {
                     n_heads: num_attention_heads,
-                    n_kv_heads: num_key_value_heads,
-                    head_dim,
+                    n_kv_heads: per_layer.map_or(num_key_value_heads, |g| g.kv_heads[i]),
+                    head_dim: per_layer.map_or(head_dim, |g| g.head_dims[i]),
                     rms_norm_eps,
                     qk_norm: has_qk_norm,
                     attention_scale,
@@ -372,7 +507,10 @@ impl StandardTransformer {
                     residual_multiplier,
                     v_norm: has_v_norm,
                     has_ffn_norms,
-                    sliding_window: arch_def.resolve_sliding_window_for_layer(sliding_window, i),
+                    sliding_window: match per_layer {
+                        Some(g) => g.sliding_windows[i],
+                        None => arch_def.resolve_sliding_window_for_layer(sliding_window, i),
+                    },
                     // GGUF runtime is dense-only; MoE GGUF support is future work.
                     moe: None,
                     linear_attn: if topo.layer_is_linear(i) {
@@ -381,7 +519,10 @@ impl StandardTransformer {
                         None
                     },
                     attn_output_gate: arch_def.attn_output_gate,
-                    rotary_dim,
+                    rotary_dim: match per_layer {
+                        Some(g) => Some(g.rotary_dims[i]),
+                        None => rotary_dim,
+                    },
                     gguf_qk_permuted: arch_def.gguf_qk_permuted,
                 };
                 TransformerBlock::load_gguf(&block_cfg, i, gguf, device, dtype, intermediate_size)
@@ -396,11 +537,12 @@ impl StandardTransformer {
             .map_err(|e| anyhow::anyhow!("Failed to load output_norm: {e}"))?;
 
         let mut ropes = Vec::with_capacity(num_hidden_layers);
-        for _ in 0..num_hidden_layers {
+        for i in 0..num_hidden_layers {
+            let per_layer = topo.per_layer.as_ref();
             let rope = RotaryEmbedding::new(
-                rotary_dim.unwrap_or(head_dim),
+                per_layer.map_or(rotary_dim.unwrap_or(head_dim), |g| g.rotary_dims[i]),
                 max_position_embeddings,
-                rope_theta,
+                per_layer.map_or(rope_theta, |g| g.rope_thetas[i]),
                 dtype,
                 device,
             )
@@ -525,5 +667,96 @@ impl BatchModel for StandardTransformer {
 
     fn has_recurrent_state(&self) -> bool {
         self.has_recurrent_state
+    }
+}
+
+#[cfg(test)]
+mod per_layer_geometry_tests {
+    use super::*;
+
+    /// The numbers `unsloth/gemma-4-12b-it-Q4_K_M.gguf` publishes, read from its
+    /// header: five sliding layers then one global, repeated eight times.
+    fn gemma4_12b() -> PerLayerSource {
+        let pattern: Vec<bool> = (0..48usize).map(|i| !(i + 1).is_multiple_of(6)).collect();
+        let kv_heads: Vec<usize> = (0..48usize)
+            .map(|i| if (i + 1).is_multiple_of(6) { 1 } else { 8 })
+            .collect();
+        PerLayerSource {
+            pattern: Some(pattern),
+            kv_heads: Some(kv_heads),
+            window: Some(1024),
+            uniform_kv: None,
+            full_key_length: 512,
+            swa_key_length: 256,
+            full_rope_theta: 1_000_000.0,
+            swa_rope_theta: 10_000.0,
+            full_rotary_dim: 512,
+            swa_rotary_dim: 256,
+        }
+    }
+
+    /// Contract: a layer takes the geometry of the kind it belongs to.
+    ///
+    /// Gemma 4's global layers are not merely its sliding layers without a
+    /// window: they carry one KV head against eight, a head twice as wide, and
+    /// a rope a hundred times slower. Reading any of those as a single value,
+    /// which is what a GGUF loader does by default, builds every layer with the
+    /// wrong shape.
+    #[test]
+    fn gemma4_layers_take_the_geometry_of_their_kind() {
+        let g = build_per_layer_geometry(&gemma4_12b(), 48, 256).expect("per-layer geometry");
+
+        // A sliding layer.
+        assert_eq!(g.kv_heads[0], 8);
+        assert_eq!(g.head_dims[0], 256);
+        assert_eq!(g.sliding_windows[0], Some(1024));
+        assert_eq!(g.rope_thetas[0], 10_000.0);
+        assert_eq!(g.rotary_dims[0], 256);
+
+        // The global layer that follows five of them.
+        assert_eq!(g.kv_heads[5], 1);
+        assert_eq!(g.head_dims[5], 512);
+        assert_eq!(g.sliding_windows[5], None);
+        assert_eq!(g.rope_thetas[5], 1_000_000.0);
+        assert_eq!(g.rotary_dims[5], 512);
+
+        assert_eq!(g.sliding_windows.iter().filter(|w| w.is_none()).count(), 8);
+    }
+
+    /// Contract: a file that publishes one value per quantity is left alone, so
+    /// nothing changes for the architectures that do not vary their layers.
+    #[test]
+    fn a_uniform_checkpoint_gets_no_per_layer_geometry() {
+        let uniform = PerLayerSource {
+            pattern: None,
+            kv_heads: None,
+            window: None,
+            uniform_kv: Some(8),
+            full_key_length: 128,
+            swa_key_length: 0,
+            full_rope_theta: 10_000.0,
+            swa_rope_theta: 0.0,
+            full_rotary_dim: 128,
+            swa_rotary_dim: 0,
+        };
+        assert!(build_per_layer_geometry(&uniform, 32, 128).is_none());
+    }
+
+    /// Contract: a quantity published once is used on every layer, so a file
+    /// that varies its KV heads but shares one rope does not end up with a rope
+    /// of zero on half its layers.
+    #[test]
+    fn a_quantity_published_once_is_used_everywhere() {
+        let mut src = gemma4_12b();
+        src.swa_rope_theta = 0.0;
+        src.swa_key_length = 0;
+        src.swa_rotary_dim = 0;
+        let g = build_per_layer_geometry(&src, 48, 256).expect("per-layer geometry");
+        assert!(g.rope_thetas.iter().all(|&t| t == 1_000_000.0));
+        assert!(g.head_dims.iter().all(|&d| d == 512));
+        assert!(g.rotary_dims.iter().all(|&d| d == 512));
+        // The window still follows the pattern, which is published.
+        assert_eq!(g.sliding_windows[0], Some(1024));
+        assert_eq!(g.sliding_windows[5], None);
     }
 }

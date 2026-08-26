@@ -131,6 +131,23 @@ impl GgufWeights {
             })
     }
 
+    /// Reads metadata `key` as an array of `u32`.
+    ///
+    /// `None` when the key is missing or is not an array, which is how a caller
+    /// distinguishes a file that publishes a value per layer from one that
+    /// publishes a single value for all of them.
+    pub fn metadata_u32_array(&self, key: &str) -> Option<Vec<u32>> {
+        let items = self.metadata.get(key)?.to_vec().ok()?;
+        items.iter().map(|v| v.to_u32().ok()).collect()
+    }
+
+    /// Reads metadata `key` as an array of `bool`. `None` as for
+    /// [`metadata_u32_array`](Self::metadata_u32_array).
+    pub fn metadata_bool_array(&self, key: &str) -> Option<Vec<bool>> {
+        let items = self.metadata.get(key)?.to_vec().ok()?;
+        items.iter().map(|v| v.to_bool().ok()).collect()
+    }
+
     /// Reads metadata `key` as a `u32`, falling back to `default` if missing or
     /// the wrong type.
     pub fn metadata_u32_or(&self, key: &str, default: u32) -> u32 {

@@ -235,6 +235,10 @@ struct SeqTracker {
     first_token_at: Option<std::time::Instant>,
     token_count: usize,
     in_thinking: bool,
+    /// True while the reasoning channel's name is still being emitted, for the
+    /// models that name it. Gemma 4 opens with `<|channel>thought\n`, and that
+    /// name is framing rather than something the model reasoned.
+    thinking_header: bool,
     output_ids: Vec<u32>,
     thinking_ids: Vec<u32>,
     decoded_len: usize,
@@ -294,6 +298,7 @@ fn enqueue_request(
     trackers: &mut HashMap<SequenceId, SeqTracker>,
     byte_table: Option<&std::sync::Arc<crate::constrain::TokenByteTable>>,
     harmony: bool,
+    named_thought_channel: bool,
 ) {
     let request_id = req.request_id.clone();
     let model_id = req.model_id.clone();
@@ -355,6 +360,7 @@ fn enqueue_request(
             first_token_at: None,
             token_count: 0,
             in_thinking: req.enable_thinking,
+            thinking_header: req.enable_thinking && named_thought_channel,
             output_ids: Vec::new(),
             thinking_ids: Vec::new(),
             decoded_len: 0,
@@ -594,8 +600,18 @@ pub fn engine_loop(
     let mut consecutive_errors: u32 = 0;
     const MAX_CONSECUTIVE_ERRORS: u32 = 3;
 
-    let think_start_id = tokenizer.special_token_id("<think>");
-    let think_end_id = tokenizer.special_token_id("</think>");
+    // Reasoning is fenced by a pair of markers whose spelling is the model's
+    // own. Gemma 4 opens its thought channel in the prompt and closes it with
+    // `<channel|>`, which is the same shape as the `<think>` pair and takes the
+    // same path.
+    let think_start_id = tokenizer
+        .special_token_id("<think>")
+        .or_else(|| tokenizer.special_token_id("<|channel>"));
+    let think_end_id = tokenizer
+        .special_token_id("</think>")
+        .or_else(|| tokenizer.special_token_id("<channel|>"));
+    // Gemma 4 names its channel; `<think>` models do not.
+    let named_thought_channel = tokenizer.special_token_id("<|channel>").is_some();
     let harmony_ids = match (
         tokenizer.special_token_id("<|channel|>"),
         tokenizer.special_token_id("<|message|>"),
@@ -638,6 +654,7 @@ pub fn engine_loop(
                     &mut trackers,
                     byte_table.as_ref(),
                     harmony_ids.is_some(),
+                    named_thought_channel,
                 );
             }
         } else {
@@ -648,6 +665,7 @@ pub fn engine_loop(
                     &mut trackers,
                     byte_table.as_ref(),
                     harmony_ids.is_some(),
+                    named_thought_channel,
                 ),
                 None => break,
             }
@@ -719,15 +737,24 @@ pub fn engine_loop(
                                         .unwrap_or_default();
 
                                     let is_think_start = think_start_id == Some(tok.token)
-                                        || raw.contains("<think>");
+                                        || raw.contains("<think>")
+                                        || raw.contains("<|channel>");
                                     if is_think_start {
                                         continue;
                                     }
 
-                                    let is_think_end =
-                                        think_end_id == Some(tok.token) || raw.contains("</think>");
+                                    let is_think_end = think_end_id == Some(tok.token)
+                                        || raw.contains("</think>")
+                                        || raw.contains("<channel|>");
                                     if is_think_end {
                                         tracker.in_thinking = false;
+                                        tracker.thinking_header = false;
+                                        continue;
+                                    }
+                                    if tracker.thinking_header {
+                                        if raw.contains('\n') {
+                                            tracker.thinking_header = false;
+                                        }
                                         continue;
                                     }
                                 }

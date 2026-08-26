@@ -4069,6 +4069,7 @@ mod fused_kernel_parity_tests {
                 (2048, 2048, 1024, "prefill con finestra"),
                 (1, 256, 0, "decode"),
                 (1, 1024, 0, "decode"),
+                (1, 1700, 0, "decode"),
             ] {
                 println!("  d={d} h={h} h_kv={h_kv} {what} t_q={t_q} t_kv={t_kv} window={window}");
                 let mk = |n: usize, salt: usize| -> Vec<f32> {
@@ -4096,6 +4097,11 @@ mod fused_kernel_parity_tests {
                 time("naive", &|| {
                     naive_attention_reference(&q, &k, &v, scale, None, prefix, window).unwrap()
                 });
+                if t_q == 1 && sdpa_available(&q, d) {
+                    time("sdpa fusa (candle)", &|| {
+                        sdpa(&q, &k, &v, None, false, scale, 1.0).unwrap()
+                    });
+                }
             }
         }
     }

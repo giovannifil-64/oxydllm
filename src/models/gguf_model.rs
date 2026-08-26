@@ -315,6 +315,34 @@ pub(crate) fn parse_gguf_topology(gguf: &GgufWeights) -> anyhow::Result<GgufTopo
     })
 }
 
+/// Groups layers by rope geometry, returning the distinct `(rotary_dim, theta)`
+/// settings and, per layer, which of them it uses.
+///
+/// A checkpoint that publishes its rope per layer still repeats a handful of
+/// settings across dozens of layers, and a table is not small: at the context
+/// Gemma 4 declares, one pair of cos/sin tables is 268 MB, so building one per
+/// layer cost 12.9 GB of a 17.8 GB working set and left the forward pass no
+/// room to run. Comparing theta by its bits is deliberate: these come from file
+/// metadata and are either the same value or a different one, never the result
+/// of arithmetic that could land a hair apart.
+fn rope_sharing_plan(geometries: &[(usize, f64)]) -> (Vec<(usize, f64)>, Vec<usize>) {
+    let mut distinct: Vec<(usize, f64)> = Vec::new();
+    let mut per_layer = Vec::with_capacity(geometries.len());
+    for &(dim, theta) in geometries {
+        let found = distinct
+            .iter()
+            .position(|&(d, t)| d == dim && t.to_bits() == theta.to_bits());
+        per_layer.push(match found {
+            Some(idx) => idx,
+            None => {
+                distinct.push((dim, theta));
+                distinct.len() - 1
+            }
+        });
+    }
+    (distinct, per_layer)
+}
+
 impl StandardTransformer {
     /// Borrowed view of the model handed to
     /// [`run_transformer_layers_batch`] each forward pass.
@@ -482,6 +510,12 @@ impl StandardTransformer {
             .map_err(|e| anyhow::anyhow!("Missing token_embd.weight: {e}"))?;
         let vocab_size = embed_qt.shape().dims()[0];
         let embed_tokens = Embedding::from_qtensor(&embed_qt, device, dtype)?;
+        // Dequantizing the table goes through an F32 copy twice the size of the
+        // BF16 one it becomes, and candle returns a buffer to its pool only at a
+        // synchronisation point. Without one here the copy stays resident for
+        // the life of the process: measured at 4 GB of a 17.8 GB working set on
+        // a 12B checkpoint, which is what left the forward pass no room.
+        crate::common::weights::drain_metal(device, "the embedding table")?;
 
         let lm_head = match gguf.try_get("output.weight") {
             Some(qt) => AnyLinear::Quantized(
@@ -547,19 +581,31 @@ impl StandardTransformer {
         let norm = RMSNorm::from_qtensor(&norm_qt, device, dtype, rms_norm_eps, norm_type)
             .map_err(|e| anyhow::anyhow!("Failed to load output_norm: {e}"))?;
 
-        let mut ropes = Vec::with_capacity(num_hidden_layers);
-        for i in 0..num_hidden_layers {
-            let per_layer = topo.per_layer.as_ref();
-            let rope = RotaryEmbedding::new(
-                per_layer.map_or(rotary_dim.unwrap_or(head_dim), |g| g.rotary_dims[i]),
-                max_position_embeddings,
-                per_layer.map_or(rope_theta, |g| g.rope_thetas[i]),
-                dtype,
-                device,
-            )
-            .map_err(|e| anyhow::anyhow!("Failed to create RoPE: {e}"))?;
-            ropes.push(rope);
+        // One table per distinct geometry, not per layer. A checkpoint that
+        // publishes its rope per layer still repeats a handful of settings
+        // across dozens of layers: Gemma 4 alternates two, so building one
+        // table each cost 48 copies of a 268 MB pair of cos/sin tables, 12.9 GB
+        // that left the forward pass no room on a 24 GB machine. Cloning shares
+        // the tensors rather than the memory behind them.
+        let geometries: Vec<(usize, f64)> = (0..num_hidden_layers)
+            .map(|i| {
+                let per_layer = topo.per_layer.as_ref();
+                (
+                    per_layer.map_or(rotary_dim.unwrap_or(head_dim), |g| g.rotary_dims[i]),
+                    per_layer.map_or(rope_theta, |g| g.rope_thetas[i]),
+                )
+            })
+            .collect();
+        let (distinct, per_layer_table) = rope_sharing_plan(&geometries);
+        let mut tables = Vec::with_capacity(distinct.len());
+        for &(dim, theta) in &distinct {
+            tables.push(
+                RotaryEmbedding::new(dim, max_position_embeddings, theta, dtype, device)
+                    .map_err(|e| anyhow::anyhow!("Failed to create RoPE: {e}"))?,
+            );
         }
+        let ropes: Vec<RotaryEmbedding> =
+            per_layer_table.iter().map(|&t| tables[t].clone()).collect();
 
         // Linear-attention layers never allocate KV blocks; they alias the
         // first full-attention layer's allocator so the scheduler's
@@ -603,6 +649,12 @@ impl StandardTransformer {
         };
 
         let stop_token_ids = gguf.eos_token_ids();
+
+        // Same reason as after the embedding table: every norm and scalar the
+        // blocks dequantised left an F32 copy in candle's buffer pool, and only
+        // a synchronisation point hands those back before the first forward
+        // pass asks for room.
+        crate::common::weights::drain_metal(device, "the model build")?;
 
         Ok(Self {
             embed_tokens,
@@ -696,6 +748,42 @@ impl BatchModel for StandardTransformer {
 #[cfg(test)]
 mod per_layer_geometry_tests {
     use super::*;
+
+    /// Contract: layers that ask for the same rope share one table.
+    ///
+    /// The failure this guards against does not look like a wrong answer. Each
+    /// table is 268 MB at the context Gemma 4 declares, so building one per
+    /// layer put 12.9 GB on a 17.8 GB device and every prompt past a few
+    /// hundred tokens came back as Insufficient Memory instead of text. Forty
+    /// eight layers, two geometries: two tables.
+    #[test]
+    fn layers_that_ask_for_the_same_rope_share_one_table() {
+        let geometries: Vec<(usize, f64)> = (0..48usize)
+            .map(|i| {
+                if (i + 1).is_multiple_of(6) {
+                    (512, 1_000_000.0)
+                } else {
+                    (256, 10_000.0)
+                }
+            })
+            .collect();
+        let (distinct, per_layer) = rope_sharing_plan(&geometries);
+
+        assert_eq!(distinct.len(), 2, "two geometries, two tables");
+        assert_eq!(per_layer.len(), 48);
+        for (i, &table) in per_layer.iter().enumerate() {
+            assert_eq!(
+                distinct[table], geometries[i],
+                "layer {i} was handed a table built for other settings"
+            );
+        }
+
+        // A checkpoint that publishes one setting for every layer builds one.
+        let uniform = vec![(128usize, 10_000.0f64); 32];
+        let (distinct, per_layer) = rope_sharing_plan(&uniform);
+        assert_eq!(distinct.len(), 1);
+        assert!(per_layer.iter().all(|&t| t == 0));
+    }
 
     /// The numbers `unsloth/gemma-4-12b-it-Q4_K_M.gguf` publishes, read from its
     /// header: five sliding layers then one global, repeated eight times.

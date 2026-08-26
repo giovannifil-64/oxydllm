@@ -57,6 +57,7 @@ pub enum RopeScaling {
 /// half-split rotation. Build one with [`new`](Self::new) for the unscaled
 /// schedule, or [`new_with_scaling`](Self::new_with_scaling) to pass a
 /// [`RopeScaling`]. On Metal the rotation runs as a single fused kernel.
+#[derive(Clone)]
 pub struct RotaryEmbedding {
     cos: Tensor,
     sin: Tensor,

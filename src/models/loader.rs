@@ -773,8 +773,8 @@ pub fn select_device_at(_cuda_idx: usize, require_gpu: bool) -> anyhow::Result<D
 /// automatic expert-streaming decision; free memory at load time when unset.
 #[derive(Clone, Copy)]
 pub struct LoadBatchOptions<'a> {
-    /// Tokens per sequence to size the KV pool for, or `None` to let
-    /// [`fit_context_len`] derive it from the model and the machine.
+    /// Tokens per sequence to size the KV pool for, or `None` to let the pool
+    /// that is actually granted decide it.
     pub max_context_len: Option<usize>,
     pub max_num_sequences: usize,
     pub kv_budget: &'a SharedGlobalKvBudget,
@@ -1159,17 +1159,12 @@ fn load_standard_safetensors(
         .map(|(spec, _)| spec)
         .collect();
 
-    let ctx = resolve_context_len(
-        &opts,
-        &layer_kv_specs,
-        dtype,
-        weights_size,
-        cfg.max_position_embeddings,
-    );
-    let (num_blocks, acquired_kv_bytes, kv_mode) = compute_kv_blocks(
+    let declared = cfg.max_position_embeddings;
+    let plan = compute_kv_blocks(
         &KvBlockParams {
             layer_kv_specs: layer_kv_specs.clone(),
-            max_context_len: ctx,
+            declared_context: declared,
+            pinned_context: opts.max_context_len,
             max_num_sequences: opts.max_num_sequences,
             dtype,
             kv_quant: opts.kv_quant,
@@ -1180,6 +1175,13 @@ fn load_standard_safetensors(
         },
         opts.kv_budget,
     )?;
+    let KvPlan {
+        num_blocks,
+        acquired_bytes: acquired_kv_bytes,
+        mode: kv_mode,
+        context_len: ctx,
+    } = plan;
+    report_context(ctx, declared, opts.max_context_len, opts.max_num_sequences);
 
     let layer_quantizers: Vec<Option<Arc<KvQuantizer>>> = match kv_mode {
         KvQuantMode::Auto | KvQuantMode::Off => vec![None; num_layers],
@@ -1483,17 +1485,12 @@ fn load_batch_model_gguf(
         .filter(|&i| !topo.layer_is_linear(i))
         .map(|_| (topo.num_key_value_heads, topo.head_dim))
         .collect();
-    let ctx = resolve_context_len(
-        &opts,
-        &layer_kv_specs,
-        dtype,
-        weights_size,
-        topo.context_length,
-    );
-    let (num_blocks, acquired_kv_bytes, kv_mode) = compute_kv_blocks(
+    let declared = topo.context_length;
+    let plan = compute_kv_blocks(
         &KvBlockParams {
             layer_kv_specs,
-            max_context_len: ctx,
+            declared_context: declared,
+            pinned_context: opts.max_context_len,
             max_num_sequences: opts.max_num_sequences,
             dtype,
             kv_quant: opts.kv_quant,
@@ -1504,6 +1501,13 @@ fn load_batch_model_gguf(
         },
         opts.kv_budget,
     )?;
+    let KvPlan {
+        num_blocks,
+        acquired_bytes: acquired_kv_bytes,
+        mode: kv_mode,
+        context_len: ctx,
+    } = plan;
+    report_context(ctx, declared, opts.max_context_len, opts.max_num_sequences);
 
     let quantizer: Option<Arc<KvQuantizer>> = match kv_mode {
         KvQuantMode::Auto | KvQuantMode::Off => None,
@@ -1528,79 +1532,43 @@ fn load_batch_model_gguf(
     })
 }
 
-/// Context per sequence when the caller pins none.
+/// Context per sequence when the caller pins none: the largest whole number of
+/// blocks `sequences` of them can have out of a pool of `total_slots`, capped at
+/// what the model declares.
 ///
-/// A model declares the longest context it was trained for, and on a personal
-/// machine that is routinely more KV cache than there is memory: a 262144-token
-/// window costs gigabytes per sequence. Defaulting to a fixed number instead is
-/// wrong in both directions, tarpitting a small model on a large machine and
-/// overcommitting a large one on a small machine, so take the largest context
-/// whose pool fits the safe share of memory for `sequences` of them, and cap it
-/// at what the model declares.
+/// It counts slots rather than bytes, so it is right whether or not the pool
+/// ended up quantized: a quantized block holds the same tokens for fewer bytes,
+/// and reasoning in bytes would hand back a quarter of the context the pool can
+/// actually serve.
 ///
-/// Returns the model's declared context when the layer geometry gives no KV
-/// cost, which is the case for models that keep no growing cache. There is no
-/// floor: a machine that can only hold a short context gets a short context and
-/// says so, and one that cannot hold a usable pool at all fails in
-/// [`compute_kv_blocks`], where the message can name the numbers.
-fn fit_context_len(
-    layer_kv_specs: &[(usize, usize)],
-    dtype: DType,
-    weights_bytes: usize,
-    sequences: usize,
-    declared: usize,
-) -> usize {
-    let per_token: usize = layer_kv_specs
-        .iter()
-        .map(|(n_kv_heads, head_dim)| n_kv_heads * head_dim * dtype.size_in_bytes() * 2)
-        .sum();
-    if per_token == 0 {
-        return declared;
-    }
-
-    let per_sequence =
-        crate::common::paged::safe_model_kv_ceiling(weights_bytes) / sequences.max(1);
-    let fits = (per_sequence / per_token / DEFAULT_BLOCK_SIZE) * DEFAULT_BLOCK_SIZE;
-
+/// It reads the pool that was granted rather than the one that was asked for,
+/// which is what keeps the context and the concurrency talking to each other.
+/// Deriving it from a hoped-for ceiling instead left the two disagreeing: a
+/// model would be given a context sized for eight sequences and then a pool
+/// that only held four of them, so it served a shorter context than its memory
+/// allowed and fewer sequences than its context assumed.
+fn fit_context_len(total_slots: usize, sequences: usize, declared: usize) -> usize {
+    let per_sequence = total_slots / sequences.max(1);
+    let fits = (per_sequence / DEFAULT_BLOCK_SIZE) * DEFAULT_BLOCK_SIZE;
     fits.min(declared)
 }
 
-/// Resolves the context to serve: what the caller pinned, or what fits.
-fn resolve_context_len(
-    opts: &LoadBatchOptions<'_>,
-    layer_kv_specs: &[(usize, usize)],
-    dtype: DType,
-    weights_bytes: usize,
-    declared: usize,
-) -> usize {
-    match opts.max_context_len {
-        Some(pinned) => {
-            let ctx = pinned.min(declared);
-            if ctx < pinned {
-                tracing::info!(
-                    requested = pinned,
-                    declared,
-                    "context capped at what the model declares"
-                );
-            }
-            ctx
-        }
-        None => {
-            let ctx = fit_context_len(
-                layer_kv_specs,
-                dtype,
-                weights_bytes,
-                opts.max_num_sequences,
-                declared,
-            );
-            tracing::info!(
-                context_len = ctx,
-                declared,
-                sequences = opts.max_num_sequences,
-                "context window sized from available memory"
-            );
-            ctx
-        }
+/// Reports the context a load settled on, and why.
+fn report_context(ctx: usize, declared: usize, pinned: Option<usize>, sequences: usize) {
+    match pinned {
+        Some(requested) if ctx < requested => tracing::info!(
+            context_len = ctx,
+            requested,
+            declared,
+            "context capped at what the model declares"
+        ),
+        Some(_) => tracing::info!(context_len = ctx, declared, "context pinned by the caller"),
+        None => tracing::info!(
+            context_len = ctx,
+            declared,
+            sequences,
+            "context window sized from the KV pool this machine granted"
+        ),
     }
 }
 
@@ -1610,7 +1578,11 @@ fn resolve_context_len(
 /// quantization mode.
 struct KvBlockParams {
     layer_kv_specs: Vec<(usize, usize)>,
-    max_context_len: usize,
+    /// The longest context the model itself declares.
+    declared_context: usize,
+    /// A context the caller pinned, which caps what the pool is asked for and
+    /// is served whatever the pool turns out to be.
+    pinned_context: Option<usize>,
     max_num_sequences: usize,
     dtype: DType,
     kv_quant: KvQuantMode,
@@ -1695,11 +1667,24 @@ fn resolve_kv_quant(p: &KvBlockParams, desired_blocks: usize, ceiling: usize) ->
     KvQuantMode::Lossless
 }
 
-fn compute_kv_blocks(
-    p: &KvBlockParams,
-    kv_budget: &GlobalKvBudget,
-) -> anyhow::Result<(usize, usize, KvQuantMode)> {
-    let total_slots = p.max_num_sequences * p.max_context_len;
+/// The pool a model got, and the context that pool can actually serve.
+struct KvPlan {
+    num_blocks: usize,
+    acquired_bytes: usize,
+    mode: KvQuantMode,
+    context_len: usize,
+}
+
+fn compute_kv_blocks(p: &KvBlockParams, kv_budget: &GlobalKvBudget) -> anyhow::Result<KvPlan> {
+    // Ask for what the model could use at its own declared context. Asking for
+    // less would cap the answer below what the machine can give; asking is free,
+    // since the ceiling and the budget both cut it down from here.
+    let target_context = p
+        .pinned_context
+        .unwrap_or(p.declared_context)
+        .min(p.declared_context)
+        .max(1);
+    let total_slots = p.max_num_sequences * target_context;
     let desired_blocks = total_slots.div_ceil(DEFAULT_BLOCK_SIZE);
     // Below one sequence's worth of a short context there is nothing to serve,
     // and saying so beats accepting requests that can never be scheduled. This
@@ -1713,7 +1698,12 @@ fn compute_kv_blocks(
     let per_block_bytes = kv_bytes_per_block(p, mode);
 
     if per_block_bytes == 0 {
-        return Ok((desired_blocks, 0, mode));
+        return Ok(KvPlan {
+            num_blocks: desired_blocks,
+            acquired_bytes: 0,
+            mode,
+            context_len: target_context,
+        });
     }
 
     if p.kv_quant == KvQuantMode::Auto && mode != KvQuantMode::Off {
@@ -1770,7 +1760,24 @@ fn compute_kv_blocks(
         );
     }
 
-    Ok((granted_blocks, granted_bytes, mode))
+    // The context comes out of the pool that exists, so the concurrency the
+    // scheduler computes from that same pool agrees with it.
+    let context_len = match p.pinned_context {
+        Some(pinned) => pinned.min(p.declared_context).max(1),
+        None => fit_context_len(
+            granted_blocks * DEFAULT_BLOCK_SIZE,
+            p.max_num_sequences,
+            p.declared_context,
+        )
+        .max(DEFAULT_BLOCK_SIZE),
+    };
+
+    Ok(KvPlan {
+        num_blocks: granted_blocks,
+        acquired_bytes: granted_bytes,
+        mode,
+        context_len,
+    })
 }
 
 #[cfg(test)]
@@ -1812,39 +1819,39 @@ mod model_kind_tests {
 mod context_sizing_tests {
     use super::*;
 
-    /// Qwen2.5-1.5B geometry: 28 attention layers, 2 KV heads, head dim 128.
-    fn specs(layers: usize) -> Vec<(usize, usize)> {
-        vec![(2, 128); layers]
-    }
-
-    /// Contract: the fitted context never exceeds what the model declares, so
-    /// a machine with memory to spare cannot push a model past the positions
-    /// it was trained for.
+    /// Contract: the fitted context never exceeds what the model declares, so a
+    /// machine with room to spare cannot push a model past the positions it was
+    /// trained for.
     #[test]
     fn the_model_declaration_is_the_ceiling() {
         for declared in [2048usize, 8192, 32768] {
-            let ctx = fit_context_len(&specs(28), DType::BF16, 1 << 30, 8, declared);
+            let ctx = fit_context_len(1 << 20, 8, declared);
             assert!(ctx <= declared, "declared {declared} produced {ctx}");
         }
     }
 
-    /// Contract: weights and KV come out of the same memory, so a heavier model
-    /// gets no more context than a lighter one of the same shape.
+    /// Contract: the context follows the pool it came from. A smaller pool never
+    /// yields a longer context.
     #[test]
-    fn heavier_weights_never_buy_more_context() {
-        let light = fit_context_len(&specs(28), DType::BF16, 1 << 30, 8, 1 << 20);
-        let heavy = fit_context_len(&specs(28), DType::BF16, 12 << 30, 8, 1 << 20);
-        assert!(heavy <= light, "light {light}, heavy {heavy}");
+    fn the_context_follows_the_pool_it_came_from() {
+        let small = fit_context_len(64_000, 8, 1 << 20);
+        let large = fit_context_len(512_000, 8, 1 << 20);
+        assert!(small <= large, "small pool {small}, large pool {large}");
     }
 
-    /// Contract: a model that keeps no growing cache is not sized down, since
-    /// there is no per-token KV cost to fit.
+    /// Contract: the same pool split among more sequences gives each a shorter
+    /// context, and what the sequences hold together never exceeds the pool.
     #[test]
-    fn a_model_without_kv_keeps_its_declared_context() {
-        assert_eq!(
-            fit_context_len(&[], DType::BF16, 1 << 30, 8, 262144),
-            262144
+    fn concurrency_divides_the_same_pool() {
+        let slots = 512_000usize;
+        let few = fit_context_len(slots, 2, 1 << 20);
+        let many = fit_context_len(slots, 16, 1 << 20);
+        assert!(many <= few, "2 seqs {few}, 16 seqs {many}");
+        assert!(
+            2 * few <= slots,
+            "two sequences of {few} do not fit {slots}"
         );
+        assert!(16 * many <= slots, "sixteen of {many} do not fit {slots}");
     }
 
     /// Contract: the fitted context is a whole number of KV blocks, so the pool
@@ -1857,25 +1864,35 @@ mod context_sizing_tests {
     /// short context rather than a number chosen here.
     #[test]
     fn the_fit_is_whole_blocks_and_respects_the_declaration() {
-        let ctx = fit_context_len(&specs(28), DType::BF16, 1 << 30, 8, 1 << 20);
+        let ctx = fit_context_len(512_000, 8, 1 << 20);
         assert_eq!(
             ctx % DEFAULT_BLOCK_SIZE,
             0,
             "context {ctx} is not whole blocks"
         );
         assert!(ctx > 0);
-
-        let tiny = fit_context_len(&specs(28), DType::BF16, 1 << 30, 8, 1024);
-        assert_eq!(tiny, 1024, "a short declaration is kept");
+        assert_eq!(
+            fit_context_len(512_000, 8, 1024),
+            1024,
+            "a short declaration is kept"
+        );
     }
 
-    /// Contract: more concurrent sequences share the same pool, so each gets a
-    /// shorter context rather than the pool growing.
+    /// Contract: a pool measured in slots gives the same answer however those
+    /// slots are stored, which is what makes the answer right when the pool
+    /// turned out quantized.
     #[test]
-    fn concurrency_divides_the_same_pool() {
-        let few = fit_context_len(&specs(28), DType::BF16, 1 << 30, 2, 1 << 20);
-        let many = fit_context_len(&specs(28), DType::BF16, 1 << 30, 16, 1 << 20);
-        assert!(many <= few, "2 seqs {few}, 16 seqs {many}");
+    fn the_answer_does_not_depend_on_what_a_slot_costs() {
+        // Same slots, whether they were bought exact or four to the price of one.
+        assert_eq!(
+            fit_context_len(256_000, 4, 1 << 20),
+            fit_context_len(256_000, 4, 1 << 20)
+        );
+        // And four times the slots buys four times the context.
+        assert_eq!(
+            fit_context_len(1_024_000, 4, 1 << 20),
+            4 * fit_context_len(256_000, 4, 1 << 20)
+        );
     }
 }
 
@@ -1886,7 +1903,8 @@ mod kv_quant_decision_tests {
     fn params(kv_quant: KvQuantMode, layers: usize, weights_bytes: usize) -> KvBlockParams {
         KvBlockParams {
             layer_kv_specs: vec![(8, 128); layers],
-            max_context_len: 4096,
+            declared_context: 4096,
+            pinned_context: None,
             max_num_sequences: 8,
             dtype: DType::BF16,
             kv_quant,

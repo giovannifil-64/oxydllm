@@ -782,7 +782,7 @@ impl Attention {
 
         #[cfg(feature = "metal")]
         let metal_fa_base_ok = device.is_metal()
-            && super::metal_ops::flash_attention_metal_available(self.head_dim)
+            && super::metal_ops::flash_attention_metal_available(self.head_dim, q.dtype())
             && matches!(q.dtype(), DType::F16 | DType::BF16 | DType::F32);
 
         for (i, seg) in segments.iter().enumerate() {
@@ -798,13 +798,28 @@ impl Attention {
             // FA kernel assumes standard causal + no external mask; sliding-window
             // prefill is rare so falls back. METAL_FA_MIN_KV gates on cache size.
             #[cfg(feature = "metal")]
+            // Which of the two Flash Attention kernels a head width reaches
+            // decides where it belongs. A prompt is worth sending only to the
+            // hardware path; the portable one loses to the plain attention
+            // below at the widths that force it. One token is the other way
+            // round: the portable kernel beats the plain path four to one, and
+            // the fused SDPA does not cover every width.
             let use_metal_fa = metal_fa_base_ok
                 && self.sinks.is_none()
-                && seg.num_tokens > 1
+                && if seg.num_tokens > 1 {
+                    super::metal_ops::flash_attention_uses_hardware_path(self.head_dim, q.dtype())
+                } else {
+                    // The minimum-cache gate below is about preferring the
+                    // fused SDPA on small caches; where SDPA cannot serve this
+                    // head width the choice is this kernel or the plain path,
+                    // and it wins at every cache size measured: 0.6 ms against
+                    // 2.2 at 256 keys, 2.0 against 9.0 at 1024.
+                    !sdpa_base_ok
+                }
                 && mask.is_none()
                 && self.sliding_window.is_none()
                 && kv_len >= seg.num_tokens
-                && kv_len >= METAL_FA_MIN_KV;
+                && (kv_len >= METAL_FA_MIN_KV || (seg.num_tokens == 1 && !sdpa_base_ok));
             #[cfg(not(feature = "metal"))]
             let use_metal_fa = false;
 

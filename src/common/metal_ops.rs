@@ -930,16 +930,58 @@ fn get_or_compile_fa_pipeline(
     Ok(pipeline)
 }
 
-/// Query/KV tile heights `(Br, Bc)` per head dim; wider heads get smaller
-/// tiles so the scratch of [`fa_threadgroup_bytes`] stays within the GPU's
-/// threadgroup-memory limit.
-fn fa_tile_sizes(head_dim: usize) -> (usize, usize) {
+/// The threadgroup memory this GPU allows, asked once.
+fn device_threadgroup_limit() -> usize {
+    use std::sync::OnceLock;
+    static LIMIT: OnceLock<usize> = OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        let Ok(device) = candle_core::Device::new_metal(0) else {
+            return 32 * 1024;
+        };
+        let candle_core::Device::Metal(metal) = &device else {
+            return 32 * 1024;
+        };
+        use objc2_metal::MTLDevice;
+        let bytes = metal.device().as_ref().maxThreadgroupMemoryLength();
+        if bytes == 0 { 32 * 1024 } else { bytes }
+    })
+}
+
+/// Query/KV tile heights `(Br, Bc)`, or `None` when no tiling of this head
+/// width fits the GPU's threadgroup memory.
+///
+/// The three widths listed are measured rather than derived, and stay listed
+/// for that reason: replacing a tuned value with a computed one that merely
+/// fits would be a change nobody measured. Every other width is computed, and
+/// that is the part that matters, because the list used to double as the
+/// answer to "can this kernel run at all" and so refused head widths the
+/// kernel handles perfectly well. Gemma 4's global layers are 512 wide.
+fn fa_tile_sizes(head_dim: usize, dtype_bytes: usize) -> Option<(usize, usize)> {
     match head_dim {
-        64 => (32, 32),
-        128 => (16, 32),
-        256 => (8, 16),
-        _ => (16, 16),
+        64 => return Some((32, 32)),
+        128 => return Some((16, 32)),
+        256 => return Some((8, 16)),
+        _ => {}
     }
+    if head_dim == 0 || !head_dim.is_multiple_of(4) {
+        // The kernel reads the head four values at a time.
+        return None;
+    }
+    let limit = device_threadgroup_limit();
+    // Same shape as the measured trio: a query tile of roughly 2048 values,
+    // then the widest KV tile that still fits.
+    let br0 = (2048 / head_dim).max(1);
+    for br in [br0, br0 / 2, br0 / 4, 1] {
+        if br == 0 {
+            continue;
+        }
+        for bc in [32usize, 16, 8, 4] {
+            if fa_threadgroup_bytes(br, bc, head_dim, dtype_bytes, true) <= limit {
+                return Some((br, bc));
+            }
+        }
+    }
+    None
 }
 
 /// Whether the GPU has hardware simdgroup-matrix MMA: Apple family 8+
@@ -1088,7 +1130,11 @@ impl CustomOp3 for FlashAttnPrefill {
         let dtype_bytes = q.dtype().size_in_bytes();
         let elem_count = b * h * t_q * d;
         let device = q.device();
-        let use_mma = metal_supports_mma(device.device());
+        // The hardware path multiplies 8x8 simdgroup tiles, so a query tile
+        // shorter than eight rows has nothing for it to fill. Head widths wide
+        // enough to force a short tile take the portable path instead, which
+        // reads the head width at runtime and does not care.
+        let use_mma = metal_supports_mma(device.device()) && self.br >= 8 && self.bc >= 8;
         let kernel_name: &'static str = match (q.dtype(), use_mma) {
             (DType::F32, true) => "flash_attention_prefill_mma_f32",
             (DType::F16, true) => "flash_attention_prefill_mma_f16",
@@ -1315,7 +1361,11 @@ pub fn flash_attention_metal_prefill(
             Err(e) => return Err(e),
         }
     }
-    let (br, bc) = fa_tile_sizes(head_dim);
+    let (br, bc) = fa_tile_sizes(head_dim, q.dtype().size_in_bytes()).ok_or_else(|| {
+        candle_core::Error::Msg(format!(
+            "flash_attention_metal_prefill: no tiling of head_dim {head_dim} fits this GPU"
+        ))
+    })?;
     q.apply_op3_no_bwd(
         k,
         v,
@@ -1330,8 +1380,21 @@ pub fn flash_attention_metal_prefill(
 }
 
 /// Whether the Flash Attention prefill kernels cover `head_dim`.
-pub fn flash_attention_metal_available(head_dim: usize) -> bool {
-    matches!(head_dim, 64 | 128 | 256)
+pub fn flash_attention_metal_available(head_dim: usize, dtype: DType) -> bool {
+    fa_tile_sizes(head_dim, dtype.size_in_bytes()).is_some()
+}
+
+/// Whether this head width reaches the hardware simdgroup path.
+///
+/// A width wide enough to force a query tile shorter than eight rows falls back
+/// to the portable kernel inside, and the two are not interchangeable: measured
+/// on an M5 at a 512-token prompt, 512-wide heads take 37 ms through the
+/// portable kernel against 10 ms through the naive path, while the same width
+/// at one token takes 2 ms against 9 ms. So the portable kernel is worth having
+/// for decode and worth avoiding for prefill, and callers need to know which
+/// one they would get.
+pub fn flash_attention_uses_hardware_path(head_dim: usize, dtype: DType) -> bool {
+    matches!(fa_tile_sizes(head_dim, dtype.size_in_bytes()), Some((br, bc)) if br >= 8 && bc >= 8)
 }
 
 /// Metal source for the quantized kernel suite: AWQ/GPTQ GEMV and dequant,
@@ -3550,10 +3613,12 @@ mod fused_kernel_parity_tests {
             } else {
                 DType::BF16
             };
-            let d = [64usize, 128, 256][next(0, 2)];
+            let d = [64usize, 128, 256, 512][next(0, 3)];
             let h_kv = [1usize, 2, 4][next(0, 2)];
             let h = h_kv * [1usize, 2, 4][next(0, 2)];
-            let t_q = next(1, 384);
+            // One token exercises the decode path, which now comes here for
+            // head widths the fused SDPA does not cover.
+            let t_q = if seed % 5 == 0 { 1 } else { next(1, 384) };
             let prefix = next(0, 256);
             let scale = 1.0 / (d as f32).sqrt();
             let mag = [0.05f32, 0.5, 3.0][next(0, 2)];
@@ -3847,13 +3912,120 @@ mod fused_kernel_parity_tests {
         assert!(format!("{err}").contains("Metal"));
     }
 
+    /// Times the prefill kernel against the naive path at Gemma 4's two head
+    /// widths, for a prompt-shaped call and a decode-shaped one. Ignored by
+    /// default; this is what decides whether offering the kernel for a width is
+    /// worth anything.
     #[test]
-    fn flash_attn_available_for_supported_head_dims() {
-        assert!(flash_attention_metal_available(64));
-        assert!(flash_attention_metal_available(128));
-        assert!(flash_attention_metal_available(256));
-        assert!(!flash_attention_metal_available(80));
-        assert!(!flash_attention_metal_available(96));
+    #[ignore]
+    fn fa_vs_naive_bench() {
+        let Some(dev) = metal_device_or_skip() else {
+            return;
+        };
+        let time = |label: &str, f: &dyn Fn() -> Tensor| {
+            let warm = f();
+            let _ = warm
+                .to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            let t0 = std::time::Instant::now();
+            let mut last = None;
+            for _ in 0..4 {
+                last = Some(f());
+            }
+            let _ = last
+                .unwrap()
+                .to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            println!(
+                "    {label:34} {:8.2} ms",
+                t0.elapsed().as_secs_f64() * 1e3 / 4.0
+            );
+        };
+        for (d, h, h_kv) in [(256usize, 16usize, 8usize), (512, 16, 1)] {
+            for (t_q, t_kv, what) in [
+                (512usize, 512usize, "prefill"),
+                (1usize, 256usize, "decode"),
+                (1usize, 1024usize, "decode"),
+            ] {
+                println!("  d={d} h={h} h_kv={h_kv} {what} t_q={t_q} t_kv={t_kv}");
+                let mk = |n: usize, salt: usize| -> Vec<f32> {
+                    (0..n)
+                        .map(|i| (((i + salt) % 17) as f32 - 8.0) * 0.4)
+                        .collect()
+                };
+                let q = Tensor::from_vec(mk(h * t_q * d, 1), (1, h, t_q, d), &dev)
+                    .unwrap()
+                    .to_dtype(DType::BF16)
+                    .unwrap();
+                let k = Tensor::from_vec(mk(h_kv * t_kv * d, 7), (1, h_kv, t_kv, d), &dev)
+                    .unwrap()
+                    .to_dtype(DType::BF16)
+                    .unwrap();
+                let v = Tensor::from_vec(mk(h_kv * t_kv * d, 13), (1, h_kv, t_kv, d), &dev)
+                    .unwrap()
+                    .to_dtype(DType::BF16)
+                    .unwrap();
+                let scale = 1.0f32;
+                let prefix = t_kv - t_q;
+                time("flash attention", &|| {
+                    flash_attention_metal_prefill(&q, &k, &v, scale, None, prefix).unwrap()
+                });
+                time("naive", &|| {
+                    naive_attention_reference(&q, &k, &v, scale, None, prefix).unwrap()
+                });
+            }
+        }
+    }
+
+    /// Prints the tiling this GPU allows per head width. Ignored by default;
+    /// useful when a new head width turns up.
+    #[test]
+    #[ignore]
+    fn show_tile_choice() {
+        println!(
+            "  limite threadgroup: {} KB",
+            device_threadgroup_limit() / 1024
+        );
+        for d in [64usize, 128, 256, 512] {
+            let t = fa_tile_sizes(d, 2);
+            let bytes = t.map(|(br, bc)| fa_threadgroup_bytes(br, bc, d, 2, true));
+            println!(
+                "  d={d:4} -> {t:?}  scratch {:?} KB",
+                bytes.map(|b| b / 1024)
+            );
+        }
+    }
+
+    /// Contract: the kernel is offered for any head width it can actually run,
+    /// which is any multiple of four whose tiling fits this GPU's threadgroup
+    /// memory.
+    ///
+    /// This replaces a list of three widths that doubled as the answer to
+    /// whether the kernel could run at all. The kernel takes the head width at
+    /// runtime and only needs it divisible by four, so the list was refusing
+    /// widths it handles: Gemma 4's global layers are 512 wide, and every one
+    /// of them fell back to the generic path, which is what made decode
+    /// collapse from 13.9 to 5.3 tokens a second once a prompt filled the
+    /// cache.
+    #[test]
+    fn flash_attn_is_offered_for_every_width_it_can_run() {
+        for d in [64usize, 128, 256, 512] {
+            assert!(
+                flash_attention_metal_available(d, DType::BF16),
+                "head width {d} should be available"
+            );
+        }
+        // Not a multiple of four: the kernel reads four values at a time.
+        assert!(!flash_attention_metal_available(66, DType::BF16));
+        assert!(!flash_attention_metal_available(0, DType::BF16));
     }
 
     #[test]

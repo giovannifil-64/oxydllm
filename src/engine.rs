@@ -237,48 +237,70 @@ impl ForwardChunk {
     }
 }
 
-/// Splits a batch into forwards of at most `cap` tokens.
+/// Walks a batch, handing out one forward at a time.
 ///
-/// Sequences keep their order and may span chunks: a prompt longer than the
-/// cap is carried across several forwards, which is what bounds the work in
-/// any one of them. A sequence contributes its logits row in the chunk where
-/// its last token lands.
-fn plan_forward_chunks(token_counts: &[usize], cap: usize) -> Vec<ForwardChunk> {
-    let cap = cap.max(1);
-    let mut chunks = Vec::new();
-    let mut seq = 0usize;
-    let mut done_in_seq = 0usize;
-    let mut start = 0usize;
+/// The cap is asked for per chunk rather than fixed up front, so a prompt that
+/// turns out slower than expected shrinks its own remaining chunks instead of
+/// only the next request's. Sequences keep their order and may span chunks: a
+/// prompt longer than the cap is carried across several forwards, which is
+/// what bounds the work in any one of them, and a sequence contributes its
+/// logits row in the chunk where its last token lands.
+struct ChunkPlanner<'a> {
+    counts: &'a [usize],
+    seq: usize,
+    done_in_seq: usize,
+    start: usize,
+}
 
-    while seq < token_counts.len() {
-        let seq_base = seq;
+impl<'a> ChunkPlanner<'a> {
+    fn new(counts: &'a [usize]) -> Self {
+        Self {
+            counts,
+            seq: 0,
+            done_in_seq: 0,
+            start: 0,
+        }
+    }
+
+    fn next(&mut self, cap: usize) -> Option<ForwardChunk> {
+        if self.seq >= self.counts.len() {
+            return None;
+        }
+        let seq_base = self.seq;
+        let start = self.start;
         let mut counts: Vec<usize> = Vec::new();
         let mut finished: Vec<usize> = Vec::new();
-        let mut room = cap;
+        let mut room = cap.max(1);
 
-        while seq < token_counts.len() && room > 0 {
-            let take = (token_counts[seq] - done_in_seq).min(room);
+        while self.seq < self.counts.len() && room > 0 {
+            let take = (self.counts[self.seq] - self.done_in_seq).min(room);
             counts.push(take);
             room -= take;
-            done_in_seq += take;
-            if done_in_seq == token_counts[seq] {
+            self.done_in_seq += take;
+            if self.done_in_seq == self.counts[self.seq] {
                 finished.push(counts.len() - 1);
-                seq += 1;
-                done_in_seq = 0;
+                self.seq += 1;
+                self.done_in_seq = 0;
             }
         }
 
-        let len: usize = counts.iter().sum();
-        chunks.push(ForwardChunk {
+        self.start += counts.iter().sum::<usize>();
+        Some(ForwardChunk {
             start,
             counts,
             seq_base,
             finished,
-        });
-        start += len;
+        })
     }
+}
 
-    chunks
+/// Every chunk a batch is split into at a fixed cap. The engine drives the
+/// planner directly, asking for a fresh cap per chunk; this is how the tests
+/// look at a whole plan at once.
+#[cfg(test)]
+fn plan_forward_chunks(token_counts: &[usize], cap: usize) -> Vec<ForwardChunk> {
+    let mut planner = ChunkPlanner::new(token_counts);
+    std::iter::from_fn(|| planner.next(cap)).collect()
 }
 
 /// Per-sequence prefill plan: how many leading tokens/blocks the prefix cache
@@ -475,7 +497,8 @@ fn run_forward_pass(
     let combined_result: Result<Tensor> = (|| {
         let mut rows: Vec<Tensor> = Vec::with_capacity(token_counts.len());
 
-        for chunk in plan_forward_chunks(&token_counts, pacer.cap()) {
+        let mut planner = ChunkPlanner::new(&token_counts);
+        while let Some(chunk) = planner.next(pacer.cap()) {
             let len = chunk.len();
             let input = Tensor::from_vec(
                 all_token_ids[chunk.start..chunk.start + len].to_vec(),
@@ -496,7 +519,20 @@ fn run_forward_pass(
                 rows.push(out.narrow(0, row, 1)?);
             }
             flush_caches(caches)?;
-            pacer.observe(len, started.elapsed());
+            // A forward returns once the work is queued, not once it has run,
+            // so the chunk has to be drained before it can be timed. Draining
+            // is also what keeps the submission bounded: without it the GPU
+            // would accumulate every chunk of the prompt as one stretch of
+            // work, which is the state this split exists to avoid.
+            // A forward returns once the work is queued, not once it has run,
+            // so a chunk has to be drained before it can be timed, and draining
+            // is also what keeps the submission bounded. Decode steps are
+            // exempt: one token per sequence is already short, and the sampler
+            // reads the logits back immediately, which drains them anyway.
+            if len > chunk.counts.len() {
+                device.synchronize()?;
+                pacer.observe(len, started.elapsed());
+            }
         }
 
         Tensor::cat(&rows, 0)

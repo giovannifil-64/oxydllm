@@ -11,7 +11,7 @@
 //! embeddings, every block in turn, the final norm and the lm-head, and returns
 //! logits. It is the function the GGUF and safetensors runtimes both call.
 
-use super::decode_profile;
+use super::profile;
 use super::{
     attention::{Attention, SegmentInfo},
     config::{Activation, BlockConfig},
@@ -372,7 +372,7 @@ impl TransformerBlock {
     ) -> Result<Tensor> {
         let dev = x.device().clone();
         let residual = x;
-        let mut attn_out = decode_profile::phase(&dev, "attn", || {
+        let mut attn_out = profile::phase(&dev, "attn", || {
             let normed = self.input_norm.forward(x)?;
             self.attention
                 .forward_batch(&normed, rope, position_ids, mask, segments)
@@ -388,7 +388,7 @@ impl TransformerBlock {
         let mut x = (residual + attn_out)?;
         let residual = x.clone();
 
-        let mut ffn_out = decode_profile::phase(&dev, "ffn", || {
+        let mut ffn_out = profile::phase(&dev, "ffn", || {
             let ffn_inp = if let Some(pre_norm) = &self.pre_ffn_norm {
                 pre_norm.forward(&x)?
             } else {
@@ -528,11 +528,14 @@ pub fn run_transformer_layers_batch(
         "token_ids and position_ids must live on the same device",
     );
 
-    decode_profile::set_active(token_counts.iter().all(|&t| t == 1));
+    profile::begin_forward(
+        token_counts.iter().all(|&t| t == 1),
+        token_counts.iter().sum(),
+    );
     let dev = token_ids.device().clone();
-    decode_profile::barrier(&dev);
+    profile::barrier(&dev);
 
-    let mut x = decode_profile::phase(&dev, "embed", || c.embed_tokens.forward(token_ids))?;
+    let mut x = profile::phase(&dev, "embed", || c.embed_tokens.forward(token_ids))?;
     if let Some(scale) = c.embed_scale {
         x = (x * scale)?;
     }
@@ -609,7 +612,7 @@ pub fn run_transformer_layers_batch(
         )?;
     }
 
-    let x = decode_profile::phase(&dev, "final_norm", || c.norm.forward(&x))?;
+    let x = profile::phase(&dev, "final_norm", || c.norm.forward(&x))?;
     let x = match rows {
         LogitRows::All => x,
         LogitRows::LastPerSequence => {
@@ -624,7 +627,7 @@ pub fn run_transformer_layers_batch(
             x.index_select(&Tensor::from_vec(idx, (token_counts.len(),), &dev)?, 1)?
         }
     };
-    let mut logits = decode_profile::phase(&dev, "lm_head", || c.lm_head.forward(&x))?;
+    let mut logits = profile::phase(&dev, "lm_head", || c.lm_head.forward(&x))?;
 
     // Granite calibrates sampling by dividing the logits (HF `logits_scaling`).
     if let Some(s) = c.logits_scaling {
@@ -648,7 +651,7 @@ pub fn run_transformer_layers_batch(
     } else {
         Ok(logits)
     };
-    decode_profile::mark_forward_end();
+    profile::mark_forward_end();
     out
 }
 

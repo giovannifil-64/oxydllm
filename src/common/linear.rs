@@ -5,7 +5,6 @@ use crate::common::awq::{AwqRawTensors, dequantize_awq};
 use crate::common::awq::{QuantWeight, dequantize_quant};
 use crate::common::weights::apply_scale_inv;
 #[cfg(feature = "metal")]
-use candle_core::quantized::GgmlDType;
 use candle_core::quantized::{QMatMul, QTensor};
 use candle_core::{DType, Device, Result, Tensor};
 use std::sync::Arc;
@@ -172,116 +171,14 @@ pub fn softmax_last_dim(x: &Tensor) -> Result<Tensor> {
 
 /// A quantized linear layer over GGUF `QTensor` weights.
 ///
-/// Holds either candle's `QMatMul` (`inner`) or, on Metal, the resident
-/// fast-path stream (`gguf_fast`). `inner` is `None` when `gguf_fast` owns the
-/// packed weights, so they are never held in memory twice. An optional `bias` is
-/// added and the output is produced in `out_dtype`.
+/// Defers the matmul to candle's `QMatMul`, which on Metal reaches roughly
+/// 3 TFLOPS on prefill shapes against the 0.4 this crate's own block-quant
+/// kernels managed, and wins at every batch size down to a single token. An
+/// optional `bias` is added and the output is produced in `out_dtype`.
 pub struct QLinear {
-    inner: Option<QMatMul>,
-    #[cfg(feature = "metal")]
-    gguf_fast: Option<GgufFastPath>,
+    inner: QMatMul,
     bias: Option<Tensor>,
     out_dtype: DType,
-}
-
-#[cfg(feature = "metal")]
-struct GgufFastPath {
-    quant: super::metal_ops::GgufFastQuant,
-    weight_bytes: Tensor,
-    in_features: usize,
-    out_features: usize,
-}
-
-#[cfg(feature = "metal")]
-impl GgufFastPath {
-    fn build(qt: &Arc<QTensor>, out_dtype: DType) -> Result<Option<Self>> {
-        if !matches!(qt.device(), Device::Metal(_)) || out_dtype != DType::BF16 {
-            return Ok(None);
-        }
-        let quant = match qt.dtype() {
-            GgmlDType::Q4_0 => super::metal_ops::GgufFastQuant::Q4_0,
-            GgmlDType::Q4_1 => super::metal_ops::GgufFastQuant::Q4_1,
-            GgmlDType::Q5_0 => super::metal_ops::GgufFastQuant::Q5_0,
-            GgmlDType::Q5_1 => super::metal_ops::GgufFastQuant::Q5_1,
-            GgmlDType::Q8_0 => super::metal_ops::GgufFastQuant::Q8_0,
-            GgmlDType::Q2K => super::metal_ops::GgufFastQuant::Q2K,
-            GgmlDType::Q3K => super::metal_ops::GgufFastQuant::Q3K,
-            GgmlDType::Q4K => super::metal_ops::GgufFastQuant::Q4K,
-            GgmlDType::Q5K => super::metal_ops::GgufFastQuant::Q5K,
-            GgmlDType::Q6K => super::metal_ops::GgufFastQuant::Q6K,
-            _ => return Ok(None),
-        };
-        let shape_dims = qt.shape().dims();
-        if shape_dims.len() != 2 {
-            return Ok(None);
-        }
-        let (out_features, in_features) = (shape_dims[0], shape_dims[1]);
-        let (block_elems, block_bytes) = quant.block_layout();
-        if !in_features.is_multiple_of(block_elems) {
-            return Ok(None);
-        }
-
-        let device = qt.device();
-        let bytes = qt
-            .data()
-            .map_err(|e| candle_core::Error::Msg(format!("GGUF fast path: qt.data() failed: {e}")))?
-            .into_owned();
-        let expected = out_features * (in_features / block_elems) * block_bytes;
-        if bytes.len() != expected {
-            candle_core::bail!(
-                "GGUF fast path: qt.data() returned {} bytes, expected {} for shape [{}, {}] dtype {:?}",
-                bytes.len(),
-                expected,
-                out_features,
-                in_features,
-                qt.dtype()
-            );
-        }
-        let weight_bytes = Tensor::from_vec(bytes, (expected,), &device)?;
-        Ok(Some(Self {
-            quant,
-            weight_bytes,
-            in_features,
-            out_features,
-        }))
-    }
-
-    // Decode path (1 <= m <= GGUF_BATCH_MAX): gemv for m=1, batched gemv above.
-    fn forward_decode(&self, x: &Tensor) -> Result<Tensor> {
-        let dims = x.dims().to_vec();
-        let in_features = *dims.last().unwrap();
-        debug_assert_eq!(in_features, self.in_features);
-        let m: usize = dims[..dims.len() - 1].iter().product();
-        let x_2d = x.reshape((m, in_features))?.contiguous()?;
-        let y_2d = super::metal_ops::gguf_quant_matmul(
-            &x_2d,
-            &self.weight_bytes,
-            self.in_features,
-            self.out_features,
-            self.quant,
-        )?;
-        let mut out_dims = dims;
-        *out_dims.last_mut().unwrap() = self.out_features;
-        y_2d.reshape(out_dims)
-    }
-
-    fn forward_prefill(&self, x: &Tensor) -> Result<Tensor> {
-        let original_dims = x.dims().to_vec();
-        let in_features = *original_dims.last().unwrap();
-        debug_assert_eq!(in_features, self.in_features);
-        let batch_flat: usize = original_dims[..original_dims.len() - 1].iter().product();
-        let x_2d = x.reshape((batch_flat, in_features))?.contiguous()?;
-        let y_2d = super::metal_ops::gguf_quant_mul_mm(
-            &x_2d,
-            &self.weight_bytes,
-            self.in_features,
-            self.out_features,
-            self.quant,
-        )?;
-        let mut new_dims = original_dims;
-        *new_dims.last_mut().unwrap() = self.out_features;
-        y_2d.reshape(new_dims)
-    }
 }
 
 impl QLinear {
@@ -294,65 +191,18 @@ impl QLinear {
         bias: Option<Tensor>,
         out_dtype: DType,
     ) -> Result<Self> {
-        #[cfg(feature = "metal")]
-        {
-            let gguf_fast = GgufFastPath::build(&qtensor, out_dtype)?;
-            let inner = if gguf_fast.is_some() {
-                drop(qtensor);
-                None
-            } else {
-                Some(QMatMul::from_arc(qtensor)?)
-            };
-            Ok(Self {
-                inner,
-                gguf_fast,
-                bias,
-                out_dtype,
-            })
-        }
-        #[cfg(not(feature = "metal"))]
-        {
-            let inner = Some(QMatMul::from_arc(qtensor)?);
-            Ok(Self {
-                inner,
-                bias,
-                out_dtype,
-            })
-        }
+        Ok(Self {
+            inner: QMatMul::from_arc(qtensor)?,
+            bias,
+            out_dtype,
+        })
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let original_dims = x.dims().to_vec();
         let in_features = *original_dims.last().unwrap();
 
-        #[cfg(feature = "metal")]
-        if let Some(ref fast) = self.gguf_fast
-            && in_features == fast.in_features
-            && x.dtype() == DType::BF16
-        {
-            let m: usize = original_dims[..original_dims.len() - 1].iter().product();
-            let out = if (1..=super::metal_ops::GGUF_BATCH_MAX).contains(&m) {
-                fast.forward_decode(x)?
-            } else {
-                fast.forward_prefill(x)?
-            };
-            let out = if out.dtype() != self.out_dtype {
-                out.to_dtype(self.out_dtype)?
-            } else {
-                out
-            };
-            return match &self.bias {
-                Some(b) => out.broadcast_add(b),
-                None => Ok(out),
-            };
-        }
-
-        let inner = self.inner.as_ref().ok_or_else(|| {
-            candle_core::Error::Msg(
-                "QLinear: candle QMatMul was released but the GGUF fast path is not engaged"
-                    .to_string(),
-            )
-        })?;
+        let inner = &self.inner;
 
         let x_f32_owned;
         let x_f32: &Tensor = if x.dtype() != DType::F32 {

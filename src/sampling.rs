@@ -578,13 +578,13 @@ fn apply_top_p(probs: &mut [f32], top_p: f32) {
     });
 }
 
-/// Gated diagnostics (`OXYDLLM_PROFILE_DECODE=1`): reports [`apply_top_p`]'s
+/// Gated diagnostics (`OXYDLLM_PROFILE=1`): reports [`apply_top_p`]'s
 /// fast-path hit rate and average candidate count every 256 calls.
 fn top_p_probe(fast_hit: bool, candidates: usize) {
     use std::sync::OnceLock;
     use std::sync::atomic::{AtomicU64, Ordering};
     static EN: OnceLock<bool> = OnceLock::new();
-    if !*EN.get_or_init(|| std::env::var("OXYDLLM_PROFILE_DECODE").as_deref() == Ok("1")) {
+    if !*EN.get_or_init(|| std::env::var("OXYDLLM_PROFILE").as_deref() == Ok("1")) {
         return;
     }
     static CALLS: AtomicU64 = AtomicU64::new(0);

@@ -34,7 +34,7 @@
 //! - [`prefix_cache`]: shared-prefix reuse across requests.
 //! - [`mask`]: causal and sliding-window attention masks.
 //! - [`config`]: the schema that drives all of the above.
-//! - [`decode_profile`]: per-phase latency profiling hooks.
+//! - [`profile`]: per-phase latency profiling hooks.
 //! - `metal_ops`: fused Metal kernels (norm, quantized matmul, attention);
 //!   compiled only under the `metal` feature.
 //!
@@ -59,7 +59,6 @@ pub mod attention;
 pub mod awq;
 pub mod block;
 pub mod config;
-pub mod decode_profile;
 pub mod expert_stream;
 pub mod ffn;
 pub mod gdn;
@@ -74,5 +73,6 @@ pub mod mxfp4;
 pub mod norm;
 pub mod paged;
 pub mod prefix_cache;
+pub mod profile;
 pub mod rope;
 pub mod weights;

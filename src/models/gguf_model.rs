@@ -536,6 +536,16 @@ impl StandardTransformer {
             arch_def.default_sliding_window
         };
 
+        // One source for the per-layer window: the blocks below and the caches
+        // built on these allocators must agree token for token, or a layer keeps
+        // a window of one width and reads one of another.
+        let layer_windows: Vec<Option<usize>> = (0..num_hidden_layers)
+            .map(|i| match topo.per_layer.as_ref() {
+                Some(g) => g.sliding_windows[i],
+                None => arch_def.resolve_sliding_window_for_layer(sliding_window, i),
+            })
+            .collect();
+
         let blocks = (0..num_hidden_layers)
             .map(|i| {
                 let per_layer = topo.per_layer.as_ref();
@@ -552,10 +562,7 @@ impl StandardTransformer {
                     residual_multiplier,
                     v_norm: has_v_norm,
                     has_ffn_norms,
-                    sliding_window: match per_layer {
-                        Some(g) => g.sliding_windows[i],
-                        None => arch_def.resolve_sliding_window_for_layer(sliding_window, i),
-                    },
+                    sliding_window: layer_windows[i],
                     // GGUF runtime is dense-only; MoE GGUF support is future work.
                     moe: None,
                     linear_attn: if topo.layer_is_linear(i) {
@@ -636,7 +643,8 @@ impl StandardTransformer {
                                 ))
                             }),
                         )
-                        .map_err(|e| anyhow::anyhow!("Failed to create block allocator: {e}"))?,
+                        .map_err(|e| anyhow::anyhow!("Failed to create block allocator: {e}"))?
+                        .with_sliding_window(layer_windows[i]),
                     )));
                 }
             }

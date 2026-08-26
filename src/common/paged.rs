@@ -392,6 +392,7 @@ pub struct BlockAllocator {
     dtype: DType,
     device: Device,
     contig_pool: ContigBufferPool,
+    sliding_window: Option<usize>,
 }
 
 pub struct StagedKvData<'a> {
@@ -449,7 +450,23 @@ impl BlockAllocator {
             dtype,
             device: device.clone(),
             contig_pool: ContigBufferPool::new(MAX_POOL_BUFFERS),
+            sliding_window: None,
         })
+    }
+
+    /// Records the sliding window this layer attends over, so the caches built
+    /// on this allocator keep only what the layer can still read.
+    ///
+    /// The window belongs to the layer, and the allocator is already the
+    /// per-layer object that carries its geometry, so the caches pick it up
+    /// without every construction site having to know about it.
+    pub fn with_sliding_window(mut self, window: Option<usize>) -> Self {
+        self.sliding_window = window;
+        self
+    }
+
+    pub fn sliding_window(&self) -> Option<usize> {
+        self.sliding_window
     }
 
     pub fn allocate(&mut self) -> Result<usize> {
@@ -756,6 +773,11 @@ impl BlockTable {
     }
 }
 
+/// Tokens a windowed cache keeps beyond its window, so that rolling back the
+/// handful of tokens a speculative verify can reject still leaves the whole
+/// window materialised.
+const WINDOW_KEEP_MARGIN: usize = 16;
+
 fn contig_buf_capacity(total_needed: usize) -> usize {
     let cap = if total_needed < 1024 {
         total_needed * 2
@@ -824,6 +846,8 @@ pub struct PagedKvCache {
     contig_k: Option<Tensor>,
     contig_v: Option<Tensor>,
     contig_len: usize,
+    contig_start: usize,
+    window: Option<usize>,
     pending_writes: Vec<PendingBatch>,
     recurrent: Option<RecurrentState>,
 }
@@ -836,6 +860,7 @@ impl PagedKvCache {
         let (n_kv, head_dim) = alloc.dims();
         let dtype = alloc.dtype();
         let device = alloc.device().clone();
+        let window = alloc.sliding_window();
         drop(alloc);
         Self {
             allocator,
@@ -849,6 +874,8 @@ impl PagedKvCache {
             contig_k: None,
             contig_v: None,
             contig_len: 0,
+            contig_start: 0,
+            window,
             pending_writes: Vec::new(),
             recurrent: None,
         }
@@ -892,11 +919,16 @@ impl PagedKvCache {
         let skip_pool_write = self.contig_len > 0 && new_seq == 1;
 
         let prev_tokens = self.table.num_tokens;
+        // The buffer holds a suffix of the sequence: never more than the whole
+        // of it, and never less than the window the layer reads.
         debug_assert!(
-            self.contig_len == 0 || self.contig_len == prev_tokens,
-            "contig_len ({}) must match table tokens ({}) when buffer exists",
+            self.contig_len <= prev_tokens
+                && (self.contig_len == 0
+                    || self.contig_len >= self.window.map_or(prev_tokens, |w| prev_tokens.min(w))),
+            "the buffer holds {} tokens of a sequence of {}, and this layer reads {:?} back",
             self.contig_len,
-            prev_tokens
+            prev_tokens,
+            self.window
         );
         let mut written = 0;
 
@@ -950,71 +982,113 @@ impl PagedKvCache {
             });
         }
 
-        let total_needed = prev_tokens + new_seq;
+        // A layer that attends over a sliding window can never read further back
+        // than that window, so the buffer holds the window rather than the whole
+        // sequence: bounded memory whatever the context, and the reads are views
+        // into it that the kernels take as they are.
+        // With no buffer yet the tokens live in the pool, and how many of them
+        // still matter is a question about the sequence, not about a buffer that
+        // does not exist: this is the path a prefix-cache hit takes.
+        let span = |w: usize| w + new_seq - 1 + WINDOW_KEEP_MARGIN;
+        let live_prev = if self.contig_k.is_some() {
+            self.contig_len
+        } else {
+            self.window
+                .map_or(prev_tokens, |w| prev_tokens.min(span(w)))
+        };
+        // A forward over `new_seq` queries reads back `window + new_seq - 1`
+        // keys: the oldest query in the batch still sees a whole window. Keeping
+        // less would quietly shorten what a prefill chunk attends to.
+        let keep = self
+            .window
+            .map_or(live_prev + new_seq, |w| (live_prev + new_seq).min(span(w)));
+        let from_new = new_seq.min(keep);
+        let from_old = keep - from_new;
+        let new_src_k = new_k.narrow(2, new_seq - from_new, from_new)?;
+        let new_src_v = new_v.narrow(2, new_seq - from_new, from_new)?;
 
-        // Region past `contig_len` is never observed (all reads narrow to it), so
-        // reusing dirty pooled memory is safe.
+        // Region outside the live window is never observed (all reads narrow to
+        // it), so reusing dirty pooled memory is safe.
         match (self.contig_k.take(), self.contig_v.take()) {
             (Some(k_buf), Some(v_buf)) => {
                 let cap = k_buf.dim(2)?;
-                if total_needed <= cap {
-                    k_buf.slice_set(new_k, 2, prev_tokens)?;
-                    v_buf.slice_set(new_v, 2, prev_tokens)?;
+                if self.contig_start + self.contig_len + new_seq <= cap {
+                    // Room where it already sits: nothing is dropped and nothing
+                    // moves, which is the whole point of carrying a start.
+                    let at = self.contig_start + self.contig_len;
+                    k_buf.slice_set(new_k, 2, at)?;
+                    v_buf.slice_set(new_v, 2, at)?;
+                    self.contig_len += new_seq;
                     self.contig_k = Some(k_buf);
                     self.contig_v = Some(v_buf);
-                } else {
-                    let (new_k_buf, new_v_buf, new_cap) = self.acquire_contig(total_needed)?;
-                    if self.contig_len > 0 {
-                        let old_k = k_buf.narrow(2, 0, self.contig_len)?.contiguous()?;
-                        let old_v = v_buf.narrow(2, 0, self.contig_len)?.contiguous()?;
-                        new_k_buf.slice_set(&old_k, 2, 0)?;
-                        new_v_buf.slice_set(&old_v, 2, 0)?;
+                    return self.current();
+                }
+                {
+                    let start = self.contig_start + (self.contig_len - from_old);
+                    // The window has walked to the end of the buffer: fold what
+                    // it still covers back to the front. With the slack this
+                    // capacity carries, that happens once every few hundred
+                    // tokens rather than once per token.
+                    let (dst_k, dst_v, dst_cap, retired) = if keep <= cap {
+                        (k_buf.clone(), v_buf.clone(), cap, None)
+                    } else {
+                        let (nk, nv, ncap) = self.acquire_contig(keep)?;
+                        (nk, nv, ncap, Some((k_buf, v_buf, cap)))
+                    };
+                    let (src_k, src_v) = retired
+                        .as_ref()
+                        .map_or((&dst_k, &dst_v), |(k, v, _)| (k, v));
+                    if from_old > 0 {
+                        let old_k = src_k.narrow(2, start, from_old)?.contiguous()?;
+                        let old_v = src_v.narrow(2, start, from_old)?.contiguous()?;
+                        dst_k.slice_set(&old_k, 2, 0)?;
+                        dst_v.slice_set(&old_v, 2, 0)?;
                     }
-                    new_k_buf.slice_set(new_k, 2, prev_tokens)?;
-                    new_v_buf.slice_set(new_v, 2, prev_tokens)?;
-                    self.release_contig(k_buf, v_buf, cap);
-                    self.contig_k = Some(new_k_buf);
-                    self.contig_v = Some(new_v_buf);
-                    let _ = new_cap;
+                    dst_k.slice_set(&new_src_k, 2, from_old)?;
+                    dst_v.slice_set(&new_src_v, 2, from_old)?;
+                    if let Some((k, v, c)) = retired {
+                        self.release_contig(k, v, c);
+                    }
+                    let _ = dst_cap;
+                    self.contig_start = 0;
+                    self.contig_len = keep;
+                    self.contig_k = Some(dst_k);
+                    self.contig_v = Some(dst_v);
                 }
             }
             (None, None) => {
-                let (k_buf, v_buf, _cap) = self.acquire_contig(total_needed)?;
+                let (k_buf, v_buf, _cap) = self.acquire_contig(keep)?;
 
-                if prev_tokens > 0 {
-                    let prefix_slots = &self.table.cached_slots[..prev_tokens];
-                    let idx = Tensor::from_slice(prefix_slots, (prev_tokens,), &self.device)?;
+                if from_old > 0 {
+                    let from_old = from_old.min(prev_tokens);
+                    let slots = &self.table.cached_slots[prev_tokens - from_old..prev_tokens];
+                    let idx = Tensor::from_slice(slots, (from_old,), &self.device)?;
                     let (pk, pv) = self.allocator.lock().unwrap().gather(&idx)?;
                     k_buf.slice_set(&pk.contiguous()?, 2, 0)?;
                     v_buf.slice_set(&pv.contiguous()?, 2, 0)?;
                 }
-                k_buf.slice_set(new_k, 2, prev_tokens)?;
-                v_buf.slice_set(new_v, 2, prev_tokens)?;
+                k_buf.slice_set(&new_src_k, 2, from_old)?;
+                v_buf.slice_set(&new_src_v, 2, from_old)?;
+                self.contig_start = 0;
+                self.contig_len = keep;
                 self.contig_k = Some(k_buf);
                 self.contig_v = Some(v_buf);
             }
             _ => unreachable!("contig_k and contig_v must always be in sync"),
         };
-        self.contig_len = total_needed;
 
-        Ok((
-            self.contig_k
-                .as_ref()
-                .unwrap()
-                .narrow(2, 0, self.contig_len)?,
-            self.contig_v
-                .as_ref()
-                .unwrap()
-                .narrow(2, 0, self.contig_len)?,
-        ))
+        self.current()
     }
 
     pub fn current(&self) -> Result<(Tensor, Tensor)> {
+        // Everything the buffer still holds: for a windowed layer that is the
+        // window plus what a rollback or a wider forward may still need. The
+        // caller trims to the exact span the forward reads.
+        let (start, len) = (self.contig_start, self.contig_len);
         match (&self.contig_k, &self.contig_v) {
-            (Some(k), Some(v)) if self.contig_len > 0 => Ok((
-                k.narrow(2, 0, self.contig_len)?,
-                v.narrow(2, 0, self.contig_len)?,
-            )),
+            (Some(k), Some(v)) if len > 0 => {
+                Ok((k.narrow(2, start, len)?, v.narrow(2, start, len)?))
+            }
             _ => Err(candle_core::Error::Msg("KV cache is empty".to_string())),
         }
     }
@@ -1169,6 +1243,7 @@ impl PagedKvCache {
         self.table.num_tokens = 0;
         self.table.cached_slots.clear();
         self.contig_len = 0;
+        self.contig_start = 0;
     }
 
     pub fn prepopulate_block(&mut self, block_id: usize) {
@@ -1182,11 +1257,13 @@ impl PagedKvCache {
     }
 
     pub fn set_num_tokens(&mut self, n: usize) {
+        // What the buffer holds is a suffix of the sequence, so dropping the
+        // tail drops exactly as many of its tokens. Without a window the suffix
+        // is the whole sequence and this leaves `n`, as it always did.
+        let removed = self.table.num_tokens.saturating_sub(n);
         self.table.cached_slots.truncate(n);
         self.table.num_tokens = n;
-        if n < self.contig_len {
-            self.contig_len = n;
-        }
+        self.contig_len = self.contig_len.saturating_sub(removed);
     }
 
     /// Drop buffered pool writes without materializing them. Speculative verify
@@ -1297,6 +1374,145 @@ mod tests {
         let a = safe_model_kv_ceiling(2 << 30);
         let b = safe_model_kv_ceiling(2 << 30);
         assert_eq!(a, b);
+    }
+
+    /// Contract: a windowed cache always shows the last `window` tokens, exactly
+    /// those and exactly their values, however the tokens arrived.
+    ///
+    /// A layer with a sliding window can never read further back than the
+    /// window, so its buffer holds the window instead of the whole sequence:
+    /// bounded memory whatever the context, where before it grew with every
+    /// token and, on a 12B checkpoint at a few thousand tokens, took gigabytes
+    /// of a device that had none to spare. The buffer that backs it is larger
+    /// than the window and the live tokens walk along it, so this drives the
+    /// sequence far enough to fold back to the front many times over, in chunks
+    /// of every shape a prompt and a decode produce.
+    #[test]
+    fn a_windowed_cache_shows_exactly_the_last_window_tokens() {
+        const W: usize = 12;
+        const HEADS: usize = 2;
+        const DIM: usize = 4;
+
+        for seed in 0u64..24 {
+            let mut rng = Rng::new(seed ^ 0xF1_0E_57);
+            let alloc = Arc::new(Mutex::new(
+                BlockAllocator::new(256, 4, HEADS, DIM, DType::F32, &Device::Cpu, None)
+                    .unwrap()
+                    .with_sliding_window(Some(W)),
+            ));
+            let mut cache = PagedKvCache::new(alloc);
+            let dev = Device::Cpu;
+            // Every token is its own number, so a window off by one token, or
+            // holding a stale one, cannot pass.
+            let mut appended: Vec<f32> = Vec::new();
+
+            let mut next_token = 0f32;
+            let mut n_max = 1usize;
+            while appended.len() < 200 {
+                let n = match rng.between(0, 3) {
+                    0 => 1,
+                    1 => rng.between(1, 5),
+                    2 => rng.between(5, 20),
+                    _ => rng.between(1, 3),
+                };
+                n_max = n_max.max(n);
+                let vals: Vec<f32> = (0..n)
+                    .flat_map(|i| vec![next_token + i as f32; HEADS * DIM])
+                    .collect();
+                // [1, HEADS, n, DIM] with the head axis outermost after batch.
+                let mut laid = vec![0f32; HEADS * n * DIM];
+                for t in 0..n {
+                    for h in 0..HEADS {
+                        for d in 0..DIM {
+                            laid[h * n * DIM + t * DIM + d] = vals[t * HEADS * DIM];
+                        }
+                    }
+                }
+                let k = Tensor::from_vec(laid.clone(), (1, HEADS, n, DIM), &dev).unwrap();
+                let v = Tensor::from_vec(laid, (1, HEADS, n, DIM), &dev).unwrap();
+                let (kk, vv) = cache.append(&k, &v).unwrap();
+                for i in 0..n {
+                    appended.push(next_token + i as f32);
+                }
+                next_token += n as f32;
+
+                // What the layer will read: a forward over n queries reaches
+                // back window + n - 1 keys. The cache may hold more, never less.
+                let dovuti = (W + n - 1).min(appended.len());
+                for (nome, t) in [("K", &kk), ("V", &vv)] {
+                    let shown = t.dim(2).unwrap();
+                    assert!(
+                        shown >= dovuti && shown <= appended.len(),
+                        "seed {seed}: {nome} shows {shown} tokens, needs at least {dovuti} of {}",
+                        appended.len()
+                    );
+                    let atteso: Vec<f32> =
+                        appended.iter().rev().take(shown).rev().copied().collect();
+                    let got: Vec<f32> = t
+                        .narrow(1, 1, 1)
+                        .unwrap()
+                        .flatten_all()
+                        .unwrap()
+                        .to_vec1::<f32>()
+                        .unwrap();
+                    for (j, want) in atteso.iter().enumerate() {
+                        for d in 0..DIM {
+                            assert_eq!(
+                                got[j * DIM + d],
+                                *want,
+                                "seed {seed}: {nome} token {j} of the window is {} not {want}",
+                                got[j * DIM + d]
+                            );
+                        }
+                    }
+                }
+                // What the cache hands out on demand must be what it just returned.
+                let (ck, _) = cache.current().unwrap();
+                assert_eq!(ck.dim(2).unwrap(), kk.dim(2).unwrap());
+                // Bounded memory is the point: the buffer must not keep growing
+                // with the sequence once the window is full.
+                assert!(
+                    kk.dim(2).unwrap() <= contig_buf_capacity(W + n_max - 1 + WINDOW_KEEP_MARGIN),
+                    "seed {seed}: the cache kept {} tokens after {} in the sequence, which is not \
+                     bounded by the window",
+                    kk.dim(2).unwrap(),
+                    appended.len()
+                );
+            }
+
+            // A speculative verify rejects a few tokens: the window must stay
+            // whole, which is why the buffer keeps a margin beyond it.
+            let before = cache.num_tokens();
+            cache.truncate_to(before - 3).unwrap();
+            appended.truncate(before - 3);
+            let (kk, _) = cache.current().unwrap();
+            assert!(
+                kk.dim(2).unwrap() >= W.min(appended.len()),
+                "seed {seed}: the window came up short after a rollback: {} tokens",
+                kk.dim(2).unwrap()
+            );
+            let got: Vec<f32> = kk
+                .narrow(1, 0, 1)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            let atteso: Vec<f32> = appended
+                .iter()
+                .rev()
+                .take(kk.dim(2).unwrap())
+                .rev()
+                .copied()
+                .collect();
+            for (j, want) in atteso.iter().enumerate() {
+                assert_eq!(
+                    got[j * DIM],
+                    *want,
+                    "seed {seed}: after the rollback token {j} of the window is wrong"
+                );
+            }
+        }
     }
 
     fn make_allocator(num_blocks: usize, block_size: usize) -> SharedBlockAllocator {

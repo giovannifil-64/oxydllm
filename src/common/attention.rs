@@ -943,19 +943,30 @@ impl Attention {
                         .narrow(3, 0, kv_len)?;
                     scores.broadcast_add(&seg_mask.to_dtype(scores.dtype())?)?
                 } else if seg.num_tokens > 1 {
-                    let cm = if kv_len > seg.num_tokens {
-                        super::mask::causal_mask_prefixed_cached_dtype(
+                    // A windowed layer must close its window here too. The
+                    // kernels above mask one themselves; this path did not, so a
+                    // prompt longer than the window read all of it.
+                    let cm = match self.sliding_window {
+                        Some(w) if kv_len > w => super::mask::sliding_window_mask_cached_dtype(
                             seg.num_tokens,
                             kv_len,
+                            w,
                             scores.dtype(),
                             device,
-                        )?
-                    } else {
-                        super::mask::causal_mask_cached_dtype(
+                        )?,
+                        _ if kv_len > seg.num_tokens => {
+                            super::mask::causal_mask_prefixed_cached_dtype(
+                                seg.num_tokens,
+                                kv_len,
+                                scores.dtype(),
+                                device,
+                            )?
+                        }
+                        _ => super::mask::causal_mask_cached_dtype(
                             seg.num_tokens,
                             scores.dtype(),
                             device,
-                        )?
+                        )?,
                     };
                     scores.broadcast_add(&cm)?
                 } else {

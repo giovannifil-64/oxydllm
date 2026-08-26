@@ -1325,15 +1325,20 @@ fn load_standard_safetensors(
             let mut real: Vec<Option<SharedBlockAllocator>> = vec![None; cfg.num_hidden_layers];
             for i in 0..cfg.num_hidden_layers {
                 if !layer_is_linear[i] {
-                    real[i] = Some(Arc::new(Mutex::new(BlockAllocator::new(
-                        num_blocks,
-                        DEFAULT_BLOCK_SIZE,
-                        per_layer_kv_heads[i],
-                        per_layer_head_dims[i],
-                        dtype,
-                        device,
-                        layer_quantizers[i].clone(),
-                    )?)));
+                    // The same per-layer window the blocks were configured
+                    // with, so a layer never keeps one width and reads another.
+                    real[i] = Some(Arc::new(Mutex::new(
+                        BlockAllocator::new(
+                            num_blocks,
+                            DEFAULT_BLOCK_SIZE,
+                            per_layer_kv_heads[i],
+                            per_layer_head_dims[i],
+                            dtype,
+                            device,
+                            layer_quantizers[i].clone(),
+                        )?
+                        .with_sliding_window(per_layer_sliding_windows[i]),
+                    )));
                 }
             }
             let first_full = real.iter().flatten().next().cloned().ok_or_else(|| {

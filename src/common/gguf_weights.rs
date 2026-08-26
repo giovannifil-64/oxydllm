@@ -26,6 +26,23 @@ pub struct GgufWeights {
     _mmaps: Vec<Mmap>,
 }
 
+/// Reads any of GGUF's integer widths as a `u32`.
+///
+/// A converter is free to write a count as `int32` where another writes
+/// `uint32`, and both mean the same thing; insisting on one of them rejects a
+/// file for how it spelled a number.
+fn any_integer(v: &gguf_file::Value) -> Option<u32> {
+    v.to_u32()
+        .ok()
+        .or_else(|| v.to_i32().ok().and_then(|x| u32::try_from(x).ok()))
+        .or_else(|| v.to_u64().ok().and_then(|x| u32::try_from(x).ok()))
+        .or_else(|| v.to_i64().ok().and_then(|x| u32::try_from(x).ok()))
+        .or_else(|| v.to_u16().ok().map(u32::from))
+        .or_else(|| v.to_i16().ok().and_then(|x| u32::try_from(x).ok()))
+        .or_else(|| v.to_u8().ok().map(u32::from))
+        .or_else(|| v.to_i8().ok().and_then(|x| u32::try_from(x).ok()))
+}
+
 impl GgufWeights {
     /// Loads a single GGUF file: mmaps it, parses the header, and materialises
     /// every tensor onto `device`.
@@ -138,7 +155,7 @@ impl GgufWeights {
     /// publishes a single value for all of them.
     pub fn metadata_u32_array(&self, key: &str) -> Option<Vec<u32>> {
         let items = self.metadata.get(key)?.to_vec().ok()?;
-        items.iter().map(|v| v.to_u32().ok()).collect()
+        items.iter().map(any_integer).collect()
     }
 
     /// Reads metadata `key` as an array of `bool`. `None` as for

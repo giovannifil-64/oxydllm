@@ -1322,6 +1322,11 @@ fn run_interactive(args: &RunArgs) -> anyhow::Result<()> {
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
 
+    // Take the machine's free-memory reading before anything is loaded, since
+    // every later sizing decision rests on it and it moves once a checkpoint
+    // starts being read.
+    common::paged::prime_memory_reading();
+
     // OTLP trace export is only meaningful for the long-running server; resolve
     // the endpoint before installing the subscriber so the OpenTelemetry layer
     // can be attached at init time (it cannot be added afterwards).

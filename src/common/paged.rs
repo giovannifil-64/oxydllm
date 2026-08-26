@@ -139,6 +139,14 @@ const KV_TOTAL_FRACTION: f64 = 0.42;
 /// which is what this floor buys them.
 const MIN_USEFUL_KV: usize = 1 << 30;
 
+/// Takes the free-memory reading now, while nothing is loaded.
+///
+/// Called at startup so the figure every later decision rests on describes an
+/// idle machine rather than one halfway through reading a checkpoint.
+pub fn prime_memory_reading() {
+    let _ = available_memory_bytes();
+}
+
 /// What the device itself says this process may hold.
 ///
 /// Apple's driver answers the question directly through
@@ -170,8 +178,13 @@ fn device_working_set_bytes() -> Option<usize> {
     None
 }
 
-/// Memory the system could hand out right now: free pages plus the ones it can
-/// reclaim without touching disk.
+/// Memory the system could hand out: free pages plus the ones it can reclaim
+/// without touching disk, read once and kept.
+///
+/// Read once because the answer moves while a model loads, and a pool sized
+/// from a reading taken mid-load would be sized against the very weights it is
+/// meant to sit beside. [`prime_memory_reading`] takes it before anything is
+/// loaded; the cache is what makes that the reading everyone sees.
 ///
 /// The device's recommended working set is the ceiling for a machine with
 /// nothing else on it; this is the other half of the answer, what is actually
@@ -246,11 +259,16 @@ pub fn safe_total_commitment_bytes() -> usize {
 /// a retry rather than corrupt an output.
 pub fn safe_model_kv_ceiling(weights_bytes: usize) -> usize {
     if let Some(budget) = device_working_set_bytes() {
-        let room = match available_memory_bytes() {
-            Some(free) => budget.min(free),
-            None => budget,
+        // The weights come off the device's budget, which does not know about
+        // them yet, but not off the free-memory reading, which already does:
+        // by the time a pool is sized the weights are being read, so
+        // subtracting them from both counts them twice and, for a model of any
+        // size, leaves nothing.
+        let by_device = budget.saturating_sub(weights_bytes);
+        return match available_memory_bytes() {
+            Some(free) => by_device.min(free),
+            None => by_device,
         };
-        return room.saturating_sub(weights_bytes);
     }
     let physical = match detect_system_memory_bytes() {
         Some(p) => p,

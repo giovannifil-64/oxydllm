@@ -43,7 +43,11 @@ enum QkvProjection {
     Separate {
         q: AnyLinear,
         k: AnyLinear,
-        v: AnyLinear,
+        /// `None` when the checkpoint ships no value projection, which Gemma 4
+        /// does on its global layers: there the value is the key, taken from
+        /// the projection before the key is normalized or rotated, and given
+        /// its own normalization afterwards.
+        v: Option<AnyLinear>,
     },
 }
 
@@ -384,7 +388,7 @@ impl Attention {
             QkvProjection::Separate {
                 q: AnyLinear::from_quant(&q_raw, q_bias, &device, dtype)?,
                 k: AnyLinear::from_quant(&k_raw, k_bias, &device, dtype)?,
-                v: AnyLinear::from_quant(&v_raw, v_bias, &device, dtype)?,
+                v: Some(AnyLinear::from_quant(&v_raw, v_bias, &device, dtype)?),
             }
         };
         let o_proj = AnyLinear::from_quant(&o_raw, o_bias, &device, dtype)?;
@@ -499,15 +503,18 @@ impl Attention {
             )?;
             let q_proj = QLinear::from_arc_with_bias(q_qt, q_bias, dtype)?;
             let k_proj = QLinear::from_arc_with_bias(k_qt, k_bias, dtype)?;
-            let v_proj = QLinear::from_arc_with_bias(
-                gguf.get(&format!("{prefix}.attn_v.weight"))?,
-                v_bias,
-                dtype,
-            )?;
+            // A missing value projection is not a broken file: Gemma 4's global
+            // layers publish none, because the value is the key there.
+            let v_proj = match gguf.try_get(&format!("{prefix}.attn_v.weight")) {
+                Some(qt) => Some(AnyLinear::Quantized(QLinear::from_arc_with_bias(
+                    qt, v_bias, dtype,
+                )?)),
+                None => None,
+            };
             QkvProjection::Separate {
                 q: AnyLinear::Quantized(q_proj),
                 k: AnyLinear::Quantized(k_proj),
-                v: AnyLinear::Quantized(v_proj),
+                v: v_proj,
             }
         };
         let o_bias = load_bias(&format!("{prefix}.attn_output.bias"))?;
@@ -581,7 +588,12 @@ impl Attention {
                 Ok((q, k, v))
             }
             QkvProjection::Separate { q, k, v } => {
-                Ok((q.forward(x)?, k.forward(x)?, v.forward(x)?))
+                let k_out = k.forward(x)?;
+                let v_out = match v {
+                    Some(v) => v.forward(x)?,
+                    None => k_out.clone(),
+                };
+                Ok((q.forward(x)?, k_out, v_out))
             }
         }
     }

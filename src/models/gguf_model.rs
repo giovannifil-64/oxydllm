@@ -263,8 +263,18 @@ pub(crate) fn parse_gguf_topology(gguf: &GgufWeights) -> anyhow::Result<GgufTopo
     }
     let num_attention_heads =
         gguf.metadata_u32(&format!("{prefix}.attention.head_count"))? as usize;
-    let num_key_value_heads =
-        gguf.metadata_u32(&format!("{prefix}.attention.head_count_kv"))? as usize;
+    // A file that varies its KV heads publishes an array here. The scalar this
+    // reads is only the representative used where a single number is needed,
+    // such as deriving the head width from a fused qkv tensor; the truth for
+    // every other purpose is the per-layer geometry below.
+    let num_key_value_heads = match gguf.metadata_u32(&format!("{prefix}.attention.head_count_kv"))
+    {
+        Ok(v) => v as usize,
+        Err(e) => gguf
+            .metadata_u32_array(&format!("{prefix}.attention.head_count_kv"))
+            .and_then(|v| v.first().map(|&x| x as usize))
+            .ok_or(e)?,
+    };
     let head_dim = {
         let from_meta = gguf.metadata_u32_or(&format!("{prefix}.attention.key_length"), 0) as usize;
         if from_meta > 0 {
@@ -561,8 +571,10 @@ impl StandardTransformer {
                         BlockAllocator::new(
                             num_kv_blocks,
                             DEFAULT_BLOCK_SIZE,
-                            num_key_value_heads,
-                            head_dim,
+                            topo.per_layer
+                                .as_ref()
+                                .map_or(num_key_value_heads, |g| g.kv_heads[i]),
+                            topo.per_layer.as_ref().map_or(head_dim, |g| g.head_dims[i]),
                             dtype,
                             device,
                             kv_quantizer.clone(),

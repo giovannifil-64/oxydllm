@@ -498,9 +498,12 @@ mod gguf {
     use tokenizers::tokenizer::SplitDelimiterBehavior;
     use tokenizers::{
         AddedToken, Tokenizer,
-        decoders::{DecoderWrapper, byte_level::ByteLevel as ByteLevelDecoder},
+        decoders::{
+            DecoderWrapper, byte_fallback::ByteFallback, byte_level::ByteLevel as ByteLevelDecoder,
+            fuse::Fuse, sequence::Sequence as DecoderSequence,
+        },
         models::bpe::{BPE, Vocab},
-        normalizers::{NormalizerWrapper, unicode::NFC},
+        normalizers::{NormalizerWrapper, replace::Replace, unicode::NFC},
         pre_tokenizers::PreTokenizerWrapper,
         processors::sequence::Sequence as ProcessorSequence,
         processors::{PostProcessorWrapper, byte_level::ByteLevel as ByteLevelProcessor},
@@ -569,6 +572,39 @@ mod gguf {
         )
         .map_err(|e| anyhow::anyhow!("pre-tokenizer split regex: {e}"))?;
         Ok(Sequence::new(vec![split.into(), byte_level.into()]).into())
+    }
+
+    /// The pipeline a SentencePiece-style BPE needs: spaces become `\u{2581}`
+    /// on the way in and come back on the way out, with byte fallback for what
+    /// the vocabulary does not cover.
+    ///
+    /// Taken from the canonical `tokenizer.json` of the checkpoints that use it
+    /// rather than from memory, including the pre-tokenizer that splits on a
+    /// space the normalizer has already replaced: it does nothing, and leaving
+    /// it out is a difference nobody would notice until it mattered.
+    fn sentencepiece_pipeline() -> Result<Pipeline> {
+        let normalizer = Replace::new(" ", "\u{2581}")
+            .map_err(|e| anyhow::anyhow!("sentencepiece normalizer: {e}"))?;
+        let replace_back = tokenizers::normalizers::replace::Replace::new("\u{2581}", " ")
+            .map_err(|e| anyhow::anyhow!("sentencepiece decoder: {e}"))?;
+        Ok(Pipeline {
+            normalizer: Some(normalizer.into()),
+            pretokenizer: Some(
+                Split::new(
+                    SplitPattern::String(" ".to_string()),
+                    SplitDelimiterBehavior::MergedWithPrevious,
+                    false,
+                )
+                .map_err(|e| anyhow::anyhow!("sentencepiece pre-tokenizer: {e}"))?
+                .into(),
+            ),
+            decoder: Some(DecoderWrapper::Sequence(DecoderSequence::new(vec![
+                DecoderWrapper::Replace(replace_back),
+                DecoderWrapper::ByteFallback(ByteFallback::default()),
+                DecoderWrapper::Fuse(Fuse::default()),
+            ]))),
+            post_processor: None,
+        })
     }
 
     fn pipeline_from_pre(pre: &str) -> Result<Pipeline> {
@@ -680,7 +716,11 @@ mod gguf {
             .to_string()
             .map_err(|e| anyhow::anyhow!("tokenizer.ggml.model: {e}"))?
             .to_lowercase();
-        if model_kind != "gpt2" {
+        // `gemma4` is a byte-level-free BPE in SentencePiece dress: the same
+        // tokens and merges as any other BPE here, read through a different
+        // pipeline. Anything else with merges would likely work too, but a
+        // tokenizer that is nearly right is worse than one that refuses.
+        if model_kind != "gpt2" && model_kind != "gemma4" {
             anyhow::bail!("unsupported tokenizer model `{model_kind}`");
         }
 
@@ -715,11 +755,15 @@ mod gguf {
             .map_err(|e| anyhow::anyhow!("BPE build: {e}"))?;
         let mut tokenizer = Tokenizer::new(bpe);
 
-        let pre = metadata_value(ct, "tokenizer.ggml.pre")
-            .and_then(|v| v.to_string().map_err(|e| anyhow::anyhow!("{e}")))
-            .map(|s| s.to_string())
-            .unwrap_or_else(|_| "gpt2".to_string());
-        let pipeline = pipeline_from_pre(pre.as_str())?;
+        let pipeline = if model_kind == "gemma4" {
+            sentencepiece_pipeline()?
+        } else {
+            let pre = metadata_value(ct, "tokenizer.ggml.pre")
+                .and_then(|v| v.to_string().map_err(|e| anyhow::anyhow!("{e}")))
+                .map(|s| s.to_string())
+                .unwrap_or_else(|_| "gpt2".to_string());
+            pipeline_from_pre(pre.as_str())?
+        };
         let post_processor_base = pipeline.post_processor.clone();
 
         let add_bos = metadata_value(ct, "tokenizer.ggml.add_bos_token")
@@ -804,6 +848,67 @@ mod gguf {
     }
 }
 
+#[cfg(test)]
+mod gemma4_tokenizer_tests {
+    use super::*;
+
+    /// Contract: the tokenizer built from a GGUF gives the same token ids as the
+    /// checkpoint's own `tokenizer.json`.
+    ///
+    /// Ollama reads this tokenizer out of the GGUF and needs nothing else; until
+    /// this passed, oxydLLM needed a `tokenizer.json` beside the file, which
+    /// somebody who pulled only the GGUF does not have. A tokenizer that is
+    /// nearly right is worse than one that refuses, so the comparison is exact
+    /// ids on text that exercises the parts most likely to differ: leading and
+    /// repeated spaces, punctuation, non-Latin scripts, and bytes with no token
+    /// of their own.
+    ///
+    /// One case is left out on purpose: the literal string `<eos>`. This file
+    /// types that token as normal rather than control, so a tokenizer that
+    /// follows the file splits it into pieces while the reference, which lists
+    /// it among its added tokens, does not. llama.cpp reads the same field the
+    /// same way, so following the file is also what matches the engine this is
+    /// compared against.
+    ///
+    /// Needs the checkpoint; run with
+    /// `cargo test gemma4_gguf_tokenizer_matches_the_reference -- --ignored`.
+    #[test]
+    #[ignore]
+    fn gemma4_gguf_tokenizer_matches_the_reference() {
+        let dir = format!(
+            "{}/.oxydllm/models/unsloth/gemma-4-12b-it-GGUF",
+            std::env::var("HOME").unwrap()
+        );
+        let gguf = format!("{dir}/gemma-4-12b-it-Q4_K_M.gguf");
+        if !std::path::Path::new(&gguf).exists() {
+            eprintln!("checkpoint assente, salto");
+            return;
+        }
+        let from_gguf = Tokenizer::from_gguf_file(&gguf).expect("tokenizer from GGUF");
+        let reference = Tokenizer::from_dir(&dir).expect("tokenizer.json reference");
+
+        let corpus = [
+            "Hello world",
+            " leading space",
+            "double  space and\ttab",
+            "What is the capital of France?",
+            "Il pesce è ottimo, però costa caro.",
+            "日本語のテキストも試す",
+            "emoji \u{1f600} and symbols \u{2603}",
+            "<|turn>user\nhello<turn|>",
+            "<|tool>name<tool|> and <channel|>",
+            "numbers 1234567890 and 3.14159",
+            "",
+        ];
+        for text in corpus {
+            let a = from_gguf.encode(text).expect("gguf encode");
+            let b = reference.encode(text).expect("reference encode");
+            assert_eq!(a, b, "ids differ for {text:?}");
+        }
+    }
+}
+
+#[cfg(test)]
 #[cfg(test)]
 mod tests {
     use super::*;

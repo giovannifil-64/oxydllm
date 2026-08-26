@@ -118,14 +118,19 @@ impl CustomOp3 for Sdpa {
         let k_off = k_l.start_offset() * esz;
         let v_off = v_l.start_offset() * esz;
 
-        let supported_head_dim = matches!(q_head, 32 | 64 | 72 | 80 | 96 | 128 | 256);
+        // The two paths do not cover the same head widths, and one list for both
+        // refused 512 (which the vector kernels do serve, and which is what a
+        // Gemma 4 global layer asks for at every decoded token) while promising
+        // 72 and 80, which only the tiled path has.
+        let full_head_dim_ok = matches!(q_head, 32 | 64 | 72 | 80 | 96 | 128 | 256 | 512);
+        let vector_head_dim_ok = matches!(q_head, 32 | 64 | 96 | 128 | 256 | 512);
 
         let supports_sdpa_full_mask = self.mask.is_none() || q_seq <= k_seq;
         let supports_sdpa_full =
-            q_seq > 8 && supported_head_dim && supports_sdpa_full_mask && self.softcapping == 1.0;
-        let supports_sdpa_vector = q_seq <= 8 && supported_head_dim && q_seq <= k_seq;
+            q_seq > 8 && full_head_dim_ok && supports_sdpa_full_mask && self.softcapping == 1.0;
+        let supports_sdpa_vector = q_seq <= 8 && vector_head_dim_ok && q_seq <= k_seq;
 
-        if !supported_head_dim || !(supports_sdpa_full || supports_sdpa_vector) {
+        if !(supports_sdpa_full || supports_sdpa_vector) {
             candle_core::bail!(
                 "Metal SDPA does not support q dims {:?}, k dims {:?}, v dims {:?}",
                 q_l.dims(),
@@ -1296,7 +1301,9 @@ pub fn rope_fused(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
 pub fn sdpa_available(tensor: &Tensor, head_dim: usize) -> bool {
     tensor.device().is_metal()
         && matches!(tensor.dtype(), DType::F16 | DType::BF16 | DType::F32)
-        && matches!(head_dim, 32 | 64 | 72 | 80 | 96 | 128 | 256)
+        // The vector kernels, which is what a single query token reaches; the
+        // tiled path additionally covers 72 and 80.
+        && matches!(head_dim, 32 | 64 | 96 | 128 | 256 | 512)
 }
 
 /// Fused `silu(gate) * up` over a packed `[.., 2*intermediate_size]` tensor;
@@ -3744,6 +3751,75 @@ mod fused_kernel_parity_tests {
                     );
                 }
             }
+        }
+    }
+
+    /// Contract: the fused SDPA answers what plain attention answers, at every
+    /// head width the gate offers and on both sides of the two-pass threshold.
+    ///
+    /// The width that matters here is 512. One list of head widths used to serve
+    /// both kernels, and it refused 512 even though the vector kernels carry it,
+    /// so Gemma 4's global layers took the tiled kernel at every decoded token
+    /// and paid four milliseconds a layer for it. The list also promised 72 and
+    /// 80, which only the tiled path has.
+    #[test]
+    fn sdpa_matches_plain_attention_at_every_offered_width() {
+        let Some(dev) = metal_device_or_skip() else {
+            return;
+        };
+        for dtype in [DType::F32, DType::BF16] {
+            let mut worst = 0f32;
+            for d in [32usize, 64, 96, 128, 256, 512] {
+                for (h, h_kv) in [(16usize, 1usize), (8, 8), (4, 2)] {
+                    // Either side of the threshold where the kernel splits the
+                    // keys into two passes.
+                    for kv in [64usize, 1024, 1700] {
+                        assert!(sdpa_available(
+                            &Tensor::zeros((1, h, 1, d), dtype, &dev).unwrap(),
+                            d
+                        ));
+                        let mk = |n: usize, salt: usize| -> Vec<f32> {
+                            (0..n)
+                                .map(|i| (((i * 31 + salt) % 61) as f32 - 30.0) * 0.05)
+                                .collect()
+                        };
+                        let t = |v: Vec<f32>, shape: (usize, usize, usize, usize)| {
+                            Tensor::from_vec(v, shape, &dev)
+                                .unwrap()
+                                .to_dtype(dtype)
+                                .unwrap()
+                        };
+                        let q = t(mk(h * d, 1), (1, h, 1, d));
+                        let k = t(mk(h_kv * kv * d, 7), (1, h_kv, kv, d));
+                        let v = t(mk(h_kv * kv * d, 13), (1, h_kv, kv, d));
+                        let scale = 1.0 / (d as f32).sqrt();
+                        let flat = |x: &Tensor| -> Vec<f32> {
+                            x.to_dtype(DType::F32)
+                                .unwrap()
+                                .flatten_all()
+                                .unwrap()
+                                .to_vec1::<f32>()
+                                .unwrap()
+                        };
+                        let got = flat(&sdpa(&q, &k, &v, None, false, scale, 1.0).unwrap());
+                        let want = flat(
+                            &naive_attention_reference(&q, &k, &v, scale, None, kv - 1, 0).unwrap(),
+                        );
+                        assert!(
+                            got.iter().all(|x| x.is_finite()),
+                            "{dtype:?} d={d} h={h} h_kv={h_kv} kv={kv}: not finite"
+                        );
+                        let peak = want.iter().fold(0f32, |a, &b| a.max(b.abs())).max(1e-6);
+                        let rel = max_abs_diff_f32(&got, &want) / peak;
+                        assert!(
+                            rel < 0.05,
+                            "{dtype:?} d={d} h={h} h_kv={h_kv} kv={kv}: relative error {rel}"
+                        );
+                        worst = worst.max(rel);
+                    }
+                }
+            }
+            println!("  {dtype:?}: peggiore relativo {worst:.5}");
         }
     }
 

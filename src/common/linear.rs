@@ -4,7 +4,6 @@ use crate::common::awq::PackDim;
 use crate::common::awq::{AwqRawTensors, dequantize_awq};
 use crate::common::awq::{QuantWeight, dequantize_quant};
 use crate::common::weights::apply_scale_inv;
-#[cfg(feature = "metal")]
 use candle_core::quantized::{QMatMul, QTensor};
 use candle_core::{DType, Device, Result, Tensor};
 use std::sync::Arc;

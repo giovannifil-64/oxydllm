@@ -276,64 +276,6 @@ fn detect_system_memory_bytes() -> Option<usize> {
         .ok()
 }
 
-/// Memory the system could hand to a large allocation, by the kernel's own
-/// pressure metric (`kern.memorystatus_level` = percentage of memory
-/// available, including purgeable and compressor-reclaimable pages that
-/// [`detect_available_memory_bytes`] does not count). Used for the automatic
-/// expert-streaming decision; falls back to the conservative helper.
-#[cfg(target_os = "macos")]
-pub(crate) fn detect_reclaimable_memory_bytes() -> Option<usize> {
-    let level = std::process::Command::new("sysctl")
-        .args(["-n", "kern.memorystatus_level"])
-        .output()
-        .ok()
-        .and_then(|o| {
-            std::str::from_utf8(&o.stdout)
-                .ok()?
-                .trim()
-                .parse::<usize>()
-                .ok()
-        })
-        .filter(|p| (1..=100).contains(p));
-    match (level, detect_system_memory_bytes()) {
-        (Some(pct), Some(total)) => Some(total / 100 * pct),
-        _ => detect_available_memory_bytes(),
-    }
-}
-
-#[cfg(not(target_os = "macos"))]
-pub(crate) fn detect_reclaimable_memory_bytes() -> Option<usize> {
-    detect_available_memory_bytes()
-}
-
-#[cfg(target_os = "macos")]
-pub(crate) fn detect_available_memory_bytes() -> Option<usize> {
-    let ps = std::process::Command::new("sysctl")
-        .args(["-n", "hw.pagesize"])
-        .output()
-        .ok()?;
-    let page_size: usize = std::str::from_utf8(&ps.stdout).ok()?.trim().parse().ok()?;
-
-    let vm = std::process::Command::new("vm_stat").output().ok()?;
-    let text = std::str::from_utf8(&vm.stdout).ok()?;
-
-    let mut pages: usize = 0;
-    for line in text.lines() {
-        let reclaimable = line.starts_with("Pages free:")
-            || line.starts_with("Pages inactive:")
-            || line.starts_with("Pages speculative:");
-        if reclaimable
-            && let Some(n) = line
-                .split_whitespace()
-                .last()
-                .and_then(|s| s.trim_end_matches('.').parse::<usize>().ok())
-        {
-            pages += n;
-        }
-    }
-    Some(pages * page_size)
-}
-
 #[cfg(target_os = "linux")]
 fn parse_meminfo_kb(key: &str) -> Option<usize> {
     std::fs::read_to_string("/proc/meminfo")
@@ -350,18 +292,8 @@ fn detect_system_memory_bytes() -> Option<usize> {
     parse_meminfo_kb("MemTotal:")
 }
 
-#[cfg(target_os = "linux")]
-pub(crate) fn detect_available_memory_bytes() -> Option<usize> {
-    parse_meminfo_kb("MemAvailable:")
-}
-
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn detect_system_memory_bytes() -> Option<usize> {
-    None
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-pub(crate) fn detect_available_memory_bytes() -> Option<usize> {
     None
 }
 

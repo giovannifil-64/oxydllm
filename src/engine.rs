@@ -185,24 +185,36 @@ fn has_matching_stop_sequence(tokens: &[u32], stop_sequences: &[Vec<u32>]) -> bo
 /// with room to spare while still being long enough to amortize a dispatch.
 const CHUNK_TARGET: Duration = Duration::from_millis(250);
 
-/// Smallest prefill chunk. Below this the per-forward overhead dominates and
-/// a machine slow enough to need it would be unusable anyway.
-const MIN_CHUNK: usize = 128;
-
 /// Tokens per forward, followed by measurement rather than assumed.
 ///
 /// The right chunk depends on the GPU, the model and the quantization, none of
-/// which a constant can capture, so the pacer starts small and lets the
-/// machine answer: a chunk comfortably faster than [`CHUNK_TARGET`] doubles
-/// the cap, one that runs over halves it. A fast GPU converges upward within a
-/// few prompts; a slow one settles where the desktop stays alive.
+/// which a constant can capture, so the pacer starts small and lets the machine
+/// answer: a chunk comfortably faster than [`CHUNK_TARGET`] doubles the cap, one
+/// that runs over halves it.
+///
+/// Halving stops on its own rather than at a floor. A chunk whose cost falls
+/// roughly in step with its size is still paying for the model; one that barely
+/// gets cheaper when halved is paying for the dispatch instead, and shrinking it
+/// further buys latency nothing while costing throughput. The pacer notices that
+/// from the pair of measurements it already has and holds the cap where the last
+/// halving still repaid itself.
 pub struct PrefillPacer {
     cap: usize,
+    floor: usize,
+    last: Option<(usize, Duration)>,
 }
 
 impl Default for PrefillPacer {
+    /// Starts at 512 tokens, which is where the search begins and not where it
+    /// ends: the first two or three chunks move the cap to wherever this
+    /// machine belongs, and starting high converges downward faster than
+    /// starting at one token would converge up.
     fn default() -> Self {
-        Self { cap: 4 * MIN_CHUNK }
+        Self {
+            cap: 512,
+            floor: 1,
+            last: None,
+        }
     }
 }
 
@@ -212,10 +224,27 @@ impl PrefillPacer {
     }
 
     /// Folds one chunk's measured cost into the cap.
+    ///
+    /// Only full chunks are evidence: a short tail says nothing about what the
+    /// cap should be.
     fn observe(&mut self, tokens: usize, elapsed: Duration) {
+        if tokens < self.cap {
+            return;
+        }
+
+        if let Some((prev_tokens, prev_elapsed)) = self.last
+            && tokens * 2 <= prev_tokens
+            && elapsed.mul_f64(1.5) > prev_elapsed
+        {
+            // Half the work took nearly as long: the dispatch is the cost now,
+            // so this is as small as it is worth going.
+            self.floor = self.floor.max(tokens);
+        }
+        self.last = Some((tokens, elapsed));
+
         if elapsed > CHUNK_TARGET {
-            self.cap = (self.cap / 2).max(MIN_CHUNK);
-        } else if tokens >= self.cap && elapsed * 2 < CHUNK_TARGET {
+            self.cap = (self.cap / 2).max(self.floor);
+        } else if elapsed * 2 < CHUNK_TARGET {
             self.cap = self.cap.saturating_mul(2);
         }
     }
@@ -1146,8 +1175,8 @@ mod tests {
     }
 
     /// Contract: the cap follows the machine. A chunk that overran the target
-    /// shrinks it, a full chunk well inside the target grows it, and it never
-    /// falls below the floor.
+    /// shrinks it, a full chunk well inside the target grows it, and a chunk
+    /// that was not full proves nothing either way.
     #[test]
     fn the_pacer_follows_what_the_machine_measures() {
         let mut p = PrefillPacer::default();
@@ -1157,17 +1186,55 @@ mod tests {
         assert_eq!(p.cap(), start / 2, "a slow chunk halves the cap");
 
         let now = p.cap();
-        p.observe(now, Duration::from_millis(10));
-        assert_eq!(p.cap(), now * 2, "a fast full chunk doubles it");
-
-        let now = p.cap();
         p.observe(now / 4, Duration::from_millis(10));
         assert_eq!(p.cap(), now, "a chunk that was not full proves nothing");
 
-        for _ in 0..12 {
-            p.observe(p.cap(), Duration::from_secs(2));
+        p.observe(now, Duration::from_millis(10));
+        assert_eq!(p.cap(), now * 2, "a fast full chunk doubles it");
+    }
+
+    /// Contract: halving stops once it stops paying for itself.
+    ///
+    /// This replaces a fixed floor of 128 tokens, which was a guess about where
+    /// dispatch overhead takes over and therefore wrong on any machine but the
+    /// one it was guessed on. The evidence is already in hand: half the tokens
+    /// costing nearly the same time means the model is no longer what is being
+    /// paid for.
+    #[test]
+    fn the_pacer_stops_shrinking_when_shrinking_stops_helping() {
+        let mut p = PrefillPacer::default();
+        let start = p.cap();
+
+        p.observe(start, Duration::from_millis(400));
+        assert_eq!(p.cap(), start / 2);
+
+        // Half the work, almost the same time: dispatch-bound.
+        p.observe(start / 2, Duration::from_millis(380));
+        assert_eq!(p.cap(), start / 2, "the cap holds where halving last paid");
+
+        for _ in 0..8 {
+            p.observe(p.cap(), Duration::from_millis(380));
         }
-        assert_eq!(p.cap(), MIN_CHUNK, "the cap stops at the floor");
+        assert_eq!(p.cap(), start / 2, "and it stays there");
+    }
+
+    /// Contract: on a machine where halving does pay, nothing stops it, and it
+    /// settles where a chunk lands on the target rather than at a fixed size.
+    #[test]
+    fn the_pacer_keeps_shrinking_while_it_pays() {
+        let mut p = PrefillPacer::default();
+        // Four seconds for 512 tokens, and every halving costs half as much:
+        // the work is still the model's, so there is nothing to stop for.
+        let mut ms = 4000u64;
+        for _ in 0..6 {
+            p.observe(p.cap(), Duration::from_millis(ms));
+            ms = (ms / 2).max(1);
+        }
+        assert!(
+            p.cap() < 64,
+            "a cap whose halving keeps repaying should keep shrinking, got {}",
+            p.cap()
+        );
     }
 
     struct FakeModel {

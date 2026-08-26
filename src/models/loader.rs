@@ -968,25 +968,28 @@ fn expert_split_runtime_bytes(paths: &[&str], dtype: DType) -> anyhow::Result<(u
 const STREAM_HEADROOM: usize = 2 << 30;
 /// Below this expert-cache size streaming would thrash; the model is rejected.
 const MIN_EXPERT_CACHE: usize = 1 << 30;
-/// Fraction of the detected envelope a *streamed* expert cache may commit.
+/// Fraction of the envelope a *streamed* expert cache may commit.
 ///
 /// Applies to streaming only: a resident load allocates once, up front, at a
 /// size known exactly from the tensor index, whereas streaming keeps churning
-/// buffers for the life of the process (every token fetches and evicts
-/// experts, and candle's Metal pool retains freed buffers until a sweep). That
-/// churn needs real slack, and the envelope it is measured against is a
-/// volatile snapshot: `kern.memorystatus_level` is a pressure indicator rather
-/// than an allocatable budget, and the `inactive` pages counted as reclaimable
-/// may not be reclaimable in time to satisfy a GPU allocation. On unified
-/// memory the same pool also backs the OS, the window server, and the Metal
-/// driver's working set.
+/// buffers for the life of the process, since every token fetches and evicts
+/// experts and candle's Metal pool retains freed buffers until a sweep. That
+/// churn is memory the envelope cannot see, because it is not held by anything
+/// at the moment the envelope is read.
 ///
-/// Measured on a 24 GB M5 with Qwen3.6-35B-A3B-FP8: a cache sized from the raw
-/// envelope (14 GB, 19 GB committed in total) fails the command buffer with
-/// `kIOGPUCommandBufferCallbackErrorOutOfMemory`, or silently hands back
+/// Measured on a 24 GB M5 with Qwen3.6-35B-A3B-FP8: a cache sized from the
+/// whole envelope (14 GB, 19 GB committed in total) fails the command buffer
+/// with `kIOGPUCommandBufferCallbackErrorOutOfMemory`, or silently hands back
 /// recycled buffers whose contents surface as out-of-range router indices.
-/// Half the envelope yields ~3.5 GB, reproducing the configuration verified to
-/// decode correctly and deterministically.
+/// Half the envelope yields ~3.5 GB, the configuration verified to decode
+/// correctly and deterministically.
+///
+/// This survived the pass that replaced the other memory fractions with what
+/// the device reports, and the arithmetic is why: against today's envelope of
+/// 17.76 GB, dropping it would size that same cache at roughly 12 GB, back
+/// inside the band measured to break. What did change is what it multiplies,
+/// which is no longer `kern.memorystatus_level`, a pressure indicator rather
+/// than an allocatable budget.
 const SAFE_ENVELOPE_FRACTION: f64 = 0.5;
 
 /// Decides expert streaming for a MoE checkpoint: `None` when everything fits
@@ -1068,8 +1071,7 @@ fn load_standard_safetensors(
             let (expert_b, rest_b) = expert_split_runtime_bytes(&weight_path_refs, dtype)?;
             let available = opts
                 .memory_budget_bytes
-                .or_else(crate::common::paged::detect_reclaimable_memory_bytes)
-                .unwrap_or(usize::MAX);
+                .unwrap_or_else(|| crate::common::paged::safe_model_kv_ceiling(0));
             let decision = auto_expert_stream_budget(expert_b, rest_b, available)?;
             if let Some(cache) = decision {
                 tracing::info!(
@@ -1526,10 +1528,6 @@ fn load_batch_model_gguf(
     })
 }
 
-/// Smallest context worth serving. A model that cannot hold this much is
-/// better off failing the load than answering two-sentence prompts.
-const MIN_AUTO_CONTEXT: usize = 4096;
-
 /// Context per sequence when the caller pins none.
 ///
 /// A model declares the longest context it was trained for, and on a personal
@@ -1541,7 +1539,10 @@ const MIN_AUTO_CONTEXT: usize = 4096;
 /// at what the model declares.
 ///
 /// Returns the model's declared context when the layer geometry gives no KV
-/// cost, which is the case for models that keep no growing cache.
+/// cost, which is the case for models that keep no growing cache. There is no
+/// floor: a machine that can only hold a short context gets a short context and
+/// says so, and one that cannot hold a usable pool at all fails in
+/// [`compute_kv_blocks`], where the message can name the numbers.
 fn fit_context_len(
     layer_kv_specs: &[(usize, usize)],
     dtype: DType,
@@ -1561,7 +1562,7 @@ fn fit_context_len(
         crate::common::paged::safe_model_kv_ceiling(weights_bytes) / sequences.max(1);
     let fits = (per_sequence / per_token / DEFAULT_BLOCK_SIZE) * DEFAULT_BLOCK_SIZE;
 
-    fits.min(declared).max(MIN_AUTO_CONTEXT.min(declared))
+    fits.min(declared)
 }
 
 /// Resolves the context to serve: what the caller pinned, or what fits.
@@ -1700,6 +1701,10 @@ fn compute_kv_blocks(
 ) -> anyhow::Result<(usize, usize, KvQuantMode)> {
     let total_slots = p.max_num_sequences * p.max_context_len;
     let desired_blocks = total_slots.div_ceil(DEFAULT_BLOCK_SIZE);
+    // Below one sequence's worth of a short context there is nothing to serve,
+    // and saying so beats accepting requests that can never be scheduled. This
+    // is the only place the judgement is made: the context itself is whatever
+    // the memory allows.
     let min_blocks: usize = 256;
 
     let ceiling = crate::common::paged::safe_model_kv_ceiling(p.weights_bytes)
@@ -1843,23 +1848,25 @@ mod context_sizing_tests {
     }
 
     /// Contract: the fitted context is a whole number of KV blocks, so the pool
-    /// carries no slot that no sequence can reach, and it never drops below a
-    /// context worth serving unless the model itself declares less.
+    /// carries no slot no sequence can reach, and a model declaring less than
+    /// fits keeps its own declaration.
+    ///
+    /// It is deliberately not floored at some minimum worth serving. That
+    /// judgement is made once, where the pool is granted and the message can
+    /// name the numbers, so a machine that can only hold a short context gets a
+    /// short context rather than a number chosen here.
     #[test]
-    fn the_fit_is_whole_blocks_and_never_pointless() {
+    fn the_fit_is_whole_blocks_and_respects_the_declaration() {
         let ctx = fit_context_len(&specs(28), DType::BF16, 1 << 30, 8, 1 << 20);
         assert_eq!(
             ctx % DEFAULT_BLOCK_SIZE,
             0,
             "context {ctx} is not whole blocks"
         );
-        assert!(ctx >= MIN_AUTO_CONTEXT, "context {ctx} below the floor");
+        assert!(ctx > 0);
 
         let tiny = fit_context_len(&specs(28), DType::BF16, 1 << 30, 8, 1024);
-        assert_eq!(
-            tiny, 1024,
-            "a model declaring less than the floor keeps its own"
-        );
+        assert_eq!(tiny, 1024, "a short declaration is kept");
     }
 
     /// Contract: more concurrent sequences share the same pool, so each gets a

@@ -1288,6 +1288,105 @@ mod tests {
         ))
     }
 
+    /// A pseudo-random source with the seed in hand, so a failure reproduces by
+    /// rerunning the same seed.
+    struct Rng(u64);
+
+    impl Rng {
+        fn new(seed: u64) -> Self {
+            Self(seed.wrapping_mul(6364136223846793005).wrapping_add(1))
+        }
+
+        fn between(&mut self, lo: usize, hi: usize) -> usize {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            lo + ((self.0 >> 33) as usize) % (hi - lo + 1)
+        }
+    }
+
+    /// Contract: blocks are conserved. Whatever sequence of allocations, shares
+    /// and frees it is put through, the allocator's free count plus the blocks
+    /// callers hold equals its capacity, and a block is never handed out twice
+    /// while someone still holds it.
+    ///
+    /// Both halves matter to correctness rather than tidiness: a leaked block
+    /// shrinks the pool until the server stops admitting work, and a block
+    /// handed to two sequences at once mixes one sequence's attention into
+    /// another's, which reads as a model that has lost its mind rather than as
+    /// a bug.
+    #[test]
+    fn fuzz_blocks_are_conserved() {
+        for seed in 0u64..64 {
+            let mut rng = Rng::new(seed);
+            let capacity = rng.between(4, 64);
+            let alloc = make_allocator(capacity, DEFAULT_BLOCK_SIZE);
+            let mut a = alloc.lock().unwrap();
+
+            // How many outstanding references each block id has.
+            let mut held: std::collections::HashMap<usize, usize> =
+                std::collections::HashMap::new();
+
+            for step in 0..256 {
+                let outstanding: usize = held.len();
+                assert_eq!(
+                    a.num_free() + outstanding,
+                    capacity,
+                    "seed {seed} step {step}: {} free plus {outstanding} held is not {capacity}",
+                    a.num_free()
+                );
+
+                match rng.between(0, 3) {
+                    0 | 1 => {
+                        if let Ok(id) = a.allocate() {
+                            assert!(
+                                !held.contains_key(&id),
+                                "seed {seed} step {step}: block {id} handed out while still held"
+                            );
+                            held.insert(id, 1);
+                        } else {
+                            assert_eq!(
+                                a.num_free(),
+                                0,
+                                "seed {seed} step {step}: allocation refused with blocks free"
+                            );
+                        }
+                    }
+                    2 => {
+                        let ids: Vec<usize> = held.keys().copied().collect();
+                        if let Some(&id) = ids.get(rng.between(0, ids.len().max(1) - 1)) {
+                            a.share(id);
+                            *held.get_mut(&id).unwrap() += 1;
+                        }
+                    }
+                    _ => {
+                        let ids: Vec<usize> = held.keys().copied().collect();
+                        if let Some(&id) = ids.get(rng.between(0, ids.len().max(1) - 1)) {
+                            a.free(id);
+                            let refs = held.get_mut(&id).unwrap();
+                            *refs -= 1;
+                            if *refs == 0 {
+                                held.remove(&id);
+                            }
+                        }
+                    }
+                }
+            }
+
+            for (id, refs) in held {
+                for _ in 0..refs {
+                    a.free(id);
+                }
+            }
+            assert_eq!(
+                a.num_free(),
+                capacity,
+                "seed {seed}: pool did not come back"
+            );
+        }
+    }
+
     #[test]
     fn allocator_alloc_free() {
         let alloc = make_allocator(4, 2);

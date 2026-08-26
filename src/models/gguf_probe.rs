@@ -250,6 +250,112 @@ mod tests {
         b
     }
 
+    /// Bytes from a seed, mixing pure noise with headers that are structurally
+    /// plausible but hostile in their declared values.
+    fn hostile_bytes(seed: u64) -> Vec<u8> {
+        let mut rng = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        let mut next = |lo: usize, hi: usize| -> usize {
+            rng = rng
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            lo + ((rng >> 33) as usize) % (hi - lo + 1)
+        };
+        let mut b = Vec::new();
+        match seed % 3 {
+            // Pure noise: nothing should get past the magic, but prove it.
+            0 => {
+                for _ in 0..next(0, 512) {
+                    b.push(next(0, 255) as u8);
+                }
+            }
+            // Past the magic, then noise: exercises the metadata walk.
+            1 => {
+                b.extend_from_slice(b"GGUF");
+                for _ in 0..next(0, 512) {
+                    b.push(next(0, 255) as u8);
+                }
+            }
+            // A header whose declared counts and lengths are chosen to be
+            // absurd: the point is that the work stays bounded by the bytes in
+            // hand rather than by a number the file asked for.
+            _ => {
+                b.extend_from_slice(b"GGUF");
+                b.extend_from_slice(&3u32.to_le_bytes());
+                let n_tensors = [0u64, 1, 1 << 20, u64::MAX][next(0, 3)];
+                let n_kv = [0u64, 1, 1 << 20, u64::MAX][next(0, 3)];
+                b.extend_from_slice(&n_tensors.to_le_bytes());
+                b.extend_from_slice(&n_kv.to_le_bytes());
+                for _ in 0..next(0, 6) {
+                    let len = [0u64, 4, 1 << 40, u64::MAX][next(0, 3)];
+                    b.extend_from_slice(&len.to_le_bytes());
+                    for _ in 0..next(0, 8) {
+                        b.push(next(0, 255) as u8);
+                    }
+                    b.extend_from_slice(&(next(0, 20) as u32).to_le_bytes());
+                }
+                b.truncate(next(0, b.len().max(1)));
+            }
+        }
+        b
+    }
+
+    /// Contract: any sequence of bytes produces a verdict.
+    ///
+    /// These bytes arrive over the network, from a range request against a file
+    /// nobody in this project wrote, and they are read by a hand-rolled cursor
+    /// whose every bound comes from the file itself: counts of tensors, counts
+    /// of metadata entries, lengths of strings. The properties that matter are
+    /// that no input panics, that the work stays proportional to the bytes in
+    /// hand rather than to a number the file declared, and that a verdict of
+    /// unreadable always names something.
+    #[test]
+    fn fuzz_inspect_header_survives_any_bytes() {
+        for seed in 0u64..512 {
+            let bytes = hostile_bytes(seed);
+            let verdict = inspect_header(&bytes);
+            match &verdict {
+                HeaderVerdict::Unreadable { offenders, .. } => {
+                    assert!(
+                        !offenders.is_empty(),
+                        "seed {seed}: unreadable names nothing"
+                    );
+                    assert!(verdict.refusal().is_some(), "seed {seed}: no message");
+                }
+                _ => assert!(
+                    verdict.refusal().is_none(),
+                    "seed {seed}: a readable verdict produced a refusal"
+                ),
+            }
+        }
+    }
+
+    /// Contract: a declared count the bytes cannot back is answered from the
+    /// bytes, not from the count.
+    ///
+    /// A header claiming four billion tensors in forty bytes must come back
+    /// unknown rather than iterating four billion times or reserving room for
+    /// them. The assertion is that this returns at all; a loop driven by the
+    /// declared count would never reach it.
+    #[test]
+    fn fuzz_a_declared_count_cannot_drive_the_work() {
+        let mut b = Vec::new();
+        b.extend_from_slice(b"GGUF");
+        b.extend_from_slice(&3u32.to_le_bytes());
+        b.extend_from_slice(&u64::MAX.to_le_bytes());
+        b.extend_from_slice(&u64::MAX.to_le_bytes());
+        b.extend_from_slice(&[0u8; 16]);
+        assert_eq!(inspect_header(&b), HeaderVerdict::Unknown);
+
+        // The same for a string longer than any machine has memory for.
+        let mut b = Vec::new();
+        b.extend_from_slice(b"GGUF");
+        b.extend_from_slice(&3u32.to_le_bytes());
+        b.extend_from_slice(&1u64.to_le_bytes());
+        b.extend_from_slice(&1u64.to_le_bytes());
+        b.extend_from_slice(&u64::MAX.to_le_bytes());
+        assert_eq!(inspect_header(&b), HeaderVerdict::Unknown);
+    }
+
     /// Contract: a file whose tensors are all decodable is reported loadable,
     /// with the architecture the caller may want to show.
     #[test]

@@ -1174,6 +1174,92 @@ mod tests {
         assert_eq!(chunks[0].finished.len(), 8);
     }
 
+    /// A pseudo-random source with the seed in hand, so a failure reproduces by
+    /// rerunning the same seed.
+    struct Rng(u64);
+
+    impl Rng {
+        fn new(seed: u64) -> Self {
+            Self(seed.wrapping_mul(6364136223846793005).wrapping_add(1))
+        }
+
+        fn between(&mut self, lo: usize, hi: usize) -> usize {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            lo + ((self.0 >> 33) as usize) % (hi - lo + 1)
+        }
+    }
+
+    /// Contract: splitting a batch into forwards neither loses a token nor
+    /// computes one twice, keeps every sequence's tokens in order, and gives
+    /// each sequence exactly one logits row.
+    ///
+    /// The planner is where a long prompt gets cut apart, and a cut in the wrong
+    /// place does not crash: it feeds the model a prompt with a hole in it, or
+    /// samples from the wrong row, and the answer is merely wrong. Chunk
+    /// boundaries land inside sequences by design, so the arithmetic deserves
+    /// more than the handful of examples a person thinks to write down.
+    #[test]
+    fn fuzz_chunking_preserves_the_batch() {
+        for seed in 0u64..256 {
+            let mut rng = Rng::new(seed);
+            let cap = rng.between(1, 64);
+            let counts: Vec<usize> = (0..rng.between(1, 8))
+                .map(|_| rng.between(1, 200))
+                .collect();
+
+            let chunks = plan_forward_chunks(&counts, cap);
+
+            let mut offset = 0usize;
+            let mut per_sequence = vec![0usize; counts.len()];
+            let mut finished = vec![0usize; counts.len()];
+
+            for chunk in &chunks {
+                assert_eq!(
+                    chunk.start, offset,
+                    "seed {seed}: chunk starts at {} but {offset} tokens came before it",
+                    chunk.start
+                );
+                assert!(
+                    chunk.len() <= cap,
+                    "seed {seed}: chunk of {} tokens over a cap of {cap}",
+                    chunk.len()
+                );
+                assert!(!chunk.counts.is_empty(), "seed {seed}: empty chunk");
+                offset += chunk.len();
+
+                for (i, &n) in chunk.counts.iter().enumerate() {
+                    let seq = chunk.seq_base + i;
+                    assert!(
+                        seq < counts.len(),
+                        "seed {seed}: chunk names sequence {seq}"
+                    );
+                    per_sequence[seq] += n;
+                }
+                for &row in &chunk.finished {
+                    finished[chunk.seq_base + row] += 1;
+                }
+            }
+
+            assert_eq!(
+                offset,
+                counts.iter().sum::<usize>(),
+                "seed {seed}: chunks cover {offset} of {} tokens",
+                counts.iter().sum::<usize>()
+            );
+            assert_eq!(
+                per_sequence, counts,
+                "seed {seed}: a sequence was fed the wrong number of tokens"
+            );
+            assert!(
+                finished.iter().all(|&f| f == 1),
+                "seed {seed}: sequences ended {finished:?} times, expected once each"
+            );
+        }
+    }
+
     /// Contract: the cap follows the machine. A chunk that overran the target
     /// shrinks it, a full chunk well inside the target grows it, and a chunk
     /// that was not full proves nothing either way.

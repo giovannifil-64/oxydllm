@@ -3428,6 +3428,205 @@ mod fused_kernel_parity_tests {
         assert!(diff < tol, "{label}: max_abs_diff = {diff} (tol {tol})");
     }
 
+    /// Calibration for the tolerances the parity property asserts. Ignored by
+    /// default; run when the kernels or the dtypes change.
+    #[test]
+    #[ignore]
+    fn fa_parity_tolerance_calibration() {
+        let Some(dev) = metal_device_or_skip() else {
+            return;
+        };
+        let mut rng = 0x243f_6a88_85a3_08d3u64;
+        let mut next = |lo: usize, hi: usize| -> usize {
+            rng = rng
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            lo + ((rng >> 33) as usize) % (hi - lo + 1)
+        };
+        for dtype in [DType::F32, DType::BF16] {
+            let mut worst_abs = 0f32;
+            let mut worst_rel = 0f32;
+            for _ in 0..24 {
+                let d = [64usize, 128, 256][next(0, 2)];
+                let h_kv = [1usize, 2, 4][next(0, 2)];
+                let h = h_kv * [1usize, 2, 4][next(0, 2)];
+                let t_q = next(1, 384);
+                let prefix = next(0, 256);
+                let scale = 1.0 / (d as f32).sqrt();
+                let mag = [0.05f32, 0.5, 3.0][next(0, 2)];
+
+                let n_q = h * t_q * d;
+                let n_kv = h_kv * (t_q + prefix) * d;
+                let mk = |n: usize, m: f32, salt: usize| -> Vec<f32> {
+                    (0..n)
+                        .map(|i| {
+                            let x = (((i + salt) % 17) as f32 - 8.0) * m;
+                            if (i + salt).is_multiple_of(977) {
+                                x * 15.0
+                            } else {
+                                x
+                            }
+                        })
+                        .collect()
+                };
+                let q = Tensor::from_vec(mk(n_q, mag, 1), (1, h, t_q, d), &dev)
+                    .unwrap()
+                    .to_dtype(dtype)
+                    .unwrap();
+                let k = Tensor::from_vec(mk(n_kv, mag, 7), (1, h_kv, t_q + prefix, d), &dev)
+                    .unwrap()
+                    .to_dtype(dtype)
+                    .unwrap();
+                let v = Tensor::from_vec(mk(n_kv, mag, 13), (1, h_kv, t_q + prefix, d), &dev)
+                    .unwrap()
+                    .to_dtype(dtype)
+                    .unwrap();
+
+                let fa = flash_attention_metal_prefill(&q, &k, &v, scale, None, prefix).unwrap();
+                let rf = naive_attention_reference(&q, &k, &v, scale, None, prefix).unwrap();
+                let f: Vec<f32> = fa
+                    .to_dtype(DType::F32)
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1()
+                    .unwrap();
+                let r: Vec<f32> = rf
+                    .to_dtype(DType::F32)
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1()
+                    .unwrap();
+                let peak = r.iter().fold(0f32, |a, &b| a.max(b.abs())).max(1e-6);
+                let diff = max_abs_diff_f32(&f, &r);
+                worst_abs = worst_abs.max(diff);
+                worst_rel = worst_rel.max(diff / peak);
+            }
+            println!(
+                "  {dtype:?}: peggiore assoluto {worst_abs:.5}, peggiore relativo {worst_rel:.5}"
+            );
+        }
+    }
+
+    /// Contract: the prefill attention kernel agrees with the naive reference on
+    /// shapes and magnitudes it was not written against.
+    ///
+    /// The two halves protect different things, and saying which matters more
+    /// than the numbers. In F32 the kernel is exact to rounding, measured at
+    /// 6e-5 across these shapes, so the bound is tight enough that a mistaken
+    /// tile bound or a mishandled remainder fails it. In BF16 it is not, and no
+    /// tight bound would be honest: a softmax over the deliberate outliers here
+    /// legitimately moves by ten percent between two BF16 paths that round
+    /// differently, which was measured at 0.11 relative. That half therefore
+    /// protects against structural breakage, output that is not finite or not
+    /// recognisably the same attention, not against precision.
+    ///
+    /// The shapes are generated because the parity cases written by hand were
+    /// all tiny and deliberately well conditioned, with a comment in this file
+    /// saying so, and that is exactly why they could not answer whether
+    /// attention was at fault when long prompts started returning nonsense.
+    /// Regenerate the bounds with `fa_parity_tolerance_calibration`.
+    #[test]
+    fn fuzz_flash_attention_matches_the_reference() {
+        const F32_ABS: f32 = 1e-3;
+        const BF16_REL: f32 = 0.35;
+
+        let Some(dev) = metal_device_or_skip() else {
+            return;
+        };
+        for seed in 0u64..24 {
+            let mut rng = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(0x243f_6a88_85a3_08d3);
+            let mut next = |lo: usize, hi: usize| -> usize {
+                rng = rng
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                lo + ((rng >> 33) as usize) % (hi - lo + 1)
+            };
+            let dtype = if seed % 2 == 0 {
+                DType::F32
+            } else {
+                DType::BF16
+            };
+            let d = [64usize, 128, 256][next(0, 2)];
+            let h_kv = [1usize, 2, 4][next(0, 2)];
+            let h = h_kv * [1usize, 2, 4][next(0, 2)];
+            let t_q = next(1, 384);
+            let prefix = next(0, 256);
+            let scale = 1.0 / (d as f32).sqrt();
+            let mag = [0.05f32, 0.5, 3.0][next(0, 2)];
+
+            let mk = |n: usize, salt: usize| -> Vec<f32> {
+                (0..n)
+                    .map(|i| {
+                        let x = (((i + salt) % 17) as f32 - 8.0) * mag;
+                        // Deliberate outliers: a channel far from the rest is
+                        // what a real model produces and what a well-conditioned
+                        // fixture never has.
+                        if (i + salt).is_multiple_of(977) {
+                            x * 15.0
+                        } else {
+                            x
+                        }
+                    })
+                    .collect()
+            };
+            let t_kv = t_q + prefix;
+            let q = Tensor::from_vec(mk(h * t_q * d, 1), (1, h, t_q, d), &dev)
+                .unwrap()
+                .to_dtype(dtype)
+                .unwrap();
+            let k = Tensor::from_vec(mk(h_kv * t_kv * d, 7), (1, h_kv, t_kv, d), &dev)
+                .unwrap()
+                .to_dtype(dtype)
+                .unwrap();
+            let v = Tensor::from_vec(mk(h_kv * t_kv * d, 13), (1, h_kv, t_kv, d), &dev)
+                .unwrap()
+                .to_dtype(dtype)
+                .unwrap();
+
+            let case = format!(
+                "seed {seed}: {dtype:?} h={h} h_kv={h_kv} t_q={t_q} prefix={prefix} d={d} mag={mag}"
+            );
+            let fa = flash_attention_metal_prefill(&q, &k, &v, scale, None, prefix)
+                .unwrap_or_else(|e| panic!("{case}: kernel failed: {e}"));
+            let rf = naive_attention_reference(&q, &k, &v, scale, None, prefix)
+                .unwrap_or_else(|e| panic!("{case}: reference failed: {e}"));
+
+            let f: Vec<f32> = fa
+                .to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1()
+                .unwrap();
+            let r: Vec<f32> = rf
+                .to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1()
+                .unwrap();
+            assert_eq!(f.len(), r.len(), "{case}: shape mismatch");
+            assert!(f.iter().all(|x| x.is_finite()), "{case}: kernel not finite");
+
+            let diff = max_abs_diff_f32(&f, &r);
+            match dtype {
+                DType::F32 => assert!(diff < F32_ABS, "{case}: max_abs_diff {diff}"),
+                _ => {
+                    let peak = r.iter().fold(0f32, |a, &b| a.max(b.abs())).max(1e-6);
+                    assert!(
+                        diff / peak < BF16_REL,
+                        "{case}: relative {} over a peak of {peak}",
+                        diff / peak
+                    );
+                }
+            }
+        }
+    }
+
     /// Contract: the prefill kernel matches the reference at the lengths a real
     /// prompt reaches, not just the dozens of tokens the other cases cover.
     ///

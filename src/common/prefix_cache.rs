@@ -189,3 +189,133 @@ fn chain_hash(block_tokens: &[u32], prev: u64) -> u64 {
     block_tokens.hash(&mut h);
     h.finish()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::common::paged::{BlockAllocator, DEFAULT_BLOCK_SIZE};
+    use candle_core::{DType, Device};
+    use std::sync::{Arc, Mutex};
+
+    /// A pseudo-random source with the seed in hand, so a failure reproduces by
+    /// rerunning the same seed.
+    struct Rng(u64);
+
+    impl Rng {
+        fn new(seed: u64) -> Self {
+            Self(seed.wrapping_mul(6364136223846793005).wrapping_add(1))
+        }
+
+        fn between(&mut self, lo: usize, hi: usize) -> usize {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            lo + ((self.0 >> 33) as usize) % (hi - lo + 1)
+        }
+    }
+
+    fn allocator(blocks: usize) -> Vec<SharedBlockAllocator> {
+        vec![Arc::new(Mutex::new(
+            BlockAllocator::new(
+                blocks,
+                DEFAULT_BLOCK_SIZE,
+                1,
+                4,
+                DType::F32,
+                &Device::Cpu,
+                None,
+            )
+            .unwrap(),
+        ))]
+    }
+
+    /// Contract (soundness): a lookup only ever returns blocks that hold exactly
+    /// the tokens it asked about.
+    ///
+    /// The failure this guards against is not a crash. Handing a sequence a
+    /// block computed from different tokens splices another prompt's attention
+    /// into it, and the model answers fluently about something nobody asked.
+    /// The tokens are generated from a deliberately tiny alphabet so prefixes
+    /// repeat and near-misses are common, which is where a chain hash compared
+    /// without its tokens would give itself away.
+    #[test]
+    fn fuzz_lookup_never_returns_another_prompt_s_blocks() {
+        const BS: usize = 4;
+        for seed in 0u64..64 {
+            let mut rng = Rng::new(seed);
+            let allocators = allocator(4096);
+            let mut cache = PrefixCache::new(rng.between(1, 32));
+            // What a correct cache could return: the ids registered for each
+            // exact token prefix, first registration winning as the cache does.
+            let mut truth: std::collections::HashMap<Vec<u32>, Vec<usize>> =
+                std::collections::HashMap::new();
+
+            for _ in 0..rng.between(1, 8) {
+                let blocks = rng.between(1, 5);
+                let tokens: Vec<u32> = (0..blocks * BS).map(|_| rng.between(0, 2) as u32).collect();
+                let ids: Vec<Vec<usize>> = (0..blocks)
+                    .map(|_| vec![allocators[0].lock().unwrap().allocate().unwrap()])
+                    .collect();
+
+                cache.register(&tokens, 0, &ids, &allocators, BS);
+                for (i, id) in ids.iter().enumerate() {
+                    truth
+                        .entry(tokens[..(i + 1) * BS].to_vec())
+                        .or_insert_with(|| id.clone());
+                }
+
+                let probe: Vec<u32> = (0..rng.between(1, 6) * BS)
+                    .map(|_| rng.between(0, 2) as u32)
+                    .collect();
+                let (n, matched) = cache.lookup(&probe, BS);
+                assert_eq!(n, matched.len());
+                for (i, got) in matched.iter().enumerate() {
+                    let prefix = probe[..(i + 1) * BS].to_vec();
+                    let expected = truth.get(&prefix).unwrap_or_else(|| {
+                        panic!(
+                            "seed {seed}: matched block {i} for a prefix that was never registered: {prefix:?}"
+                        )
+                    });
+                    assert_eq!(
+                        got, expected,
+                        "seed {seed}: block {i} of {probe:?} came from another prompt"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Contract: counting and looking up agree, so the scheduler's block
+    /// arithmetic and the engine's reuse cannot disagree about how much of a
+    /// prompt is already computed. The count is a peek, so it must not change
+    /// what a following lookup finds either.
+    #[test]
+    fn fuzz_counting_agrees_with_looking_up() {
+        const BS: usize = 4;
+        for seed in 0u64..64 {
+            let mut rng = Rng::new(seed ^ 0x5eed_c0de);
+            let allocators = allocator(4096);
+            let mut cache = PrefixCache::new(rng.between(1, 32));
+
+            for _ in 0..rng.between(1, 8) {
+                let blocks = rng.between(1, 5);
+                let tokens: Vec<u32> = (0..blocks * BS).map(|_| rng.between(0, 2) as u32).collect();
+                let ids: Vec<Vec<usize>> = (0..blocks)
+                    .map(|_| vec![allocators[0].lock().unwrap().allocate().unwrap()])
+                    .collect();
+                cache.register(&tokens, 0, &ids, &allocators, BS);
+
+                let probe: Vec<u32> = (0..rng.between(1, 6) * BS)
+                    .map(|_| rng.between(0, 2) as u32)
+                    .collect();
+                let counted = cache.count_cached_blocks(&probe, BS);
+                let (looked_up, _) = cache.lookup(&probe, BS);
+                assert_eq!(
+                    counted, looked_up,
+                    "seed {seed}: counted {counted} blocks but looked up {looked_up}"
+                );
+            }
+        }
+    }
+}

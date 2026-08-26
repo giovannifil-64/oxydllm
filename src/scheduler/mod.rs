@@ -600,6 +600,231 @@ mod tests {
         assert_eq!(sched.num_waiting(), 0);
     }
 
+    /// A pseudo-random source with the seed in hand, so a failure reproduces by
+    /// rerunning the same seed rather than by luck.
+    struct Rng(u64);
+
+    impl Rng {
+        fn new(seed: u64) -> Self {
+            Self(seed.wrapping_mul(6364136223846793005).wrapping_add(1))
+        }
+
+        /// Uniform in `[lo, hi]`.
+        fn between(&mut self, lo: usize, hi: usize) -> usize {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            lo + ((self.0 >> 33) as usize) % (hi - lo + 1)
+        }
+    }
+
+    /// Contract (liveness): every prompt admitted to the queue eventually runs,
+    /// whatever its length relative to a step's token budget.
+    ///
+    /// This is the property the scheduler broke by refusing to admit a prompt
+    /// longer than one step: nothing crashed, the queue simply never advanced,
+    /// and the request hung with no error while blocking everything behind it.
+    /// A liveness property finds that in seconds; no example-based test did,
+    /// because each one asserted about a batch it had chosen to be schedulable.
+    #[test]
+    fn fuzz_every_admitted_prompt_eventually_runs() {
+        for seed in 0u64..64 {
+            let mut rng = Rng::new(seed);
+            let budget = [4usize, 16, 64, 256][rng.between(0, 3)];
+            let config = SchedulerConfig {
+                max_num_sequences: rng.between(1, 4),
+                max_tokens_per_step: budget,
+            };
+            // Blocks are deliberately plentiful: this property is about the
+            // token budget, and starving the pool would make preemption, not
+            // admission, the reason a queue stalls.
+            let allocators = make_allocators(1, 4096);
+            let mut sched = Scheduler::new(config, allocators, 1);
+
+            let n = rng.between(1, 6);
+            let mut ids = Vec::new();
+            for _ in 0..n {
+                // Lengths straddle the budget on purpose, since that is exactly
+                // where admission used to give up.
+                let prompt_len = rng.between(1, budget * 3);
+                let max_tokens = rng.between(1, 4);
+                ids.push(sched.add_request(
+                    vec![7u32; prompt_len],
+                    SamplingParams::default(),
+                    max_tokens,
+                ));
+            }
+
+            let mut ran: std::collections::HashSet<SequenceId> = std::collections::HashSet::new();
+            let mut steps = 0usize;
+            let limit = 4096;
+            while sched.has_pending_work() && steps < limit {
+                steps += 1;
+                let out = sched.schedule(None);
+                for s in &out.scheduled {
+                    ran.insert(s.id);
+                    let seq = sched.get_running_mut(s.id).unwrap();
+                    match s.phase {
+                        SequencePhase::Prefill => {
+                            seq.num_processed_tokens = seq.all_tokens.len();
+                            seq.phase = SequencePhase::Decode;
+                        }
+                        SequencePhase::Decode => seq.num_processed_tokens += 1,
+                    }
+                    seq.append_token(7);
+                    seq.apply_token(7, false);
+                }
+                sched.retire_finished();
+            }
+
+            assert_eq!(
+                ran.len(),
+                ids.len(),
+                "seed {seed}: {} of {} prompts never ran (budget {budget})",
+                ran.len(),
+                ids.len()
+            );
+            assert!(
+                !sched.has_pending_work(),
+                "seed {seed}: queue still holds work after {steps} steps (budget {budget})"
+            );
+        }
+    }
+
+    /// Contract: a step never feeds the model more than one prompt's worth over
+    /// the budget, so the exemption that keeps an oversized prompt moving does
+    /// not turn into an unbounded batch.
+    #[test]
+    fn fuzz_a_step_never_exceeds_the_budget_by_more_than_one_prompt() {
+        for seed in 0u64..64 {
+            let mut rng = Rng::new(seed ^ 0x5eed);
+            let budget = [4usize, 16, 64][rng.between(0, 2)];
+            let config = SchedulerConfig {
+                max_num_sequences: rng.between(1, 4),
+                max_tokens_per_step: budget,
+            };
+            let allocators = make_allocators(1, 4096);
+            let mut sched = Scheduler::new(config, allocators, 1);
+
+            let mut lengths = std::collections::HashMap::new();
+            for _ in 0..rng.between(1, 6) {
+                let len = rng.between(1, budget * 3);
+                let id = sched.add_request(vec![7u32; len], SamplingParams::default(), 2);
+                lengths.insert(id, len);
+            }
+
+            let mut steps = 0usize;
+            while sched.has_pending_work() && steps < 4096 {
+                steps += 1;
+                let out = sched.schedule(None);
+                let mut prefill_tokens = 0usize;
+                let mut oversized = 0usize;
+                for s in &out.scheduled {
+                    if s.phase == SequencePhase::Prefill {
+                        let len = lengths[&s.id];
+                        prefill_tokens += len;
+                        if len > budget {
+                            oversized = oversized.max(len);
+                        }
+                    }
+                }
+                assert!(
+                    prefill_tokens <= budget.max(oversized),
+                    "seed {seed}: step carried {prefill_tokens} prefill tokens on a budget of \
+                     {budget} with the largest oversized prompt at {oversized}"
+                );
+                for s in &out.scheduled {
+                    let seq = sched.get_running_mut(s.id).unwrap();
+                    match s.phase {
+                        SequencePhase::Prefill => {
+                            seq.num_processed_tokens = seq.all_tokens.len();
+                            seq.phase = SequencePhase::Decode;
+                        }
+                        SequencePhase::Decode => seq.num_processed_tokens += 1,
+                    }
+                    seq.append_token(7);
+                    seq.apply_token(7, false);
+                }
+                sched.retire_finished();
+            }
+        }
+    }
+
+    /// Contract: no sequence lifecycle leaks blocks.
+    ///
+    /// With the pool deliberately too small, sequences get preempted, requeued
+    /// and re-prefilled, and every one of those paths has to give its blocks
+    /// back. A leak here is invisible until the pool runs dry and the server
+    /// quietly stops admitting anything, which is a support case rather than a
+    /// crash.
+    #[test]
+    fn fuzz_preemption_and_retirement_give_every_block_back() {
+        for seed in 0u64..64 {
+            let mut rng = Rng::new(seed ^ 0xb10c);
+            // Small enough that preemption is the normal case, not the corner.
+            let capacity = rng.between(2, 8);
+            let allocators = make_allocators(1, capacity);
+            let config = SchedulerConfig {
+                max_num_sequences: rng.between(1, 3),
+                max_tokens_per_step: [8usize, 32, 128][rng.between(0, 2)],
+            };
+            let mut sched = Scheduler::new(config, allocators.clone(), 1);
+
+            for _ in 0..rng.between(1, 5) {
+                let len = rng.between(1, 4 * DEFAULT_BLOCK_SIZE);
+                sched.add_request(
+                    vec![7u32; len],
+                    SamplingParams::default(),
+                    rng.between(1, 3),
+                );
+            }
+
+            for _ in 0..256 {
+                let out = sched.schedule(None);
+                for s in &out.scheduled {
+                    // Stand in for the engine, which fills the cache and lets it
+                    // take the blocks it needs. Going through the cache is the
+                    // point: it is the thing that must give them back.
+                    let (id, phase) = (s.id, s.phase);
+                    let seq = sched.get_running_mut(id).unwrap();
+                    let tokens = match phase {
+                        SequencePhase::Prefill => seq.all_tokens.len(),
+                        SequencePhase::Decode => 1,
+                    };
+                    let kv = candle_core::Tensor::zeros(
+                        (1, 1, tokens, 4),
+                        candle_core::DType::F32,
+                        &candle_core::Device::Cpu,
+                    )
+                    .unwrap();
+                    // An exhausted pool fails the append, exactly as it would in
+                    // the engine; the scheduler preempts on the next step.
+                    let _ = seq.caches[0].append(&kv, &kv);
+                    if phase == SequencePhase::Prefill {
+                        seq.num_processed_tokens = seq.all_tokens.len();
+                        seq.phase = SequencePhase::Decode;
+                    } else {
+                        seq.num_processed_tokens += 1;
+                    }
+                    seq.append_token(7);
+                    seq.apply_token(7, false);
+                }
+                sched.retire_finished();
+                if !sched.has_pending_work() {
+                    break;
+                }
+            }
+
+            sched.abort_all();
+            assert_eq!(
+                allocators[0].lock().unwrap().num_free(),
+                capacity,
+                "seed {seed}: pool came back short after every sequence was gone"
+            );
+        }
+    }
+
     #[test]
     fn preempted_sequence_is_requeued_as_prefill() {
         let allocators = make_allocators(1, 2);

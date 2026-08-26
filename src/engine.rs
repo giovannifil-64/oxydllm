@@ -16,6 +16,7 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use candle_core::{Device, Result, Tensor};
 
@@ -163,6 +164,7 @@ pub struct Engine {
     allocators: Vec<SharedBlockAllocator>,
     prefix_cache: PrefixCache,
     block_size: usize,
+    pacer: PrefillPacer,
 }
 
 /// True when `tokens` ends with any of the configured multi-token stop
@@ -174,33 +176,109 @@ fn has_matching_stop_sequence(tokens: &[u32], stop_sequences: &[Vec<u32>]) -> bo
     })
 }
 
-/// Minimum total prefill tokens before a batch is split into two forward
-/// chunks.
-const PREFILL_CHUNK_THRESHOLD: usize = 1024;
-
-/// Chooses the sequence index at which to split a large prefill batch into
-/// two roughly token-balanced forward chunks.
+/// How long one forward should hold the GPU.
 ///
-/// Returns `None` when the batch is below [`PREFILL_CHUNK_THRESHOLD`], has
-/// fewer than two prefills, or the balance point would leave no prefill in
-/// the second half.
-fn pick_prefill_chunk_split(uncached_lens: &[usize], total_prefill_tokens: usize) -> Option<usize> {
-    if uncached_lens.len() < 2 || total_prefill_tokens < PREFILL_CHUNK_THRESHOLD {
-        return None;
+/// A forward is submitted as one uninterrupted stretch of GPU work, and while
+/// it runs the system compositor cannot draw. macOS kills its window server
+/// after forty seconds of that, which a single multi-thousand-token prefill
+/// reaches on a laptop GPU. A quarter of a second keeps the desktop responsive
+/// with room to spare while still being long enough to amortize a dispatch.
+const CHUNK_TARGET: Duration = Duration::from_millis(250);
+
+/// Smallest prefill chunk. Below this the per-forward overhead dominates and
+/// a machine slow enough to need it would be unusable anyway.
+const MIN_CHUNK: usize = 128;
+
+/// Tokens per forward, followed by measurement rather than assumed.
+///
+/// The right chunk depends on the GPU, the model and the quantization, none of
+/// which a constant can capture, so the pacer starts small and lets the
+/// machine answer: a chunk comfortably faster than [`CHUNK_TARGET`] doubles
+/// the cap, one that runs over halves it. A fast GPU converges upward within a
+/// few prompts; a slow one settles where the desktop stays alive.
+pub struct PrefillPacer {
+    cap: usize,
+}
+
+impl Default for PrefillPacer {
+    fn default() -> Self {
+        Self { cap: 4 * MIN_CHUNK }
     }
-    let target = total_prefill_tokens / 2;
-    let mut acc = 0usize;
-    for (i, &n) in uncached_lens.iter().enumerate() {
-        acc += n;
-        if acc >= target {
-            return if i + 1 < uncached_lens.len() {
-                Some(i + 1)
-            } else {
-                None
-            };
+}
+
+impl PrefillPacer {
+    fn cap(&self) -> usize {
+        self.cap
+    }
+
+    /// Folds one chunk's measured cost into the cap.
+    fn observe(&mut self, tokens: usize, elapsed: Duration) {
+        if elapsed > CHUNK_TARGET {
+            self.cap = (self.cap / 2).max(MIN_CHUNK);
+        } else if tokens >= self.cap && elapsed * 2 < CHUNK_TARGET {
+            self.cap = self.cap.saturating_mul(2);
         }
     }
-    None
+}
+
+/// One forward's worth of a batch: which sequences it carries, how many tokens
+/// of each, and which of them end here and so contribute a logits row.
+#[derive(Debug, PartialEq, Eq)]
+struct ForwardChunk {
+    start: usize,
+    counts: Vec<usize>,
+    seq_base: usize,
+    finished: Vec<usize>,
+}
+
+impl ForwardChunk {
+    fn len(&self) -> usize {
+        self.counts.iter().sum()
+    }
+}
+
+/// Splits a batch into forwards of at most `cap` tokens.
+///
+/// Sequences keep their order and may span chunks: a prompt longer than the
+/// cap is carried across several forwards, which is what bounds the work in
+/// any one of them. A sequence contributes its logits row in the chunk where
+/// its last token lands.
+fn plan_forward_chunks(token_counts: &[usize], cap: usize) -> Vec<ForwardChunk> {
+    let cap = cap.max(1);
+    let mut chunks = Vec::new();
+    let mut seq = 0usize;
+    let mut done_in_seq = 0usize;
+    let mut start = 0usize;
+
+    while seq < token_counts.len() {
+        let seq_base = seq;
+        let mut counts: Vec<usize> = Vec::new();
+        let mut finished: Vec<usize> = Vec::new();
+        let mut room = cap;
+
+        while seq < token_counts.len() && room > 0 {
+            let take = (token_counts[seq] - done_in_seq).min(room);
+            counts.push(take);
+            room -= take;
+            done_in_seq += take;
+            if done_in_seq == token_counts[seq] {
+                finished.push(counts.len() - 1);
+                seq += 1;
+                done_in_seq = 0;
+            }
+        }
+
+        let len: usize = counts.iter().sum();
+        chunks.push(ForwardChunk {
+            start,
+            counts,
+            seq_base,
+            finished,
+        });
+        start += len;
+    }
+
+    chunks
 }
 
 /// Per-sequence prefill plan: how many leading tokens/blocks the prefix cache
@@ -218,13 +296,11 @@ struct PrefillInfo {
 
 /// Flattened model input for one step: token ids and positions for all
 /// prefill suffixes followed by one token per decode sequence, with
-/// per-sequence `token_counts` and `total_prefill_tokens` marking the
-/// prefill/decode boundary.
+/// `token_counts` giving each sequence's share.
 struct BatchInput {
     all_token_ids: Vec<u32>,
     all_positions: Vec<u32>,
     token_counts: Vec<usize>,
-    total_prefill_tokens: usize,
 }
 
 /// Engine-level stop criteria: merged stop token ids plus multi-token stop
@@ -351,8 +427,6 @@ fn build_batch_input(
         token_counts.push(info.uncached_len);
     }
 
-    let total_prefill_tokens = all_token_ids.len();
-
     for &seq_id in decode_ids {
         let seq = scheduler.get_running_mut(seq_id).unwrap();
         all_token_ids.push(*seq.all_tokens.last().unwrap());
@@ -364,17 +438,18 @@ fn build_batch_input(
         all_token_ids,
         all_positions,
         token_counts,
-        total_prefill_tokens,
     }
 }
 
-/// Runs the batched forward over prefill and decode inputs and returns the
-/// logits `[total_tokens, vocab]`.
+/// Runs the batch as one or more forwards and returns one logits row per
+/// sequence, in batch order.
 ///
+/// The batch is split by [`plan_forward_chunks`] into forwards the GPU can
+/// finish promptly, so a long prompt no longer submits one uninterrupted
+/// stretch of work; `pacer` learns the size from what the machine measures.
 /// Caches are moved out through a [`CacheRestoreGuard`] so they are restored
-/// even when the forward fails. When [`pick_prefill_chunk_split`] elects a
-/// split, the prefill portion runs as two consecutive forwards whose logits
-/// are concatenated; decode tokens always ride in the second chunk.
+/// even when a forward fails, and each chunk's staged pool writes are flushed
+/// before the next one starts.
 ///
 /// ## Errors
 ///
@@ -385,68 +460,51 @@ fn run_forward_pass(
     scheduler: &mut Scheduler,
     prefill_ids: &[SequenceId],
     decode_ids: &[SequenceId],
-    prefill_uncached_lens: &[usize],
+    pacer: &mut PrefillPacer,
     batch: BatchInput,
 ) -> Result<Tensor> {
     let BatchInput {
         all_token_ids,
         all_positions,
         token_counts,
-        total_prefill_tokens,
     } = batch;
-    let total_tokens = all_token_ids.len();
-    let split_seq_idx = pick_prefill_chunk_split(prefill_uncached_lens, total_prefill_tokens);
 
     let mut cache_guard = CacheRestoreGuard::new(scheduler, prefill_ids, decode_ids);
     let mut cache_slices = cache_guard.cache_slices();
 
     let combined_result: Result<Tensor> = (|| {
-        let logits = if let Some(split) = split_seq_idx {
-            let prefill_a_tokens: usize = prefill_uncached_lens[..split].iter().sum();
-            let chunk_b_tokens = total_tokens - prefill_a_tokens;
+        let mut rows: Vec<Tensor> = Vec::with_capacity(token_counts.len());
 
-            let input_a = Tensor::from_vec(
-                all_token_ids[..prefill_a_tokens].to_vec(),
-                (1, prefill_a_tokens),
+        for chunk in plan_forward_chunks(&token_counts, pacer.cap()) {
+            let len = chunk.len();
+            let input = Tensor::from_vec(
+                all_token_ids[chunk.start..chunk.start + len].to_vec(),
+                (1, len),
                 device,
             )?;
-            let positions_a = Tensor::from_vec(
-                all_positions[..prefill_a_tokens].to_vec(),
-                (prefill_a_tokens,),
+            let positions = Tensor::from_vec(
+                all_positions[chunk.start..chunk.start + len].to_vec(),
+                (len,),
                 device,
             )?;
-            let input_b = Tensor::from_vec(
-                all_token_ids[prefill_a_tokens..].to_vec(),
-                (1, chunk_b_tokens),
-                device,
-            )?;
-            let positions_b = Tensor::from_vec(
-                all_positions[prefill_a_tokens..].to_vec(),
-                (chunk_b_tokens,),
-                device,
-            )?;
+            let caches = &mut cache_slices[chunk.seq_base..chunk.seq_base + chunk.counts.len()];
 
-            let counts_a: Vec<usize> = token_counts[..split].to_vec();
-            let counts_b: Vec<usize> = token_counts[split..].to_vec();
+            let started = Instant::now();
+            let out = model.forward_batch_last(&input, &positions, caches, &chunk.counts)?;
+            let out = out.squeeze(0)?;
+            for &row in &chunk.finished {
+                rows.push(out.narrow(0, row, 1)?);
+            }
+            flush_caches(caches)?;
+            pacer.observe(len, started.elapsed());
+        }
 
-            let (caches_a, caches_b) = cache_slices.split_at_mut(split);
-
-            let logits_a = model.forward_batch(&input_a, &positions_a, caches_a, &counts_a)?;
-            let logits_b = model.forward_batch(&input_b, &positions_b, caches_b, &counts_b)?;
-
-            Tensor::cat(&[&logits_a, &logits_b], 1)?
-        } else {
-            let input = Tensor::from_vec(all_token_ids, (1, total_tokens), device)?;
-            let position_ids = Tensor::from_vec(all_positions, (total_tokens,), device)?;
-            model.forward_batch(&input, &position_ids, &mut cache_slices, &token_counts)?
-        };
-        flush_caches(&mut cache_slices)?;
-        Ok(logits)
+        Tensor::cat(&rows, 0)
     })();
 
     drop(cache_slices);
     cache_guard.restore();
-    combined_result?.squeeze(0)
+    combined_result
 }
 
 /// Samples the first generated token for each prefill sequence from its last
@@ -464,11 +522,8 @@ fn sample_prefill_outputs(
     stop: &StopRules,
     new_tokens: &mut Vec<NewToken>,
 ) -> Result<()> {
-    let mut logit_offset = 0usize;
-    for info in prefill_infos {
-        let last_idx = logit_offset + info.uncached_len - 1;
-        let seq_logits = batch_logits.get(last_idx)?;
-        logit_offset += info.uncached_len;
+    for (row, info) in prefill_infos.iter().enumerate() {
+        let seq_logits = batch_logits.get(row)?;
 
         let sample_out = {
             let seq = scheduler.get_running(info.seq_id).unwrap();
@@ -533,12 +588,12 @@ fn sample_decode_outputs(
     scheduler: &mut Scheduler,
     decode_ids: &[SequenceId],
     batch_logits: &Tensor,
-    total_prefill_tokens: usize,
+    num_prefills: usize,
     stop: &StopRules,
     new_tokens: &mut Vec<NewToken>,
 ) -> Result<()> {
     for (i, &seq_id) in decode_ids.iter().enumerate() {
-        let seq_logits = batch_logits.get(total_prefill_tokens + i)?;
+        let seq_logits = batch_logits.get(num_prefills + i)?;
         let sample_out = {
             let seq = scheduler.get_running(seq_id).unwrap();
             let vocab = seq_logits.dims1()?;
@@ -741,6 +796,7 @@ impl Engine {
             allocators,
             prefix_cache,
             block_size,
+            pacer: PrefillPacer::default(),
         }
     }
 
@@ -845,6 +901,7 @@ impl Engine {
             allocators,
             prefix_cache,
             block_size,
+            pacer,
         } = self;
         let block_size = *block_size;
         let draft = draft_model.as_deref();
@@ -893,16 +950,13 @@ impl Engine {
         let mut new_tokens = Vec::new();
 
         if !batch.all_token_ids.is_empty() {
-            let prefill_uncached_lens: Vec<usize> =
-                prefill_infos.iter().map(|i| i.uncached_len).collect();
-            let total_prefill_tokens = batch.total_prefill_tokens;
             let batch_logits = run_forward_pass(
                 model.as_ref(),
                 device,
                 scheduler,
                 &prefill_ids,
                 decode_for_batch,
-                &prefill_uncached_lens,
+                pacer,
                 batch,
             )?;
             let mut prefix = PrefixRegistry {
@@ -922,7 +976,7 @@ impl Engine {
                 scheduler,
                 &normal_decode_ids,
                 &batch_logits,
-                total_prefill_tokens,
+                prefill_infos.len(),
                 &stop,
                 &mut new_tokens,
             )?;
@@ -994,27 +1048,90 @@ mod tests {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    /// Contract: a prompt longer than one forward's cap is carried across
+    /// consecutive forwards instead of being submitted whole, and it yields its
+    /// logits row in the chunk where its last token lands.
+    ///
+    /// Submitting it whole is what let a multi-thousand-token prefill hold the
+    /// GPU for tens of seconds, long enough for macOS to kill its window
+    /// server.
     #[test]
-    fn pick_chunk_split_skips_small_batches() {
-        assert_eq!(pick_prefill_chunk_split(&[256, 256], 512), None);
-        assert_eq!(pick_prefill_chunk_split(&[4096], 4096), None);
-        assert_eq!(pick_prefill_chunk_split(&[], 0), None);
+    fn a_long_prompt_is_carried_across_forwards() {
+        let chunks = plan_forward_chunks(&[1000], 256);
+        assert_eq!(chunks.len(), 4);
+        assert!(
+            chunks.iter().all(|c| c.len() <= 256),
+            "no forward may exceed the cap"
+        );
+        assert_eq!(chunks.iter().map(|c| c.len()).sum::<usize>(), 1000);
+        assert_eq!(chunks[0].start, 0);
+        assert_eq!(chunks[3].start, 768);
+        assert!(
+            chunks[..3].iter().all(|c| c.finished.is_empty()),
+            "the sequence ends only once"
+        );
+        assert_eq!(chunks[3].finished, vec![0]);
     }
 
+    /// Contract: sequences that fit share a forward, so batching survives the
+    /// cap, and each one is placed against the right cache.
     #[test]
-    fn pick_chunk_split_balances_two_equal_seqs() {
-        assert_eq!(pick_prefill_chunk_split(&[1024, 1024], 2048), Some(1));
+    fn sequences_that_fit_share_one_forward() {
+        let chunks = plan_forward_chunks(&[100, 60, 40], 256);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].counts, vec![100, 60, 40]);
+        assert_eq!(chunks[0].seq_base, 0);
+        assert_eq!(chunks[0].finished, vec![0, 1, 2]);
     }
 
+    /// Contract: a chunk boundary inside one sequence does not disturb the
+    /// sequences after it; the next forward resumes at the right cache and the
+    /// token offsets stay contiguous.
     #[test]
-    fn pick_chunk_split_handles_uneven_seqs() {
-        assert_eq!(pick_prefill_chunk_split(&[200, 1500], 1700), None);
-        assert_eq!(pick_prefill_chunk_split(&[800, 800, 800], 2400), Some(2));
+    fn a_split_sequence_keeps_the_batch_aligned() {
+        let chunks = plan_forward_chunks(&[300, 50], 256);
+        assert_eq!(chunks[0].counts, vec![256]);
+        assert_eq!(chunks[0].seq_base, 0);
+        assert!(chunks[0].finished.is_empty());
+        assert_eq!(chunks[1].counts, vec![44, 50]);
+        assert_eq!(chunks[1].seq_base, 0);
+        assert_eq!(chunks[1].finished, vec![0, 1]);
+        assert_eq!(chunks[1].start, 256);
+        assert_eq!(chunks.iter().map(|c| c.len()).sum::<usize>(), 350);
     }
 
+    /// Contract: decode steps, one token per sequence, still go out as a single
+    /// forward.
     #[test]
-    fn pick_chunk_split_returns_none_when_first_seq_dominates() {
-        assert_eq!(pick_prefill_chunk_split(&[3000, 100], 3100), Some(1));
+    fn a_decode_step_stays_one_forward() {
+        let chunks = plan_forward_chunks(&[1; 8], 512);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].finished.len(), 8);
+    }
+
+    /// Contract: the cap follows the machine. A chunk that overran the target
+    /// shrinks it, a full chunk well inside the target grows it, and it never
+    /// falls below the floor.
+    #[test]
+    fn the_pacer_follows_what_the_machine_measures() {
+        let mut p = PrefillPacer::default();
+        let start = p.cap();
+
+        p.observe(start, Duration::from_millis(400));
+        assert_eq!(p.cap(), start / 2, "a slow chunk halves the cap");
+
+        let now = p.cap();
+        p.observe(now, Duration::from_millis(10));
+        assert_eq!(p.cap(), now * 2, "a fast full chunk doubles it");
+
+        let now = p.cap();
+        p.observe(now / 4, Duration::from_millis(10));
+        assert_eq!(p.cap(), now, "a chunk that was not full proves nothing");
+
+        for _ in 0..12 {
+            p.observe(p.cap(), Duration::from_secs(2));
+        }
+        assert_eq!(p.cap(), MIN_CHUNK, "the cap stops at the floor");
     }
 
     struct FakeModel {
@@ -1073,10 +1190,6 @@ mod tests {
 
         fn stop_token_ids(&self) -> &[u32] {
             &self.stop_tokens
-        }
-
-        fn max_seq_len(&self) -> usize {
-            1024
         }
 
         fn device(&self) -> &Device {
@@ -1153,10 +1266,6 @@ mod tests {
             &self.stop_tokens
         }
 
-        fn max_seq_len(&self) -> usize {
-            2048
-        }
-
         fn device(&self) -> &Device {
             &self.device
         }
@@ -1201,10 +1310,6 @@ mod tests {
 
         fn stop_token_ids(&self) -> &[u32] {
             &[]
-        }
-
-        fn max_seq_len(&self) -> usize {
-            1024
         }
 
         fn device(&self) -> &Device {

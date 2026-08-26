@@ -135,7 +135,7 @@ pub struct ModelManager {
     memory_budget_bytes: Option<usize>,
     registry: BTreeMap<String, RegistryEntry>,
     cuda_devices: Vec<usize>,
-    max_context_len: usize,
+    max_context_len: Option<usize>,
     kv_budget: SharedGlobalKvBudget,
     kv_quant: KvQuantMode,
     qjl_quantization: bool,
@@ -263,7 +263,7 @@ pub struct ModelManagerConfig {
     pub keep_alive: Duration,
     pub memory_budget_bytes: Option<usize>,
     pub cuda_devices: Vec<usize>,
-    pub max_context_len: usize,
+    pub max_context_len: Option<usize>,
     pub kv_quant: KvQuantMode,
     pub qjl_quantization: bool,
     pub require_gpu: bool,
@@ -824,7 +824,7 @@ struct SpawnLoadParams {
     manager: SharedModelManager,
     effective_keep_alive: Duration,
     cuda_devices: Vec<usize>,
-    max_context_len: usize,
+    max_context_len: Option<usize>,
     kv_budget: SharedGlobalKvBudget,
     kv_quant: KvQuantMode,
     qjl_quantization: bool,
@@ -1069,7 +1069,7 @@ fn spawn_load(params: SpawnLoadParams) {
             .is_some()
             .then(|| kv_budget.acquire(kv_budget.available_bytes() / 2));
 
-        let (batch_model, weights_size_bytes) = match loader::load_batch_model(
+        let loaded = match loader::load_batch_model(
             &model_dir,
             &model_id_thread,
             &device,
@@ -1093,7 +1093,12 @@ fn spawn_load(params: SpawnLoadParams) {
             }
         };
 
-        let max_seq_len = batch_model.max_seq_len();
+        let loader::LoadedModel {
+            model: batch_model,
+            weights_bytes: weights_size_bytes,
+            context_len: max_context_len,
+        } = loaded;
+        let max_seq_len = max_context_len;
         let vocab_size = batch_model.vocab_size();
         let num_layers = batch_model.num_layers();
         let kv_cache_bytes = batch_model.kv_cache_bytes();
@@ -1211,7 +1216,7 @@ fn spawn_load(params: SpawnLoadParams) {
                 draft_id,
                 &device,
                 loader::LoadBatchOptions {
-                    max_context_len,
+                    max_context_len: Some(max_context_len),
                     max_num_sequences: load_max_num_sequences,
                     kv_budget: &kv_budget,
                     kv_quant,
@@ -1220,14 +1225,14 @@ fn spawn_load(params: SpawnLoadParams) {
                     memory_budget_bytes,
                 },
             ) {
-                Ok((d, _)) if d.vocab_size() == vocab_size => {
+                Ok(d) if d.model.vocab_size() == vocab_size => {
                     tracing::info!(model_id = %model_id_thread, draft = %draft_id, "speculative draft model loaded");
-                    Some(d)
+                    Some(d.model)
                 }
-                Ok((d, _)) => {
+                Ok(d) => {
                     tracing::warn!(
                         model_id = %model_id_thread, draft = %draft_id,
-                        draft_vocab = d.vocab_size(), target_vocab = vocab_size,
+                        draft_vocab = d.model.vocab_size(), target_vocab = vocab_size,
                         "draft vocab mismatch; speculative decoding disabled for this model"
                     );
                     None
@@ -1424,7 +1429,7 @@ mod tests {
             keep_alive,
             memory_budget_bytes: budget,
             cuda_devices: vec![],
-            max_context_len: 512,
+            max_context_len: Some(512),
             kv_quant: crate::common::kv_quant::KvQuantMode::Off,
             qjl_quantization: false,
             require_gpu: false,

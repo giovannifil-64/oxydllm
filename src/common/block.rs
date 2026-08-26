@@ -480,6 +480,20 @@ pub struct TransformerComponents<'a> {
 /// mismatch would otherwise be silently miscomputed by downstream ops rather
 /// than caught here. These are `debug_assert!`s, compiled out of release builds.
 ///
+/// Which rows the final projection is asked for.
+///
+/// A prompt's logits are read one row per sequence, but projecting every token
+/// allocates `tokens x vocab` values: sixteen thousand tokens over a 152k
+/// vocabulary is 4.9 GB to read 152k numbers from, which exhausts GPU memory
+/// and, before it does, slows prefill down by a matmul nobody reads.
+/// [`LogitRows::All`] exists for speculative decoding, which scores every
+/// drafted position.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum LogitRows {
+    All,
+    LastPerSequence,
+}
+
 /// ## Errors
 /// Propagates tensor-op failures, and fails if a per-layer-input embedding
 /// dimension is not divisible by the layer count.
@@ -489,6 +503,7 @@ pub fn run_transformer_layers_batch(
     position_ids: &Tensor,
     seq_caches: &mut [&mut [PagedKvCache]],
     token_counts: &[usize],
+    rows: LogitRows,
 ) -> Result<Tensor> {
     debug_assert_eq!(
         token_counts.len(),
@@ -595,6 +610,20 @@ pub fn run_transformer_layers_batch(
     }
 
     let x = decode_profile::phase(&dev, "final_norm", || c.norm.forward(&x))?;
+    let x = match rows {
+        LogitRows::All => x,
+        LogitRows::LastPerSequence => {
+            let mut end = 0u32;
+            let idx: Vec<u32> = token_counts
+                .iter()
+                .map(|&n| {
+                    end += n as u32;
+                    end - 1
+                })
+                .collect();
+            x.index_select(&Tensor::from_vec(idx, (token_counts.len(),), &dev)?, 1)?
+        }
+    };
     let mut logits = decode_profile::phase(&dev, "lm_head", || c.lm_head.forward(&x))?;
 
     // Granite calibrates sampling by dividing the logits (HF `logits_scaling`).

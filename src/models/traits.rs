@@ -10,9 +10,39 @@ pub trait BatchModel {
         token_counts: &[usize],
     ) -> Result<Tensor>;
 
+    /// Logits for the last token of each sequence, one row per sequence.
+    ///
+    /// The engine samples exactly one row per sequence, so a model that can
+    /// project only those rows should: running the head over a whole prompt
+    /// allocates `tokens x vocab` values, which for a long prompt is gigabytes
+    /// read once. The default projects everything and then selects, which is
+    /// correct but keeps the allocation.
+    ///
+    /// ## Errors
+    ///
+    /// Propagates the forward's own failures.
+    fn forward_batch_last(
+        &self,
+        token_ids: &Tensor,
+        position_ids: &Tensor,
+        seq_caches: &mut [&mut [PagedKvCache]],
+        token_counts: &[usize],
+    ) -> Result<Tensor> {
+        let full = self.forward_batch(token_ids, position_ids, seq_caches, token_counts)?;
+        let mut end = 0u32;
+        let idx: Vec<u32> = token_counts
+            .iter()
+            .map(|&n| {
+                end += n as u32;
+                end - 1
+            })
+            .collect();
+        let idx = Tensor::from_vec(idx, (token_counts.len(),), full.device())?;
+        full.index_select(&idx, full.rank() - 2)
+    }
+
     fn vocab_size(&self) -> usize;
     fn stop_token_ids(&self) -> &[u32];
-    fn max_seq_len(&self) -> usize;
     fn device(&self) -> &Device;
     fn num_layers(&self) -> usize;
 

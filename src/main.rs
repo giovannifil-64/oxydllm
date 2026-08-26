@@ -41,7 +41,7 @@ struct StartArgs {
     shutdown_timeout: Duration,
     memory_budget_bytes: Option<usize>,
     cuda_devices: Vec<usize>,
-    max_context_len: usize,
+    max_context_len: Option<usize>,
     kv_quant: common::kv_quant::KvQuantMode,
     qjl_quantization: bool,
     require_gpu: bool,
@@ -58,7 +58,7 @@ struct RunArgs {
     model_id: String,
     sampling_params: SamplingParams,
     cuda_device: Option<usize>,
-    max_context_len: usize,
+    max_context_len: Option<usize>,
     kv_quant: common::kv_quant::KvQuantMode,
     qjl_quantization: bool,
     require_gpu: bool,
@@ -161,7 +161,7 @@ Server options (start):
   --keep-alive <SECS>        Keep-alive seconds before eviction (default: 900, env: OXYDLLM_KEEP_ALIVE)
   --shutdown-timeout <SECS>  Seconds to wait for in-flight requests on shutdown (default: 30, env: OXYDLLM_SHUTDOWN_TIMEOUT)
   --memory-budget <MB>       Max total VRAM for loaded models in MB; LRU eviction when exceeded (env: OXYDLLM_MEMORY_BUDGET)
-  --max-context-len <N>      Max tokens per sequence for KV cache (default: 4096, env: OXYDLLM_MAX_CONTEXT_LEN)
+  --max-context-len <N>      Tokens per sequence for KV cache (default: sized from memory, env: OXYDLLM_MAX_CONTEXT_LEN)
   --devices <IDS>            Comma-separated CUDA device indices to use (default: auto, env: OXYDLLM_DEVICES)
                              Examples: --devices 0   --devices 0,1,2
   --kv-quant <MODE>          KV cache quantization mode (default: auto, env: OXYDLLM_KV_QUANT)
@@ -186,7 +186,7 @@ Server options (start):
 Chat options (run):
   --models-dir <DIR>         Models directory (default: ~/.oxydllm/models/)
   --devices <ID>             CUDA device index to use (default: auto, env: OXYDLLM_DEVICES)
-  --max-context-len <N>      Max tokens per sequence for KV cache (default: 4096)
+  --max-context-len <N>      Tokens per sequence for KV cache (default: sized from memory)
   --kv-quant <MODE>          KV cache quantization: auto, off, lossless, balanced, aggressive
   --allow-cpu                Allow CPU fallback when no GPU is available (default: GPU required, env: OXYDLLM_ALLOW_CPU)
   --draft-model <NAME>       Enable greedy speculative decoding with this draft model
@@ -701,7 +701,7 @@ fn parse_start_args(args: &[String]) -> Result<StartArgs, String> {
     let mut shutdown_timeout_secs: u64 = env_u64("OXYDLLM_SHUTDOWN_TIMEOUT").unwrap_or(30);
     let mut memory_budget_mb: Option<usize> = env_usize("OXYDLLM_MEMORY_BUDGET");
     let mut devices_raw: Option<Vec<usize>> = None;
-    let mut max_context_len: usize = env_usize("OXYDLLM_MAX_CONTEXT_LEN").unwrap_or(4096);
+    let mut max_context_len: Option<usize> = env_usize("OXYDLLM_MAX_CONTEXT_LEN");
     let mut kv_quant = std::env::var("OXYDLLM_KV_QUANT")
         .ok()
         .map(|v| common::kv_quant::KvQuantMode::parse(&v))
@@ -750,9 +750,11 @@ fn parse_start_args(args: &[String]) -> Result<StartArgs, String> {
                 devices_raw = Some(parse_devices(next_arg(args, &mut i, "--devices")?)?);
             }
             "--max-context-len" => {
-                max_context_len = next_arg(args, &mut i, "--max-context-len")?
-                    .parse()
-                    .map_err(|_| "Invalid max-context-len value (expected integer)")?;
+                max_context_len = Some(
+                    next_arg(args, &mut i, "--max-context-len")?
+                        .parse()
+                        .map_err(|_| "Invalid max-context-len value (expected integer)")?,
+                );
             }
             "--kv-quant" => {
                 kv_quant =
@@ -853,7 +855,7 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
     let mut draft_name: Option<String> = None;
     let mut models_dir: Option<PathBuf> = None;
     let mut devices_raw: Option<Vec<usize>> = None;
-    let mut max_context_len: usize = 4096;
+    let mut max_context_len: Option<usize> = None;
     let mut kv_quant = common::kv_quant::KvQuantMode::Auto;
     let qjl_quantization = false;
     let env_allow_cpu = std::env::var("OXYDLLM_ALLOW_CPU")
@@ -891,9 +893,11 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
                 devices_raw = Some(d);
             }
             "--max-context-len" => {
-                max_context_len = next_arg(args, &mut i, "--max-context-len")?
-                    .parse()
-                    .map_err(|_| "Invalid max-context-len value")?;
+                max_context_len = Some(
+                    next_arg(args, &mut i, "--max-context-len")?
+                        .parse()
+                        .map_err(|_| "Invalid max-context-len value")?,
+                );
             }
             "--temperature" | "-t" => {
                 params.temperature = next_arg(args, &mut i, "--temperature")?
@@ -1070,7 +1074,7 @@ fn run_interactive(args: &RunArgs) -> anyhow::Result<()> {
     let kv_budget = std::sync::Arc::new(crate::common::paged::GlobalKvBudget::new(
         crate::common::paged::detect_system_kv_budget(None, is_cpu),
     ));
-    let (batch_model, weights_size_bytes) = models::loader::load_batch_model(
+    let loaded = models::loader::load_batch_model(
         &args.model_dir,
         &args.model_id,
         &device,
@@ -1084,7 +1088,11 @@ fn run_interactive(args: &RunArgs) -> anyhow::Result<()> {
             memory_budget_bytes: None,
         },
     )?;
-    let max_seq_len = batch_model.max_seq_len();
+    let models::loader::LoadedModel {
+        model: batch_model,
+        weights_bytes: weights_size_bytes,
+        context_len: max_seq_len,
+    } = loaded;
     let kv_cache_bytes = batch_model.kv_cache_bytes();
     let total_bytes = weights_size_bytes + kv_cache_bytes;
     println!(
@@ -1098,12 +1106,12 @@ fn run_interactive(args: &RunArgs) -> anyhow::Result<()> {
 
     let draft_model = if let Some((draft_dir, draft_id)) = &args.draft_model {
         println!("Loading draft model from '{draft_dir}'...");
-        let (draft, _) = models::loader::load_batch_model(
+        let draft = models::loader::load_batch_model(
             draft_dir,
             draft_id,
             &device,
             models::loader::LoadBatchOptions {
-                max_context_len: args.max_context_len,
+                max_context_len: Some(max_seq_len),
                 max_num_sequences: 1,
                 kv_budget: &kv_budget,
                 kv_quant: args.kv_quant,
@@ -1112,15 +1120,15 @@ fn run_interactive(args: &RunArgs) -> anyhow::Result<()> {
                 memory_budget_bytes: None,
             },
         )?;
-        if draft.vocab_size() != batch_model.vocab_size() {
+        if draft.model.vocab_size() != batch_model.vocab_size() {
             anyhow::bail!(
                 "draft vocab_size {} != target vocab_size {}: draft and target must share a tokenizer",
-                draft.vocab_size(),
+                draft.model.vocab_size(),
                 batch_model.vocab_size()
             );
         }
         println!("Draft model loaded: speculative decoding enabled.");
-        Some(draft)
+        Some(draft.model)
     } else {
         None
     };

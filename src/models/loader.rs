@@ -773,7 +773,9 @@ pub fn select_device_at(_cuda_idx: usize, require_gpu: bool) -> anyhow::Result<D
 /// automatic expert-streaming decision; free memory at load time when unset.
 #[derive(Clone, Copy)]
 pub struct LoadBatchOptions<'a> {
-    pub max_context_len: usize,
+    /// Tokens per sequence to size the KV pool for, or `None` to let
+    /// [`fit_context_len`] derive it from the model and the machine.
+    pub max_context_len: Option<usize>,
     pub max_num_sequences: usize,
     pub kv_budget: &'a SharedGlobalKvBudget,
     pub kv_quant: KvQuantMode,
@@ -782,9 +784,19 @@ pub struct LoadBatchOptions<'a> {
     pub memory_budget_bytes: Option<usize>,
 }
 
-/// Loads the model in `model_dir` as a [`BatchModel`], returning it together
-/// with its weight footprint in bytes (used by the manager's memory
-/// accounting).
+/// What a load produced.
+///
+/// `context_len` is the tokens per sequence the KV pool was actually sized
+/// for, which is what the server must cap requests at: it is the model's
+/// declared context only when the machine had room for it.
+pub struct LoadedModel {
+    pub model: Box<dyn BatchModel>,
+    pub weights_bytes: usize,
+    pub context_len: usize,
+}
+
+/// Loads the model in `model_dir` as a [`BatchModel`], with the bytes its
+/// weights occupy and the context its KV pool was sized for.
 ///
 /// GGUF directories (per [`is_gguf_model`]) go through the GGUF path, where
 /// `model_id` selects the quant variant; everything else parses config.json
@@ -805,7 +817,7 @@ pub fn load_batch_model(
     model_id: &str,
     device: &Device,
     opts: LoadBatchOptions<'_>,
-) -> anyhow::Result<(Box<dyn BatchModel>, usize)> {
+) -> anyhow::Result<LoadedModel> {
     let mut cap: Option<usize> = None;
 
     for attempt in 0..=KV_RETRY_HALVINGS {
@@ -825,7 +837,8 @@ pub fn load_batch_model(
             load_standard_safetensors(cfg, model_dir, device, dtype, opts, cap)
         };
 
-        let (model, weights_size) = loaded?;
+        let loaded = loaded?;
+        let model = &loaded.model;
 
         // The weight uploads and the KV pool allocation are both queued work at
         // this point. Draining reports a command buffer that failed outright;
@@ -834,11 +847,11 @@ pub fn load_batch_model(
         // the writes never reached.
         crate::common::weights::drain_metal(device, "model load")?;
         if weights_read_consistently(model.as_ref(), device) {
-            return Ok((model, weights_size));
+            return Ok(loaded);
         }
 
         let pool_bytes = kv_pool_bytes(model.as_ref());
-        drop(model);
+        drop(loaded);
         crate::common::weights::drain_metal(device, "failed attempt reclamation").ok();
 
         if attempt == KV_RETRY_HALVINGS || pool_bytes == 0 {
@@ -1031,7 +1044,7 @@ fn load_standard_safetensors(
     dtype: DType,
     opts: LoadBatchOptions<'_>,
     retry_cap: Option<usize>,
-) -> anyhow::Result<(Box<dyn BatchModel>, usize)> {
+) -> anyhow::Result<LoadedModel> {
     let weight_paths = resolve_weight_paths(model_dir)?;
     let weight_path_refs: Vec<&str> = weight_paths.iter().map(|s| s.as_str()).collect();
 
@@ -1134,7 +1147,13 @@ fn load_standard_safetensors(
         .map(|(spec, _)| spec)
         .collect();
 
-    let ctx = opts.max_context_len.min(cfg.max_position_embeddings);
+    let ctx = resolve_context_len(
+        &opts,
+        &layer_kv_specs,
+        dtype,
+        weights_size,
+        cfg.max_position_embeddings,
+    );
     let (num_blocks, acquired_kv_bytes, kv_mode) = compute_kv_blocks(
         &KvBlockParams {
             layer_kv_specs: layer_kv_specs.clone(),
@@ -1164,7 +1183,7 @@ fn load_standard_safetensors(
             .collect(),
     };
 
-    let result = (|| -> anyhow::Result<(Box<dyn BatchModel>, usize)> {
+    let result = (|| -> anyhow::Result<LoadedModel> {
         let embed_weight_name = "model.embed_tokens.weight";
         let embed_weight = weights
             .get(embed_weight_name)
@@ -1360,8 +1379,8 @@ fn load_standard_safetensors(
             None
         };
 
-        Ok((
-            Box::new(StandardTransformer {
+        Ok(LoadedModel {
+            model: Box::new(StandardTransformer {
                 embed_tokens,
                 blocks,
                 norm,
@@ -1371,7 +1390,6 @@ fn load_standard_safetensors(
                 device: device.clone(),
                 stop_token_ids: cfg.eos_token_ids,
                 vocab_size: cfg.vocab_size,
-                max_seq_len: ctx,
                 embed_scale: cfg.embed_scale,
                 logit_softcap: cfg.logit_softcap,
                 logits_scaling: cfg.logits_scaling,
@@ -1384,8 +1402,9 @@ fn load_standard_safetensors(
                 kv_shared_layer_map: cfg.kv_shared_layer_map.clone(),
                 has_recurrent_state: layer_is_linear.iter().any(|&b| b),
             }),
-            weights_size,
-        ))
+            weights_bytes: weights_size,
+            context_len: ctx,
+        })
     })();
 
     if result.is_err() {
@@ -1409,7 +1428,7 @@ fn load_batch_model_gguf(
     device: &Device,
     opts: LoadBatchOptions<'_>,
     retry_cap: Option<usize>,
-) -> anyhow::Result<(Box<dyn BatchModel>, usize)> {
+) -> anyhow::Result<LoadedModel> {
     let dir = Path::new(model_dir);
     let all_gguf_paths = find_gguf_files(dir)
         .ok_or_else(|| anyhow::anyhow!("No .gguf file found in {}", model_dir))?;
@@ -1446,13 +1465,19 @@ fn load_batch_model_gguf(
     let weights_size = gguf.total_size_bytes();
 
     let topo = crate::models::gguf_model::parse_gguf_topology(&gguf)?;
-    let ctx = opts.max_context_len.min(topo.context_length);
     // Hybrid models budget KV only for their full-attention layers; the
     // linear layers keep O(1) recurrent state instead.
     let layer_kv_specs: Vec<(usize, usize)> = (0..topo.num_hidden_layers)
         .filter(|&i| !topo.layer_is_linear(i))
         .map(|_| (topo.num_key_value_heads, topo.head_dim))
         .collect();
+    let ctx = resolve_context_len(
+        &opts,
+        &layer_kv_specs,
+        dtype,
+        weights_size,
+        topo.context_length,
+    );
     let (num_blocks, acquired_kv_bytes, kv_mode) = compute_kv_blocks(
         &KvBlockParams {
             layer_kv_specs,
@@ -1484,7 +1509,88 @@ fn load_batch_model_gguf(
             return Err(e);
         }
     };
-    Ok((Box::new(model), weights_size))
+    Ok(LoadedModel {
+        model: Box::new(model),
+        weights_bytes: weights_size,
+        context_len: ctx,
+    })
+}
+
+/// Smallest context worth serving. A model that cannot hold this much is
+/// better off failing the load than answering two-sentence prompts.
+const MIN_AUTO_CONTEXT: usize = 4096;
+
+/// Context per sequence when the caller pins none.
+///
+/// A model declares the longest context it was trained for, and on a personal
+/// machine that is routinely more KV cache than there is memory: a 262144-token
+/// window costs gigabytes per sequence. Defaulting to a fixed number instead is
+/// wrong in both directions, tarpitting a small model on a large machine and
+/// overcommitting a large one on a small machine, so take the largest context
+/// whose pool fits the safe share of memory for `sequences` of them, and cap it
+/// at what the model declares.
+///
+/// Returns the model's declared context when the layer geometry gives no KV
+/// cost, which is the case for models that keep no growing cache.
+fn fit_context_len(
+    layer_kv_specs: &[(usize, usize)],
+    dtype: DType,
+    weights_bytes: usize,
+    sequences: usize,
+    declared: usize,
+) -> usize {
+    let per_token: usize = layer_kv_specs
+        .iter()
+        .map(|(n_kv_heads, head_dim)| n_kv_heads * head_dim * dtype.size_in_bytes() * 2)
+        .sum();
+    if per_token == 0 {
+        return declared;
+    }
+
+    let per_sequence =
+        crate::common::paged::safe_model_kv_ceiling(weights_bytes) / sequences.max(1);
+    let fits = (per_sequence / per_token / DEFAULT_BLOCK_SIZE) * DEFAULT_BLOCK_SIZE;
+
+    fits.min(declared).max(MIN_AUTO_CONTEXT.min(declared))
+}
+
+/// Resolves the context to serve: what the caller pinned, or what fits.
+fn resolve_context_len(
+    opts: &LoadBatchOptions<'_>,
+    layer_kv_specs: &[(usize, usize)],
+    dtype: DType,
+    weights_bytes: usize,
+    declared: usize,
+) -> usize {
+    match opts.max_context_len {
+        Some(pinned) => {
+            let ctx = pinned.min(declared);
+            if ctx < pinned {
+                tracing::info!(
+                    requested = pinned,
+                    declared,
+                    "context capped at what the model declares"
+                );
+            }
+            ctx
+        }
+        None => {
+            let ctx = fit_context_len(
+                layer_kv_specs,
+                dtype,
+                weights_bytes,
+                opts.max_num_sequences,
+                declared,
+            );
+            tracing::info!(
+                context_len = ctx,
+                declared,
+                sequences = opts.max_num_sequences,
+                "context window sized from available memory"
+            );
+            ctx
+        }
+    }
 }
 
 /// Inputs to [`compute_kv_blocks`]: `layer_kv_specs` lists
@@ -1684,6 +1790,75 @@ mod model_kind_tests {
         let d = tempfile::tempdir().unwrap();
         std::fs::write(d.path().join("config.json"), "{}").unwrap();
         assert!(!is_gguf_model(d.path().to_str().unwrap()));
+    }
+}
+
+#[cfg(test)]
+mod context_sizing_tests {
+    use super::*;
+
+    /// Qwen2.5-1.5B geometry: 28 attention layers, 2 KV heads, head dim 128.
+    fn specs(layers: usize) -> Vec<(usize, usize)> {
+        vec![(2, 128); layers]
+    }
+
+    /// Contract: the fitted context never exceeds what the model declares, so
+    /// a machine with memory to spare cannot push a model past the positions
+    /// it was trained for.
+    #[test]
+    fn the_model_declaration_is_the_ceiling() {
+        for declared in [2048usize, 8192, 32768] {
+            let ctx = fit_context_len(&specs(28), DType::BF16, 1 << 30, 8, declared);
+            assert!(ctx <= declared, "declared {declared} produced {ctx}");
+        }
+    }
+
+    /// Contract: weights and KV come out of the same memory, so a heavier model
+    /// gets no more context than a lighter one of the same shape.
+    #[test]
+    fn heavier_weights_never_buy_more_context() {
+        let light = fit_context_len(&specs(28), DType::BF16, 1 << 30, 8, 1 << 20);
+        let heavy = fit_context_len(&specs(28), DType::BF16, 12 << 30, 8, 1 << 20);
+        assert!(heavy <= light, "light {light}, heavy {heavy}");
+    }
+
+    /// Contract: a model that keeps no growing cache is not sized down, since
+    /// there is no per-token KV cost to fit.
+    #[test]
+    fn a_model_without_kv_keeps_its_declared_context() {
+        assert_eq!(
+            fit_context_len(&[], DType::BF16, 1 << 30, 8, 262144),
+            262144
+        );
+    }
+
+    /// Contract: the fitted context is a whole number of KV blocks, so the pool
+    /// carries no slot that no sequence can reach, and it never drops below a
+    /// context worth serving unless the model itself declares less.
+    #[test]
+    fn the_fit_is_whole_blocks_and_never_pointless() {
+        let ctx = fit_context_len(&specs(28), DType::BF16, 1 << 30, 8, 1 << 20);
+        assert_eq!(
+            ctx % DEFAULT_BLOCK_SIZE,
+            0,
+            "context {ctx} is not whole blocks"
+        );
+        assert!(ctx >= MIN_AUTO_CONTEXT, "context {ctx} below the floor");
+
+        let tiny = fit_context_len(&specs(28), DType::BF16, 1 << 30, 8, 1024);
+        assert_eq!(
+            tiny, 1024,
+            "a model declaring less than the floor keeps its own"
+        );
+    }
+
+    /// Contract: more concurrent sequences share the same pool, so each gets a
+    /// shorter context rather than the pool growing.
+    #[test]
+    fn concurrency_divides_the_same_pool() {
+        let few = fit_context_len(&specs(28), DType::BF16, 1 << 30, 2, 1 << 20);
+        let many = fit_context_len(&specs(28), DType::BF16, 1 << 30, 16, 1 << 20);
+        assert!(many <= few, "2 seqs {few}, 16 seqs {many}");
     }
 }
 

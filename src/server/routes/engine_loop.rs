@@ -1050,9 +1050,6 @@ mod metrics_loop_tests {
         fn stop_token_ids(&self) -> &[u32] {
             &[]
         }
-        fn max_seq_len(&self) -> usize {
-            1024
-        }
         fn device(&self) -> &Device {
             &self.device
         }

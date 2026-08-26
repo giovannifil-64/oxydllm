@@ -3427,6 +3427,36 @@ mod fused_kernel_parity_tests {
         assert!(diff < tol, "{label}: max_abs_diff = {diff} (tol {tol})");
     }
 
+    /// Contract: the prefill kernel matches the reference at the lengths a real
+    /// prompt reaches, not just the dozens of tokens the other cases cover.
+    ///
+    /// The gap mattered: when long prompts started returning nonsense, the
+    /// existing cases could not tell whether attention was at fault, and F32
+    /// parity at these lengths is what ruled the kernel out.
+    #[test]
+    fn flash_attn_prefill_matches_naive_at_prompt_lengths() {
+        let Some(dev) = metal_device_or_skip() else {
+            return;
+        };
+        for t in [1024usize, 4096] {
+            run_fa_parity(
+                &dev,
+                DType::F32,
+                FaCase {
+                    b: 1,
+                    h: 12,
+                    h_kv: 2,
+                    t_q: t,
+                    t_kv: t,
+                    d: 128,
+                },
+                None,
+                1e-3,
+                &format!("f32 d128 prefill t={t}"),
+            );
+        }
+    }
+
     #[test]
     fn flash_attn_f32_d64_prefill_matches_naive() {
         let Some(dev) = metal_device_or_skip() else {

@@ -254,7 +254,6 @@ mod tests {
             device: dev,
             stop_token_ids: vec![2],
             vocab_size: VOCAB,
-            max_seq_len: MAX_SEQ,
             embed_scale: spec.embed_scale,
             logit_softcap: spec.logit_softcap,
             logits_scaling: spec.logits_scaling,

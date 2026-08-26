@@ -54,7 +54,6 @@ pub struct StandardTransformer {
     pub(crate) device: Device,
     pub(crate) stop_token_ids: Vec<u32>,
     pub(crate) vocab_size: usize,
-    pub(crate) max_seq_len: usize,
     pub(crate) embed_scale: Option<f64>,
     pub(crate) logit_softcap: Option<f64>,
     pub(crate) logits_scaling: Option<f64>,
@@ -450,7 +449,6 @@ impl StandardTransformer {
             device: device.clone(),
             stop_token_ids,
             vocab_size,
-            max_seq_len: max_position_embeddings,
             embed_scale,
             logit_softcap,
             logits_scaling,
@@ -484,6 +482,24 @@ impl BatchModel for StandardTransformer {
             position_ids,
             seq_caches,
             token_counts,
+            crate::common::block::LogitRows::All,
+        )
+    }
+
+    fn forward_batch_last(
+        &self,
+        token_ids: &Tensor,
+        position_ids: &Tensor,
+        seq_caches: &mut [&mut [PagedKvCache]],
+        token_counts: &[usize],
+    ) -> Result<Tensor> {
+        run_transformer_layers_batch(
+            self.components(),
+            token_ids,
+            position_ids,
+            seq_caches,
+            token_counts,
+            crate::common::block::LogitRows::LastPerSequence,
         )
     }
 
@@ -493,10 +509,6 @@ impl BatchModel for StandardTransformer {
 
     fn stop_token_ids(&self) -> &[u32] {
         &self.stop_token_ids
-    }
-
-    fn max_seq_len(&self) -> usize {
-        self.max_seq_len
     }
 
     fn device(&self) -> &Device {

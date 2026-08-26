@@ -157,7 +157,7 @@ pub struct StartServerArgs {
     pub shutdown_timeout: Duration,
     pub memory_budget_bytes: Option<usize>,
     pub cuda_devices: Vec<usize>,
-    pub max_context_len: usize,
+    pub max_context_len: Option<usize>,
     pub kv_quant: crate::common::kv_quant::KvQuantMode,
     pub qjl_quantization: bool,
     pub require_gpu: bool,

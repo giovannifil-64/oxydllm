@@ -715,12 +715,26 @@ fn contig_buf_capacity(total_needed: usize) -> usize {
     cap.max(64)
 }
 
-/// Deferred block-pool write that avoids GPU-to-CPU sync during the forward pass.
-struct PendingWrite {
-    block_id: usize,
-    offset: usize,
-    k_chunk: Tensor,
-    v_chunk: Tensor,
+/// One contiguous run of a staged append: the `n_tokens` rows starting at
+/// `src_offset` in the batch's source tensors belong at pool slot `dst_slot`.
+struct PendingRun {
+    dst_slot: usize,
+    src_offset: usize,
+    n_tokens: usize,
+}
+
+/// One append's deferred pool writes, keeping the source tensors whole.
+///
+/// Slicing the source per block would stage two GPU buffers for every sixteen
+/// tokens of every layer, so a prefill of a few thousand tokens keeps tens of
+/// thousands of buffers alive until the flush. The Metal allocator does not
+/// survive that: it starts failing allocations without reporting an error and
+/// the forward silently computes garbage, which measured as coherent output
+/// below roughly twenty thousand staged buffers and nonsense above it.
+struct PendingBatch {
+    k_src: Tensor,
+    v_src: Tensor,
+    runs: Vec<PendingRun>,
 }
 
 struct BgFlushItem {
@@ -760,7 +774,7 @@ pub struct PagedKvCache {
     contig_k: Option<Tensor>,
     contig_v: Option<Tensor>,
     contig_len: usize,
-    pending_writes: Vec<PendingWrite>,
+    pending_writes: Vec<PendingBatch>,
     recurrent: Option<RecurrentState>,
 }
 
@@ -836,11 +850,11 @@ impl PagedKvCache {
         );
         let mut written = 0;
 
+        let mut runs: Vec<PendingRun> = Vec::new();
+
         while written < new_seq {
             let current_offset = self.table.num_tokens % block_size;
             let n = (new_seq - written).min(block_size - current_offset);
-            let k_chunk = k_flat.narrow(0, written, n)?.contiguous()?;
-            let v_chunk = v_flat.narrow(0, written, n)?.contiguous()?;
 
             let block_id = {
                 let mut alloc = self.allocator.lock().unwrap();
@@ -852,12 +866,20 @@ impl PagedKvCache {
             };
 
             if !skip_pool_write {
-                self.pending_writes.push(PendingWrite {
-                    block_id,
-                    offset: current_offset,
-                    k_chunk: k_chunk.clone(),
-                    v_chunk: v_chunk.clone(),
-                });
+                let dst_slot = block_id * block_size + current_offset;
+                match runs.last_mut() {
+                    Some(prev)
+                        if prev.dst_slot + prev.n_tokens == dst_slot
+                            && prev.src_offset + prev.n_tokens == written =>
+                    {
+                        prev.n_tokens += n;
+                    }
+                    _ => runs.push(PendingRun {
+                        dst_slot,
+                        src_offset: written,
+                        n_tokens: n,
+                    }),
+                }
             }
 
             let base = u32::try_from(block_id * block_size)
@@ -868,6 +890,14 @@ impl PagedKvCache {
 
             self.table.num_tokens += n;
             written += n;
+        }
+
+        if !runs.is_empty() {
+            self.pending_writes.push(PendingBatch {
+                k_src: k_flat.contiguous()?,
+                v_src: v_flat.contiguous()?,
+                runs,
+            });
         }
 
         let total_needed = prev_tokens + new_seq;
@@ -946,43 +976,50 @@ impl PagedKvCache {
             return Ok(());
         }
 
+        let block_size = self.block_size;
         if self.quantizer.is_none() {
+            let batches = std::mem::take(&mut self.pending_writes);
             let mut alloc = self.allocator.lock().unwrap();
-            for pw in self.pending_writes.drain(..) {
-                alloc.write(pw.block_id, pw.offset, &pw.k_chunk, &pw.v_chunk)?;
+            for batch in &batches {
+                for run in &batch.runs {
+                    alloc.write(
+                        run.dst_slot / block_size,
+                        run.dst_slot % block_size,
+                        &batch.k_src.narrow(0, run.src_offset, run.n_tokens)?,
+                        &batch.v_src.narrow(0, run.src_offset, run.n_tokens)?,
+                    )?;
+                }
             }
             return Ok(());
         }
 
-        // Batch all pending K/V chunks into one GPU-to-CPU transfer each.
-        let pending_writes = std::mem::take(&mut self.pending_writes);
+        // Batch every staged run into one GPU-to-CPU transfer each.
+        let batches = std::mem::take(&mut self.pending_writes);
 
-        let token_counts: Vec<usize> = pending_writes
-            .iter()
-            .map(|pw| pw.k_chunk.dim(0).unwrap_or(1))
-            .collect();
+        let mut k_parts: Vec<Tensor> = Vec::new();
+        let mut v_parts: Vec<Tensor> = Vec::new();
+        let mut items: Vec<BgFlushItem> = Vec::new();
+        for batch in &batches {
+            for run in &batch.runs {
+                k_parts.push(batch.k_src.narrow(0, run.src_offset, run.n_tokens)?);
+                v_parts.push(batch.v_src.narrow(0, run.src_offset, run.n_tokens)?);
+                items.push(BgFlushItem {
+                    block_id: run.dst_slot / block_size,
+                    offset: run.dst_slot % block_size,
+                    n_tokens: run.n_tokens,
+                });
+            }
+        }
 
-        let k_cat = if pending_writes.len() == 1 {
-            pending_writes[0].k_chunk.clone()
+        let k_cat = if k_parts.len() == 1 {
+            k_parts[0].clone()
         } else {
-            Tensor::cat(
-                &pending_writes
-                    .iter()
-                    .map(|pw| &pw.k_chunk)
-                    .collect::<Vec<_>>(),
-                0,
-            )?
+            Tensor::cat(&k_parts, 0)?
         };
-        let v_cat = if pending_writes.len() == 1 {
-            pending_writes[0].v_chunk.clone()
+        let v_cat = if v_parts.len() == 1 {
+            v_parts[0].clone()
         } else {
-            Tensor::cat(
-                &pending_writes
-                    .iter()
-                    .map(|pw| &pw.v_chunk)
-                    .collect::<Vec<_>>(),
-                0,
-            )?
+            Tensor::cat(&v_parts, 0)?
         };
 
         let k_vec: Vec<f32> = k_cat
@@ -995,16 +1032,6 @@ impl PagedKvCache {
             .to_dtype(DType::F32)?
             .flatten_all()?
             .to_vec1()?;
-
-        let items: Vec<BgFlushItem> = pending_writes
-            .iter()
-            .zip(token_counts.iter())
-            .map(|(pw, &n)| BgFlushItem {
-                block_id: pw.block_id,
-                offset: pw.offset,
-                n_tokens: n,
-            })
-            .collect();
 
         let quantizer = Arc::clone(self.quantizer.as_ref().unwrap());
         let (nkv, hd) = self.allocator.lock().unwrap().dims();

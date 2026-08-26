@@ -5949,6 +5949,57 @@ pub fn sdpa_vector_sink(
 }
 
 #[cfg(all(test, feature = "metal"))]
+mod quantized_matmul_floor {
+    use candle_core::quantized::{GgmlDType, QMatMul, QTensor};
+    use candle_core::{Device, Module, Tensor};
+
+    /// Contract: the quantized matmul this crate leans on stays fast enough to
+    /// be worth leaning on.
+    ///
+    /// This crate carried its own block-quant kernels until they were measured
+    /// against candle's and found eight times slower at prefill shapes, having
+    /// been written when the comparison went the other way and never rechecked.
+    /// The floor is a quarter of what candle measured when those kernels were
+    /// removed (3.1 TFLOPS at this shape): low enough to survive a busy machine
+    /// or a slower GPU, high enough that a regression of that size fails here
+    /// instead of quietly costing every user four times the prompt latency.
+    #[test]
+    fn candle_quantized_matmul_stays_fast() {
+        const FLOOR_GFLOPS: f64 = 750.0;
+        let Ok(dev) = Device::new_metal(0) else {
+            return;
+        };
+        let (n, k, m) = (8960usize, 1536usize, 512usize);
+        let w: Vec<f32> = (0..n * k)
+            .map(|i| ((i % 23) as f32 - 11.0) * 0.04)
+            .collect();
+        let w = Tensor::from_vec(w, (n, k), &dev).unwrap();
+        let qt = std::sync::Arc::new(QTensor::quantize(&w, GgmlDType::Q4K).unwrap());
+        let mm = QMatMul::from_arc(qt).unwrap();
+        let x: Vec<f32> = (0..m * k).map(|i| ((i % 13) as f32 - 6.0) * 0.03).collect();
+        let x = Tensor::from_vec(x, (m, k), &dev).unwrap();
+
+        let readback = |t: Tensor| t.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        readback(mm.forward(&x).unwrap());
+
+        let reps = 8;
+        let t0 = std::time::Instant::now();
+        let mut last = None;
+        for _ in 0..reps {
+            last = Some(mm.forward(&x).unwrap());
+        }
+        readback(last.unwrap());
+        let secs = t0.elapsed().as_secs_f64() / reps as f64;
+        let gflops = 2.0 * m as f64 * n as f64 * k as f64 / secs / 1e9;
+
+        assert!(
+            gflops > FLOOR_GFLOPS,
+            "quantized matmul fell to {gflops:.0} GFLOPS at {n}x{k} m={m}, floor is {FLOOR_GFLOPS:.0}"
+        );
+    }
+}
+
+#[cfg(all(test, feature = "metal"))]
 mod decode_batch_scaling_tests {
     use super::*;
     use candle_core::Device;

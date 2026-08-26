@@ -1137,20 +1137,7 @@ impl CustomOp3 for FlashAttnPrefill {
         // shorter than eight rows has nothing for it to fill. Head widths wide
         // enough to force a short tile take the portable path instead, which
         // reads the head width at runtime and does not care.
-        // The hardware path multiplies 8x8 simdgroup tiles, so a query tile
-        // shorter than eight rows has nothing for it to fill.
-        //
-        // It also disagrees with the reference when the sliding window is
-        // narrower than one KV tile: measured against the naive path at a
-        // 32-wide tile, windows of 7 and below come out unrelated while 33 and
-        // above match to BF16 rounding. The cause is not understood, and the
-        // portable variant is correct at every window measured, so those cases
-        // take it. No model served here has a window that narrow: Gemma 4's is
-        // 1024 against a tile of 32.
-        let use_mma = metal_supports_mma(device.device())
-            && self.br >= 8
-            && self.bc >= 8
-            && (self.window == 0 || self.window >= self.bc);
+        let use_mma = metal_supports_mma(device.device()) && self.br >= 8 && self.bc >= 8;
         let kernel_name: &'static str = match (q.dtype(), use_mma) {
             (DType::F32, true) => "flash_attention_prefill_mma_f32",
             (DType::F16, true) => "flash_attention_prefill_mma_f16",
@@ -1347,9 +1334,10 @@ pub fn softcap_fused(x: &Tensor, softcap: f32) -> Result<Tensor> {
 ///
 /// BF16 inputs with no softcap and head dim 64/128/256 first try
 /// [`MppFlashAttn`]; if the TensorOps runtime is unavailable or breaks
-/// mid-flight, the call falls back to [`FlashAttnPrefill`] with tile sizes
-/// from [`fa_tile_sizes`]. `prefix_len` is the number of KV-cache tokens
-/// ahead of the queries (`prefix_len + T_q == T_kv`).
+/// mid-flight, the call falls back to [`FlashAttnPrefill`] with tile sizes from
+/// [`fa_tile_sizes`]. `prefix_len` is the number of KV-cache tokens ahead of the
+/// queries (`prefix_len + T_q == T_kv`), and `window` bounds how far back a
+/// query may attend, 0 for the whole prefix.
 ///
 /// ## Errors
 /// Fails when q/k/v are off-Metal, on shape or dtype mismatches, or when
@@ -1373,7 +1361,15 @@ pub fn flash_attention_metal_prefill(
         && let candle_core::Device::Metal(md) = q.device()
         && mpp_gemm_available(md.device())
     {
-        match q.apply_op3_no_bwd(k, v, &MppFlashAttn { scale, prefix_len }) {
+        match q.apply_op3_no_bwd(
+            k,
+            v,
+            &MppFlashAttn {
+                scale,
+                prefix_len,
+                window,
+            },
+        ) {
             Ok(y) => return Ok(y),
             Err(_) if mpp_runtime_broken() => {}
             Err(e) => return Err(e),
@@ -1398,15 +1394,9 @@ pub fn flash_attention_metal_prefill(
     )
 }
 
-/// Whether the Flash Attention prefill kernels cover `head_dim`.
-pub fn flash_attention_metal_available(head_dim: usize, dtype: DType, window: usize) -> bool {
-    // A sliding window is not offered, though the kernel now carries the code
-    // for one. Measured against the naive path on data with the outliers a real
-    // model produces, a windowed call at a few hundred query tokens comes out
-    // roughly as far from the reference as the answer itself is large, while
-    // the same shapes without a window match to BF16 rounding. The cause is not
-    // understood, and the parity property refuses to let it ship until it is.
-    window == 0 && fa_tile_sizes(head_dim, dtype.size_in_bytes()).is_some()
+/// Whether the Flash Attention prefill kernels cover `head_dim`, windowed or not.
+pub fn flash_attention_metal_available(head_dim: usize, dtype: DType, _window: usize) -> bool {
+    fa_tile_sizes(head_dim, dtype.size_in_bytes()).is_some()
 }
 
 /// Whether this head width reaches the hardware simdgroup path.
@@ -2894,6 +2884,7 @@ struct MppFaParams {
     h_kv: i32,
     scale: f32,
     prefix_len: i32,
+    window: i32,
 }
 
 /// TensorOps Flash Attention prefill: BF16 only, head dim 64/128/256, no
@@ -2901,6 +2892,7 @@ struct MppFaParams {
 struct MppFlashAttn {
     scale: f32,
     prefix_len: usize,
+    window: usize,
 }
 
 impl CustomOp3 for MppFlashAttn {
@@ -2978,6 +2970,7 @@ impl CustomOp3 for MppFlashAttn {
             h_kv: h_kv as i32,
             scale: self.scale,
             prefix_len: self.prefix_len as i32,
+            window: self.window as i32,
         };
 
         let pipeline = get_or_compile_mpp_pipeline(device.device(), kernel)?;
@@ -3604,75 +3597,6 @@ mod fused_kernel_parity_tests {
         }
     }
 
-    #[test]
-    #[ignore]
-    fn window_isolate() {
-        let Some(dev) = metal_device_or_skip() else {
-            return;
-        };
-        for (d, path) in [(128usize, "MMA")] {
-            for (window, t_q, h, h_kv, prefix) in [
-                (222usize, 367usize, 16usize, 4usize, 3usize),
-                (222, 96, 16, 4, 3),
-                (222, 367, 16, 4, 0),
-                (100, 367, 16, 4, 3),
-                (300, 367, 16, 4, 3),
-                (369, 367, 16, 4, 3),
-            ] {
-                let t_kv = t_q + prefix;
-                let _ = path;
-                let mk = |n: usize, salt: usize| -> Vec<f32> {
-                    (0..n)
-                        .map(|i| {
-                            let x = (((i + salt) % 17) as f32 - 8.0) * 0.5;
-                            if (i + salt).is_multiple_of(977) {
-                                x * 15.0
-                            } else {
-                                x
-                            }
-                        })
-                        .collect()
-                };
-                let q = Tensor::from_vec(mk(h * t_q * d, 1), (1, h, t_q, d), &dev)
-                    .unwrap()
-                    .to_dtype(DType::BF16)
-                    .unwrap();
-                let k = Tensor::from_vec(mk(h_kv * t_kv * d, 7), (1, h_kv, t_kv, d), &dev)
-                    .unwrap()
-                    .to_dtype(DType::BF16)
-                    .unwrap();
-                let v = Tensor::from_vec(mk(h_kv * t_kv * d, 13), (1, h_kv, t_kv, d), &dev)
-                    .unwrap()
-                    .to_dtype(DType::BF16)
-                    .unwrap();
-                let scale = 1.0 / (d as f32).sqrt();
-                let fa =
-                    flash_attention_metal_prefill(&q, &k, &v, scale, None, prefix, window).unwrap();
-                let rf =
-                    naive_attention_reference(&q, &k, &v, scale, None, prefix, window).unwrap();
-                let f: Vec<f32> = fa
-                    .to_dtype(DType::F32)
-                    .unwrap()
-                    .flatten_all()
-                    .unwrap()
-                    .to_vec1()
-                    .unwrap();
-                let r: Vec<f32> = rf
-                    .to_dtype(DType::F32)
-                    .unwrap()
-                    .flatten_all()
-                    .unwrap()
-                    .to_vec1()
-                    .unwrap();
-                let peak = r.iter().fold(0f32, |a, &b| a.max(b.abs())).max(1e-6);
-                println!(
-                    "  window={window} t_q={t_q} h={h}/{h_kv} prefix={prefix}: rel {:.4}",
-                    max_abs_diff_f32(&f, &r) / peak
-                );
-            }
-        }
-    }
-
     /// Contract: the prefill attention kernel agrees with the naive reference on
     /// shapes and magnitudes it was not written against.
     ///
@@ -3699,7 +3623,7 @@ mod fused_kernel_parity_tests {
         let Some(dev) = metal_device_or_skip() else {
             return;
         };
-        for seed in 0u64..24 {
+        for seed in 0u64..64 {
             let mut rng = seed
                 .wrapping_mul(6364136223846793005)
                 .wrapping_add(0x243f_6a88_85a3_08d3);
@@ -3724,8 +3648,17 @@ mod fused_kernel_parity_tests {
             let scale = 1.0 / (d as f32).sqrt();
             let mag = [0.05f32, 0.5, 3.0][next(0, 2)];
             // Half the cases carry a sliding window, which is what most of
-            // Gemma 4's layers have and what used to keep them off this kernel.
-            let window = if seed % 2 == 0 { 0 } else { next(1, 300) };
+            // Gemma 4's layers have. Drawn independently of the dtype: keying it
+            // on the same seed parity left every windowed case in BF16, so the
+            // tight F32 bound, the one that catches a wrong mask rather than
+            // wrong rounding, never saw a window at all. Narrow windows are
+            // drawn as often as wide ones because a window shorter than one KV
+            // tile is where a mask bound is easiest to get wrong.
+            let window = match next(0, 3) {
+                0 | 1 => 0,
+                2 => next(1, 31),
+                _ => next(32, 300),
+            };
             if !flash_attention_metal_available(d, dtype, window) {
                 continue;
             }
@@ -3795,6 +3728,69 @@ mod fused_kernel_parity_tests {
                         diff / peak
                     );
                 }
+            }
+        }
+    }
+
+    /// Contract: a window at least as wide as the sequence masks exactly what no
+    /// window masks, so it must give the identical answer, bit for bit.
+    ///
+    /// This is the sharp half of the windowed cover. The generated parity above
+    /// compares against the reference, and in BF16 its honest tolerance is wide
+    /// enough that a mask off by one token, or a block skipped one too early,
+    /// can hide inside it. Here both sides run the same kernel on the same data
+    /// and the only difference is the window, so the comparison needs no
+    /// tolerance at all and a single wrongly masked token fails it. The shapes
+    /// cover both kernels: BF16 at 64/128/256 goes to the TensorOps path, F32
+    /// and 512 to the tiled one.
+    #[test]
+    fn a_window_wider_than_the_sequence_changes_nothing() {
+        let Some(dev) = metal_device_or_skip() else {
+            return;
+        };
+        for (dtype, d, h, h_kv, t_q, prefix) in [
+            (DType::BF16, 64usize, 4usize, 2usize, 33usize, 100usize),
+            (DType::BF16, 128, 8, 8, 64, 32),
+            (DType::BF16, 256, 4, 1, 200, 0),
+            (DType::BF16, 512, 2, 1, 48, 16),
+            (DType::F32, 128, 4, 2, 96, 8),
+        ] {
+            let t_kv = t_q + prefix;
+            let mk = |n: usize, salt: usize| -> Vec<f32> {
+                (0..n)
+                    .map(|i| (((i + salt) % 17) as f32 - 8.0) * 0.5)
+                    .collect()
+            };
+            let mkt = |n: usize, salt: usize, shape: (usize, usize, usize, usize)| {
+                Tensor::from_vec(mk(n, salt), shape, &dev)
+                    .unwrap()
+                    .to_dtype(dtype)
+                    .unwrap()
+            };
+            let q = mkt(h * t_q * d, 1, (1, h, t_q, d));
+            let k = mkt(h_kv * t_kv * d, 7, (1, h_kv, t_kv, d));
+            let v = mkt(h_kv * t_kv * d, 13, (1, h_kv, t_kv, d));
+            let scale = 1.0 / (d as f32).sqrt();
+
+            let flat = |t: &Tensor| -> Vec<f32> {
+                t.to_dtype(DType::F32)
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap()
+            };
+            let base =
+                flat(&flash_attention_metal_prefill(&q, &k, &v, scale, None, prefix, 0).unwrap());
+            for window in [t_kv, t_kv + 10] {
+                let wide = flat(
+                    &flash_attention_metal_prefill(&q, &k, &v, scale, None, prefix, window)
+                        .unwrap(),
+                );
+                assert_eq!(
+                    base, wide,
+                    "{dtype:?} d={d} t_q={t_q} prefix={prefix}: window {window} changed the answer"
+                );
             }
         }
     }
@@ -4066,12 +4062,15 @@ mod fused_kernel_parity_tests {
             );
         };
         for (d, h, h_kv) in [(256usize, 16usize, 8usize), (512, 16, 1)] {
-            for (t_q, t_kv, what) in [
-                (512usize, 512usize, "prefill"),
-                (1usize, 256usize, "decode"),
-                (1usize, 1024usize, "decode"),
+            for (t_q, t_kv, window, what) in [
+                (512usize, 512usize, 0usize, "prefill"),
+                (2048, 2048, 0, "prefill"),
+                // What five of every six of Gemma 4's layers ask for.
+                (2048, 2048, 1024, "prefill con finestra"),
+                (1, 256, 0, "decode"),
+                (1, 1024, 0, "decode"),
             ] {
-                println!("  d={d} h={h} h_kv={h_kv} {what} t_q={t_q} t_kv={t_kv}");
+                println!("  d={d} h={h} h_kv={h_kv} {what} t_q={t_q} t_kv={t_kv} window={window}");
                 let mk = |n: usize, salt: usize| -> Vec<f32> {
                     (0..n)
                         .map(|i| (((i + salt) % 17) as f32 - 8.0) * 0.4)
@@ -4092,10 +4091,10 @@ mod fused_kernel_parity_tests {
                 let scale = 1.0f32;
                 let prefix = t_kv - t_q;
                 time("flash attention", &|| {
-                    flash_attention_metal_prefill(&q, &k, &v, scale, None, prefix, 0).unwrap()
+                    flash_attention_metal_prefill(&q, &k, &v, scale, None, prefix, window).unwrap()
                 });
                 time("naive", &|| {
-                    naive_attention_reference(&q, &k, &v, scale, None, prefix, 0).unwrap()
+                    naive_attention_reference(&q, &k, &v, scale, None, prefix, window).unwrap()
                 });
             }
         }
@@ -4142,9 +4141,15 @@ mod fused_kernel_parity_tests {
         // Not a multiple of four: the kernel reads four values at a time.
         assert!(!flash_attention_metal_available(66, DType::BF16, 0));
         assert!(!flash_attention_metal_available(0, DType::BF16, 0));
-        // A sliding window is refused rather than served wrong; see the
-        // measurement in `flash_attention_metal_available`.
-        assert!(!flash_attention_metal_available(128, DType::BF16, 1024));
+        // A sliding window does not change what the kernel can run: it masks one
+        // itself, and refusing windowed layers is what left five of every six of
+        // Gemma 4's on the generic path.
+        for window in [1usize, 31, 1024] {
+            assert!(
+                flash_attention_metal_available(128, DType::BF16, window),
+                "window {window} should be available"
+            );
+        }
     }
 
     #[test]

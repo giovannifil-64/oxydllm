@@ -799,8 +799,9 @@ impl Attention {
                 seg.num_tokens,
             )?;
 
-            // FA kernel assumes standard causal + no external mask; sliding-window
-            // prefill is rare so falls back. METAL_FA_MIN_KV gates on cache size.
+            // The kernel masks causally and, when the layer has one, inside the
+            // sliding window; an external mask still falls back, and
+            // METAL_FA_MIN_KV gates on cache size.
             #[cfg(feature = "metal")]
             // Which of the two Flash Attention kernels a head width reaches
             // decides where it belongs. A prompt is worth sending only to the

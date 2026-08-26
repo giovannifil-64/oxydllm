@@ -282,6 +282,7 @@ struct MppFaParams {
     int h_kv;
     float scale;
     int prefix_len;
+    int window;        // sliding window in tokens; 0 = attend to the whole prefix
 };
 
 constant constexpr int FA_BR = 32;
@@ -341,7 +342,16 @@ inline void mpp_fa_impl(
     }
 
     int kv_max = min(p.t_kv, p.prefix_len + q0 + br);
-    for (int kv0 = 0; kv0 < kv_max; kv0 += FA_BC) {
+    // A window bounds the loop from below too: keys older than what the oldest
+    // query row of this tile can see are skipped rather than masked.
+    int kv_min = 0;
+    if (p.window > 0) {
+        int oldest = p.prefix_len + q0 - p.window + 1;
+        if (oldest > 0) {
+            kv_min = (oldest / FA_BC) * FA_BC;
+        }
+    }
+    for (int kv0 = kv_min; kv0 < kv_max; kv0 += FA_BC) {
         int bc = min(FA_BC, p.t_kv - kv0);
 
 #pragma clang loop unroll(full)
@@ -360,7 +370,9 @@ inline void mpp_fa_impl(
                 int n = int(idx[0]);
                 int m = int(idx[1]);
                 float val = sT[i] * p.scale;
-                if (kv0 + n > p.prefix_len + q0 + m) {
+                int q_pos = p.prefix_len + q0 + m;
+                int kv_pos = kv0 + n;
+                if (kv_pos > q_pos || (p.window > 0 && q_pos >= kv_pos + p.window)) {
                     val = -INFINITY;
                 }
                 sT[i] = val;
@@ -400,7 +412,10 @@ inline void mpp_fa_impl(
                 auto idx = sT.get_multidimensional_index(i);
                 int n = int(idx[0]);
                 int m = int(idx[1]);
-                float pv = exp(sT[i] - tg_m[m]);
+                // Wholly masked row: exp(-inf - -inf) is NaN, and a window can
+                // mask an entire block for a row whose window starts later than
+                // the tile's oldest row.
+                float pv = (sT[i] == -INFINITY) ? 0.0f : exp(sT[i] - tg_m[m]);
                 sT[i] = pv;
                 tg_p[m * FA_BC + n] = bfloat(pv);
             }

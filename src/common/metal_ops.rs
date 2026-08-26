@@ -5949,6 +5949,40 @@ pub fn sdpa_vector_sink(
 }
 
 #[cfg(all(test, feature = "metal"))]
+mod memory_budget_probe {
+    use candle_core::Device;
+    use objc2_metal::MTLDevice;
+
+    #[test]
+    #[ignore]
+    fn what_the_driver_reports() {
+        let Ok(dev) = Device::new_metal(0) else {
+            return;
+        };
+        let Device::Metal(md) = &dev else { return };
+        let d = md.device().as_ref();
+        let gb = |b: u64| b as f64 / 1_073_741_824.0;
+        println!("  hasUnifiedMemory            = {}", d.hasUnifiedMemory());
+        println!(
+            "  recommendedMaxWorkingSetSize= {:.2} GB",
+            gb(d.recommendedMaxWorkingSetSize())
+        );
+        println!(
+            "  currentAllocatedSize        = {:.2} GB",
+            gb(d.currentAllocatedSize() as u64)
+        );
+        println!(
+            "  nostro soffitto con 1 GB di pesi   = {:.2} GB",
+            gb(crate::common::paged::safe_model_kv_ceiling(1 << 30) as u64)
+        );
+        println!(
+            "  nostro soffitto con 13 GB di pesi  = {:.2} GB",
+            gb(crate::common::paged::safe_model_kv_ceiling(13 << 30) as u64)
+        );
+    }
+}
+
+#[cfg(all(test, feature = "metal"))]
 mod quantized_matmul_floor {
     use candle_core::quantized::{GgmlDType, QMatMul, QTensor};
     use candle_core::{Device, Module, Tensor};

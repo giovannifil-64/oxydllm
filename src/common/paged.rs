@@ -68,6 +68,16 @@ impl GlobalKvBudget {
 /// capped against its own weights by [`safe_model_kv_ceiling`], since the
 /// weights and the KV pool come out of the same memory.
 pub fn detect_system_kv_budget(memory_budget_bytes: Option<usize>, is_cpu: bool) -> usize {
+    if !is_cpu && let Some(budget) = device_working_set_bytes() {
+        let room = match available_memory_bytes() {
+            Some(free) => budget.min(free),
+            None => budget,
+        };
+        return match memory_budget_bytes {
+            Some(b) => b.min(room),
+            None => room,
+        };
+    }
     let physical = detect_system_memory_bytes().unwrap_or(8 * 1024 * 1024 * 1024);
     let base = match memory_budget_bytes {
         Some(b) => b.min(physical),
@@ -129,6 +139,84 @@ const KV_TOTAL_FRACTION: f64 = 0.42;
 /// which is what this floor buys them.
 const MIN_USEFUL_KV: usize = 1 << 30;
 
+/// What the device itself says this process may hold.
+///
+/// Apple's driver answers the question directly through
+/// `recommendedMaxWorkingSetSize`, which already accounts for the machine, its
+/// memory and what the system needs to keep for itself: on a 24 GB M5 it
+/// reports 17.76 GB. Asking it beats any share of physical memory we could
+/// fit, because a fitted share is right for the machine it was fitted on and
+/// wrong everywhere else.
+///
+/// `None` when there is no such device to ask, which is every backend but
+/// Metal; callers then fall back to a share of physical memory.
+#[cfg(feature = "metal")]
+fn device_working_set_bytes() -> Option<usize> {
+    use std::sync::OnceLock;
+    static BUDGET: OnceLock<Option<usize>> = OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        let device = Device::new_metal(0).ok()?;
+        let Device::Metal(metal) = &device else {
+            return None;
+        };
+        use objc2_metal::MTLDevice;
+        let bytes = metal.device().as_ref().recommendedMaxWorkingSetSize() as usize;
+        (bytes > 0).then_some(bytes)
+    })
+}
+
+#[cfg(not(feature = "metal"))]
+fn device_working_set_bytes() -> Option<usize> {
+    None
+}
+
+/// Memory the system could hand out right now: free pages plus the ones it can
+/// reclaim without touching disk.
+///
+/// The device's recommended working set is the ceiling for a machine with
+/// nothing else on it; this is the other half of the answer, what is actually
+/// going spare while a browser and an editor are open. `None` where the figure
+/// cannot be read, which leaves the caller with the ceiling alone.
+#[cfg(target_os = "macos")]
+fn available_memory_bytes() -> Option<usize> {
+    use std::sync::OnceLock;
+    static AVAILABLE: OnceLock<Option<usize>> = OnceLock::new();
+    *AVAILABLE.get_or_init(read_available_memory_bytes)
+}
+
+/// Reads the figure once; [`available_memory_bytes`] caches it so a pool sized
+/// twice in one run comes out the same size both times.
+#[cfg(target_os = "macos")]
+fn read_available_memory_bytes() -> Option<usize> {
+    let out = std::process::Command::new("vm_stat").output().ok()?;
+    let text = std::str::from_utf8(&out.stdout).ok()?;
+    let mut page_size = 4096usize;
+    let mut pages = 0usize;
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("Mach Virtual Memory Statistics:")
+            && let Some(p) = rest.split("page size of ").nth(1)
+        {
+            page_size = p.split_whitespace().next()?.parse().ok()?;
+        }
+        for label in [
+            "Pages free:",
+            "Pages inactive:",
+            "Pages speculative:",
+            "Pages purgeable:",
+        ] {
+            if let Some(rest) = line.strip_prefix(label) {
+                pages += rest.trim().trim_end_matches('.').parse::<usize>().ok()?;
+            }
+        }
+    }
+    (pages > 0).then(|| pages * page_size)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn available_memory_bytes() -> Option<usize> {
+    None
+}
+
 /// How much memory all loaded models together may occupy before the manager
 /// starts evicting to make room.
 ///
@@ -139,6 +227,9 @@ const MIN_USEFUL_KV: usize = 1 << 30;
 /// expects, and it is the same share of physical memory the per-model ceiling
 /// is measured against, so the two agree by construction.
 pub fn safe_total_commitment_bytes() -> usize {
+    if let Some(budget) = device_working_set_bytes() {
+        return budget;
+    }
     match detect_system_memory_bytes() {
         Some(p) => (p as f64 * KV_TOTAL_FRACTION) as usize,
         None => usize::MAX,
@@ -147,11 +238,20 @@ pub fn safe_total_commitment_bytes() -> usize {
 
 /// The most KV a model with `weights_bytes` of weights should pool.
 ///
-/// The pool never exceeds [`KV_POOL_FRACTION`] of physical memory, and weights
-/// plus pool never exceed [`KV_TOTAL_FRACTION`] of it, except that a model too
-/// large for the second rule still receives [`MIN_USEFUL_KV`] rather than
-/// nothing.
+/// Whatever the device says it can hold, less the weights that will sit next to
+/// the pool in the same memory. There is no safety fraction on top: the shares
+/// this used to apply were fitted against forwards that allocated gigabytes of
+/// transient buffers, and with those gone the loader's own check, that the
+/// weights survived the allocation, is what makes an over-generous answer cost
+/// a retry rather than corrupt an output.
 pub fn safe_model_kv_ceiling(weights_bytes: usize) -> usize {
+    if let Some(budget) = device_working_set_bytes() {
+        let room = match available_memory_bytes() {
+            Some(free) => budget.min(free),
+            None => budget,
+        };
+        return room.saturating_sub(weights_bytes);
+    }
     let physical = match detect_system_memory_bytes() {
         Some(p) => p,
         None => return usize::MAX,
@@ -1215,49 +1315,38 @@ mod tests {
 
     /// Contract: the pool ceiling bounds every model, the total ceiling takes
     /// over as weights grow, and a model too large for either still receives a
-    /// workable pool instead of being refused.
+    /// Contract: a model is never told it may pool more than the device says it
+    /// can hold, and heavier weights leave less room for the pool.
+    ///
+    /// This replaces a rule that fixed the pool at a quarter of physical memory
+    /// and the weights-plus-pool total at 42% of it. Those shares were fitted
+    /// against forwards that allocated gigabytes of transient buffers, on one
+    /// 24 GB machine; with that allocation gone they only left capacity unused,
+    /// and on any other machine they were a guess.
     #[test]
-    fn kv_ceiling_balances_pool_total_and_floor() {
-        let Some(physical) = detect_system_memory_bytes() else {
-            return;
-        };
-        let by_pool = (physical as f64 * KV_POOL_FRACTION) as usize;
-        let total_share = (physical as f64 * KV_TOTAL_FRACTION) as usize;
+    fn the_ceiling_follows_the_device_and_the_weights() {
+        let light = safe_model_kv_ceiling(1 << 30);
+        let heavy = safe_model_kv_ceiling(12 << 30);
+        assert!(heavy <= light, "light {light}, heavy {heavy}");
 
-        let light = safe_model_kv_ceiling(physical / 24);
-        assert!(light <= by_pool, "pool ceiling must bound a light model");
-
-        let mid = safe_model_kv_ceiling(total_share / 2);
-        assert!(
-            mid <= by_pool && total_share / 2 + mid <= total_share.max(1),
-            "weights plus pool must respect the total share"
-        );
-
-        let huge = safe_model_kv_ceiling(physical);
-        assert_eq!(
-            huge,
-            MIN_USEFUL_KV.min(by_pool),
-            "a huge model keeps a floor"
-        );
-        assert!(huge > 0, "a servable model must never get a zero pool");
+        if let Some(budget) = device_working_set_bytes() {
+            assert!(
+                light <= budget,
+                "ceiling {light} exceeds what the device reported, {budget}"
+            );
+        }
     }
 
-    /// Contract: the ceiling stays inside the band measured to decode
-    /// correctly. On a 24 GB machine it must land at or below 7 GB, since a
-    /// 9 GB pool corrupts output with no error raised anywhere.
+    /// Contract: sizing the same model twice in one run gives the same pool.
+    ///
+    /// The figure the ceiling rests on is read once and cached for exactly this
+    /// reason: two loads of one model must not differ because a page freed
+    /// between them.
     #[test]
-    fn kv_ceiling_stays_in_the_measured_good_band() {
-        let Some(physical) = detect_system_memory_bytes() else {
-            return;
-        };
-        if !(20 << 30..=32u64 << 30).contains(&(physical as u64)) {
-            return;
-        }
-        let ceiling = safe_model_kv_ceiling(2 << 30);
-        assert!(
-            ceiling <= 7 << 30,
-            "ceiling {ceiling} exceeds the measured-good band"
-        );
+    fn the_ceiling_is_stable_within_a_run() {
+        let a = safe_model_kv_ceiling(2 << 30);
+        let b = safe_model_kv_ceiling(2 << 30);
+        assert_eq!(a, b);
     }
 
     fn make_allocator(num_blocks: usize, block_size: usize) -> SharedBlockAllocator {

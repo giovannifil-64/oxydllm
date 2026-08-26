@@ -845,9 +845,18 @@ pub fn load_batch_model(
         // it does not report the case where a pool simply crowded the weights,
         // which stays silent and surfaces as a first forward reading buffers
         // the writes never reached.
-        crate::common::weights::drain_metal(device, "model load")?;
-        if weights_read_consistently(model.as_ref(), device) {
+        // A pool the device could not back shows up here, either as a command
+        // buffer that failed outright or as weights that no longer read back
+        // the same. Both mean the same thing, that this pool was too big, and
+        // both are worth another attempt at half the size rather than a failed
+        // load: the size this machine can actually hold is measured, not
+        // predicted.
+        let drained = crate::common::weights::drain_metal(device, "model load");
+        if drained.is_ok() && weights_read_consistently(model.as_ref(), device) {
             return Ok(loaded);
+        }
+        if let Err(e) = &drained {
+            tracing::warn!(model_id, error = %format!("{e:#}"), "the device could not back this KV pool");
         }
 
         let pool_bytes = kv_pool_bytes(model.as_ref());
@@ -855,6 +864,7 @@ pub fn load_batch_model(
         crate::common::weights::drain_metal(device, "failed attempt reclamation").ok();
 
         if attempt == KV_RETRY_HALVINGS || pool_bytes == 0 {
+            drained?;
             anyhow::bail!(
                 "model '{model_id}' loaded but its weights did not survive the KV pool \
                  allocation, and halving the pool {KV_RETRY_HALVINGS} times did not help; \

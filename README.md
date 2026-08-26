@@ -400,7 +400,7 @@ Every option can be set via a CLI flag or an environment variable. CLI flags tak
 | `--models-dir <DIR>` | `OXYDLLM_MODELS_DIR` | `~/.oxydllm/models` | Model storage directory |
 | `--keep-alive <SECS>` | `OXYDLLM_KEEP_ALIVE` | `900` | Idle seconds before model eviction |
 | `--memory-budget <MB>` | `OXYDLLM_MEMORY_BUDGET` | - | Max VRAM for loaded models; LRU eviction when exceeded |
-| `--max-context-len <N>` | `OXYDLLM_MAX_CONTEXT_LEN` | `4096` | KV cache context length per sequence |
+| `--max-context-len <N>` | `OXYDLLM_MAX_CONTEXT_LEN` | sized from memory | Tokens per sequence for the KV cache. The default is computed from what the model declares and what the machine can hold, and reported in the load log; set this to pin it. |
 | `--max-num-seqs <N>` | `OXYDLLM_MAX_NUM_SEQS` | auto | Max concurrent sequences per model (auto-computed from KV block budget at load time) |
 | `--max-queued-requests <N>` | `OXYDLLM_MAX_QUEUED_REQUESTS` | `200` | Request queue depth; returns HTTP 429 when full |
 | `--devices <IDS>` | `OXYDLLM_DEVICES` | auto | Comma-separated CUDA device indices |
@@ -410,6 +410,16 @@ Every option can be set via a CLI flag or an environment variable. CLI flags tak
 | `--shutdown-timeout <SECS>` | `OXYDLLM_SHUTDOWN_TIMEOUT` | `30` | Grace period for in-flight requests on shutdown |
 | `--allow-cpu` | `OXYDLLM_ALLOW_CPU` | disabled | Permit CPU fallback when no GPU is available. By default startup fails fast on a GPU-less host. |
 | `--api-key <KEY>` | `OXYDLLM_API_KEY` | disabled | Require an API key on `/v1/*` and `/metrics` (see [Security](#security)). |
+
+### Diagnostics
+
+Off unless set, and none of them change what the server computes.
+
+| Variable | What it does |
+|---|---|
+| `OXYDLLM_PROFILE=1` | Per-phase timing of every forward, prefill and decode reported apart. Each phase is synced before it is charged, so the numbers are GPU time, not queueing time; the totals are therefore slower than the same run unprofiled. |
+| `OXYDLLM_GDN_DEBUG=1` | Logs NaN, infinity and peak magnitude per stage of the gated delta rule, for the hybrid models that use it. Reads every stage back to the CPU, so it is slow. |
+| `OXYDLLM_DISABLE_MPP=1` | Keeps the Metal 4 tensor path out of matmuls. An escape hatch for a machine where that path misbehaves; the engine already disables it by itself when the runtime reports it broken. |
 | `--request-timeout <SECS>` | `OXYDLLM_REQUEST_TIMEOUT` | `300` | Wall-clock timeout per `/v1/chat/completions` request. Non-streaming responses are returned as `408 Request Timeout`; streaming responses emit a final `request_timeout` error chunk followed by `[DONE]`. Set to `0` to disable. |
 | `--otel-endpoint <URL>` | `OXYDLLM_OTEL_ENDPOINT` | disabled | Export per-request traces over OTLP/HTTP to this collector (e.g. `http://localhost:4318`); also honors the standard `OTEL_EXPORTER_OTLP_ENDPOINT`. See [Observability](#observability). |
 

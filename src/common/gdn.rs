@@ -25,8 +25,10 @@ use super::paged::RecurrentState;
 use super::weights::ModelWeights;
 use candle_core::{D, DType, Result, Tensor};
 
-/// Prefill chunk size (matches the transformers reference). Override with
-/// `OXYDLLM_GDN_CHUNK` for experiments.
+/// Prefill chunk size of the gated delta rule, matching the transformers
+/// reference. The blocked recurrence is algebraically the same at any chunk
+/// size but not numerically, so this is not a tuning knob: changing it moves
+/// the output without telling anyone.
 const CHUNK_SIZE: usize = 64;
 /// Base size for the blocked triangular inversion, see `invert_unit_lower`.
 const INVERT_BLOCK: usize = 16;
@@ -60,17 +62,6 @@ fn debug_probe(label: &str, t: &Tensor) {
         }
         Err(e) => tracing::warn!("GDN probe {label}: stats failed: {e}"),
     }
-}
-
-fn chunk_size() -> usize {
-    use std::sync::OnceLock;
-    static SIZE: OnceLock<usize> = OnceLock::new();
-    *SIZE.get_or_init(|| {
-        std::env::var("OXYDLLM_GDN_CHUNK")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(CHUNK_SIZE)
-    })
 }
 
 enum BaProjection {
@@ -701,7 +692,7 @@ impl GatedDeltaNet {
         debug_probe("fwd.v", &v);
         let (core, new_s) = match state.as_ref() {
             Some(st) if t == 1 => recurrent_delta_step(&q, &k, &v, g, beta, &st.s)?,
-            _ => chunk_gated_delta_rule(&q, &k, &v, g, beta, None, chunk_size())?,
+            _ => chunk_gated_delta_rule(&q, &k, &v, g, beta, None, CHUNK_SIZE)?,
         };
         debug_probe("fwd.core", &core);
         *state = Some(RecurrentState {

@@ -61,7 +61,7 @@ A rust-based inference engine for Large Language Models.
 - Paged KV cache with prefix caching, plus optional KV cache quantization (Lossless/Balanced/Aggressive, 2-4× smaller)
 - Multi-model server with LRU eviction and configurable memory budgets
 - Quantized checkpoint support, auto-detected per checkpoint with no flags:
-  - **GGUF**: resident Metal fast path for ten quant types (`Q4_0`, `Q4_1`, `Q5_0`, `Q5_1`, `Q8_0`, `Q2_K`, `Q3_K`, `Q4_K`, `Q5_K`, `Q6_K`), zero-copy mmap loader, sharded files
+  - **GGUF**: every ggml quant type candle decodes, through its quantized matmul, plus a zero-copy mmap loader and sharded files
   - **AWQ** 4/8-bit and **GPTQ** 4/8-bit (`desc_act=false`): packed weights stay resident on Metal with fused GEMV kernels (batched across concurrent sequences for AWQ-layout checkpoints)
   - **compressed-tensors** pack-quantized INT4 (llm-compressor): converted to the AWQ layout at load, fully-quantized or mixed-precision
   - **FP8** (E4M3) block-wise and **MXFP4** (GPT-OSS experts, packed-resident)
@@ -485,7 +485,7 @@ The following options are shared between `start` and `run`:
 `--models-dir`, `--devices`, `--max-context-len`, `--kv-quant`, `--allow-cpu`.
 
 ## Known Limitations and Work in Progress
-- GGUF compatibility: i-quants (`IQ*`) and ternary (`TQ*`) types fall back to candle's F32 path instead of the resident Metal fast path (see Features for the supported quants); MoE GGUFs are not yet wired.
+- GGUF compatibility: MoE GGUF checkpoints are not yet wired, and a GGUF whose tensors use quantizations candle cannot decode is refused before the download rather than after it.
 - Thinking mode is template-dependent: `enable_thinking` is applied only when the tokenizer chat template supports it.
 - Byte-level tokenizers: Streaming decode uses incremental buffering; occasional model-specific Unicode artifacts can still appear.
 - Tool / schema adherence is model-dependent: the OpenAI-compatible request fields, response shapes, and streaming semantics are implemented server-side, but local models can still ignore tool instructions or emit invalid JSON / tool arguments.
@@ -535,6 +535,8 @@ CUDA is currently a functional compatibility path, not a performance-tuned backe
 ## Benchmarks
 
 All numbers were measured on the Apple Silicon reference machine (M5, 24 GB unified memory). Every model below passes the deterministic coherence check in the regression suite; decode `tok/s` is the steady-state median over five 150-token runs after one warm-up. Run-to-run variance is ~10%; treat the figures as indicative of relative cost, not as guarantees.
+
+> The GGUF rows below understate current throughput. They were measured before quantized matmuls moved to candle's kernels, which raised decode by roughly 1.2× and prompt processing by 3.5 to 4× on every GGUF checkpoint tested (Qwen3-4B-Q4_K_M, for one, decodes at 35.5 tok/s against the 27.0 listed here). The table is refreshed by the regression sweep, not by hand, so it will move when the sweep next runs. Rows in safetensors, AWQ, GPTQ and FP8 formats are unaffected: those paths did not change.
 
 | Model | Architecture | Format | Decode tok/s |
 |---|---|---|---|

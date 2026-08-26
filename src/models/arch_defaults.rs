@@ -53,6 +53,12 @@ pub struct ArchDefaults {
     pub gpt_oss_moe: bool,
     pub attn_output_gate: bool,
     pub gguf_qk_permuted: bool,
+    /// Softmax scale when the architecture fixes one instead of deriving it
+    /// from the head width. Gemma 4 sets it to 1: its queries and keys are
+    /// RMS-normalized before the product, so the usual `1/sqrt(head_dim)` is
+    /// not merely redundant there but wrong, and a model given it answers with
+    /// control tokens.
+    pub attention_scale: Option<f64>,
 }
 
 impl ArchDefaults {
@@ -94,6 +100,7 @@ impl ArchDefaults {
 impl Default for ArchDefaults {
     fn default() -> Self {
         Self {
+            attention_scale: None,
             activation: Activation::SiLU,
             norm_type: NormType::Standard,
             qk_norm: false,
@@ -118,6 +125,7 @@ impl Default for ArchDefaults {
 /// entries in [`arch_defaults`] start from this and override a few fields.
 pub fn llama_defaults() -> ArchDefaults {
     ArchDefaults {
+        attention_scale: None,
         activation: Activation::SiLU,
         norm_type: NormType::Standard,
         qk_norm: false,
@@ -304,6 +312,7 @@ pub fn arch_defaults(arch: &str) -> Option<ArchDefaults> {
         | "gemma4_text"
         | "Gemma4ForCausalLM"
         | "Gemma4ForConditionalGeneration" => Some(ArchDefaults {
+            attention_scale: Some(1.0),
             activation: Activation::GeLUTanh,
             norm_type: NormType::Standard,
             qk_norm: true,

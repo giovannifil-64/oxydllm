@@ -279,6 +279,15 @@ impl TransformerBlock {
     /// either `ffn_norm` (standard archs) or `post_attention_norm` (Qwen3.5),
     /// matching llama.cpp's naming.
     ///
+    /// A file carrying `post_ffw_norm` is a Gemma-style sandwich instead, and
+    /// its four norms map onto the reference's order: `attn_norm` before the
+    /// mixer, `post_attention_norm` on the mixer's output, `ffn_norm` before
+    /// the feed-forward, `post_ffw_norm` on its output. Reading `ffn_norm` as
+    /// the post-attention norm, which the two-norm shape above does, puts two
+    /// of them in the wrong place on such a file. `layer_output_scale`, when
+    /// present, is the learned scalar the reference multiplies the whole layer
+    /// output by.
+    ///
     /// ## Errors
     /// Fails if a required tensor is missing, or if `cfg.moe` is set: GGUF MoE
     /// models are not yet supported (different tensor naming and per-expert
@@ -302,12 +311,33 @@ impl TransformerBlock {
             cfg.norm_type,
         )?;
 
-        let ffn_norm_qt = match gguf.try_get(&format!("{prefix}.ffn_norm.weight")) {
-            Some(qt) => qt,
-            None => gguf.get(&format!("{prefix}.post_attention_norm.weight"))?,
+        let norm = |qt: &std::sync::Arc<candle_core::quantized::QTensor>| {
+            RMSNorm::from_qtensor(qt, device, dtype, cfg.rms_norm_eps, cfg.norm_type)
         };
-        let ffn_norm =
-            RMSNorm::from_qtensor(&ffn_norm_qt, device, dtype, cfg.rms_norm_eps, cfg.norm_type)?;
+        let sandwich = gguf.try_get(&format!("{prefix}.post_ffw_norm.weight"));
+        let (ffn_norm, pre_ffn_norm, post_ffn_norm) = match sandwich {
+            Some(post_ffw) => (
+                norm(&gguf.get(&format!("{prefix}.post_attention_norm.weight"))?)?,
+                Some(norm(&gguf.get(&format!("{prefix}.ffn_norm.weight"))?)?),
+                Some(norm(&post_ffw)?),
+            ),
+            None => {
+                let qt = match gguf.try_get(&format!("{prefix}.ffn_norm.weight")) {
+                    Some(qt) => qt,
+                    None => gguf.get(&format!("{prefix}.post_attention_norm.weight"))?,
+                };
+                (norm(&qt)?, None, None)
+            }
+        };
+
+        let layer_scalar = gguf
+            .try_get(&format!("{prefix}.layer_output_scale.weight"))
+            .map(|qt| {
+                qt.dequantize(device)
+                    .and_then(|t| t.to_dtype(candle_core::DType::F32))
+                    .and_then(|t| tensor_to_scalar_f64(&t))
+            })
+            .transpose()?;
 
         let attention = if cfg.linear_attn.is_some() {
             TokenMixer::Gdn(GatedDeltaNet::load_gguf(
@@ -335,13 +365,13 @@ impl TransformerBlock {
             attention,
             ffn_norm,
             ffn,
-            pre_ffn_norm: None,
-            post_ffn_norm: None,
+            pre_ffn_norm,
+            post_ffn_norm,
             per_layer_input_gate: None,
             per_layer_projection: None,
             post_per_layer_input_norm: None,
             residual_multiplier: cfg.residual_multiplier,
-            layer_scalar: None,
+            layer_scalar,
             activation: cfg.activation,
         })
     }

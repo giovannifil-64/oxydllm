@@ -473,6 +473,7 @@ impl StandardTransformer {
                 Some(1.0 / scalar.sqrt())
             } else {
                 positive_f64(gguf, &format!("{prefix}.attention.scale"))
+                    .or(arch_def.attention_scale)
             }
         };
 

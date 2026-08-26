@@ -868,10 +868,31 @@ impl Attention {
             } else if use_seg_sdpa {
                 #[cfg(feature = "metal")]
                 {
+                    // The vector kernel is given the stride between KV heads, so
+                    // a window view goes straight in. What it does assume is
+                    // that a head's rows are contiguous and one head width
+                    // apart, which is what the cache produces and what this
+                    // checks before trusting it. Copying instead cost eight
+                    // times the kernel it fed, since the copy crosses the gaps
+                    // the buffer leaves between heads.
+                    let straight_in = |t: &Tensor| -> bool {
+                        let stride = t.layout().stride();
+                        stride[3] == 1 && stride[2] == t.dims()[3]
+                    };
+                    let k_in = if straight_in(&k_seg) {
+                        k_seg.clone()
+                    } else {
+                        k_seg.contiguous()?
+                    };
+                    let v_in = if straight_in(&v_seg) {
+                        v_seg.clone()
+                    } else {
+                        v_seg.contiguous()?
+                    };
                     let seg_out = super::metal_ops::sdpa(
                         &q_seg.contiguous()?,
-                        &k_seg.contiguous()?,
-                        &v_seg.contiguous()?,
+                        &k_in,
+                        &v_in,
                         None,
                         seg.num_tokens > 1,
                         self.scale as f32,

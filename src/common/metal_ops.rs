@@ -109,6 +109,15 @@ impl CustomOp3 for Sdpa {
         let q_seq = q_l.dim(2)?;
         let k_seq = k_l.dim(2)?;
 
+        // Metal takes a buffer offset in bytes; candle counts a layout's start
+        // offset in elements. Passing one for the other reads the right buffer
+        // at the wrong place, which stays invisible for as long as every input
+        // is made contiguous first and its start offset is therefore zero.
+        let esz = q.dtype().size_in_bytes();
+        let q_off = q_l.start_offset() * esz;
+        let k_off = k_l.start_offset() * esz;
+        let v_off = v_l.start_offset() * esz;
+
         let supported_head_dim = matches!(q_head, 32 | 64 | 72 | 80 | 96 | 128 | 256);
 
         let supports_sdpa_full_mask = self.mask.is_none() || q_seq <= k_seq;
@@ -172,14 +181,14 @@ impl CustomOp3 for Sdpa {
                     device.device(),
                     encoder,
                     device.kernels(),
-                    q_l.start_offset(),
+                    q_off,
                     q_l.dims(),
                     q.buffer(),
-                    k_l.start_offset(),
+                    k_off,
                     k_l.dims(),
                     k_l.stride(),
                     k.buffer(),
-                    v_l.start_offset(),
+                    v_off,
                     v_l.stride(),
                     v.buffer(),
                     &output,
@@ -196,14 +205,14 @@ impl CustomOp3 for Sdpa {
                     device.device(),
                     encoder,
                     device.kernels(),
-                    q_l.start_offset(),
+                    q_off,
                     q_l.dims(),
                     q.buffer(),
-                    k_l.start_offset(),
+                    k_off,
                     k_l.dims(),
                     k_l.stride(),
                     k.buffer(),
-                    v_l.start_offset(),
+                    v_off,
                     v_l.stride(),
                     v.buffer(),
                     &output,
@@ -234,6 +243,12 @@ impl CustomOp3 for Sdpa {
                     candle_core::bail!("Mask dtype {mask_type:?} must match q dtype {itype:?}");
                 }
 
+                // The kernels take the mask's strides but no offset, so a view
+                // that starts partway into its buffer would be read from the
+                // wrong place. Refuse it rather than mask the wrong tokens.
+                if mask_l.start_offset() != 0 {
+                    candle_core::bail!("SDPA: mask must start at the beginning of its buffer");
+                }
                 if mask_l.dims() != [q_l.dim(0)?, q_l.dim(1)?, q_l.dim(2)?, k_seq] {
                     candle_core::bail!(
                         "Mask shape must be {:?}, got {:?}",
@@ -255,15 +270,15 @@ impl CustomOp3 for Sdpa {
                 device.device(),
                 encoder,
                 device.kernels(),
-                q_l.start_offset(),
+                q_off,
                 q_l.dims(),
                 q_l.stride(),
                 q.buffer(),
-                k_l.start_offset(),
+                k_off,
                 k_l.dims(),
                 k_l.stride(),
                 k.buffer(),
-                v_l.start_offset(),
+                v_off,
                 v.buffer(),
                 v_l.stride(),
                 mask_type,
@@ -3729,6 +3744,82 @@ mod fused_kernel_parity_tests {
                     );
                 }
             }
+        }
+    }
+
+    /// Contract: the fused SDPA reads a K/V view that begins partway into its
+    /// buffer, exactly where the view says it does.
+    ///
+    /// This is what a sliding window hands the kernel: the last `window` tokens
+    /// of a longer cache, which is a view with a non-zero start offset and a
+    /// gap between heads. It used to be copied into fresh contiguous memory
+    /// first, and that copy was measured at eight times the cost of the kernel
+    /// it fed. The copy also hid a defect, since candle counts a start offset in
+    /// elements and Metal wants bytes: without the copy, and before the fix,
+    /// this read eight rows too early and answered fluently from the wrong
+    /// tokens. Every value of V here is its own row index, so a shifted read
+    /// moves the output mean and cannot pass by accident.
+    #[test]
+    fn sdpa_reads_a_view_that_starts_partway_into_its_buffer() {
+        let Some(dev) = metal_device_or_skip() else {
+            return;
+        };
+        for (h, h_kv, d, cap, start, len) in [
+            (4usize, 4usize, 128usize, 64usize, 16usize, 32usize),
+            (16, 8, 256, 2048, 1024, 1024),
+            (8, 2, 64, 100, 37, 63),
+        ] {
+            let rows = |n: usize| -> Vec<f32> { (0..n).map(|i| (i / d % cap) as f32).collect() };
+            let q = Tensor::from_vec(
+                (0..h * d)
+                    .map(|i| ((i % 13) as f32 - 6.0) * 0.25)
+                    .collect::<Vec<f32>>(),
+                (1, h, 1, d),
+                &dev,
+            )
+            .unwrap()
+            .to_dtype(DType::BF16)
+            .unwrap();
+            let k_full = Tensor::from_vec(rows(h_kv * cap * d), (1, h_kv, cap, d), &dev)
+                .unwrap()
+                .to_dtype(DType::BF16)
+                .unwrap();
+            let v_full = k_full.clone();
+            let k_view = k_full.narrow(2, start, len).unwrap();
+            let v_view = v_full.narrow(2, start, len).unwrap();
+            assert!(!k_view.is_contiguous() || h_kv == 1);
+
+            let scale = 1.0 / (d as f32).sqrt();
+            let flat = |t: &Tensor| -> Vec<f32> {
+                t.to_dtype(DType::F32)
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap()
+            };
+            let copiato = flat(
+                &sdpa(
+                    &q,
+                    &k_view.contiguous().unwrap(),
+                    &v_view.contiguous().unwrap(),
+                    None,
+                    false,
+                    scale,
+                    1.0,
+                )
+                .unwrap(),
+            );
+            let visto = flat(&sdpa(&q, &k_view, &v_view, None, false, scale, 1.0).unwrap());
+            assert_eq!(
+                copiato, visto,
+                "d={d} start={start} len={len}: the view and its copy must give the same answer"
+            );
+            let media = visto.iter().sum::<f32>() / visto.len() as f32;
+            assert!(
+                media >= start as f32 && media <= (start + len) as f32,
+                "d={d} start={start}: output mean {media} falls outside the rows the view covers"
+            );
         }
     }
 

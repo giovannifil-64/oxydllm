@@ -1043,6 +1043,7 @@ struct FlashAttnParams {
     scale: f32,
     softcap: f32,
     prefix_len: u32,
+    window: u32,
 }
 
 /// Flash Attention prefill over `[B, H, T, D]` q/k/v with causal masking
@@ -1056,6 +1057,8 @@ struct FlashAttnPrefill {
     scale: f32,
     softcap: f32,
     prefix_len: usize,
+    /// Sliding window in tokens, or 0 for none.
+    window: usize,
     br: usize,
     bc: usize,
 }
@@ -1134,7 +1137,20 @@ impl CustomOp3 for FlashAttnPrefill {
         // shorter than eight rows has nothing for it to fill. Head widths wide
         // enough to force a short tile take the portable path instead, which
         // reads the head width at runtime and does not care.
-        let use_mma = metal_supports_mma(device.device()) && self.br >= 8 && self.bc >= 8;
+        // The hardware path multiplies 8x8 simdgroup tiles, so a query tile
+        // shorter than eight rows has nothing for it to fill.
+        //
+        // It also disagrees with the reference when the sliding window is
+        // narrower than one KV tile: measured against the naive path at a
+        // 32-wide tile, windows of 7 and below come out unrelated while 33 and
+        // above match to BF16 rounding. The cause is not understood, and the
+        // portable variant is correct at every window measured, so those cases
+        // take it. No model served here has a window that narrow: Gemma 4's is
+        // 1024 against a tile of 32.
+        let use_mma = metal_supports_mma(device.device())
+            && self.br >= 8
+            && self.bc >= 8
+            && (self.window == 0 || self.window >= self.bc);
         let kernel_name: &'static str = match (q.dtype(), use_mma) {
             (DType::F32, true) => "flash_attention_prefill_mma_f32",
             (DType::F16, true) => "flash_attention_prefill_mma_f16",
@@ -1157,6 +1173,7 @@ impl CustomOp3 for FlashAttnPrefill {
             scale: self.scale,
             softcap: self.softcap,
             prefix_len: self.prefix_len as u32,
+            window: self.window as u32,
         };
 
         let tg_bytes = fa_threadgroup_bytes(self.br, self.bc, d, dtype_bytes, use_mma);
@@ -1344,6 +1361,7 @@ pub fn flash_attention_metal_prefill(
     scale: f32,
     softcap: Option<f32>,
     prefix_len: usize,
+    window: usize,
 ) -> Result<Tensor> {
     if !q.device().is_metal() || !k.device().is_metal() || !v.device().is_metal() {
         candle_core::bail!("flash_attention_metal_prefill: q, k, v must all be on a Metal device");
@@ -1373,6 +1391,7 @@ pub fn flash_attention_metal_prefill(
             scale,
             softcap: softcap.unwrap_or(0.0),
             prefix_len,
+            window,
             br,
             bc,
         },
@@ -1380,8 +1399,14 @@ pub fn flash_attention_metal_prefill(
 }
 
 /// Whether the Flash Attention prefill kernels cover `head_dim`.
-pub fn flash_attention_metal_available(head_dim: usize, dtype: DType) -> bool {
-    fa_tile_sizes(head_dim, dtype.size_in_bytes()).is_some()
+pub fn flash_attention_metal_available(head_dim: usize, dtype: DType, window: usize) -> bool {
+    // A sliding window is not offered, though the kernel now carries the code
+    // for one. Measured against the naive path on data with the outliers a real
+    // model produces, a windowed call at a few hundred query tokens comes out
+    // roughly as far from the reference as the answer itself is large, while
+    // the same shapes without a window match to BF16 rounding. The cause is not
+    // understood, and the parity property refuses to let it ship until it is.
+    window == 0 && fa_tile_sizes(head_dim, dtype.size_in_bytes()).is_some()
 }
 
 /// Whether this head width reaches the hardware simdgroup path.
@@ -3367,6 +3392,7 @@ mod fused_kernel_parity_tests {
         scale: f32,
         softcap: Option<f32>,
         prefix_len: usize,
+        window: usize,
     ) -> Result<Tensor> {
         let (b, h, t_q, _d) = q.dims4()?;
         let (_, h_kv, t_kv, _) = k.dims4()?;
@@ -3394,13 +3420,15 @@ mod fused_kernel_parity_tests {
             scores = (scores / (cap as f64))?.tanh()?.affine(cap as f64, 0.0)?;
         }
 
-        // Build causal mask shifted by prefix_len:
-        //   mask[i, j] = -INF if j > prefix + i, else 0
+        // Causal mask shifted by prefix_len, and bounded below by the window
+        // when there is one: mask[i, j] = -INF if j > prefix + i, or if the key
+        // is older than the window that query row can see.
         let device = q.device();
         let mut mask_data = vec![0.0f32; t_q * t_kv];
         for i in 0..t_q {
             for j in 0..t_kv {
-                if j > prefix_len + i {
+                let q_pos = prefix_len + i;
+                if j > q_pos || (window != 0 && q_pos >= j + window) {
                     mask_data[i * t_kv + j] = f32::NEG_INFINITY;
                 }
             }
@@ -3421,6 +3449,8 @@ mod fused_kernel_parity_tests {
         t_q: usize,
         t_kv: usize,
         d: usize,
+        /// Sliding window in tokens, 0 for none.
+        window: usize,
     }
 
     fn run_fa_parity(
@@ -3438,9 +3468,11 @@ mod fused_kernel_parity_tests {
             t_q,
             t_kv,
             d,
+            window: _,
         } = case;
         let prefix = t_kv - t_q;
         let scale = 1.0 / (d as f32).sqrt();
+        let window = case.window;
 
         // Deterministic small values to keep softmax well-conditioned and BF16
         // accumulation stable across the two paths.
@@ -3462,10 +3494,10 @@ mod fused_kernel_parity_tests {
             .to_dtype(dtype)
             .unwrap();
 
-        let out_fa = flash_attention_metal_prefill(&q, &k, &v, scale, softcap, prefix)
+        let out_fa = flash_attention_metal_prefill(&q, &k, &v, scale, softcap, prefix, window)
             .expect("FA kernel must not error");
 
-        let out_ref = naive_attention_reference(&q, &k, &v, scale, softcap, prefix)
+        let out_ref = naive_attention_reference(&q, &k, &v, scale, softcap, prefix, window)
             .expect("naive reference must not error");
 
         let f = out_fa
@@ -3545,8 +3577,8 @@ mod fused_kernel_parity_tests {
                     .to_dtype(dtype)
                     .unwrap();
 
-                let fa = flash_attention_metal_prefill(&q, &k, &v, scale, None, prefix).unwrap();
-                let rf = naive_attention_reference(&q, &k, &v, scale, None, prefix).unwrap();
+                let fa = flash_attention_metal_prefill(&q, &k, &v, scale, None, prefix, 0).unwrap();
+                let rf = naive_attention_reference(&q, &k, &v, scale, None, prefix, 0).unwrap();
                 let f: Vec<f32> = fa
                     .to_dtype(DType::F32)
                     .unwrap()
@@ -3569,6 +3601,75 @@ mod fused_kernel_parity_tests {
             println!(
                 "  {dtype:?}: peggiore assoluto {worst_abs:.5}, peggiore relativo {worst_rel:.5}"
             );
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn window_isolate() {
+        let Some(dev) = metal_device_or_skip() else {
+            return;
+        };
+        for (d, path) in [(128usize, "MMA")] {
+            for (window, t_q, h, h_kv, prefix) in [
+                (222usize, 367usize, 16usize, 4usize, 3usize),
+                (222, 96, 16, 4, 3),
+                (222, 367, 16, 4, 0),
+                (100, 367, 16, 4, 3),
+                (300, 367, 16, 4, 3),
+                (369, 367, 16, 4, 3),
+            ] {
+                let t_kv = t_q + prefix;
+                let _ = path;
+                let mk = |n: usize, salt: usize| -> Vec<f32> {
+                    (0..n)
+                        .map(|i| {
+                            let x = (((i + salt) % 17) as f32 - 8.0) * 0.5;
+                            if (i + salt).is_multiple_of(977) {
+                                x * 15.0
+                            } else {
+                                x
+                            }
+                        })
+                        .collect()
+                };
+                let q = Tensor::from_vec(mk(h * t_q * d, 1), (1, h, t_q, d), &dev)
+                    .unwrap()
+                    .to_dtype(DType::BF16)
+                    .unwrap();
+                let k = Tensor::from_vec(mk(h_kv * t_kv * d, 7), (1, h_kv, t_kv, d), &dev)
+                    .unwrap()
+                    .to_dtype(DType::BF16)
+                    .unwrap();
+                let v = Tensor::from_vec(mk(h_kv * t_kv * d, 13), (1, h_kv, t_kv, d), &dev)
+                    .unwrap()
+                    .to_dtype(DType::BF16)
+                    .unwrap();
+                let scale = 1.0 / (d as f32).sqrt();
+                let fa =
+                    flash_attention_metal_prefill(&q, &k, &v, scale, None, prefix, window).unwrap();
+                let rf =
+                    naive_attention_reference(&q, &k, &v, scale, None, prefix, window).unwrap();
+                let f: Vec<f32> = fa
+                    .to_dtype(DType::F32)
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1()
+                    .unwrap();
+                let r: Vec<f32> = rf
+                    .to_dtype(DType::F32)
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1()
+                    .unwrap();
+                let peak = r.iter().fold(0f32, |a, &b| a.max(b.abs())).max(1e-6);
+                println!(
+                    "  window={window} t_q={t_q} h={h}/{h_kv} prefix={prefix}: rel {:.4}",
+                    max_abs_diff_f32(&f, &r) / peak
+                );
+            }
         }
     }
 
@@ -3622,6 +3723,12 @@ mod fused_kernel_parity_tests {
             let prefix = next(0, 256);
             let scale = 1.0 / (d as f32).sqrt();
             let mag = [0.05f32, 0.5, 3.0][next(0, 2)];
+            // Half the cases carry a sliding window, which is what most of
+            // Gemma 4's layers have and what used to keep them off this kernel.
+            let window = if seed % 2 == 0 { 0 } else { next(1, 300) };
+            if !flash_attention_metal_available(d, dtype, window) {
+                continue;
+            }
 
             let mk = |n: usize, salt: usize| -> Vec<f32> {
                 (0..n)
@@ -3653,11 +3760,11 @@ mod fused_kernel_parity_tests {
                 .unwrap();
 
             let case = format!(
-                "seed {seed}: {dtype:?} h={h} h_kv={h_kv} t_q={t_q} prefix={prefix} d={d} mag={mag}"
+                "seed {seed}: {dtype:?} h={h} h_kv={h_kv} t_q={t_q} prefix={prefix} d={d} mag={mag} window={window}"
             );
-            let fa = flash_attention_metal_prefill(&q, &k, &v, scale, None, prefix)
+            let fa = flash_attention_metal_prefill(&q, &k, &v, scale, None, prefix, window)
                 .unwrap_or_else(|e| panic!("{case}: kernel failed: {e}"));
-            let rf = naive_attention_reference(&q, &k, &v, scale, None, prefix)
+            let rf = naive_attention_reference(&q, &k, &v, scale, None, prefix, window)
                 .unwrap_or_else(|e| panic!("{case}: reference failed: {e}"));
 
             let f: Vec<f32> = fa
@@ -3714,6 +3821,7 @@ mod fused_kernel_parity_tests {
                     t_q: t,
                     t_kv: t,
                     d: 128,
+                    window: 0,
                 },
                 None,
                 1e-3,
@@ -3737,6 +3845,7 @@ mod fused_kernel_parity_tests {
                 t_q: 16,
                 t_kv: 16,
                 d: 64,
+                window: 0,
             },
             None,
             1e-4,
@@ -3759,6 +3868,7 @@ mod fused_kernel_parity_tests {
                 t_q: 16,
                 t_kv: 16,
                 d: 64,
+                window: 0,
             },
             None,
             0.05,
@@ -3781,6 +3891,7 @@ mod fused_kernel_parity_tests {
                 t_q: 8,
                 t_kv: 8,
                 d: 128,
+                window: 0,
             },
             None,
             0.05,
@@ -3803,6 +3914,7 @@ mod fused_kernel_parity_tests {
                 t_q: 70,
                 t_kv: 90,
                 d: 256,
+                window: 0,
             },
             None,
             0.05,
@@ -3826,6 +3938,7 @@ mod fused_kernel_parity_tests {
                 t_q: 8,
                 t_kv: 8,
                 d: 64,
+                window: 0,
             },
             None,
             0.05,
@@ -3849,6 +3962,7 @@ mod fused_kernel_parity_tests {
                 t_q: 16,
                 t_kv: 16,
                 d: 64,
+                window: 0,
             },
             Some(30.0),
             0.05,
@@ -3872,6 +3986,7 @@ mod fused_kernel_parity_tests {
                 t_q: 8,
                 t_kv: 32,
                 d: 64,
+                window: 0,
             },
             None,
             0.05,
@@ -3894,6 +4009,7 @@ mod fused_kernel_parity_tests {
                 t_q: 16,
                 t_kv: 16,
                 d: 64,
+                window: 0,
             },
             None,
             0.02,
@@ -3907,7 +4023,7 @@ mod fused_kernel_parity_tests {
         let q = Tensor::zeros((1, 4, 4, 64), DType::F32, &dev).unwrap();
         let k = Tensor::zeros((1, 4, 4, 64), DType::F32, &dev).unwrap();
         let v = Tensor::zeros((1, 4, 4, 64), DType::F32, &dev).unwrap();
-        let err = flash_attention_metal_prefill(&q, &k, &v, 0.125, None, 0)
+        let err = flash_attention_metal_prefill(&q, &k, &v, 0.125, None, 0, 0)
             .expect_err("must reject CPU tensors");
         assert!(format!("{err}").contains("Metal"));
     }
@@ -3976,10 +4092,10 @@ mod fused_kernel_parity_tests {
                 let scale = 1.0f32;
                 let prefix = t_kv - t_q;
                 time("flash attention", &|| {
-                    flash_attention_metal_prefill(&q, &k, &v, scale, None, prefix).unwrap()
+                    flash_attention_metal_prefill(&q, &k, &v, scale, None, prefix, 0).unwrap()
                 });
                 time("naive", &|| {
-                    naive_attention_reference(&q, &k, &v, scale, None, prefix).unwrap()
+                    naive_attention_reference(&q, &k, &v, scale, None, prefix, 0).unwrap()
                 });
             }
         }
@@ -4019,13 +4135,16 @@ mod fused_kernel_parity_tests {
     fn flash_attn_is_offered_for_every_width_it_can_run() {
         for d in [64usize, 128, 256, 512] {
             assert!(
-                flash_attention_metal_available(d, DType::BF16),
+                flash_attention_metal_available(d, DType::BF16, 0),
                 "head width {d} should be available"
             );
         }
         // Not a multiple of four: the kernel reads four values at a time.
-        assert!(!flash_attention_metal_available(66, DType::BF16));
-        assert!(!flash_attention_metal_available(0, DType::BF16));
+        assert!(!flash_attention_metal_available(66, DType::BF16, 0));
+        assert!(!flash_attention_metal_available(0, DType::BF16, 0));
+        // A sliding window is refused rather than served wrong; see the
+        // measurement in `flash_attention_metal_available`.
+        assert!(!flash_attention_metal_available(128, DType::BF16, 1024));
     }
 
     #[test]
@@ -4045,6 +4164,7 @@ mod fused_kernel_parity_tests {
                 t_q: 4,
                 t_kv: 128,
                 d: 64,
+                window: 0,
             },
             None,
             0.05,

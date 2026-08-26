@@ -782,7 +782,11 @@ impl Attention {
 
         #[cfg(feature = "metal")]
         let metal_fa_base_ok = device.is_metal()
-            && super::metal_ops::flash_attention_metal_available(self.head_dim, q.dtype())
+            && super::metal_ops::flash_attention_metal_available(
+                self.head_dim,
+                q.dtype(),
+                self.sliding_window.unwrap_or(0),
+            )
             && matches!(q.dtype(), DType::F16 | DType::BF16 | DType::F32);
 
         for (i, seg) in segments.iter().enumerate() {
@@ -817,7 +821,6 @@ impl Attention {
                     !sdpa_base_ok
                 }
                 && mask.is_none()
-                && self.sliding_window.is_none()
                 && kv_len >= seg.num_tokens
                 && (kv_len >= METAL_FA_MIN_KV || (seg.num_tokens == 1 && !sdpa_base_ok));
             #[cfg(not(feature = "metal"))]
@@ -857,6 +860,7 @@ impl Attention {
                         self.scale as f32,
                         self.attn_softcap.map(|s| s as f32),
                         prefix_len,
+                        self.sliding_window.unwrap_or(0),
                     )?;
                     out_buf.slice_set(&seg_out.contiguous()?, 2, q_offset)?;
                 }

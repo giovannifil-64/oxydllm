@@ -56,6 +56,7 @@ struct FlashAttnParams {
     float scale;
     float softcap;     // 0.0 = disabled
     uint  prefix_len;  // = t_kv - t_q
+    uint  window;      // sliding window in tokens; 0 = attend to the whole prefix
 };
 
 constant float M_LOG2E_F_CONST = 1.4426950408889634f;
@@ -119,10 +120,16 @@ inline void flash_attention_prefill_impl(
         (last_q_global + p.bc) / p.bc
     );
 
-    for (uint n = 0; n < n_block_max; n++) {
+    // A sliding window also bounds the loop from below: keys older than the
+    // oldest query row's window can be skipped outright rather than masked.
+    const uint n_block_min = (p.window != 0u && first_q_global + 1u > p.window)
+        ? (first_q_global + 1u - p.window) / p.bc
+        : 0u;
+
+    for (uint n = n_block_min; n < n_block_max; n++) {
         const uint kv_start  = n * p.bc;
         const uint bc_act    = min(p.bc, p.t_kv - kv_start);
-        const bool need_mask = (n >= mask_boundary);
+        const bool need_mask = (n >= mask_boundary) || (p.window != 0u);
 
         // Zero-fill rows >= bc_act so the unrolled PV loop sees 0 (no NaN propagation).
         const uint k_base = ((batch_idx * p.h_kv) + kv_head) * p.t_kv * p.d + kv_start * p.d;
@@ -163,7 +170,9 @@ inline void flash_attention_prefill_impl(
                 if (need_mask) {
                     uint q_pos  = p.prefix_len + q_start + i;
                     uint kv_pos = kv_start + j;
-                    if (kv_pos > q_pos) {
+                    // Causal, and inside the window when there is one: a token
+                    // sees itself and the `window - 1` tokens before it.
+                    if (kv_pos > q_pos || (p.window != 0u && q_pos >= kv_pos + p.window)) {
                         dot = -INFINITY;
                     }
                 }
@@ -340,10 +349,16 @@ inline void flash_attention_prefill_mma_impl(
     const uint total_s_tiles = s_tiles_m * s_tiles_n;
     const uint total_o_tiles = o_tiles_m * o_tiles_n;
 
-    for (uint n = 0; n < n_block_max; n++) {
+    // A sliding window also bounds the loop from below: keys older than the
+    // oldest query row's window can be skipped outright rather than masked.
+    const uint n_block_min = (p.window != 0u && first_q_global + 1u > p.window)
+        ? (first_q_global + 1u - p.window) / p.bc
+        : 0u;
+
+    for (uint n = n_block_min; n < n_block_max; n++) {
         const uint kv_start  = n * p.bc;
         const uint bc_act    = min(p.bc, p.t_kv - kv_start);
-        const bool need_mask = (n >= mask_boundary);
+        const bool need_mask = (n >= mask_boundary) || (p.window != 0u);
 
         const uint k_base = ((batch_idx * p.h_kv) + kv_head) * p.t_kv * p.d + kv_start * p.d;
         for (uint k = tid; k < p.bc * p.d; k += tg_size) {
@@ -395,7 +410,9 @@ inline void flash_attention_prefill_mma_impl(
                 if (need_mask) {
                     uint q_pos  = p.prefix_len + q_start + i;
                     uint kv_pos = kv_start + j;
-                    if (kv_pos > q_pos) {
+                    // Causal, and inside the window when there is one: a token
+                    // sees itself and the `window - 1` tokens before it.
+                    if (kv_pos > q_pos || (p.window != 0u && q_pos >= kv_pos + p.window)) {
                         val = -INFINITY;
                     }
                 }

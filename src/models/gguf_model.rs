@@ -361,7 +361,7 @@ impl StandardTransformer {
         device: &Device,
         dtype: DType,
         num_kv_blocks: usize,
-        kv_quantizer: Option<Arc<KvQuantizer>>,
+        kv_quant: Option<(u8, bool)>,
     ) -> anyhow::Result<Self> {
         let arch = gguf.architecture()?;
         let prefix = &arch;
@@ -578,7 +578,17 @@ impl StandardTransformer {
                             topo.per_layer.as_ref().map_or(head_dim, |g| g.head_dims[i]),
                             dtype,
                             device,
-                            kv_quantizer.clone(),
+                            // One quantizer per layer: it is built for a
+                            // head width, and a model whose layers differ in
+                            // that width would otherwise dequantize a global
+                            // layer's keys into half the room they need.
+                            kv_quant.map(|(bits, qjl)| {
+                                Arc::new(KvQuantizer::new_with_qjl(
+                                    bits,
+                                    topo.per_layer.as_ref().map_or(head_dim, |g| g.head_dims[i]),
+                                    qjl,
+                                ))
+                            }),
                         )
                         .map_err(|e| anyhow::anyhow!("Failed to create block allocator: {e}"))?,
                     )));

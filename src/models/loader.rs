@@ -1514,13 +1514,9 @@ fn load_batch_model_gguf(
     } = plan;
     report_context(ctx, declared, opts.max_context_len, opts.max_num_sequences);
 
-    let quantizer: Option<Arc<KvQuantizer>> = match kv_mode {
+    let quantizer: Option<(u8, bool)> = match kv_mode {
         KvQuantMode::Auto | KvQuantMode::Off => None,
-        mode => Some(Arc::new(KvQuantizer::new_with_qjl(
-            mode.bit_width(),
-            topo.head_dim,
-            opts.qjl_quantization,
-        ))),
+        mode => Some((mode.bit_width(), opts.qjl_quantization)),
     };
 
     let model = match StandardTransformer::load_gguf(&gguf, device, dtype, num_blocks, quantizer) {

@@ -67,9 +67,9 @@ impl GgufWeights {
             "GGUF mmap+header parsed"
         );
 
-        prefault(&file, mmap.len());
         let tensors = parallelise_tensor_load(
-            &mmap,
+            &file,
+            mmap.len(),
             content.tensor_data_offset,
             &content.tensor_infos,
             device,
@@ -221,7 +221,8 @@ impl GgufWeights {
             }
             total_tensors += content.tensor_infos.len();
             let shard_tensors = parallelise_tensor_load(
-                &mmap,
+                &file,
+                mmap.len(),
                 content.tensor_data_offset,
                 &content.tensor_infos,
                 device,
@@ -325,40 +326,22 @@ pub fn depermute_qk_rows(
 }
 
 /// Builds every tensor from the mmap in parallel (rayon), keyed by name.
-/// Brings the whole file into the page cache before any tensor is built.
-///
-/// Materialising a tensor reads its slice, and building them one at a time
-/// therefore reads the file one tensor at a time, through a lock, at a queue
-/// depth of one: measured at 7.4 s for a 7 GB checkpoint that a plain
-/// sequential read brings in in 1.05. Reading it here in parallel, in units the
-/// device likes, hands that loop a warm map and costs a second.
-///
-/// The reads go into a small scratch buffer that is thrown away: what is wanted
-/// is the side effect on the page cache, and the map is what the tensors are
-/// built from. Touching one byte per page instead does work, but at a third of
-/// the rate a read does.
-fn prefault(file: &std::fs::File, len: usize) {
-    use std::os::unix::fs::FileExt;
-    const SLICE: usize = 64 * 1024 * 1024;
-    let slices: Vec<usize> = (0..len).step_by(SLICE).collect();
-    slices.par_iter().for_each(|&start| {
-        let mut scratch = vec![0u8; SLICE.min(len - start)];
-        let _ = file.read_at(&mut scratch, start as u64);
-        std::hint::black_box(scratch.len());
-    });
-}
-
 fn parallelise_tensor_load(
-    mmap: &Mmap,
+    file: &std::fs::File,
+    file_len: usize,
     data_offset: u64,
     tensor_infos: &HashMap<String, gguf_file::TensorInfo>,
     device: &Device,
 ) -> anyhow::Result<FxHashMap<String, Arc<QTensor>>> {
-    let infos: Vec<(&String, &gguf_file::TensorInfo)> = tensor_infos.iter().collect();
+    // In file order: the pool splits a sorted list into contiguous ranges, so
+    // each worker walks the map forwards instead of jumping around it, and the
+    // pages it touches are the ones just read.
+    let mut infos: Vec<(&String, &gguf_file::TensorInfo)> = tensor_infos.iter().collect();
+    infos.sort_unstable_by_key(|(_, info)| info.offset);
     let pairs: anyhow::Result<Vec<(String, Arc<QTensor>)>> = infos
         .par_iter()
         .map(|(name, info)| {
-            let qt = build_qtensor_from_mmap(mmap, data_offset, info, device)
+            let qt = build_qtensor(file, file_len, data_offset, info, device)
                 .with_context(|| format!("Failed to load GGUF tensor '{}'", name))?;
             Ok(((*name).clone(), Arc::new(qt)))
         })
@@ -369,10 +352,18 @@ fn parallelise_tensor_load(
     Ok(tensors)
 }
 
-/// Builds one `QTensor` from its slice of the memory map, validating the element
-/// count against the block size and that the slice lies within bounds.
-fn build_qtensor_from_mmap(
-    mmap: &Mmap,
+/// Builds one `QTensor` by reading its bytes from the file, validating the
+/// element count against the block size and that the range lies within it.
+///
+/// The bytes are read rather than taken from the map on purpose. Reading is what
+/// the device does well: a plain sequential read of a 7 GB checkpoint takes a
+/// second, where faulting the same pages in one tensor at a time, through the
+/// lock the Metal allocation needs, took seven. Reading also keeps the page
+/// cache out of it, which matters because materialising the tensors allocates
+/// as much memory again and would evict whatever the file had warmed.
+fn build_qtensor(
+    file: &std::fs::File,
+    file_len: usize,
     data_offset: u64,
     info: &gguf_file::TensorInfo,
     device: &Device,
@@ -391,15 +382,21 @@ fn build_qtensor_from_mmap(
     let end = start
         .checked_add(size_in_bytes)
         .ok_or_else(|| anyhow::anyhow!("tensor offset overflow"))?;
-    if end > mmap.len() {
+    if end > file_len {
         anyhow::bail!(
-            "tensor slice ({}..{}) out of mmap bounds ({})",
+            "tensor slice ({}..{}) out of file bounds ({})",
             start,
             end,
-            mmap.len()
+            file_len
         );
     }
-    let slice = &mmap[start..end];
+    let mut bytes = vec![0u8; size_in_bytes];
+    {
+        use std::os::unix::fs::FileExt;
+        file.read_exact_at(&mut bytes, start as u64)
+            .with_context(|| format!("reading tensor bytes at {start}"))?;
+    }
+    let slice = &bytes[..];
     // Serialize Metal storage creation across the rayon workers: candle
     // 0.11's residency-set registration is not thread-safe (see
     // `weights::metal_alloc_lock`).

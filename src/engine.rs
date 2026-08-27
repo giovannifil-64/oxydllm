@@ -520,9 +520,9 @@ fn build_batch_input(
 /// Runs the batch as one or more forwards and returns one logits row per
 /// sequence, in batch order.
 ///
-/// The batch is split by [`plan_forward_chunks`] into forwards the GPU can
-/// finish promptly, so a long prompt no longer submits one uninterrupted
-/// stretch of work; `pacer` learns the size from what the machine measures.
+/// The batch is split by [`ChunkPlanner`] into forwards the GPU can finish
+/// promptly, so a long prompt no longer submits one uninterrupted stretch of
+/// work; `pacer` learns the size from what the machine measures.
 /// Caches are moved out through a [`CacheRestoreGuard`] so they are restored
 /// even when a forward fails, and each chunk's staged pool writes are flushed
 /// before the next one starts.

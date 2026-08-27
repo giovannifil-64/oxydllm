@@ -20,8 +20,8 @@
 //!   [`w4a16_matmul`], [`w8a16_matmul`], [`gptq_matmul`], and the prefill
 //!   dequantizers [`dequantize_w4`], [`dequantize_w8`],
 //!   [`dequantize_gptq_packed`].
-//! - GGUF block quants: [`gguf_quant_matmul`] (decode, M up to
-//!   [`GGUF_BATCH_MAX`]) and [`gguf_quant_mul_mm`] (tiled prefill GEMM).
+//! - GGUF block quants: candle's own quantized matmul carries these, and this
+//!   module only measures it.
 //! - FP8 block-scaled E4M3: [`cast_f8e4m3_to_f32`],
 //!   [`f8_block_dequant_bf16`], [`f8_gemv`].
 //! - MXFP4 (GPT-OSS experts): [`mxfp4_matmul`].

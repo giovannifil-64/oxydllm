@@ -3913,15 +3913,15 @@ mod fused_kernel_parity_tests {
         }
     }
 
-    /// Contract: the prefill kernels read a KV view whose heads sit further
-    /// apart than the tokens it covers, and get the same answer as from a copy.
+    /// Contract: attention on a cache view answers what attention on its copy
+    /// answers.
     ///
     /// That view is what the cache hands over: a window into a buffer holding
     /// more tokens than this forward reads. Copying it first is a real cost at
     /// every layer of every chunk, and the kernels only need to be told how far
     /// apart two heads sit.
     #[test]
-    fn the_prefill_kernels_read_a_kv_view_in_place() {
+    fn attention_on_a_cache_view_matches_attention_on_its_copy() {
         let Some(dev) = metal_device_or_skip() else {
             return;
         };

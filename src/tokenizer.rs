@@ -716,10 +716,6 @@ mod gguf {
             .to_string()
             .map_err(|e| anyhow::anyhow!("tokenizer.ggml.model: {e}"))?
             .to_lowercase();
-        // `gemma4` is a byte-level-free BPE in SentencePiece dress: the same
-        // tokens and merges as any other BPE here, read through a different
-        // pipeline. Anything else with merges would likely work too, but a
-        // tokenizer that is nearly right is worse than one that refuses.
         if model_kind != "gpt2" && model_kind != "gemma4" {
             anyhow::bail!("unsupported tokenizer model `{model_kind}`");
         }

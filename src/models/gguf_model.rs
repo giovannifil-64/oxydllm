@@ -510,10 +510,6 @@ impl StandardTransformer {
             .get("token_embd.weight")
             .map_err(|e| anyhow::anyhow!("Missing token_embd.weight: {e}"))?;
         let vocab_size = embed_qt.shape().dims()[0];
-        // The table stays as the file stores it and hands back the rows each
-        // batch asks for. Materialising it cost five seconds of the load and two
-        // gigabytes for the life of the process, to answer lookups of a few
-        // thousand rows.
         let embed_tokens = if Embedding::can_gather(embed_qt.dtype()) {
             Embedding::quantized(embed_qt.clone(), dtype)
         } else {
@@ -539,9 +535,6 @@ impl StandardTransformer {
             arch_def.default_sliding_window
         };
 
-        // One source for the per-layer window: the blocks below and the caches
-        // built on these allocators must agree token for token, or a layer keeps
-        // a window of one width and reads one of another.
         let layer_windows: Vec<Option<usize>> = (0..num_hidden_layers)
             .map(|i| match topo.per_layer.as_ref() {
                 Some(g) => g.sliding_windows[i],
@@ -591,12 +584,6 @@ impl StandardTransformer {
         let norm = RMSNorm::from_qtensor(&norm_qt, device, dtype, rms_norm_eps, norm_type)
             .map_err(|e| anyhow::anyhow!("Failed to load output_norm: {e}"))?;
 
-        // One table per distinct geometry, not per layer. A checkpoint that
-        // publishes its rope per layer still repeats a handful of settings
-        // across dozens of layers: Gemma 4 alternates two, so building one
-        // table each cost 48 copies of a 268 MB pair of cos/sin tables, 12.9 GB
-        // that left the forward pass no room on a 24 GB machine. Cloning shares
-        // the tensors rather than the memory behind them.
         let geometries: Vec<(usize, f64)> = (0..num_hidden_layers)
             .map(|i| {
                 let per_layer = topo.per_layer.as_ref();
@@ -606,11 +593,6 @@ impl StandardTransformer {
                 )
             })
             .collect();
-        // Per-dimension frequency divisors, when the checkpoint ships them.
-        // Gemma 4 gives them only to its layers without a window, and freezes
-        // most of the spectrum: without this the slow components keep turning
-        // and the long-range path, which is exactly what those layers are for,
-        // reads noise a few thousand tokens out.
         let rope_factors: Option<Vec<f64>> = match gguf.try_get("rope_freqs.weight") {
             Some(qt) => {
                 let t = qt
@@ -627,8 +609,6 @@ impl StandardTransformer {
         let (distinct, per_layer_table) = rope_sharing_plan(&geometries);
         let mut tables = Vec::with_capacity(distinct.len());
         for (idx, &(dim, theta)) in distinct.iter().enumerate() {
-            // The factors belong to the layers the checkpoint gives them to:
-            // those without a sliding window.
             let scaling = match &rope_factors {
                 Some(f)
                     if per_layer_table
@@ -643,11 +623,6 @@ impl StandardTransformer {
             tables.push(
                 RotaryEmbedding::new_with_scaling(
                     dim,
-                    // The tables only need the positions this model will serve.
-                    // A checkpoint declaring a quarter of a million of them and
-                    // granted eight thousand was building thirty two times the
-                    // table it can ever read, which is both the time and the
-                    // memory of building it.
                     max_position_embeddings.min(context_len.max(1)),
                     theta,
                     scaling,
@@ -677,10 +652,6 @@ impl StandardTransformer {
                             topo.per_layer.as_ref().map_or(head_dim, |g| g.head_dims[i]),
                             dtype,
                             device,
-                            // One quantizer per layer: it is built for a
-                            // head width, and a model whose layers differ in
-                            // that width would otherwise dequantize a global
-                            // layer's keys into half the room they need.
                             kv_quant.map(|(bits, qjl)| {
                                 Arc::new(KvQuantizer::new_with_qjl(
                                     bits,
@@ -704,10 +675,6 @@ impl StandardTransformer {
 
         let stop_token_ids = gguf.eos_token_ids();
 
-        // Same reason as after the embedding table: every norm and scalar the
-        // blocks dequantised left an F32 copy in candle's buffer pool, and only
-        // a synchronisation point hands those back before the first forward
-        // pass asks for room.
         crate::common::weights::drain_metal(device, "the model build")?;
 
         Ok(Self {
@@ -832,7 +799,6 @@ mod per_layer_geometry_tests {
             );
         }
 
-        // A checkpoint that publishes one setting for every layer builds one.
         let uniform = vec![(128usize, 10_000.0f64); 32];
         let (distinct, per_layer) = rope_sharing_plan(&uniform);
         assert_eq!(distinct.len(), 1);

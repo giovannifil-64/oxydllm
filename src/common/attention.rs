@@ -609,6 +609,24 @@ impl Attention {
             .reshape((b, n_kv_h * n_rep, seq, hd))
     }
 
+    /// Runs attention over a batch of segments, one forward per call.
+    ///
+    /// Which kernel each segment reaches depends on its shape and on the layer:
+    /// a prompt goes to the Flash Attention path where the head width has a
+    /// hardware tiling, a single token to the fused SDPA where that covers the
+    /// width, and everything else to the plain path, which is the only one that
+    /// needs an explicit mask.
+    ///
+    /// A layer with a sliding window hands its keys and values to the vector
+    /// kernel as views rather than copies. That kernel takes the stride between
+    /// KV heads and assumes only that a head's rows are contiguous and one head
+    /// width apart, which is what the cache produces and what the guard here
+    /// checks before trusting it. Copying instead measured eight times the cost
+    /// of the kernel it fed, because the copy crosses the gaps the buffer leaves
+    /// between heads.
+    ///
+    /// ## Errors
+    /// Propagates projection, cache and kernel failures.
     pub fn forward_batch(
         &self,
         x: &Tensor,
@@ -799,26 +817,12 @@ impl Attention {
                 seg.num_tokens,
             )?;
 
-            // The kernel masks causally and, when the layer has one, inside the
-            // sliding window; an external mask still falls back, and
-            // METAL_FA_MIN_KV gates on cache size.
             #[cfg(feature = "metal")]
-            // Which of the two Flash Attention kernels a head width reaches
-            // decides where it belongs. A prompt is worth sending only to the
-            // hardware path; the portable one loses to the plain attention
-            // below at the widths that force it. One token is the other way
-            // round: the portable kernel beats the plain path four to one, and
-            // the fused SDPA does not cover every width.
             let use_metal_fa = metal_fa_base_ok
                 && self.sinks.is_none()
                 && if seg.num_tokens > 1 {
                     super::metal_ops::flash_attention_uses_hardware_path(self.head_dim, q.dtype())
                 } else {
-                    // The minimum-cache gate below is about preferring the
-                    // fused SDPA on small caches; where SDPA cannot serve this
-                    // head width the choice is this kernel or the plain path,
-                    // and it wins at every cache size measured: 0.6 ms against
-                    // 2.2 at 256 keys, 2.0 against 9.0 at 1024.
                     !sdpa_base_ok
                 }
                 && mask.is_none()
@@ -868,13 +872,6 @@ impl Attention {
             } else if use_seg_sdpa {
                 #[cfg(feature = "metal")]
                 {
-                    // The vector kernel is given the stride between KV heads, so
-                    // a window view goes straight in. What it does assume is
-                    // that a head's rows are contiguous and one head width
-                    // apart, which is what the cache produces and what this
-                    // checks before trusting it. Copying instead cost eight
-                    // times the kernel it fed, since the copy crosses the gaps
-                    // the buffer leaves between heads.
                     let straight_in = |t: &Tensor| -> bool {
                         let stride = t.layout().stride();
                         stride[3] == 1 && stride[2] == t.dims()[3]
@@ -943,9 +940,6 @@ impl Attention {
                         .narrow(3, 0, kv_len)?;
                     scores.broadcast_add(&seg_mask.to_dtype(scores.dtype())?)?
                 } else if seg.num_tokens > 1 {
-                    // A windowed layer must close its window here too. The
-                    // kernels above mask one themselves; this path did not, so a
-                    // prompt longer than the window read all of it.
                     let cm = match self.sliding_window {
                         Some(w) if kv_len > w => super::mask::sliding_window_mask_cached_dtype(
                             seg.num_tokens,

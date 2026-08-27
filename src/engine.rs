@@ -247,7 +247,6 @@ impl PrefillPacer {
         let rate = tokens as f64 / elapsed.as_secs_f64().max(1e-9);
 
         match self.best {
-            // Doubling stopped paying: keep the size that did.
             Some((best_tokens, best_rate)) if rate <= best_rate * 1.05 => {
                 self.cap = best_tokens;
                 self.settled = true;
@@ -568,10 +567,6 @@ fn run_forward_pass(
             let caches = &mut cache_slices[chunk.seq_base..chunk.seq_base + chunk.counts.len()];
 
             let started = Instant::now();
-            // A chunk the device cannot back means the cap is too big for this
-            // model on this machine. The failed forward has already written part
-            // of its layers into the caches, so this request cannot simply try
-            // again: it fails, and the cap comes down so the next one does not.
             let out = match model.forward_batch_last(&input, &positions, caches, &chunk.counts) {
                 Ok(out) => out,
                 Err(e) => {
@@ -1314,7 +1309,6 @@ mod tests {
     /// tokens and spent forty percent of the time to first token doing it.
     #[test]
     fn the_cap_climbs_while_a_bigger_chunk_pays() {
-        // Started below the ceiling so the climb itself is what is measured.
         let mut p = PrefillPacer {
             cap: 64,
             best: None,
@@ -1322,14 +1316,12 @@ mod tests {
         };
         let start = p.cap();
 
-        // Twice the tokens in the same time: twice the throughput.
         p.observe(start, Duration::from_millis(100));
         assert_eq!(p.cap(), start * 2, "a chunk that paid doubles the cap");
 
         p.observe(start * 2, Duration::from_millis(100));
         assert_eq!(p.cap(), start * 4, "and again while it keeps paying");
 
-        // Twice the tokens for twice the time: the same throughput, so stop.
         p.observe(start * 4, Duration::from_millis(400));
         assert_eq!(
             p.cap(),
@@ -1378,7 +1370,6 @@ mod tests {
         assert!(p.shrink());
         assert_eq!(p.cap(), start / 2);
 
-        // And the climb does not resume on its own.
         p.observe(p.cap(), Duration::from_millis(1));
         assert_eq!(p.cap(), start / 2);
 

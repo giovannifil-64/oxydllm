@@ -90,7 +90,6 @@ pub fn sliding_window_mask_prefixed(
     let cols = Tensor::from_vec(col, (1, kv_len), device)?;
     let diff = cols.broadcast_sub(&rows)?;
     let later = diff.affine(1000.0, -500.0)?.tanh()?.affine(0.5, 0.5)?;
-    // Older than the window: (q_pos - kv_pos) >= window, one smooth step again.
     let older = diff
         .affine(-1000.0, -1000.0 * window as f64 + 500.0)?
         .tanh()?

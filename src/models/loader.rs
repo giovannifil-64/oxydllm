@@ -1296,9 +1296,6 @@ fn load_standard_safetensors(
                 block_cfg.head_dim = per_layer_head_dims[i];
                 block_cfg.n_kv_heads = per_layer_kv_heads[i];
                 block_cfg.sliding_window = per_layer_sliding_windows[i];
-                // The table this layer rotates against and the span it rotates
-                // must be the same number, or the rotation lands on the wrong
-                // dimensions.
                 if let Some(dims) = cfg.per_layer_rotary_dims.as_ref()
                     && let Some(&d) = dims.get(i)
                     && d < per_layer_head_dims[i]
@@ -1314,8 +1311,6 @@ fn load_standard_safetensors(
 
         let norm = RMSNorm::load(&weights, "model.norm", cfg.rms_norm_eps, cfg.norm_type)?;
 
-        // A checkpoint may rotate a different share of each layer's head: Gemma 4
-        // rotates a quarter of its full-attention heads and all of the others.
         let per_layer_rotary_dims: Vec<usize> = (0..cfg.num_hidden_layers)
             .map(|i| {
                 cfg.per_layer_rotary_dims
@@ -1345,8 +1340,6 @@ fn load_standard_safetensors(
             let mut real: Vec<Option<SharedBlockAllocator>> = vec![None; cfg.num_hidden_layers];
             for i in 0..cfg.num_hidden_layers {
                 if !layer_is_linear[i] {
-                    // The same per-layer window the blocks were configured
-                    // with, so a layer never keeps one width and reads another.
                     real[i] = Some(Arc::new(Mutex::new(
                         BlockAllocator::new(
                             num_blocks,

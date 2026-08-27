@@ -333,9 +333,6 @@ fn parallelise_tensor_load(
     tensor_infos: &HashMap<String, gguf_file::TensorInfo>,
     device: &Device,
 ) -> anyhow::Result<FxHashMap<String, Arc<QTensor>>> {
-    // In file order: the pool splits a sorted list into contiguous ranges, so
-    // each worker walks the map forwards instead of jumping around it, and the
-    // pages it touches are the ones just read.
     let mut infos: Vec<(&String, &gguf_file::TensorInfo)> = tensor_infos.iter().collect();
     infos.sort_unstable_by_key(|(_, info)| info.offset);
     let pairs: anyhow::Result<Vec<(String, Arc<QTensor>)>> = infos

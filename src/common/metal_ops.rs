@@ -53,6 +53,19 @@ use std::sync::{Mutex, OnceLock};
 /// 1024 so long contexts keep the GPU busy), longer prefills run the full
 /// kernel, which also accepts an additive `mask` and a `do_causal` flag.
 /// `softcapping` other than 1.0 is only supported on the vector path.
+///
+/// The two paths do not cover the same head widths: the vector kernels carry
+/// 32, 64, 96, 128, 256 and 512, the tiled one adds 72 and 80. A single list
+/// for both refused 512, which is what a Gemma 4 global layer asks for at every
+/// decoded token, and promised widths the vector kernels would have failed to
+/// look up.
+///
+/// Offsets reach the kernels in bytes, which is what Metal binds a buffer with,
+/// while a candle layout counts its start offset in elements. Passing one for
+/// the other reads the right buffer at the wrong place, and stays invisible for
+/// as long as every input is made contiguous first and its start offset is
+/// therefore zero. Passing the views straight in, which is what a sliding
+/// window produces, is what made the difference visible.
 struct Sdpa {
     scale: f32,
     softcapping: f32,
@@ -109,19 +122,11 @@ impl CustomOp3 for Sdpa {
         let q_seq = q_l.dim(2)?;
         let k_seq = k_l.dim(2)?;
 
-        // Metal takes a buffer offset in bytes; candle counts a layout's start
-        // offset in elements. Passing one for the other reads the right buffer
-        // at the wrong place, which stays invisible for as long as every input
-        // is made contiguous first and its start offset is therefore zero.
         let esz = q.dtype().size_in_bytes();
         let q_off = q_l.start_offset() * esz;
         let k_off = k_l.start_offset() * esz;
         let v_off = v_l.start_offset() * esz;
 
-        // The two paths do not cover the same head widths, and one list for both
-        // refused 512 (which the vector kernels do serve, and which is what a
-        // Gemma 4 global layer asks for at every decoded token) while promising
-        // 72 and 80, which only the tiled path has.
         let full_head_dim_ok = matches!(q_head, 32 | 64 | 72 | 80 | 96 | 128 | 256 | 512);
         let vector_head_dim_ok = matches!(q_head, 32 | 64 | 96 | 128 | 256 | 512);
 
@@ -248,9 +253,6 @@ impl CustomOp3 for Sdpa {
                     candle_core::bail!("Mask dtype {mask_type:?} must match q dtype {itype:?}");
                 }
 
-                // The kernels take the mask's strides but no offset, so a view
-                // that starts partway into its buffer would be read from the
-                // wrong place. Refuse it rather than mask the wrong tokens.
                 if mask_l.start_offset() != 0 {
                     candle_core::bail!("SDPA: mask must start at the beginning of its buffer");
                 }
@@ -984,12 +986,9 @@ fn fa_tile_sizes(head_dim: usize, dtype_bytes: usize) -> Option<(usize, usize)> 
         _ => {}
     }
     if head_dim == 0 || !head_dim.is_multiple_of(4) {
-        // The kernel reads the head four values at a time.
         return None;
     }
     let limit = device_threadgroup_limit();
-    // Same shape as the measured trio: a query tile of roughly 2048 values,
-    // then the widest KV tile that still fits.
     let br0 = (2048 / head_dim).max(1);
     for br in [br0, br0 / 2, br0 / 4, 1] {
         if br == 0 {
@@ -1153,10 +1152,6 @@ impl CustomOp3 for FlashAttnPrefill {
         let dtype_bytes = q.dtype().size_in_bytes();
         let elem_count = b * h * t_q * d;
         let device = q.device();
-        // The hardware path multiplies 8x8 simdgroup tiles, so a query tile
-        // shorter than eight rows has nothing for it to fill. Head widths wide
-        // enough to force a short tile take the portable path instead, which
-        // reads the head width at runtime and does not care.
         let use_mma = metal_supports_mma(device.device()) && self.br >= 8 && self.bc >= 8;
         let kernel_name: &'static str = match (q.dtype(), use_mma) {
             (DType::F32, true) => "flash_attention_prefill_mma_f32",
@@ -1301,8 +1296,6 @@ pub fn rope_fused(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
 pub fn sdpa_available(tensor: &Tensor, head_dim: usize) -> bool {
     tensor.device().is_metal()
         && matches!(tensor.dtype(), DType::F16 | DType::BF16 | DType::F32)
-        // The vector kernels, which is what a single query token reaches; the
-        // tiled path additionally covers 72 and 80.
         && matches!(head_dim, 32 | 64 | 96 | 128 | 256 | 512)
 }
 
@@ -1438,12 +1431,10 @@ pub fn flash_attention_uses_hardware_path(head_dim: usize, dtype: DType) -> bool
 /// GGUF block quants, FP8, MXFP4, and the sink-SDPA decode kernel.
 const QUANT_METAL_SOURCE: &str = include_str!("quant_kernels.metal");
 
-/// Benchmark-only toggle: selects the retired atomic split-K epilogue in the
-/// AWQ/GPTQ GEMV kernels so `quant_gemv_bench` can measure the deterministic
-/// replacement against it in the same process (paired samples cancel the
-/// machine's GPU timing drift). Production never sets this: the atomic
-/// epilogue's scheduling-dependent float addition order made temp-0 decode
-/// flip borderline tokens run to run.
+/// Selects the retired atomic split-K epilogue in the AWQ/GPTQ GEMV kernels,
+/// so the deterministic replacement can be measured against it in one process.
+/// Production never sets this: the atomic epilogue's scheduling-dependent float
+/// addition order made temp-0 decode flip borderline tokens run to run.
 #[doc(hidden)]
 pub static QUANT_GEMV_ATOMIC: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
@@ -1579,7 +1570,7 @@ impl AwqShape {
 /// four input tensors and `CustomOp3` tops out at three. The default
 /// deterministic kernels reduce their k-splits inside one threadgroup in
 /// fixed order, keeping temp-0 decode bitwise stable; the retired atomic
-/// variants stay selectable via [`QUANT_GEMV_ATOMIC`] for `quant_gemv_bench`.
+/// variants stay selectable via [`QUANT_GEMV_ATOMIC`].
 struct W4A16Matmul {
     x: Tensor,
     qweight: Tensor,
@@ -3435,9 +3426,6 @@ mod fused_kernel_parity_tests {
             scores = (scores / (cap as f64))?.tanh()?.affine(cap as f64, 0.0)?;
         }
 
-        // Causal mask shifted by prefix_len, and bounded below by the window
-        // when there is one: mask[i, j] = -INF if j > prefix + i, or if the key
-        // is older than the window that query row can see.
         let device = q.device();
         let mut mask_data = vec![0.0f32; t_q * t_kv];
         for i in 0..t_q {
@@ -3538,87 +3526,6 @@ mod fused_kernel_parity_tests {
         assert!(diff < tol, "{label}: max_abs_diff = {diff} (tol {tol})");
     }
 
-    /// Calibration for the tolerances the parity property asserts. Ignored by
-    /// default; run when the kernels or the dtypes change.
-    #[test]
-    #[ignore]
-    fn fa_parity_tolerance_calibration() {
-        let Some(dev) = metal_device_or_skip() else {
-            return;
-        };
-        let mut rng = 0x243f_6a88_85a3_08d3u64;
-        let mut next = |lo: usize, hi: usize| -> usize {
-            rng = rng
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            lo + ((rng >> 33) as usize) % (hi - lo + 1)
-        };
-        for dtype in [DType::F32, DType::BF16] {
-            let mut worst_abs = 0f32;
-            let mut worst_rel = 0f32;
-            for _ in 0..24 {
-                let d = [64usize, 128, 256][next(0, 2)];
-                let h_kv = [1usize, 2, 4][next(0, 2)];
-                let h = h_kv * [1usize, 2, 4][next(0, 2)];
-                let t_q = next(1, 384);
-                let prefix = next(0, 256);
-                let scale = 1.0 / (d as f32).sqrt();
-                let mag = [0.05f32, 0.5, 3.0][next(0, 2)];
-
-                let n_q = h * t_q * d;
-                let n_kv = h_kv * (t_q + prefix) * d;
-                let mk = |n: usize, m: f32, salt: usize| -> Vec<f32> {
-                    (0..n)
-                        .map(|i| {
-                            let x = (((i + salt) % 17) as f32 - 8.0) * m;
-                            if (i + salt).is_multiple_of(977) {
-                                x * 15.0
-                            } else {
-                                x
-                            }
-                        })
-                        .collect()
-                };
-                let q = Tensor::from_vec(mk(n_q, mag, 1), (1, h, t_q, d), &dev)
-                    .unwrap()
-                    .to_dtype(dtype)
-                    .unwrap();
-                let k = Tensor::from_vec(mk(n_kv, mag, 7), (1, h_kv, t_q + prefix, d), &dev)
-                    .unwrap()
-                    .to_dtype(dtype)
-                    .unwrap();
-                let v = Tensor::from_vec(mk(n_kv, mag, 13), (1, h_kv, t_q + prefix, d), &dev)
-                    .unwrap()
-                    .to_dtype(dtype)
-                    .unwrap();
-
-                let fa = flash_attention_metal_prefill(&q, &k, &v, scale, None, prefix, 0).unwrap();
-                let rf = naive_attention_reference(&q, &k, &v, scale, None, prefix, 0).unwrap();
-                let f: Vec<f32> = fa
-                    .to_dtype(DType::F32)
-                    .unwrap()
-                    .flatten_all()
-                    .unwrap()
-                    .to_vec1()
-                    .unwrap();
-                let r: Vec<f32> = rf
-                    .to_dtype(DType::F32)
-                    .unwrap()
-                    .flatten_all()
-                    .unwrap()
-                    .to_vec1()
-                    .unwrap();
-                let peak = r.iter().fold(0f32, |a, &b| a.max(b.abs())).max(1e-6);
-                let diff = max_abs_diff_f32(&f, &r);
-                worst_abs = worst_abs.max(diff);
-                worst_rel = worst_rel.max(diff / peak);
-            }
-            println!(
-                "  {dtype:?}: peggiore assoluto {worst_abs:.5}, peggiore relativo {worst_rel:.5}"
-            );
-        }
-    }
-
     /// Contract: the prefill attention kernel agrees with the naive reference on
     /// shapes and magnitudes it was not written against.
     ///
@@ -3636,7 +3543,6 @@ mod fused_kernel_parity_tests {
     /// all tiny and deliberately well conditioned, with a comment in this file
     /// saying so, and that is exactly why they could not answer whether
     /// attention was at fault when long prompts started returning nonsense.
-    /// Regenerate the bounds with `fa_parity_tolerance_calibration`.
     #[test]
     fn fuzz_flash_attention_matches_the_reference() {
         const F32_ABS: f32 = 1e-3;
@@ -3663,19 +3569,10 @@ mod fused_kernel_parity_tests {
             let d = [64usize, 128, 256, 512][next(0, 3)];
             let h_kv = [1usize, 2, 4][next(0, 2)];
             let h = h_kv * [1usize, 2, 4][next(0, 2)];
-            // One token exercises the decode path, which now comes here for
-            // head widths the fused SDPA does not cover.
             let t_q = if seed % 5 == 0 { 1 } else { next(1, 384) };
             let prefix = next(0, 256);
             let scale = 1.0 / (d as f32).sqrt();
             let mag = [0.05f32, 0.5, 3.0][next(0, 2)];
-            // Half the cases carry a sliding window, which is what most of
-            // Gemma 4's layers have. Drawn independently of the dtype: keying it
-            // on the same seed parity left every windowed case in BF16, so the
-            // tight F32 bound, the one that catches a wrong mask rather than
-            // wrong rounding, never saw a window at all. Narrow windows are
-            // drawn as often as wide ones because a window shorter than one KV
-            // tile is where a mask bound is easiest to get wrong.
             let window = match next(0, 3) {
                 0 | 1 => 0,
                 2 => next(1, 31),
@@ -3771,8 +3668,6 @@ mod fused_kernel_parity_tests {
             let mut worst = 0f32;
             for d in [32usize, 64, 96, 128, 256, 512] {
                 for (h, h_kv) in [(16usize, 1usize), (8, 8), (4, 2)] {
-                    // Either side of the threshold where the kernel splits the
-                    // keys into two passes.
                     for kv in [64usize, 1024, 1700] {
                         assert!(sdpa_available(
                             &Tensor::zeros((1, h, 1, d), dtype, &dev).unwrap(),
@@ -4191,107 +4086,6 @@ mod fused_kernel_parity_tests {
         assert!(format!("{err}").contains("Metal"));
     }
 
-    /// Times the prefill kernel against the naive path at Gemma 4's two head
-    /// widths, for a prompt-shaped call and a decode-shaped one. Ignored by
-    /// default; this is what decides whether offering the kernel for a width is
-    /// worth anything.
-    #[test]
-    #[ignore]
-    fn fa_vs_naive_bench() {
-        let Some(dev) = metal_device_or_skip() else {
-            return;
-        };
-        let time = |label: &str, f: &dyn Fn() -> Tensor| {
-            let warm = f();
-            let _ = warm
-                .to_dtype(DType::F32)
-                .unwrap()
-                .flatten_all()
-                .unwrap()
-                .to_vec1::<f32>()
-                .unwrap();
-            let t0 = std::time::Instant::now();
-            let mut last = None;
-            for _ in 0..4 {
-                last = Some(f());
-            }
-            let _ = last
-                .unwrap()
-                .to_dtype(DType::F32)
-                .unwrap()
-                .flatten_all()
-                .unwrap()
-                .to_vec1::<f32>()
-                .unwrap();
-            println!(
-                "    {label:34} {:8.2} ms",
-                t0.elapsed().as_secs_f64() * 1e3 / 4.0
-            );
-        };
-        for (d, h, h_kv) in [(256usize, 16usize, 8usize), (512, 16, 1)] {
-            for (t_q, t_kv, window, what) in [
-                (512usize, 512usize, 0usize, "prefill"),
-                (2048, 2048, 0, "prefill"),
-                // What five of every six of Gemma 4's layers ask for.
-                (2048, 2048, 1024, "prefill con finestra"),
-                (1, 256, 0, "decode"),
-                (1, 1024, 0, "decode"),
-                (1, 1700, 0, "decode"),
-            ] {
-                println!("  d={d} h={h} h_kv={h_kv} {what} t_q={t_q} t_kv={t_kv} window={window}");
-                let mk = |n: usize, salt: usize| -> Vec<f32> {
-                    (0..n)
-                        .map(|i| (((i + salt) % 17) as f32 - 8.0) * 0.4)
-                        .collect()
-                };
-                let q = Tensor::from_vec(mk(h * t_q * d, 1), (1, h, t_q, d), &dev)
-                    .unwrap()
-                    .to_dtype(DType::BF16)
-                    .unwrap();
-                let k = Tensor::from_vec(mk(h_kv * t_kv * d, 7), (1, h_kv, t_kv, d), &dev)
-                    .unwrap()
-                    .to_dtype(DType::BF16)
-                    .unwrap();
-                let v = Tensor::from_vec(mk(h_kv * t_kv * d, 13), (1, h_kv, t_kv, d), &dev)
-                    .unwrap()
-                    .to_dtype(DType::BF16)
-                    .unwrap();
-                let scale = 1.0f32;
-                let prefix = t_kv - t_q;
-                time("flash attention", &|| {
-                    flash_attention_metal_prefill(&q, &k, &v, scale, None, prefix, window).unwrap()
-                });
-                time("naive", &|| {
-                    naive_attention_reference(&q, &k, &v, scale, None, prefix, window).unwrap()
-                });
-                if t_q == 1 && sdpa_available(&q, d) {
-                    time("sdpa fusa (candle)", &|| {
-                        sdpa(&q, &k, &v, None, false, scale, 1.0).unwrap()
-                    });
-                }
-            }
-        }
-    }
-
-    /// Prints the tiling this GPU allows per head width. Ignored by default;
-    /// useful when a new head width turns up.
-    #[test]
-    #[ignore]
-    fn show_tile_choice() {
-        println!(
-            "  limite threadgroup: {} KB",
-            device_threadgroup_limit() / 1024
-        );
-        for d in [64usize, 128, 256, 512] {
-            let t = fa_tile_sizes(d, 2);
-            let bytes = t.map(|(br, bc)| fa_threadgroup_bytes(br, bc, d, 2, true));
-            println!(
-                "  d={d:4} -> {t:?}  scratch {:?} KB",
-                bytes.map(|b| b / 1024)
-            );
-        }
-    }
-
     /// Contract: the kernel is offered for any head width it can actually run,
     /// which is any multiple of four whose tiling fits this GPU's threadgroup
     /// memory.
@@ -4311,12 +4105,8 @@ mod fused_kernel_parity_tests {
                 "head width {d} should be available"
             );
         }
-        // Not a multiple of four: the kernel reads four values at a time.
         assert!(!flash_attention_metal_available(66, DType::BF16, 0));
         assert!(!flash_attention_metal_available(0, DType::BF16, 0));
-        // A sliding window does not change what the kernel can run: it masks one
-        // itself, and refusing windowed layers is what left five of every six of
-        // Gemma 4's on the generic path.
         for window in [1usize, 31, 1024] {
             assert!(
                 flash_attention_metal_available(128, DType::BF16, window),
@@ -5147,109 +4937,6 @@ mod fused_kernel_parity_tests {
                         "[{out_f}x{in_f} m={m}] run {run} elem {i}: {a} != {b}"
                     );
                 }
-            }
-        }
-    }
-
-    /// Micro-benchmark for the quantized GEMV kernels on the layer shapes of
-    /// the locally tested models (Qwen3-4B-AWQ, Qwen3-0.6B-GPTQ-Int8).
-    /// Ignored by default; run explicitly when touching these kernels:
-    /// `cargo test quant_gemv_bench -- --ignored --nocapture`.
-    #[test]
-    #[ignore]
-    fn quant_gemv_bench() {
-        let Some(dev) = metal_device_or_skip() else {
-            return;
-        };
-        // 64 back-to-back launches per sample with a single readback (so the
-        // per-call sync overhead does not mask kernel-time differences), and
-        // det/atomic samples interleaved so slow thermal/scheduler drift
-        // cancels in the per-pair ratio.
-        const LAUNCHES: usize = 64;
-        use std::sync::atomic::Ordering;
-        let sample_us = |f: &dyn Fn() -> Tensor| -> f64 {
-            let t0 = std::time::Instant::now();
-            let mut last = None;
-            for _ in 0..LAUNCHES {
-                last = Some(f());
-            }
-            let _ = last
-                .unwrap()
-                .to_dtype(DType::F32)
-                .unwrap()
-                .flatten_all()
-                .unwrap()
-                .to_vec1::<f32>()
-                .unwrap();
-            t0.elapsed().as_secs_f64() * 1e6 / LAUNCHES as f64
-        };
-        let med = |v: &mut Vec<f64>| -> f64 {
-            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
-            v[v.len() / 2]
-        };
-        let paired = |f: &dyn Fn() -> Tensor| -> (f64, f64, f64) {
-            QUANT_GEMV_ATOMIC.store(false, Ordering::Relaxed);
-            let _ = sample_us(f);
-            QUANT_GEMV_ATOMIC.store(true, Ordering::Relaxed);
-            let _ = sample_us(f);
-            let mut det = Vec::new();
-            let mut atomic = Vec::new();
-            let mut ratios = Vec::new();
-            for _ in 0..12 {
-                QUANT_GEMV_ATOMIC.store(false, Ordering::Relaxed);
-                let d = sample_us(f);
-                QUANT_GEMV_ATOMIC.store(true, Ordering::Relaxed);
-                let a = sample_us(f);
-                det.push(d);
-                atomic.push(a);
-                ratios.push(d / a);
-            }
-            QUANT_GEMV_ATOMIC.store(false, Ordering::Relaxed);
-            (med(&mut det), med(&mut atomic), med(&mut ratios))
-        };
-
-        // Qwen3-4B-AWQ layer shapes (hidden 2560, q 4096, ffn 9728).
-        for (out, k) in [
-            (4096usize, 2560usize),
-            (2560, 4096),
-            (9728, 2560),
-            (2560, 9728),
-        ] {
-            let raw = build_awq_triplet(&dev, DType::BF16, k, out, 128);
-            for m in [1usize, 4] {
-                let x = batch_x(&dev, DType::BF16, m, k);
-                let (det, atomic, ratio) = paired(&|| {
-                    w4a16_matmul(&x, &raw.qweight, raw.qzeros.as_ref().unwrap(), &raw.scales)
-                        .unwrap()
-                });
-                println!(
-                    "awq4  out={out:<5} k={k:<5} m={m}: det {det:7.1} us | atomic {atomic:7.1} us | paired ratio {ratio:.2}"
-                );
-            }
-        }
-        // Qwen3-0.6B-GPTQ-Int8 layer shapes (hidden 1024, q 2048, ffn 3072).
-        for (out, k) in [
-            (2048usize, 1024usize),
-            (1024, 2048),
-            (3072, 1024),
-            (1024, 3072),
-        ] {
-            let raw = build_gptq_triplet(&dev, DType::BF16, 8, k, out, 128);
-            for m in [1usize, 4] {
-                let x = batch_x(&dev, DType::BF16, m, k);
-                let (det, atomic, ratio) = paired(&|| {
-                    gptq_matmul(
-                        &x,
-                        &raw.qweight,
-                        raw.qzeros.as_ref().unwrap(),
-                        &raw.scales,
-                        8,
-                    )
-                    .unwrap()
-                });
-                println!(
-                    "gptq8 out={out:<5} k={k:<5} m={m}: det {det:7.1} us | atomic {atomic:7.1} us | paired ratio {ratio:.2}"
-                );
             }
         }
     }
@@ -6618,150 +6305,9 @@ pub fn sdpa_vector_sink(
 }
 
 #[cfg(all(test, feature = "metal"))]
-mod memory_budget_probe {
-    use candle_core::Device;
-    use objc2_metal::MTLDevice;
-
-    #[test]
-    #[ignore]
-    fn what_the_driver_reports() {
-        let Ok(dev) = Device::new_metal(0) else {
-            return;
-        };
-        let Device::Metal(md) = &dev else { return };
-        let d = md.device().as_ref();
-        let gb = |b: u64| b as f64 / 1_073_741_824.0;
-        println!("  hasUnifiedMemory            = {}", d.hasUnifiedMemory());
-        println!(
-            "  recommendedMaxWorkingSetSize= {:.2} GB",
-            gb(d.recommendedMaxWorkingSetSize())
-        );
-        println!(
-            "  currentAllocatedSize        = {:.2} GB",
-            gb(d.currentAllocatedSize() as u64)
-        );
-        println!(
-            "  nostro soffitto con 1 GB di pesi   = {:.2} GB",
-            gb(crate::common::paged::safe_model_kv_ceiling(1 << 30) as u64)
-        );
-        println!(
-            "  nostro soffitto con 13 GB di pesi  = {:.2} GB",
-            gb(crate::common::paged::safe_model_kv_ceiling(13 << 30) as u64)
-        );
-    }
-}
-
-#[cfg(all(test, feature = "metal"))]
 mod quantized_matmul_floor {
     use candle_core::quantized::{GgmlDType, QMatMul, QTensor};
     use candle_core::{Device, Module, Tensor};
-
-    /// Contract: the quantized matmul this crate leans on stays fast enough to
-    /// be worth leaning on.
-    ///
-    /// This crate carried its own block-quant kernels until they were measured
-    /// against candle's and found eight times slower at prefill shapes, having
-    /// been written when the comparison went the other way and never rechecked.
-    /// The floor is a quarter of what candle measured when those kernels were
-    /// removed (3.1 TFLOPS at this shape): low enough to survive a busy machine
-    /// or a slower GPU, high enough that a regression of that size fails here
-    /// instead of quietly costing every user four times the prompt latency.
-    /// Prices the ways this crate could multiply a prefill batch by a quantized
-    /// weight, at the shape Gemma 4's feed-forward actually uses. Ignored by
-    /// default.
-    ///
-    /// Measured on an M5: candle's quantized matmul 3.4 TFLOPS, the TensorOps
-    /// GEMM on an already-dense weight 7.3, which is the regime llama.cpp
-    /// reaches on this checkpoint and the reason its prefill is three times
-    /// ours. Dequantising through the gather kernel to get there does not pay:
-    /// the dequantisation is 9 ms and the transpose the GEMM needs is another
-    /// 16, so the route lands at 44 ms against candle's 35. Closing that gap
-    /// needs a quantized matmul that keeps the weight quantized and uses
-    /// simdgroup matrices, which is a kernel this crate once had and removed
-    /// for being eight times slower than candle's.
-    #[test]
-    #[ignore]
-    fn prezzo_delle_matmul_di_prefill() {
-        use candle_core::DType;
-        let Ok(dev) = Device::new_metal(0) else {
-            return;
-        };
-        // gate/up of a 12B: [15360, 3840] against a chunk of 1024 tokens.
-        let (n, k, m) = (15360usize, 3840usize, 1024usize);
-        let w: Vec<f32> = (0..n * k)
-            .map(|i| ((i % 23) as f32 - 11.0) * 0.04)
-            .collect();
-        let w32 = Tensor::from_vec(w, (n, k), &dev).unwrap();
-        let qt = std::sync::Arc::new(QTensor::quantize(&w32, GgmlDType::Q4K).unwrap());
-        let mm = QMatMul::from_arc(qt).unwrap();
-        let w_bf = w32.to_dtype(DType::BF16).unwrap();
-        let w_bf_t = w_bf.t().unwrap().contiguous().unwrap();
-
-        let x32: Vec<f32> = (0..m * k).map(|i| ((i % 13) as f32 - 6.0) * 0.03).collect();
-        let x32 = Tensor::from_vec(x32, (m, k), &dev).unwrap();
-        let x_bf = x32.to_dtype(DType::BF16).unwrap();
-
-        let flops = 2.0 * m as f64 * n as f64 * k as f64;
-        let cronometra = |nome: &str, f: &dyn Fn() -> Tensor| {
-            let _ = f()
-                .to_dtype(DType::F32)
-                .unwrap()
-                .flatten_all()
-                .unwrap()
-                .to_vec1::<f32>();
-            let reps = 5;
-            let t0 = std::time::Instant::now();
-            let mut last = None;
-            for _ in 0..reps {
-                last = Some(f());
-            }
-            let _ = last
-                .unwrap()
-                .to_dtype(DType::F32)
-                .unwrap()
-                .flatten_all()
-                .unwrap()
-                .to_vec1::<f32>();
-            let secs = t0.elapsed().as_secs_f64() / reps as f64;
-            println!(
-                "    {nome:34} {:8.2} ms  {:6.0} GFLOPS",
-                secs * 1e3,
-                flops / secs / 1e9
-            );
-        };
-
-        cronometra("candle QMatMul (Q4_K)", &|| mm.forward(&x32).unwrap());
-        cronometra("candle matmul BF16", &|| x_bf.matmul(&w_bf_t).unwrap());
-        // Dequantizing through the gather kernel, then MPP: the two together are
-        // what a prefill matmul would actually cost if it took this route.
-        let righe = Tensor::arange(0u32, n as u32, &dev).unwrap();
-        let qt2 = std::sync::Arc::new(QTensor::quantize(&w32, GgmlDType::Q4K).unwrap());
-        cronometra("gather-dequant + MPP", &|| {
-            let w = qt2
-                .embedding(&righe)
-                .unwrap()
-                .to_dtype(DType::BF16)
-                .unwrap()
-                .t()
-                .unwrap()
-                .contiguous()
-                .unwrap();
-            crate::common::metal_ops::maybe_mpp_matmul(&x_bf, &w)
-                .unwrap()
-                .expect("MPP")
-        });
-        cronometra("solo gather-dequant", &|| {
-            qt2.embedding(&righe)
-                .unwrap()
-                .to_dtype(DType::BF16)
-                .unwrap()
-        });
-        cronometra("MPP GEMM BF16", &|| {
-            crate::common::metal_ops::maybe_mpp_matmul(&x_bf, &w_bf_t)
-                .unwrap()
-                .expect("MPP should take this shape")
-        });
-    }
 
     #[test]
     fn candle_quantized_matmul_stays_fast() {

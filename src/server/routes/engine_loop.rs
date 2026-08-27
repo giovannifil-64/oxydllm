@@ -600,17 +600,12 @@ pub fn engine_loop(
     let mut consecutive_errors: u32 = 0;
     const MAX_CONSECUTIVE_ERRORS: u32 = 3;
 
-    // Reasoning is fenced by a pair of markers whose spelling is the model's
-    // own. Gemma 4 opens its thought channel in the prompt and closes it with
-    // `<channel|>`, which is the same shape as the `<think>` pair and takes the
-    // same path.
     let think_start_id = tokenizer
         .special_token_id("<think>")
         .or_else(|| tokenizer.special_token_id("<|channel>"));
     let think_end_id = tokenizer
         .special_token_id("</think>")
         .or_else(|| tokenizer.special_token_id("<channel|>"));
-    // Gemma 4 names its channel; `<think>` models do not.
     let named_thought_channel = tokenizer.special_token_id("<|channel>").is_some();
     let harmony_ids = match (
         tokenizer.special_token_id("<|channel|>"),

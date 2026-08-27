@@ -257,6 +257,11 @@ pub fn safe_total_commitment_bytes() -> usize {
 /// transient buffers, and with those gone the loader's own check, that the
 /// weights survived the allocation, is what makes an over-generous answer cost
 /// a retry rather than corrupt an output.
+///
+/// The weights come off the device's budget, which does not know about them
+/// yet, and not off the free-memory reading, which already does: by the time a
+/// pool is sized the weights are being read, so subtracting them from both
+/// counts them twice and leaves nothing for a model of any size.
 pub fn safe_model_kv_ceiling(weights_bytes: usize) -> usize {
     if let Some(budget) = device_working_set_bytes() {
         // The weights come off the device's budget, which does not know about
@@ -906,6 +911,26 @@ impl PagedKvCache {
             .release_contig_buffer(k, v, cap);
     }
 
+    /// Appends `new_k`/`new_v` to this layer's cache and returns the keys and
+    /// values the next forward should read.
+    ///
+    /// Two structures are kept. The block pool holds whole blocks for the prefix
+    /// cache to share; decode skips writing to it, since only full blocks filled
+    /// during prefill are ever reused. The contiguous per-sequence buffer is
+    /// what the attention kernels read, and what this returns a view of.
+    ///
+    /// For a layer with a sliding window that buffer holds the window rather
+    /// than the sequence, which is what bounds the memory a long context costs.
+    /// It holds `window + new_seq - 1` tokens plus a margin, not `window`: a
+    /// forward over `new_seq` queries reaches back that far, because its oldest
+    /// query still sees a whole window, and the margin is what leaves the window
+    /// whole after a speculative verify rolls a few tokens back. Tokens leave
+    /// only when the live region reaches the end of the buffer, and folding it
+    /// back to the front then costs one copy every few hundred tokens instead of
+    /// one per token.
+    ///
+    /// ## Errors
+    /// Fails when the pool has no free block, or on a tensor operation.
     pub fn append(&mut self, new_k: &Tensor, new_v: &Tensor) -> Result<(Tensor, Tensor)> {
         let (_, _, new_seq, _) = new_k.dims4()?;
         let new_k = &new_k.contiguous()?;
@@ -919,8 +944,6 @@ impl PagedKvCache {
         let skip_pool_write = self.contig_len > 0 && new_seq == 1;
 
         let prev_tokens = self.table.num_tokens;
-        // The buffer holds a suffix of the sequence: never more than the whole
-        // of it, and never less than the window the layer reads.
         debug_assert!(
             self.contig_len <= prev_tokens
                 && (self.contig_len == 0
@@ -982,13 +1005,6 @@ impl PagedKvCache {
             });
         }
 
-        // A layer that attends over a sliding window can never read further back
-        // than that window, so the buffer holds the window rather than the whole
-        // sequence: bounded memory whatever the context, and the reads are views
-        // into it that the kernels take as they are.
-        // With no buffer yet the tokens live in the pool, and how many of them
-        // still matter is a question about the sequence, not about a buffer that
-        // does not exist: this is the path a prefix-cache hit takes.
         let span = |w: usize| w + new_seq - 1 + WINDOW_KEEP_MARGIN;
         let live_prev = if self.contig_k.is_some() {
             self.contig_len
@@ -996,9 +1012,6 @@ impl PagedKvCache {
             self.window
                 .map_or(prev_tokens, |w| prev_tokens.min(span(w)))
         };
-        // A forward over `new_seq` queries reads back `window + new_seq - 1`
-        // keys: the oldest query in the batch still sees a whole window. Keeping
-        // less would quietly shorten what a prefill chunk attends to.
         let keep = self
             .window
             .map_or(live_prev + new_seq, |w| (live_prev + new_seq).min(span(w)));
@@ -1007,14 +1020,10 @@ impl PagedKvCache {
         let new_src_k = new_k.narrow(2, new_seq - from_new, from_new)?;
         let new_src_v = new_v.narrow(2, new_seq - from_new, from_new)?;
 
-        // Region outside the live window is never observed (all reads narrow to
-        // it), so reusing dirty pooled memory is safe.
         match (self.contig_k.take(), self.contig_v.take()) {
             (Some(k_buf), Some(v_buf)) => {
                 let cap = k_buf.dim(2)?;
                 if self.contig_start + self.contig_len + new_seq <= cap {
-                    // Room where it already sits: nothing is dropped and nothing
-                    // moves, which is the whole point of carrying a start.
                     let at = self.contig_start + self.contig_len;
                     k_buf.slice_set(new_k, 2, at)?;
                     v_buf.slice_set(new_v, 2, at)?;
@@ -1025,10 +1034,6 @@ impl PagedKvCache {
                 }
                 {
                     let start = self.contig_start + (self.contig_len - from_old);
-                    // The window has walked to the end of the buffer: fold what
-                    // it still covers back to the front. With the slack this
-                    // capacity carries, that happens once every few hundred
-                    // tokens rather than once per token.
                     let (dst_k, dst_v, dst_cap, retired) = if keep <= cap {
                         (k_buf.clone(), v_buf.clone(), cap, None)
                     } else {
@@ -1080,10 +1085,15 @@ impl PagedKvCache {
         self.current()
     }
 
+    /// The keys and values this layer currently holds, as a view.
+    ///
+    /// Everything the buffer still has: for a windowed layer that is the window
+    /// plus whatever a rollback or a wider forward may still need, and the
+    /// caller trims to the exact span its forward reads.
+    ///
+    /// ## Errors
+    /// Fails when the cache is empty.
     pub fn current(&self) -> Result<(Tensor, Tensor)> {
-        // Everything the buffer still holds: for a windowed layer that is the
-        // window plus what a rollback or a wider forward may still need. The
-        // caller trims to the exact span the forward reads.
         let (start, len) = (self.contig_start, self.contig_len);
         match (&self.contig_k, &self.contig_v) {
             (Some(k), Some(v)) if len > 0 => {
@@ -1256,10 +1266,12 @@ impl PagedKvCache {
         }
     }
 
+    /// Drops the sequence back to `n` tokens.
+    ///
+    /// What the buffer holds is a suffix of the sequence, so dropping the tail
+    /// drops exactly as many of its tokens. Without a window that suffix is the
+    /// whole sequence and this leaves `n`, as it always did.
     pub fn set_num_tokens(&mut self, n: usize) {
-        // What the buffer holds is a suffix of the sequence, so dropping the
-        // tail drops exactly as many of its tokens. Without a window the suffix
-        // is the whole sequence and this leaves `n`, as it always did.
         let removed = self.table.num_tokens.saturating_sub(n);
         self.table.cached_slots.truncate(n);
         self.table.num_tokens = n;
@@ -1402,8 +1414,6 @@ mod tests {
             ));
             let mut cache = PagedKvCache::new(alloc);
             let dev = Device::Cpu;
-            // Every token is its own number, so a window off by one token, or
-            // holding a stale one, cannot pass.
             let mut appended: Vec<f32> = Vec::new();
 
             let mut next_token = 0f32;
@@ -1419,7 +1429,6 @@ mod tests {
                 let vals: Vec<f32> = (0..n)
                     .flat_map(|i| vec![next_token + i as f32; HEADS * DIM])
                     .collect();
-                // [1, HEADS, n, DIM] with the head axis outermost after batch.
                 let mut laid = vec![0f32; HEADS * n * DIM];
                 for t in 0..n {
                     for h in 0..HEADS {
@@ -1436,8 +1445,6 @@ mod tests {
                 }
                 next_token += n as f32;
 
-                // What the layer will read: a forward over n queries reaches
-                // back window + n - 1 keys. The cache may hold more, never less.
                 let dovuti = (W + n - 1).min(appended.len());
                 for (nome, t) in [("K", &kk), ("V", &vv)] {
                     let shown = t.dim(2).unwrap();
@@ -1466,11 +1473,8 @@ mod tests {
                         }
                     }
                 }
-                // What the cache hands out on demand must be what it just returned.
                 let (ck, _) = cache.current().unwrap();
                 assert_eq!(ck.dim(2).unwrap(), kk.dim(2).unwrap());
-                // Bounded memory is the point: the buffer must not keep growing
-                // with the sequence once the window is full.
                 assert!(
                     kk.dim(2).unwrap() <= contig_buf_capacity(W + n_max - 1 + WINDOW_KEEP_MARGIN),
                     "seed {seed}: the cache kept {} tokens after {} in the sequence, which is not \
@@ -1480,8 +1484,6 @@ mod tests {
                 );
             }
 
-            // A speculative verify rejects a few tokens: the window must stay
-            // whole, which is why the buffer keeps a margin beyond it.
             let before = cache.num_tokens();
             cache.truncate_to(before - 3).unwrap();
             appended.truncate(before - 3);

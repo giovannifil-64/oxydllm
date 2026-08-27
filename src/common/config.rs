@@ -182,6 +182,10 @@ pub struct StandardTransformerConfig {
 
     pub per_layer_num_key_value_heads: Option<Vec<usize>>,
     pub per_layer_head_dims: Option<Vec<usize>>,
+    /// How many of each layer's head dimensions carry a rotation, when the
+    /// checkpoint states a partial rotary factor per attention type. Gemma 4
+    /// rotates a quarter of its full-attention heads and all of its sliding
+    /// ones; the rest of those heads carry no position at all.
     pub per_layer_rotary_dims: Option<Vec<usize>>,
     pub per_layer_sliding_windows: Option<Vec<Option<usize>>>,
     pub per_layer_rope_thetas: Option<Vec<f64>>,

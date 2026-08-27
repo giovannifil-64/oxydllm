@@ -235,12 +235,6 @@ pub fn parse(config_path: &str) -> Result<StandardTransformerConfig> {
         .filter(|&f| f > 0.0 && f < 1.0)
         .map(|f| (head_dim as f64 * f) as usize);
 
-    // Gemma 4 states a partial rotary factor per attention type, and gives its
-    // full-attention layers a quarter: those heads rotate 128 of their 512
-    // dimensions and leave the rest without a position. The GGUF of the same
-    // model says it with a tensor of frequency divisors; this is the same thing
-    // said in the config, and leaving it out is invisible over a few hundred
-    // tokens and ruinous over a few thousand.
     let fattore_per_tipo = |tipo: &str| -> Option<f64> {
         rope_parameters
             .get(tipo)

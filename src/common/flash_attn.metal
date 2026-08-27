@@ -120,8 +120,6 @@ inline void flash_attention_prefill_impl(
         (last_q_global + p.bc) / p.bc
     );
 
-    // A sliding window also bounds the loop from below: keys older than the
-    // oldest query row's window can be skipped outright rather than masked.
     const uint n_block_min = (p.window != 0u && first_q_global + 1u > p.window)
         ? (first_q_global + 1u - p.window) / p.bc
         : 0u;
@@ -170,8 +168,6 @@ inline void flash_attention_prefill_impl(
                 if (need_mask) {
                     uint q_pos  = p.prefix_len + q_start + i;
                     uint kv_pos = kv_start + j;
-                    // Causal, and inside the window when there is one: a token
-                    // sees itself and the `window - 1` tokens before it.
                     if (kv_pos > q_pos || (p.window != 0u && q_pos >= kv_pos + p.window)) {
                         dot = -INFINITY;
                     }
@@ -349,8 +345,6 @@ inline void flash_attention_prefill_mma_impl(
     const uint total_s_tiles = s_tiles_m * s_tiles_n;
     const uint total_o_tiles = o_tiles_m * o_tiles_n;
 
-    // A sliding window also bounds the loop from below: keys older than the
-    // oldest query row's window can be skipped outright rather than masked.
     const uint n_block_min = (p.window != 0u && first_q_global + 1u > p.window)
         ? (first_q_global + 1u - p.window) / p.bc
         : 0u;
@@ -410,8 +404,6 @@ inline void flash_attention_prefill_mma_impl(
                 if (need_mask) {
                     uint q_pos  = p.prefix_len + q_start + i;
                     uint kv_pos = kv_start + j;
-                    // Causal, and inside the window when there is one: a token
-                    // sees itself and the `window - 1` tokens before it.
                     if (kv_pos > q_pos || (p.window != 0u && q_pos >= kv_pos + p.window)) {
                         val = -INFINITY;
                     }

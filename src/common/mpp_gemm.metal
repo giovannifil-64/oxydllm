@@ -342,8 +342,6 @@ inline void mpp_fa_impl(
     }
 
     int kv_max = min(p.t_kv, p.prefix_len + q0 + br);
-    // A window bounds the loop from below too: keys older than what the oldest
-    // query row of this tile can see are skipped rather than masked.
     int kv_min = 0;
     if (p.window > 0) {
         int oldest = p.prefix_len + q0 - p.window + 1;
@@ -412,9 +410,6 @@ inline void mpp_fa_impl(
                 auto idx = sT.get_multidimensional_index(i);
                 int n = int(idx[0]);
                 int m = int(idx[1]);
-                // Wholly masked row: exp(-inf - -inf) is NaN, and a window can
-                // mask an entire block for a row whose window starts later than
-                // the tile's oldest row.
                 float pv = (sT[i] == -INFINITY) ? 0.0f : exp(sT[i] - tg_m[m]);
                 sT[i] = pv;
                 tg_p[m * FA_BC + n] = bfloat(pv);

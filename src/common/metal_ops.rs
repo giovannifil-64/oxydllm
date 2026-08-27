@@ -6666,9 +6666,19 @@ mod quantized_matmul_floor {
     /// removed (3.1 TFLOPS at this shape): low enough to survive a busy machine
     /// or a slower GPU, high enough that a regression of that size fails here
     /// instead of quietly costing every user four times the prompt latency.
-    /// Prices the three ways this crate could multiply a prefill batch by a
-    /// quantized weight, at the shape Gemma 4's feed-forward actually uses.
-    /// Ignored by default.
+    /// Prices the ways this crate could multiply a prefill batch by a quantized
+    /// weight, at the shape Gemma 4's feed-forward actually uses. Ignored by
+    /// default.
+    ///
+    /// Measured on an M5: candle's quantized matmul 3.4 TFLOPS, the TensorOps
+    /// GEMM on an already-dense weight 7.3, which is the regime llama.cpp
+    /// reaches on this checkpoint and the reason its prefill is three times
+    /// ours. Dequantising through the gather kernel to get there does not pay:
+    /// the dequantisation is 9 ms and the transpose the GEMM needs is another
+    /// 16, so the route lands at 44 ms against candle's 35. Closing that gap
+    /// needs a quantized matmul that keeps the weight quantized and uses
+    /// simdgroup matrices, which is a kernel this crate once had and removed
+    /// for being eight times slower than candle's.
     #[test]
     #[ignore]
     fn prezzo_delle_matmul_di_prefill() {
@@ -6722,6 +6732,30 @@ mod quantized_matmul_floor {
 
         cronometra("candle QMatMul (Q4_K)", &|| mm.forward(&x32).unwrap());
         cronometra("candle matmul BF16", &|| x_bf.matmul(&w_bf_t).unwrap());
+        // Dequantizing through the gather kernel, then MPP: the two together are
+        // what a prefill matmul would actually cost if it took this route.
+        let righe = Tensor::arange(0u32, n as u32, &dev).unwrap();
+        let qt2 = std::sync::Arc::new(QTensor::quantize(&w32, GgmlDType::Q4K).unwrap());
+        cronometra("gather-dequant + MPP", &|| {
+            let w = qt2
+                .embedding(&righe)
+                .unwrap()
+                .to_dtype(DType::BF16)
+                .unwrap()
+                .t()
+                .unwrap()
+                .contiguous()
+                .unwrap();
+            crate::common::metal_ops::maybe_mpp_matmul(&x_bf, &w)
+                .unwrap()
+                .expect("MPP")
+        });
+        cronometra("solo gather-dequant", &|| {
+            qt2.embedding(&righe)
+                .unwrap()
+                .to_dtype(DType::BF16)
+                .unwrap()
+        });
         cronometra("MPP GEMM BF16", &|| {
             crate::common::metal_ops::maybe_mpp_matmul(&x_bf, &w_bf_t)
                 .unwrap()

@@ -183,37 +183,50 @@ fn has_matching_stop_sequence(tokens: &[u32], stop_sequences: &[Vec<u32>]) -> bo
 /// after forty seconds of that, which a single multi-thousand-token prefill
 /// reaches on a laptop GPU. A quarter of a second keeps the desktop responsive
 /// with room to spare while still being long enough to amortize a dispatch.
-const CHUNK_TARGET: Duration = Duration::from_millis(250);
+/// A chunk this slow is submitting too much work at once whatever it buys in
+/// throughput: the cap stops growing there.
+const CHUNK_CEILING: Duration = Duration::from_secs(3);
 
-/// Tokens per forward, followed by measurement rather than assumed.
+/// Tokens a chunk will never exceed, so one forward's activations stay bounded
+/// however fast the machine is.
 ///
-/// The right chunk depends on the GPU, the model and the quantization, none of
-/// which a constant can capture, so the pacer starts small and lets the machine
-/// answer: a chunk comfortably faster than [`CHUNK_TARGET`] doubles the cap, one
-/// that runs over halves it.
+/// Measured on a 12B checkpoint at 1658 tokens of prompt: 512 tokens a chunk
+/// gives 15.5 s to first token and 1024 gives 15.1, so the climb is over well
+/// before here, and the layers that materialise their attention scores make a
+/// larger chunk a memory risk rather than a gain.
+const CHUNK_MAX: usize = 1024;
+
+/// Tokens per forward, climbed toward the throughput the machine actually
+/// delivers.
 ///
-/// Halving stops on its own rather than at a floor. A chunk whose cost falls
-/// roughly in step with its size is still paying for the model; one that barely
-/// gets cheaper when halved is paying for the dispatch instead, and shrinking it
-/// further buys latency nothing while costing throughput. The pacer notices that
-/// from the pair of measurements it already has and holds the cap where the last
-/// halving still repaid itself.
+/// Splitting a prompt into chunks does not let anything else run: the whole
+/// batch belongs to one step either way. What the split buys is bounded
+/// activations and a bounded GPU submission, and what it costs is throughput,
+/// since a small chunk pays the same per-layer overhead for less work. Chasing a
+/// fixed per-chunk latency therefore optimises nothing a caller can see: on a
+/// 12B checkpoint that target walked the cap down to forty tokens and spent
+/// forty percent of the time to first token on the walk.
+///
+/// So the cap climbs while the measured tokens per second improve, and holds at
+/// the best size it has seen once doubling stops paying. It also stops growing
+/// at [`CHUNK_CEILING`] and never passes [`CHUNK_MAX`], and it halves whenever a
+/// chunk fails outright, which is what a chunk too large for the device to back
+/// looks like.
 pub struct PrefillPacer {
     cap: usize,
-    floor: usize,
-    last: Option<(usize, Duration)>,
+    best: Option<(usize, f64)>,
+    settled: bool,
 }
 
 impl Default for PrefillPacer {
-    /// Starts at 512 tokens, which is where the search begins and not where it
-    /// ends: the first two or three chunks move the cap to wherever this
-    /// machine belongs, and starting high converges downward faster than
-    /// starting at one token would converge up.
+    /// Starts at 512 tokens and climbs: a couple of doublings reach the size
+    /// this machine likes, and starting there rather than at one token means
+    /// even a short prompt runs in one or two chunks.
     fn default() -> Self {
         Self {
             cap: 512,
-            floor: 1,
-            last: None,
+            best: None,
+            settled: false,
         }
     }
 }
@@ -223,30 +236,43 @@ impl PrefillPacer {
         self.cap
     }
 
-    /// Folds one chunk's measured cost into the cap.
+    /// Folds one chunk's measured throughput into the cap.
     ///
     /// Only full chunks are evidence: a short tail says nothing about what the
     /// cap should be.
     fn observe(&mut self, tokens: usize, elapsed: Duration) {
-        if tokens < self.cap {
+        if tokens < self.cap || self.settled {
             return;
         }
+        let rate = tokens as f64 / elapsed.as_secs_f64().max(1e-9);
 
-        if let Some((prev_tokens, prev_elapsed)) = self.last
-            && tokens * 2 <= prev_tokens
-            && elapsed.mul_f64(1.5) > prev_elapsed
-        {
-            // Half the work took nearly as long: the dispatch is the cost now,
-            // so this is as small as it is worth going.
-            self.floor = self.floor.max(tokens);
+        match self.best {
+            // Doubling stopped paying: keep the size that did.
+            Some((best_tokens, best_rate)) if rate <= best_rate * 1.05 => {
+                self.cap = best_tokens;
+                self.settled = true;
+            }
+            _ => {
+                self.best = Some((tokens, rate));
+                if elapsed >= CHUNK_CEILING || self.cap >= CHUNK_MAX {
+                    self.settled = true;
+                } else {
+                    self.cap = (self.cap * 2).min(CHUNK_MAX);
+                }
+            }
         }
-        self.last = Some((tokens, elapsed));
+    }
 
-        if elapsed > CHUNK_TARGET {
-            self.cap = (self.cap / 2).max(self.floor);
-        } else if elapsed * 2 < CHUNK_TARGET {
-            self.cap = self.cap.saturating_mul(2);
+    /// Halves the cap after a chunk the device could not back, and stops the
+    /// climb: whatever the throughput would have been, this size does not run.
+    fn shrink(&mut self) -> bool {
+        if self.cap <= 32 {
+            return false;
         }
+        self.cap /= 2;
+        self.best = None;
+        self.settled = true;
+        true
     }
 }
 
@@ -542,7 +568,24 @@ fn run_forward_pass(
             let caches = &mut cache_slices[chunk.seq_base..chunk.seq_base + chunk.counts.len()];
 
             let started = Instant::now();
-            let out = model.forward_batch_last(&input, &positions, caches, &chunk.counts)?;
+            // A chunk the device cannot back means the cap is too big for this
+            // model on this machine. The failed forward has already written part
+            // of its layers into the caches, so this request cannot simply try
+            // again: it fails, and the cap comes down so the next one does not.
+            let out = match model.forward_batch_last(&input, &positions, caches, &chunk.counts) {
+                Ok(out) => out,
+                Err(e) => {
+                    if pacer.shrink() {
+                        tracing::warn!(
+                            tokens = len,
+                            new_cap = pacer.cap(),
+                            error = %e,
+                            "prefill chunk failed; the cap comes down for the next request"
+                        );
+                    }
+                    return Err(e);
+                }
+            };
             let out = out.squeeze(0)?;
             for &row in &chunk.finished {
                 rows.push(out.narrow(0, row, 1)?);
@@ -1262,65 +1305,86 @@ mod tests {
 
     /// Contract: the cap follows the machine. A chunk that overran the target
     /// shrinks it, a full chunk well inside the target grows it, and a chunk
-    /// that was not full proves nothing either way.
-    #[test]
-    fn the_pacer_follows_what_the_machine_measures() {
-        let mut p = PrefillPacer::default();
-        let start = p.cap();
-
-        p.observe(start, Duration::from_millis(400));
-        assert_eq!(p.cap(), start / 2, "a slow chunk halves the cap");
-
-        let now = p.cap();
-        p.observe(now / 4, Duration::from_millis(10));
-        assert_eq!(p.cap(), now, "a chunk that was not full proves nothing");
-
-        p.observe(now, Duration::from_millis(10));
-        assert_eq!(p.cap(), now * 2, "a fast full chunk doubles it");
-    }
-
-    /// Contract: halving stops once it stops paying for itself.
+    /// Contract: the cap climbs while a bigger chunk delivers more tokens per
+    /// second, and holds at the size that delivered the most.
     ///
-    /// This replaces a fixed floor of 128 tokens, which was a guess about where
-    /// dispatch overhead takes over and therefore wrong on any machine but the
-    /// one it was guessed on. The evidence is already in hand: half the tokens
-    /// costing nearly the same time means the model is no longer what is being
-    /// paid for.
+    /// This replaces a cap that chased a fixed per-chunk latency. Splitting a
+    /// prompt does not let anything else run, so that target optimised nothing a
+    /// caller can see: on a 12B checkpoint it walked the cap down to forty
+    /// tokens and spent forty percent of the time to first token doing it.
     #[test]
-    fn the_pacer_stops_shrinking_when_shrinking_stops_helping() {
-        let mut p = PrefillPacer::default();
+    fn the_cap_climbs_while_a_bigger_chunk_pays() {
+        // Started below the ceiling so the climb itself is what is measured.
+        let mut p = PrefillPacer {
+            cap: 64,
+            best: None,
+            settled: false,
+        };
         let start = p.cap();
 
-        p.observe(start, Duration::from_millis(400));
-        assert_eq!(p.cap(), start / 2);
+        // Twice the tokens in the same time: twice the throughput.
+        p.observe(start, Duration::from_millis(100));
+        assert_eq!(p.cap(), start * 2, "a chunk that paid doubles the cap");
 
-        // Half the work, almost the same time: dispatch-bound.
-        p.observe(start / 2, Duration::from_millis(380));
-        assert_eq!(p.cap(), start / 2, "the cap holds where halving last paid");
+        p.observe(start * 2, Duration::from_millis(100));
+        assert_eq!(p.cap(), start * 4, "and again while it keeps paying");
+
+        // Twice the tokens for twice the time: the same throughput, so stop.
+        p.observe(start * 4, Duration::from_millis(400));
+        assert_eq!(
+            p.cap(),
+            start * 2,
+            "the cap returns to the size that delivered the most"
+        );
 
         for _ in 0..8 {
-            p.observe(p.cap(), Duration::from_millis(380));
+            p.observe(p.cap(), Duration::from_millis(1));
         }
-        assert_eq!(p.cap(), start / 2, "and it stays there");
+        assert_eq!(p.cap(), start * 2, "and stays there");
     }
 
-    /// Contract: on a machine where halving does pay, nothing stops it, and it
-    /// settles where a chunk lands on the target rather than at a fixed size.
+    /// Contract: a chunk that is not full says nothing about the cap.
     #[test]
-    fn the_pacer_keeps_shrinking_while_it_pays() {
+    fn a_short_tail_does_not_move_the_cap() {
         let mut p = PrefillPacer::default();
-        // Four seconds for 512 tokens, and every halving costs half as much:
-        // the work is still the model's, so there is nothing to stop for.
-        let mut ms = 4000u64;
-        for _ in 0..6 {
-            p.observe(p.cap(), Duration::from_millis(ms));
-            ms = (ms / 2).max(1);
+        let start = p.cap();
+        p.observe(start / 4, Duration::from_millis(1));
+        assert_eq!(p.cap(), start);
+    }
+
+    /// Contract: the climb stops at a chunk slow enough to be one submission too
+    /// many, however good its throughput, and never passes the hard ceiling.
+    #[test]
+    fn the_climb_stops_at_the_ceiling() {
+        let mut p = PrefillPacer::default();
+        p.observe(p.cap(), CHUNK_CEILING + Duration::from_millis(1));
+        let settled = p.cap();
+        p.observe(settled, Duration::from_millis(1));
+        assert_eq!(p.cap(), settled, "a chunk that slow ends the climb");
+
+        let mut q = PrefillPacer::default();
+        for _ in 0..12 {
+            q.observe(q.cap(), Duration::from_millis(1));
         }
-        assert!(
-            p.cap() < 64,
-            "a cap whose halving keeps repaying should keep shrinking, got {}",
-            p.cap()
-        );
+        assert!(q.cap() <= CHUNK_MAX, "the cap never passes {CHUNK_MAX}");
+    }
+
+    /// Contract: a chunk the device could not back brings the cap down and ends
+    /// the climb, so the next request does not repeat it.
+    #[test]
+    fn a_failed_chunk_brings_the_cap_down() {
+        let mut p = PrefillPacer::default();
+        let start = p.cap();
+        assert!(p.shrink());
+        assert_eq!(p.cap(), start / 2);
+
+        // And the climb does not resume on its own.
+        p.observe(p.cap(), Duration::from_millis(1));
+        assert_eq!(p.cap(), start / 2);
+
+        let mut q = PrefillPacer::default();
+        while q.shrink() {}
+        assert!(q.cap() <= 32, "shrinking stops rather than reaching zero");
     }
 
     struct FakeModel {

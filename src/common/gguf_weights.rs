@@ -67,6 +67,7 @@ impl GgufWeights {
             "GGUF mmap+header parsed"
         );
 
+        prefault(&file, mmap.len());
         let tensors = parallelise_tensor_load(
             &mmap,
             content.tensor_data_offset,
@@ -324,6 +325,29 @@ pub fn depermute_qk_rows(
 }
 
 /// Builds every tensor from the mmap in parallel (rayon), keyed by name.
+/// Brings the whole file into the page cache before any tensor is built.
+///
+/// Materialising a tensor reads its slice, and building them one at a time
+/// therefore reads the file one tensor at a time, through a lock, at a queue
+/// depth of one: measured at 7.4 s for a 7 GB checkpoint that a plain
+/// sequential read brings in in 1.05. Reading it here in parallel, in units the
+/// device likes, hands that loop a warm map and costs a second.
+///
+/// The reads go into a small scratch buffer that is thrown away: what is wanted
+/// is the side effect on the page cache, and the map is what the tensors are
+/// built from. Touching one byte per page instead does work, but at a third of
+/// the rate a read does.
+fn prefault(file: &std::fs::File, len: usize) {
+    use std::os::unix::fs::FileExt;
+    const SLICE: usize = 64 * 1024 * 1024;
+    let slices: Vec<usize> = (0..len).step_by(SLICE).collect();
+    slices.par_iter().for_each(|&start| {
+        let mut scratch = vec![0u8; SLICE.min(len - start)];
+        let _ = file.read_at(&mut scratch, start as u64);
+        std::hint::black_box(scratch.len());
+    });
+}
+
 fn parallelise_tensor_load(
     mmap: &Mmap,
     data_offset: u64,

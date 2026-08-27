@@ -390,6 +390,7 @@ impl StandardTransformer {
         dtype: DType,
         num_kv_blocks: usize,
         kv_quant: Option<(u8, bool)>,
+        context_len: usize,
     ) -> anyhow::Result<Self> {
         let arch = gguf.architecture()?;
         let prefix = &arch;
@@ -640,7 +641,12 @@ impl StandardTransformer {
             tables.push(
                 RotaryEmbedding::new_with_scaling(
                     dim,
-                    max_position_embeddings,
+                    // The tables only need the positions this model will serve.
+                    // A checkpoint declaring a quarter of a million of them and
+                    // granted eight thousand was building thirty two times the
+                    // table it can ever read, which is both the time and the
+                    // memory of building it.
+                    max_position_embeddings.min(context_len.max(1)),
                     theta,
                     scaling,
                     dtype,

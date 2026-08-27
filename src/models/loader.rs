@@ -1544,13 +1544,14 @@ fn load_batch_model_gguf(
         mode => Some((mode.bit_width(), opts.qjl_quantization)),
     };
 
-    let model = match StandardTransformer::load_gguf(&gguf, device, dtype, num_blocks, quantizer) {
-        Ok(m) => m,
-        Err(e) => {
-            opts.kv_budget.release(acquired_kv_bytes);
-            return Err(e);
-        }
-    };
+    let model =
+        match StandardTransformer::load_gguf(&gguf, device, dtype, num_blocks, quantizer, ctx) {
+            Ok(m) => m,
+            Err(e) => {
+                opts.kv_budget.release(acquired_kv_bytes);
+                return Err(e);
+            }
+        };
     Ok(LoadedModel {
         model: Box::new(model),
         weights_bytes: weights_size,

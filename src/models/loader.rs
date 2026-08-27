@@ -1296,6 +1296,15 @@ fn load_standard_safetensors(
                 block_cfg.head_dim = per_layer_head_dims[i];
                 block_cfg.n_kv_heads = per_layer_kv_heads[i];
                 block_cfg.sliding_window = per_layer_sliding_windows[i];
+                // The table this layer rotates against and the span it rotates
+                // must be the same number, or the rotation lands on the wrong
+                // dimensions.
+                if let Some(dims) = cfg.per_layer_rotary_dims.as_ref()
+                    && let Some(&d) = dims.get(i)
+                    && d < per_layer_head_dims[i]
+                {
+                    block_cfg.rotary_dim = Some(d);
+                }
                 if layer_is_linear[i] {
                     block_cfg.linear_attn = cfg.linear_attn;
                 }
@@ -1305,10 +1314,21 @@ fn load_standard_safetensors(
 
         let norm = RMSNorm::load(&weights, "model.norm", cfg.rms_norm_eps, cfg.norm_type)?;
 
+        // A checkpoint may rotate a different share of each layer's head: Gemma 4
+        // rotates a quarter of its full-attention heads and all of the others.
+        let per_layer_rotary_dims: Vec<usize> = (0..cfg.num_hidden_layers)
+            .map(|i| {
+                cfg.per_layer_rotary_dims
+                    .as_ref()
+                    .and_then(|d| d.get(i).copied())
+                    .or(cfg.rotary_dim)
+                    .unwrap_or(per_layer_head_dims[i])
+            })
+            .collect();
         let ropes = (0..cfg.num_hidden_layers)
             .map(|i| {
                 RotaryEmbedding::new_with_scaling(
-                    cfg.rotary_dim.unwrap_or(per_layer_head_dims[i]),
+                    per_layer_rotary_dims[i],
                     ctx,
                     per_layer_rope_thetas[i],
                     cfg.rope_scaling.clone(),

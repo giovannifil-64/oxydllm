@@ -235,6 +235,43 @@ pub fn parse(config_path: &str) -> Result<StandardTransformerConfig> {
         .filter(|&f| f > 0.0 && f < 1.0)
         .map(|f| (head_dim as f64 * f) as usize);
 
+    // Gemma 4 states a partial rotary factor per attention type, and gives its
+    // full-attention layers a quarter: those heads rotate 128 of their 512
+    // dimensions and leave the rest without a position. The GGUF of the same
+    // model says it with a tensor of frequency divisors; this is the same thing
+    // said in the config, and leaving it out is invisible over a few hundred
+    // tokens and ruinous over a few thousand.
+    let fattore_per_tipo = |tipo: &str| -> Option<f64> {
+        rope_parameters
+            .get(tipo)
+            .and_then(|x| x.get("partial_rotary_factor"))
+            .and_then(Value::as_f64)
+            .filter(|&f| f > 0.0 && f < 1.0)
+    };
+    let per_layer_rotary_dims = layer_types.as_ref().and_then(|types| {
+        let pieno = fattore_per_tipo("full_attention");
+        let scorrevole = fattore_per_tipo("sliding_attention");
+        if pieno.is_none() && scorrevole.is_none() {
+            return None;
+        }
+        Some(
+            types
+                .iter()
+                .map(|layer_type| {
+                    let (dim, fattore) = if layer_type == "full_attention" {
+                        (global_head_dim.unwrap_or(head_dim), pieno)
+                    } else {
+                        (head_dim, scorrevole)
+                    };
+                    match fattore {
+                        Some(f) => (dim as f64 * f) as usize,
+                        None => dim,
+                    }
+                })
+                .collect::<Vec<_>>(),
+        )
+    });
+
     let per_layer_head_dims = layer_types.as_ref().map(|types| {
         types
             .iter()
@@ -355,6 +392,7 @@ pub fn parse(config_path: &str) -> Result<StandardTransformerConfig> {
         sliding_window,
         per_layer_num_key_value_heads,
         per_layer_head_dims,
+        per_layer_rotary_dims,
         per_layer_sliding_windows,
         per_layer_rope_thetas,
         kv_shared_layer_map,
@@ -687,6 +725,57 @@ mod tests {
     use serde_json::json;
     use std::fs;
     use tempfile::tempdir;
+
+    /// Contract: a partial rotary factor stated per attention type reaches the
+    /// layers it belongs to, and only those.
+    ///
+    /// Gemma 4 rotates a quarter of its full-attention heads and all of its
+    /// sliding ones. Reading the factor as if it applied to every layer, or not
+    /// reading it at all, leaves the slow frequencies of the long-range layers
+    /// turning: harmless over a few hundred tokens, and the difference between
+    /// an answer and "Theededededed" over a few thousand.
+    #[test]
+    fn a_partial_rotary_factor_per_attention_type_reaches_only_its_layers() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("config.json");
+        let cfg = json!({
+            "architectures": ["Gemma4ForCausalLM"],
+            "hidden_size": 3840,
+            "num_hidden_layers": 6,
+            "num_attention_heads": 16,
+            "num_key_value_heads": 8,
+            "head_dim": 256,
+            "global_head_dim": 512,
+            "intermediate_size": 15360,
+            "vocab_size": 262144,
+            "max_position_embeddings": 262144,
+            "rms_norm_eps": 1e-6,
+            "sliding_window": 1024,
+            "layer_types": [
+                "sliding_attention", "sliding_attention", "sliding_attention",
+                "sliding_attention", "sliding_attention", "full_attention"
+            ],
+            "rope_parameters": {
+                "full_attention": {
+                    "rope_theta": 1000000.0,
+                    "partial_rotary_factor": 0.25,
+                    "rope_type": "proportional"
+                },
+                "sliding_attention": {"rope_theta": 10000.0, "rope_type": "default"}
+            }
+        });
+        fs::write(&config_path, serde_json::to_string(&cfg).unwrap()).unwrap();
+
+        let parsed = parse(config_path.to_str().unwrap()).expect("parse");
+        let dims = parsed
+            .per_layer_rotary_dims
+            .expect("the factor must produce per-layer rotary dims");
+        assert_eq!(
+            dims,
+            vec![256, 256, 256, 256, 256, 128],
+            "the sliding layers rotate their whole head, the full-attention one a quarter of its 512"
+        );
+    }
 
     /// Contract: multimodal configs nesting LLM params under `text_config`
     /// win over root-level fields on collision.

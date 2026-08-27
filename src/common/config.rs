@@ -182,6 +182,7 @@ pub struct StandardTransformerConfig {
 
     pub per_layer_num_key_value_heads: Option<Vec<usize>>,
     pub per_layer_head_dims: Option<Vec<usize>>,
+    pub per_layer_rotary_dims: Option<Vec<usize>>,
     pub per_layer_sliding_windows: Option<Vec<Option<usize>>>,
     pub per_layer_rope_thetas: Option<Vec<f64>>,
     pub kv_shared_layer_map: Option<Vec<Option<usize>>>,

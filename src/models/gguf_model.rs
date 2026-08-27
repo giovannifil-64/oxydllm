@@ -27,7 +27,7 @@ use crate::common::{
     linear::{AnyLinear, Embedding, QLinear},
     norm::RMSNorm,
     paged::{BlockAllocator, DEFAULT_BLOCK_SIZE, PagedKvCache, SharedBlockAllocator},
-    rope::RotaryEmbedding,
+    rope::{RopeScaling, RotaryEmbedding},
 };
 use crate::models::traits::BatchModel;
 
@@ -603,12 +603,50 @@ impl StandardTransformer {
                 )
             })
             .collect();
+        // Per-dimension frequency divisors, when the checkpoint ships them.
+        // Gemma 4 gives them only to its layers without a window, and freezes
+        // most of the spectrum: without this the slow components keep turning
+        // and the long-range path, which is exactly what those layers are for,
+        // reads noise a few thousand tokens out.
+        let rope_factors: Option<Vec<f64>> = match gguf.try_get("rope_freqs.weight") {
+            Some(qt) => {
+                let t = qt
+                    .dequantize(device)
+                    .and_then(|t| t.to_dtype(candle_core::DType::F32))
+                    .and_then(|t| t.flatten_all())
+                    .and_then(|t| t.to_vec1::<f32>())
+                    .map_err(|e| anyhow::anyhow!("rope_freqs.weight: {e}"))?;
+                Some(t.into_iter().map(f64::from).collect())
+            }
+            None => None,
+        };
+
         let (distinct, per_layer_table) = rope_sharing_plan(&geometries);
         let mut tables = Vec::with_capacity(distinct.len());
-        for &(dim, theta) in &distinct {
+        for (idx, &(dim, theta)) in distinct.iter().enumerate() {
+            // The factors belong to the layers the checkpoint gives them to:
+            // those without a sliding window.
+            let scaling = match &rope_factors {
+                Some(f)
+                    if per_layer_table
+                        .iter()
+                        .enumerate()
+                        .any(|(layer, &t)| t == idx && layer_windows[layer].is_none()) =>
+                {
+                    RopeScaling::FrequencyFactors(f.clone())
+                }
+                _ => RopeScaling::None,
+            };
             tables.push(
-                RotaryEmbedding::new(dim, max_position_embeddings, theta, dtype, device)
-                    .map_err(|e| anyhow::anyhow!("Failed to create RoPE: {e}"))?,
+                RotaryEmbedding::new_with_scaling(
+                    dim,
+                    max_position_embeddings,
+                    theta,
+                    scaling,
+                    dtype,
+                    device,
+                )
+                .map_err(|e| anyhow::anyhow!("Failed to create RoPE: {e}"))?,
             );
         }
         let ropes: Vec<RotaryEmbedding> =

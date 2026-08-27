@@ -47,6 +47,15 @@ pub enum RopeScaling {
         long_factor: Vec<f64>,
         original_max_pos: usize,
     },
+    /// One divisor per frequency pair, straight from the checkpoint.
+    ///
+    /// Gemma 4 ships these for its global layers and freezes most of the
+    /// spectrum with them: the first 64 pairs divide by one and rotate, the
+    /// remaining 192 divide by 1e30 and therefore do not rotate at all. Leaving
+    /// them out costs nothing over a few hundred tokens and everything over a
+    /// few thousand, because the phase those slow components accumulate is what
+    /// long-range attention reads.
+    FrequencyFactors(Vec<f64>),
 }
 
 /// Precomputed RoPE cos/sin tables for one model, ready to apply to q and k.
@@ -193,6 +202,15 @@ impl RotaryEmbedding {
                     }
                 }
             }
+            RopeScaling::FrequencyFactors(ref factors) => {
+                for (i, inv) in inv_freq.iter_mut().enumerate() {
+                    if let Some(&f) = factors.get(i)
+                        && f > 0.0
+                    {
+                        *inv /= f as f32;
+                    }
+                }
+            }
             RopeScaling::None => {}
         }
 
@@ -302,6 +320,80 @@ impl RotaryEmbedding {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Contract: a frequency divisor from the checkpoint freezes the dimensions
+    /// it is large for, and leaves the others turning as they were.
+    ///
+    /// Gemma 4 ships one of these for its layers without a window and freezes
+    /// three quarters of the spectrum with it. Ignoring the tensor costs nothing
+    /// over a few hundred tokens and everything over a few thousand: the slow
+    /// components keep accumulating phase, and the long-range path, which is the
+    /// only thing those layers are for, ends up reading noise. A checkpoint that
+    /// answered a question about its own first line at five thousand tokens
+    /// answered "Theedededed" instead.
+    #[test]
+    fn a_frequency_divisor_freezes_the_dimensions_it_is_large_for() {
+        let dev = Device::Cpu;
+        let (dim, positions) = (16usize, 4096usize);
+        let mut factors = vec![1.0f64; dim / 2];
+        for f in factors.iter_mut().skip(2) {
+            *f = 1e30;
+        }
+        let frozen = RotaryEmbedding::new_with_scaling(
+            dim,
+            positions,
+            10_000.0,
+            RopeScaling::FrequencyFactors(factors),
+            DType::F32,
+            &dev,
+        )
+        .unwrap();
+        let plain = RotaryEmbedding::new(dim, positions, 10_000.0, DType::F32, &dev).unwrap();
+
+        let riga = |r: &RotaryEmbedding, p: usize| -> (Vec<f32>, Vec<f32>) {
+            (
+                r.cos
+                    .narrow(0, p, 1)
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1()
+                    .unwrap(),
+                r.sin
+                    .narrow(0, p, 1)
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1()
+                    .unwrap(),
+            )
+        };
+        for p in [1usize, 100, 4095] {
+            let (cos_f, sin_f) = riga(&frozen, p);
+            let (cos_p, sin_p) = riga(&plain, p);
+            for i in 0..dim / 2 {
+                if i < 2 {
+                    assert_eq!(
+                        (cos_f[i], sin_f[i]),
+                        (cos_p[i], sin_p[i]),
+                        "position {p}, pair {i}: a divisor of one must change nothing"
+                    );
+                } else {
+                    assert!(
+                        (cos_f[i] - 1.0).abs() < 1e-6 && sin_f[i].abs() < 1e-6,
+                        "position {p}, pair {i}: a divisor of 1e30 must leave it unrotated, \
+                         got cos {} sin {}",
+                        cos_f[i],
+                        sin_f[i]
+                    );
+                    assert!(
+                        p < 2 || sin_p[i] != 0.0,
+                        "the plain schedule should turn this pair, or the test proves nothing"
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn llama3_equal_freq_factors_do_not_produce_nan() {

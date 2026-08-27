@@ -1291,12 +1291,111 @@ pub fn rope_fused(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
     x.apply_op3_no_bwd(cos, sin, &RopeOp)
 }
 
-/// Whether [`sdpa`] can run for this tensor: Metal device, float dtype, and
-/// a head dim the kernels support.
+/// Whether [`sdpa`] can serve this tensor's dtype and head width on this GPU.
+///
+/// The width has to be one the vector kernels carry, and the kernel has to
+/// agree with plain attention when it runs here. The second half is not
+/// paranoia: the 512-wide kernel answers correctly on the GPU this was written
+/// against and returns zeros on the one continuous integration runs, so a list
+/// of widths alone promises something it cannot know. The check runs once per
+/// dtype and width per device, on tensors small enough to cost microseconds,
+/// and covers both the single-pass kernel and the two-pass one a long cache
+/// reaches.
 pub fn sdpa_available(tensor: &Tensor, head_dim: usize) -> bool {
-    tensor.device().is_metal()
-        && matches!(tensor.dtype(), DType::F16 | DType::BF16 | DType::F32)
-        && matches!(head_dim, 32 | 64 | 96 | 128 | 256 | 512)
+    if !tensor.device().is_metal()
+        || !matches!(tensor.dtype(), DType::F16 | DType::BF16 | DType::F32)
+        || !matches!(head_dim, 32 | 64 | 96 | 128 | 256 | 512)
+    {
+        return false;
+    }
+    sdpa_agrees_with_plain_attention(tensor.device(), tensor.dtype(), head_dim)
+}
+
+/// Runs the fused attention against plain attention once, and remembers the
+/// answer for this device, dtype and head width.
+/// `(device registry id, dtype, head width)`.
+type SdpaProbeKey = (usize, u8, usize);
+
+fn sdpa_agrees_with_plain_attention(
+    device: &candle_core::Device,
+    dtype: DType,
+    head_dim: usize,
+) -> bool {
+    static CACHE: OnceLock<Mutex<HashMap<SdpaProbeKey, bool>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let key = (
+        match device {
+            candle_core::Device::Metal(md) => md.device().registry_id() as usize,
+            _ => 0,
+        },
+        dtype as u8,
+        head_dim,
+    );
+    if let Ok(map) = cache.lock()
+        && let Some(&sound) = map.get(&key)
+    {
+        return sound;
+    }
+    let sound = sdpa_probe(device, dtype, head_dim).unwrap_or(false);
+    if !sound {
+        tracing::warn!(
+            ?dtype,
+            head_dim,
+            "fused attention disagrees with plain attention here; using the other paths"
+        );
+    }
+    if let Ok(mut map) = cache.lock() {
+        map.insert(key, sound);
+    }
+    sound
+}
+
+fn sdpa_probe(device: &candle_core::Device, dtype: DType, head_dim: usize) -> Result<bool> {
+    let (h, h_kv) = (2usize, 1usize);
+    let make = |n: usize, salt: usize, shape: (usize, usize, usize, usize)| -> Result<Tensor> {
+        let v: Vec<f32> = (0..n)
+            .map(|i| (((i + salt) % 17) as f32 - 8.0) * 0.05)
+            .collect();
+        Tensor::from_vec(v, shape, device)?.to_dtype(dtype)
+    };
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    // Either side of the length where the kernel splits the keys into two passes.
+    for kv in [8usize, 1088] {
+        let q = make(h * head_dim, 1, (1, h, 1, head_dim))?;
+        let k = make(h_kv * kv * head_dim, 7, (1, h_kv, kv, head_dim))?;
+        let v = make(h_kv * kv * head_dim, 13, (1, h_kv, kv, head_dim))?;
+        let fused = sdpa(&q, &k, &v, None, false, scale, 1.0)?;
+
+        let k_rep = k.broadcast_as((1, h, kv, head_dim))?.contiguous()?;
+        let v_rep = v.broadcast_as((1, h, kv, head_dim))?.contiguous()?;
+        let scores = (q
+            .to_dtype(DType::F32)?
+            .matmul(&k_rep.to_dtype(DType::F32)?.t()?)?
+            * f64::from(scale))?;
+        let plain = crate::common::linear::softmax_last_dim(&scores)?
+            .matmul(&v_rep.to_dtype(DType::F32)?)?;
+
+        let a: Vec<f32> = fused
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        let b: Vec<f32> = plain.flatten_all()?.to_vec1::<f32>()?;
+        if a.len() != b.len() {
+            return Ok(false);
+        }
+        let peak = b
+            .iter()
+            .fold(0f32, |m: f32, &x: &f32| m.max(x.abs()))
+            .max(1e-6);
+        let worst = a
+            .iter()
+            .zip(b.iter())
+            .fold(0f32, |m: f32, (&x, &y): (&f32, &f32)| m.max((x - y).abs()));
+        if !worst.is_finite() || worst / peak > 0.05 {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// Fused `silu(gate) * up` over a packed `[.., 2*intermediate_size]` tensor;
@@ -3667,12 +3766,11 @@ mod fused_kernel_parity_tests {
         for dtype in [DType::F32, DType::BF16] {
             let mut worst = 0f32;
             for d in [32usize, 64, 96, 128, 256, 512] {
+                if !sdpa_available(&Tensor::zeros((1, 2, 1, d), dtype, &dev).unwrap(), d) {
+                    continue;
+                }
                 for (h, h_kv) in [(16usize, 1usize), (8, 8), (4, 2)] {
                     for kv in [64usize, 1024, 1700] {
-                        assert!(sdpa_available(
-                            &Tensor::zeros((1, h, 1, d), dtype, &dev).unwrap(),
-                            d
-                        ));
                         let mk = |n: usize, salt: usize| -> Vec<f32> {
                             (0..n)
                                 .map(|i| (((i * 31 + salt) % 61) as f32 - 30.0) * 0.05)

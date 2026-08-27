@@ -6666,6 +6666,69 @@ mod quantized_matmul_floor {
     /// removed (3.1 TFLOPS at this shape): low enough to survive a busy machine
     /// or a slower GPU, high enough that a regression of that size fails here
     /// instead of quietly costing every user four times the prompt latency.
+    /// Prices the three ways this crate could multiply a prefill batch by a
+    /// quantized weight, at the shape Gemma 4's feed-forward actually uses.
+    /// Ignored by default.
+    #[test]
+    #[ignore]
+    fn prezzo_delle_matmul_di_prefill() {
+        use candle_core::DType;
+        let Ok(dev) = Device::new_metal(0) else {
+            return;
+        };
+        // gate/up of a 12B: [15360, 3840] against a chunk of 1024 tokens.
+        let (n, k, m) = (15360usize, 3840usize, 1024usize);
+        let w: Vec<f32> = (0..n * k)
+            .map(|i| ((i % 23) as f32 - 11.0) * 0.04)
+            .collect();
+        let w32 = Tensor::from_vec(w, (n, k), &dev).unwrap();
+        let qt = std::sync::Arc::new(QTensor::quantize(&w32, GgmlDType::Q4K).unwrap());
+        let mm = QMatMul::from_arc(qt).unwrap();
+        let w_bf = w32.to_dtype(DType::BF16).unwrap();
+        let w_bf_t = w_bf.t().unwrap().contiguous().unwrap();
+
+        let x32: Vec<f32> = (0..m * k).map(|i| ((i % 13) as f32 - 6.0) * 0.03).collect();
+        let x32 = Tensor::from_vec(x32, (m, k), &dev).unwrap();
+        let x_bf = x32.to_dtype(DType::BF16).unwrap();
+
+        let flops = 2.0 * m as f64 * n as f64 * k as f64;
+        let cronometra = |nome: &str, f: &dyn Fn() -> Tensor| {
+            let _ = f()
+                .to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>();
+            let reps = 5;
+            let t0 = std::time::Instant::now();
+            let mut last = None;
+            for _ in 0..reps {
+                last = Some(f());
+            }
+            let _ = last
+                .unwrap()
+                .to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>();
+            let secs = t0.elapsed().as_secs_f64() / reps as f64;
+            println!(
+                "    {nome:34} {:8.2} ms  {:6.0} GFLOPS",
+                secs * 1e3,
+                flops / secs / 1e9
+            );
+        };
+
+        cronometra("candle QMatMul (Q4_K)", &|| mm.forward(&x32).unwrap());
+        cronometra("candle matmul BF16", &|| x_bf.matmul(&w_bf_t).unwrap());
+        cronometra("MPP GEMM BF16", &|| {
+            crate::common::metal_ops::maybe_mpp_matmul(&x_bf, &w_bf_t)
+                .unwrap()
+                .expect("MPP should take this shape")
+        });
+    }
+
     #[test]
     fn candle_quantized_matmul_stays_fast() {
         const FLOOR_GFLOPS: f64 = 750.0;

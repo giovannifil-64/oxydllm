@@ -8,21 +8,50 @@ use candle_core::quantized::{QMatMul, QTensor};
 use candle_core::{DType, Device, Result, Tensor};
 use std::sync::Arc;
 
-pub struct Embedding {
-    weight: Tensor,
+/// The token embedding table, kept in whatever form the checkpoint gave it.
+///
+/// A quantized table stays quantized and hands back only the rows a batch asks
+/// for. Materialising it instead costs its full dense size for as long as the
+/// model lives, which on a 262144-token vocabulary is two gigabytes, and costs
+/// the dequantisation up front: five seconds on the checkpoint that motivated
+/// this, against a per-forward gather that reads a few thousand rows.
+pub enum Embedding {
+    Dense { weight: Tensor },
+    Quantized { table: Arc<QTensor>, dtype: DType },
 }
 
 impl Embedding {
     pub fn new(weight: Tensor) -> Self {
-        Self { weight }
+        Self::Dense { weight }
+    }
+
+    /// Keeps the table quantized and gathers rows from it per forward.
+    pub fn quantized(table: Arc<QTensor>, dtype: DType) -> Self {
+        Self::Quantized { table, dtype }
+    }
+
+    /// Whether rows can be gathered from a table of this type without
+    /// materialising it. Two of GGUF's types have no gather kernel, and a table
+    /// in one of those has to be dequantized as before.
+    pub fn can_gather(dtype: candle_core::quantized::GgmlDType) -> bool {
+        use candle_core::quantized::GgmlDType as G;
+        !matches!(dtype, G::Q8_1 | G::Q8K)
     }
 
     pub fn forward(&self, tokens: &Tensor) -> Result<Tensor> {
         let (batch, seq) = tokens.dims2()?;
-        let hidden = self.weight.dims()[1];
         let flat = tokens.flatten_all()?;
-        let embedded = self.weight.index_select(&flat, 0)?;
-        embedded.reshape((batch, seq, hidden))
+        match self {
+            Self::Dense { weight } => {
+                let hidden = weight.dims()[1];
+                weight.index_select(&flat, 0)?.reshape((batch, seq, hidden))
+            }
+            Self::Quantized { table, dtype } => {
+                let hidden = table.shape().dims()[1];
+                let rows = table.embedding(&flat)?.to_dtype(*dtype)?;
+                rows.reshape((batch, seq, hidden))
+            }
+        }
     }
 
     pub fn from_qtensor(qtensor: &QTensor, device: &Device, dtype: DType) -> Result<Self> {
@@ -463,6 +492,48 @@ impl AnyLinear {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Contract: gathering rows from the quantized table gives what
+    /// materialising it and indexing would have given.
+    ///
+    /// The table stays quantized because materialising a vocabulary-sized one
+    /// costs its dense size for the life of the process, two gigabytes on the
+    /// checkpoint that motivated this, and five seconds of the load to build.
+    /// That is only worth having if the rows come back the same.
+    #[test]
+    fn gathering_from_a_quantized_table_matches_materialising_it() {
+        use candle_core::quantized::{GgmlDType, QTensor};
+        let dev = Device::Cpu;
+        let (vocab, hidden) = (512usize, 256usize);
+        let valori: Vec<f32> = (0..vocab * hidden)
+            .map(|i| ((i % 91) as f32 - 45.0) * 0.017)
+            .collect();
+        let denso = Tensor::from_vec(valori, (vocab, hidden), &dev).unwrap();
+        for gtype in [GgmlDType::Q4K, GgmlDType::Q6K, GgmlDType::Q8_0] {
+            let qt = std::sync::Arc::new(QTensor::quantize(&denso, gtype).unwrap());
+            let materializzato = Embedding::from_qtensor(&qt, &dev, DType::F32).unwrap();
+            let quantizzato = Embedding::quantized(qt.clone(), DType::F32);
+            assert!(
+                Embedding::can_gather(gtype),
+                "{gtype:?} should be gatherable"
+            );
+
+            let ids = Tensor::from_vec(vec![0u32, 7, 63, 200, 511, 1], (1, 6), &dev).unwrap();
+            let flat = |e: &Embedding| -> Vec<f32> {
+                e.forward(&ids)
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap()
+            };
+            assert_eq!(
+                flat(&quantizzato),
+                flat(&materializzato),
+                "{gtype:?}: the gathered rows differ from the materialised ones"
+            );
+        }
+    }
 
     // Repro for the candle-metal-kernels 0.10.2 command-buffer-pool data race
     // (root cause of intermittent Metal gibberish). Each thread runs the same

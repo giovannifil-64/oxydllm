@@ -17,6 +17,16 @@ use std::time::Instant;
 /// only decides how often the running breakdown is printed.
 const REPORT_EVERY: u64 = 16;
 
+/// How many forwards of one regime a report waits for, overridable while
+/// hunting: a prefill that now runs in two chunks never reaches sixteen.
+fn report_every() -> u64 {
+    std::env::var("OXYD_PROFILE_EVERY")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&n: &u64| n > 0)
+        .unwrap_or(REPORT_EVERY)
+}
+
 fn enabled() -> bool {
     static EN: OnceLock<bool> = OnceLock::new();
     *EN.get_or_init(|| std::env::var("OXYDLLM_PROFILE").as_deref() == Ok("1"))
@@ -120,7 +130,7 @@ pub fn mark_forward_end() {
     let due = {
         let acc = ACC.lock().unwrap();
         acc.get(&regime)
-            .is_some_and(|t| t.forwards.is_multiple_of(REPORT_EVERY))
+            .is_some_and(|t| t.forwards.is_multiple_of(report_every()))
     };
     if due {
         report(regime);

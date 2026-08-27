@@ -183,6 +183,13 @@ inline void gptq_stage_tile(
     }
 }
 
+// ── Staged GGUF k-quant GEMM ───────────────────────────────────────────────
+//
+// Same shape as the packed-quant path above, for the block layout GGUF uses:
+// one buffer of 256-element superblocks per output row, each carrying a scale,
+// a minimum, eight pairs of six-bit sub-scales and 128 bytes of nibbles. The
+// block maths mirrors ggml's dequantize_row_q4_K.
+
 template<uint BITS, bool GPTQ>
 inline void mpp_gemm_quant_impl(
     device bfloat*  a,
@@ -275,6 +282,10 @@ MPP_QUANT_KERNEL(mpp_gemm_gptq8_staged, 8, true)
 // into the output cooperative tensor. Causal mask shifted by prefix_len,
 // GQA-native (no KV repeat).
 
+// `kv_head_stride` is how far apart two KV heads sit, in elements. It is
+// t_kv * D for a packed tensor and larger for a view into a cache that holds
+// more tokens than this call reads, which is what lets the cache hand its
+// window over without copying it.
 struct MppFaParams {
     int t_q;
     int t_kv;
@@ -282,7 +293,8 @@ struct MppFaParams {
     int h_kv;
     float scale;
     int prefix_len;
-    int window;        // sliding window in tokens; 0 = attend to the whole prefix
+    int window;
+    int kv_head_stride;
 };
 
 constant constexpr int FA_BR = 32;
@@ -321,8 +333,9 @@ inline void mpp_fa_impl(
     int hkv = hh / (p.h / p.h_kv);
 
     device bfloat* qp = q + ((size_t(b) * p.h + hh) * p.t_q + q0) * D;
-    device bfloat* kb = k + (size_t(b) * p.h_kv + hkv) * size_t(p.t_kv) * D;
-    device bfloat* vb = v + (size_t(b) * p.h_kv + hkv) * size_t(p.t_kv) * D;
+    size_t kv_stride = size_t(p.kv_head_stride);
+    device bfloat* kb = k + (size_t(b) * p.h_kv + hkv) * kv_stride;
+    device bfloat* vb = v + (size_t(b) * p.h_kv + hkv) * kv_stride;
 
     auto tQ = tensor(qp, dextents<int, 2>{D, br}, array<int, 2>{1, D});
     auto tP = tensor(tg_p, dextents<int, 2>{FA_BC, FA_BR}, array<int, 2>{1, FA_BC});
@@ -336,9 +349,9 @@ inline void mpp_fa_impl(
             oT[i] = 0.0f;
         }
     }
-    if (lane < uint(FA_BR)) {
-        tg_m[lane] = -INFINITY;
-        tg_l[lane] = 0.0f;
+    for (uint r = lane; r < uint(FA_BR); r += 32u) {
+        tg_m[r] = -INFINITY;
+        tg_l[r] = 0.0f;
     }
 
     int kv_max = min(p.t_kv, p.prefix_len + q0 + br);
@@ -390,10 +403,10 @@ inline void mpp_fa_impl(
         }
         simdgroup_barrier(mem_flags::mem_threadgroup);
 
-        if (lane < uint(FA_BR)) {
-            float m_new = max(tg_m[lane], tg_r[lane]);
-            tg_a[lane] = (tg_m[lane] == -INFINITY) ? 0.0f : exp(tg_m[lane] - m_new);
-            tg_m[lane] = m_new;
+        for (uint r = lane; r < uint(FA_BR); r += 32u) {
+            float m_new = max(tg_m[r], tg_r[r]);
+            tg_a[r] = (tg_m[r] == -INFINITY) ? 0.0f : exp(tg_m[r] - m_new);
+            tg_m[r] = m_new;
         }
         for (uint i = lane; i < uint(FA_BR * FA_BC); i += 32u) {
             tg_p[i] = bfloat(0.0f);
@@ -428,8 +441,8 @@ inline void mpp_fa_impl(
         }
         simdgroup_barrier(mem_flags::mem_threadgroup);
 
-        if (lane < uint(FA_BR)) {
-            tg_l[lane] = tg_l[lane] * tg_a[lane] + tg_r[lane];
+        for (uint r = lane; r < uint(FA_BR); r += 32u) {
+            tg_l[r] = tg_l[r] * tg_a[r] + tg_r[r];
         }
         simdgroup_barrier(mem_flags::mem_threadgroup);
 

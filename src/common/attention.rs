@@ -827,7 +827,9 @@ impl Attention {
                 }
                 && mask.is_none()
                 && kv_len >= seg.num_tokens
-                && (kv_len >= METAL_FA_MIN_KV || (seg.num_tokens == 1 && !sdpa_base_ok));
+                && (kv_len >= METAL_FA_MIN_KV
+                    || seg.num_tokens > 1
+                    || (seg.num_tokens == 1 && !sdpa_base_ok));
             #[cfg(not(feature = "metal"))]
             let use_metal_fa = false;
 
@@ -860,8 +862,8 @@ impl Attention {
                     let prefix_len = kv_len - seg.num_tokens;
                     let seg_out = super::metal_ops::flash_attention_metal_prefill(
                         &q_seg.contiguous()?,
-                        &k_seg.contiguous()?,
-                        &v_seg.contiguous()?,
+                        &k_seg,
+                        &v_seg,
                         self.scale as f32,
                         self.attn_softcap.map(|s| s as f32),
                         prefix_len,

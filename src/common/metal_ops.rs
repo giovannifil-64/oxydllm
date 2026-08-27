@@ -1063,6 +1063,7 @@ struct FlashAttnParams {
     softcap: f32,
     prefix_len: u32,
     window: u32,
+    kv_head_stride: u32,
 }
 
 /// Flash Attention prefill over `[B, H, T, D]` q/k/v with causal masking
@@ -1111,12 +1112,6 @@ impl CustomOp3 for FlashAttnPrefill {
         if !q_l.is_contiguous() {
             candle_core::bail!("FlashAttnPrefill: q must be contiguous");
         }
-        if !k_l.is_contiguous() {
-            candle_core::bail!("FlashAttnPrefill: k must be contiguous");
-        }
-        if !v_l.is_contiguous() {
-            candle_core::bail!("FlashAttnPrefill: v must be contiguous");
-        }
         if q.dtype() != k.dtype() || q.dtype() != v.dtype() {
             candle_core::bail!("FlashAttnPrefill: q, k, v dtypes must match");
         }
@@ -1149,6 +1144,10 @@ impl CustomOp3 for FlashAttnPrefill {
             );
         }
 
+        let kv_stride = match (kv_head_stride(k_l), kv_head_stride(v_l)) {
+            (Some(ks), Some(vs)) if ks == vs => ks,
+            _ => candle_core::bail!("FlashAttnPrefill: k and v must be rows a head width apart"),
+        };
         let dtype_bytes = q.dtype().size_in_bytes();
         let elem_count = b * h * t_q * d;
         let device = q.device();
@@ -1176,6 +1175,7 @@ impl CustomOp3 for FlashAttnPrefill {
             softcap: self.softcap,
             prefix_len: self.prefix_len as u32,
             window: self.window as u32,
+            kv_head_stride: kv_stride as u32,
         };
 
         let tg_bytes = fa_threadgroup_bytes(self.br, self.bc, d, dtype_bytes, use_mma);
@@ -2986,6 +2986,21 @@ pub fn maybe_mpp_quant_matmul(
     }
 }
 
+/// Elements between two KV heads, when the tensor's rows are packed and one
+/// head width apart.
+///
+/// A cache hands its window over as a view into a longer buffer, where the
+/// heads sit further apart than the tokens this call reads. The kernels take
+/// that distance as a parameter and read the view in place; a layout whose rows
+/// are not packed has no such distance, and the caller copies instead.
+fn kv_head_stride(layout: &Layout) -> Option<usize> {
+    let (dims, stride) = (layout.dims(), layout.stride());
+    if dims.len() != 4 || stride[3] != 1 || stride[2] != dims[3] {
+        return None;
+    }
+    Some(stride[1])
+}
+
 /// Kernel argument block for the TensorOps Flash Attention kernels; must
 /// match `MppFaParams` in `mpp_gemm.metal`.
 #[repr(C)]
@@ -2997,6 +3012,7 @@ struct MppFaParams {
     scale: f32,
     prefix_len: i32,
     window: i32,
+    kv_head_stride: i32,
 }
 
 /// TensorOps Flash Attention prefill: BF16 only, head dim 64/128/256, no
@@ -3033,9 +3049,13 @@ impl CustomOp3 for MppFlashAttn {
         v: &MetalStorage,
         v_l: &Layout,
     ) -> Result<(MetalStorage, Shape)> {
-        if !q_l.is_contiguous() || !k_l.is_contiguous() || !v_l.is_contiguous() {
-            candle_core::bail!("MppFlashAttn: q, k, v must be contiguous");
+        if !q_l.is_contiguous() {
+            candle_core::bail!("MppFlashAttn: q must be contiguous");
         }
+        let kv_head_stride = match (kv_head_stride(k_l), kv_head_stride(v_l)) {
+            (Some(ks), Some(vs)) if ks == vs => ks,
+            _ => candle_core::bail!("MppFlashAttn: k and v must be rows a head width apart"),
+        };
         if q.dtype() != DType::BF16 || k.dtype() != DType::BF16 || v.dtype() != DType::BF16 {
             candle_core::bail!("MppFlashAttn: BF16 only");
         }
@@ -3083,6 +3103,7 @@ impl CustomOp3 for MppFlashAttn {
             scale: self.scale,
             prefix_len: self.prefix_len as i32,
             window: self.window as i32,
+            kv_head_stride: kv_head_stride as i32,
         };
 
         let pipeline = get_or_compile_mpp_pipeline(device.device(), kernel)?;
@@ -3888,6 +3909,76 @@ mod fused_kernel_parity_tests {
             assert!(
                 media >= start as f32 && media <= (start + len) as f32,
                 "d={d} start={start}: output mean {media} falls outside the rows the view covers"
+            );
+        }
+    }
+
+    /// Contract: the prefill kernels read a KV view whose heads sit further
+    /// apart than the tokens it covers, and get the same answer as from a copy.
+    ///
+    /// That view is what the cache hands over: a window into a buffer holding
+    /// more tokens than this forward reads. Copying it first is a real cost at
+    /// every layer of every chunk, and the kernels only need to be told how far
+    /// apart two heads sit.
+    #[test]
+    fn the_prefill_kernels_read_a_kv_view_in_place() {
+        let Some(dev) = metal_device_or_skip() else {
+            return;
+        };
+        for (h, h_kv, d, cap, start, len, window) in [
+            (
+                8usize, 4usize, 128usize, 512usize, 96usize, 320usize, 0usize,
+            ),
+            (16, 8, 256, 600, 64, 400, 128),
+            (4, 1, 64, 300, 0, 200, 0),
+        ] {
+            let t_q = len / 2;
+            let mk = |n: usize, salt: usize| -> Vec<f32> {
+                (0..n)
+                    .map(|i| (((i + salt) % 19) as f32 - 9.0) * 0.3)
+                    .collect()
+            };
+            let q = Tensor::from_vec(mk(h * t_q * d, 1), (1, h, t_q, d), &dev)
+                .unwrap()
+                .to_dtype(DType::BF16)
+                .unwrap();
+            let big = Tensor::from_vec(mk(h_kv * cap * d, 7), (1, h_kv, cap, d), &dev)
+                .unwrap()
+                .to_dtype(DType::BF16)
+                .unwrap();
+            let k_view = big.narrow(2, start, len).unwrap();
+            let v_view = big.narrow(2, start, len).unwrap();
+            assert!(!k_view.is_contiguous() || h_kv == 1);
+
+            let scale = 1.0 / (d as f32).sqrt();
+            let prefix = len - t_q;
+            let flat = |t: &Tensor| -> Vec<f32> {
+                t.to_dtype(DType::F32)
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap()
+            };
+            let copiato = flat(
+                &flash_attention_metal_prefill(
+                    &q,
+                    &k_view.contiguous().unwrap(),
+                    &v_view.contiguous().unwrap(),
+                    scale,
+                    None,
+                    prefix,
+                    window,
+                )
+                .unwrap(),
+            );
+            let visto = flat(
+                &flash_attention_metal_prefill(&q, &k_view, &v_view, scale, None, prefix, window)
+                    .unwrap(),
+            );
+            assert_eq!(
+                copiato, visto,
+                "d={d} len={len} window={window}: the view and its copy must agree"
             );
         }
     }
@@ -6407,6 +6498,16 @@ mod quantized_matmul_floor {
     use candle_core::quantized::{GgmlDType, QMatMul, QTensor};
     use candle_core::{Device, Module, Tensor};
 
+    /// Contract: the quantized matmul this crate leans on stays fast enough to
+    /// be worth leaning on.
+    ///
+    /// This crate carried its own block-quant kernels until they were measured
+    /// against candle's and found eight times slower at prefill shapes, having
+    /// been written when the comparison went the other way and never rechecked.
+    /// The floor is a quarter of what candle measured when those kernels were
+    /// removed (3.1 TFLOPS at this shape): low enough to survive a busy machine
+    /// or a slower GPU, high enough that a regression of that size fails here
+    /// instead of quietly costing every user four times the prompt latency.
     #[test]
     fn candle_quantized_matmul_stays_fast() {
         const FLOOR_GFLOPS: f64 = 750.0;

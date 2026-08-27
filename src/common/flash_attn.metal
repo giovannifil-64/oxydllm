@@ -57,6 +57,7 @@ struct FlashAttnParams {
     float softcap;     // 0.0 = disabled
     uint  prefix_len;  // = t_kv - t_q
     uint  window;      // sliding window in tokens; 0 = attend to the whole prefix
+    uint  kv_head_stride;  // elements between two KV heads; t_kv * d when packed
 };
 
 constant float M_LOG2E_F_CONST = 1.4426950408889634f;
@@ -130,7 +131,7 @@ inline void flash_attention_prefill_impl(
         const bool need_mask = (n >= mask_boundary) || (p.window != 0u);
 
         // Zero-fill rows >= bc_act so the unrolled PV loop sees 0 (no NaN propagation).
-        const uint k_base = ((batch_idx * p.h_kv) + kv_head) * p.t_kv * p.d + kv_start * p.d;
+        const uint k_base = ((batch_idx * p.h_kv) + kv_head) * p.kv_head_stride + kv_start * p.d;
         for (uint k = tid; k < p.bc * p.d; k += tg_size) {
             uint row = k / p.d;
             uint col = k % p.d;
@@ -231,7 +232,7 @@ inline void flash_attention_prefill_impl(
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         // V reuses kv_tile (K no longer needed).
-        const uint v_base = ((batch_idx * p.h_kv) + kv_head) * p.t_kv * p.d + kv_start * p.d;
+        const uint v_base = ((batch_idx * p.h_kv) + kv_head) * p.kv_head_stride + kv_start * p.d;
         for (uint k = tid; k < p.bc * p.d; k += tg_size) {
             uint row = k / p.d;
             uint col = k % p.d;
@@ -354,7 +355,7 @@ inline void flash_attention_prefill_mma_impl(
         const uint bc_act    = min(p.bc, p.t_kv - kv_start);
         const bool need_mask = (n >= mask_boundary) || (p.window != 0u);
 
-        const uint k_base = ((batch_idx * p.h_kv) + kv_head) * p.t_kv * p.d + kv_start * p.d;
+        const uint k_base = ((batch_idx * p.h_kv) + kv_head) * p.kv_head_stride + kv_start * p.d;
         for (uint k = tid; k < p.bc * p.d; k += tg_size) {
             uint row = k / p.d;
             uint col = k % p.d;
@@ -461,7 +462,7 @@ inline void flash_attention_prefill_mma_impl(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        const uint v_base = ((batch_idx * p.h_kv) + kv_head) * p.t_kv * p.d + kv_start * p.d;
+        const uint v_base = ((batch_idx * p.h_kv) + kv_head) * p.kv_head_stride + kv_start * p.d;
         for (uint k = tid; k < p.bc * p.d; k += tg_size) {
             uint row = k / p.d;
             uint col = k % p.d;

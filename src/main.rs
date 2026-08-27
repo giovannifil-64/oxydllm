@@ -1039,6 +1039,71 @@ fn fmt_size(bytes: usize) -> String {
     }
 }
 
+/// What a freshly generated token belongs to.
+#[derive(PartialEq, Eq)]
+enum TokenRole {
+    /// A marker or a channel name, which the reader should not see.
+    Marker,
+    /// Part of the model's reasoning.
+    Thought,
+    /// The last marker of the thought channel: the answer starts after it.
+    ThoughtEnd,
+    /// Part of the answer.
+    Answer,
+}
+
+/// Splits a reasoning model's stream into its thought channel and its answer.
+///
+/// A model that reasons has the channel opened for it by the chat template and
+/// closes it with a marker of its own, so the split is a matter of watching for
+/// that marker rather than of parsing text. The terminal dims the reasoning and
+/// keeps it out of the conversation, which is what `ollama run` shows and what
+/// the HTTP path already does by routing it to `reasoning_content`.
+struct ThoughtChannel {
+    inside: bool,
+    naming: bool,
+    start: Option<u32>,
+    end: Option<u32>,
+}
+
+impl ThoughtChannel {
+    /// Watches the channel a template has opened, or nothing when the model
+    /// does not reason.
+    fn new(tokenizer: &Tokenizer, opened: bool) -> Self {
+        Self {
+            inside: opened,
+            naming: false,
+            start: tokenizer
+                .special_token_id("<think>")
+                .or_else(|| tokenizer.special_token_id("<|channel>")),
+            end: tokenizer
+                .special_token_id("</think>")
+                .or_else(|| tokenizer.special_token_id("<channel|>")),
+        }
+    }
+
+    fn classify(&mut self, tokenizer: &Tokenizer, token: u32) -> TokenRole {
+        if !self.inside {
+            return TokenRole::Answer;
+        }
+        let raw = tokenizer.decode_with_special(&[token]).unwrap_or_default();
+        if self.start == Some(token) || raw.contains("<think>") || raw.contains("<|channel>") {
+            self.naming = true;
+            return TokenRole::Marker;
+        }
+        if self.end == Some(token) || raw.contains("</think>") || raw.contains("<channel|>") {
+            self.inside = false;
+            self.naming = false;
+            return TokenRole::ThoughtEnd;
+        }
+        if self.naming {
+            self.naming = !raw.contains('\n');
+            return TokenRole::Marker;
+        }
+        TokenRole::Thought
+    }
+}
+
 fn clamp_to_char_boundary(s: &str, idx: usize) -> usize {
     let mut i = idx.min(s.len());
     while i > 0 && !s.is_char_boundary(i) {
@@ -1165,6 +1230,13 @@ fn run_interactive(args: &RunArgs) -> anyhow::Result<()> {
         .unwrap_or(0)
         .saturating_sub(1);
 
+    let thinking = tokenizer.has_thinking_support();
+    let (dim, undim) = if std::io::IsTerminal::is_terminal(&std::io::stdout()) {
+        ("\x1b[2m", "\x1b[0m")
+    } else {
+        ("", "")
+    };
+
     println!("\nType your message (/exit to quit).\n");
 
     let stdin = std::io::stdin();
@@ -1196,7 +1268,7 @@ fn run_interactive(args: &RunArgs) -> anyhow::Result<()> {
             name: None,
         });
 
-        let mut prompt = server::apply_chat_template(&tokenizer, &messages, false, None, None)
+        let mut prompt = server::apply_chat_template(&tokenizer, &messages, thinking, None, None)
             .unwrap_or_else(|_| crate::chat_template::format_plain_chat(&messages));
         let mut prompt_tokens = tokenizer.encode(&prompt)?;
 
@@ -1206,7 +1278,7 @@ fn run_interactive(args: &RunArgs) -> anyhow::Result<()> {
             if messages.len() > 1 && messages[1].role == "assistant" {
                 messages.remove(1);
             }
-            prompt = server::apply_chat_template(&tokenizer, &messages, false, None, None)
+            prompt = server::apply_chat_template(&tokenizer, &messages, thinking, None, None)
                 .unwrap_or_else(|_| crate::chat_template::format_plain_chat(&messages));
             prompt_tokens = tokenizer.encode(&prompt)?;
             tracing::warn!(
@@ -1235,9 +1307,39 @@ fn run_interactive(args: &RunArgs) -> anyhow::Result<()> {
         let mut decoded_len: usize = 0;
         let mut stream_buffer = String::new();
         let mut hit_text_stop = false;
+        let mut channel = ThoughtChannel::new(&tokenizer, thinking);
+        let mut thought_ids: Vec<u32> = Vec::new();
+        let mut thought_len: usize = 0;
         while engine.has_pending_work() && !hit_text_stop {
             let step = engine.step().map_err(|e| anyhow::anyhow!("{}", e))?;
             for tok in &step.new_tokens {
+                match channel.classify(&tokenizer, tok.token) {
+                    TokenRole::Marker => continue,
+                    TokenRole::ThoughtEnd => {
+                        if !thought_ids.is_empty() {
+                            println!("\n{dim}...done thinking.{undim}\n");
+                        }
+                        continue;
+                    }
+                    TokenRole::Thought => {
+                        if thought_ids.is_empty() {
+                            println!("{dim}Thinking...");
+                        }
+                        thought_ids.push(tok.token);
+                        let full = tokenizer.decode(&thought_ids)?;
+                        let start = clamp_to_char_boundary(&full, thought_len);
+                        let fresh = full[start..].trim_end_matches('\u{FFFD}');
+                        if fresh.is_empty() {
+                            thought_len = start;
+                            continue;
+                        }
+                        thought_len = start + fresh.len();
+                        print!("{fresh}");
+                        std::io::stdout().flush()?;
+                        continue;
+                    }
+                    TokenRole::Answer => {}
+                }
                 output_ids.push(tok.token);
                 let full = tokenizer.decode(&output_ids)?;
                 let start = clamp_to_char_boundary(&full, decoded_len);

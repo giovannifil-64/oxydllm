@@ -510,7 +510,21 @@ impl StandardTransformer {
             .get("token_embd.weight")
             .map_err(|e| anyhow::anyhow!("Missing token_embd.weight: {e}"))?;
         let vocab_size = embed_qt.shape().dims()[0];
-        let embed_tokens = Embedding::from_qtensor(&embed_qt, device, dtype)?;
+        // The vocabulary-sized embedding is the one tensor worth decoding by
+        // hand: candle's dequantiser walks it on a single thread through an f32
+        // buffer, which on this checkpoint is five of the six seconds the model
+        // build takes and four gigabytes of scratch.
+        let embed_tokens =
+            match gguf
+                .raw_tensor("token_embd.weight")
+                .and_then(|(bytes, gtype, dims)| {
+                    crate::common::gguf_weights::dequantize_rows_parallel(
+                        bytes, gtype, dims, dtype, device,
+                    )
+                }) {
+                Some(dense) => Embedding::new(dense?),
+                None => Embedding::from_qtensor(&embed_qt, device, dtype)?,
+            };
         // Dequantizing the table goes through an F32 copy twice the size of the
         // BF16 one it becomes, and candle returns a buffer to its pool only at a
         // synchronisation point. Without one here the copy stays resident for

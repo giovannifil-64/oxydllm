@@ -12,8 +12,8 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use candle_core::Device;
-use candle_core::quantized::QTensor;
 use candle_core::quantized::gguf_file;
+use candle_core::quantized::{GgmlDType, QTensor};
 use memmap2::Mmap;
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
@@ -23,7 +23,20 @@ use rustc_hash::FxHashMap;
 pub struct GgufWeights {
     tensors: FxHashMap<String, Arc<QTensor>>,
     pub metadata: HashMap<String, gguf_file::Value>,
+    /// Where each tensor's bytes live in the maps, so a caller that wants to
+    /// decode them itself does not have to go through the device.
+    raw: FxHashMap<String, RawTensor>,
     _mmaps: Vec<Mmap>,
+}
+
+/// One tensor's quantized bytes: which map holds them, where, and how to read
+/// them.
+struct RawTensor {
+    shard: usize,
+    start: usize,
+    end: usize,
+    dtype: GgmlDType,
+    dims: Vec<usize>,
 }
 
 /// Reads any of GGUF's integer widths as a `u32`.
@@ -75,9 +88,11 @@ impl GgufWeights {
             device,
         )?;
 
+        let raw = index_raw(0, content.tensor_data_offset, &content.tensor_infos);
         Ok(Self {
             tensors,
             metadata: content.metadata,
+            raw,
             _mmaps: vec![mmap],
         })
     }
@@ -96,6 +111,17 @@ impl GgufWeights {
     /// Returns the tensor named `name`, or `None` if it is absent.
     pub fn try_get(&self, name: &str) -> Option<Arc<QTensor>> {
         self.tensors.get(name).cloned()
+    }
+
+    /// The tensor's bytes as the file stores them, with its type and shape.
+    ///
+    /// Decoding them directly is worth it where the alternative goes through
+    /// candle's dequantiser, which blits the tensor back to the host and walks
+    /// it on one thread: five seconds for a vocabulary-sized embedding.
+    pub fn raw_tensor(&self, name: &str) -> Option<(&[u8], GgmlDType, &[usize])> {
+        let r = self.raw.get(name)?;
+        let map = self._mmaps.get(r.shard)?;
+        Some((&map[r.start..r.end], r.dtype, &r.dims))
     }
 
     /// Total on-device size of all loaded tensors, in bytes.
@@ -192,6 +218,7 @@ impl GgufWeights {
         let mut tensors = FxHashMap::default();
         let mut metadata = HashMap::new();
         let mut mmaps = Vec::with_capacity(paths.len());
+        let mut raw: FxHashMap<String, RawTensor> = FxHashMap::default();
         let total_shards = paths.len();
         let mut total_tensors = 0usize;
         for (shard_idx, path) in paths.iter().enumerate() {
@@ -220,6 +247,11 @@ impl GgufWeights {
                 );
             }
             total_tensors += content.tensor_infos.len();
+            raw.extend(index_raw(
+                shard_idx,
+                content.tensor_data_offset,
+                &content.tensor_infos,
+            ));
             let shard_tensors = parallelise_tensor_load(
                 &mmap,
                 content.tensor_data_offset,
@@ -238,6 +270,7 @@ impl GgufWeights {
         Ok(Self {
             tensors,
             metadata,
+            raw,
             _mmaps: mmaps,
         })
     }
@@ -348,6 +381,117 @@ fn prefault(file: &std::fs::File, len: usize) {
     });
 }
 
+/// Byte range of one tensor inside the map that holds it.
+fn raw_range(data_offset: u64, info: &gguf_file::TensorInfo) -> (usize, usize) {
+    let elems = info.shape.elem_count();
+    let size = elems / info.ggml_dtype.block_size() * info.ggml_dtype.type_size();
+    let start = (data_offset + info.offset) as usize;
+    (start, start + size)
+}
+
+/// Decodes a tensor's quantized bytes into `dtype`, in parallel.
+///
+/// candle's own dequantiser blits the tensor back to the host and walks it on
+/// one thread through an `f32` buffer: for a 262144 by 3840 embedding that is
+/// five seconds and four gigabytes of scratch, which is most of what loading a
+/// 12B checkpoint costs. This walks row blocks across the rayon pool and writes
+/// the target type straight out, keeping the scratch to one small buffer per
+/// worker. Types it does not know fall back to the caller's slow path.
+pub fn dequantize_rows_parallel(
+    bytes: &[u8],
+    dtype: GgmlDType,
+    dims: &[usize],
+    out_dtype: candle_core::DType,
+    device: &Device,
+) -> Option<candle_core::Result<candle_core::Tensor>> {
+    use candle_core::quantized::k_quants::GgmlType;
+
+    let elems: usize = dims.iter().product();
+    let block = dtype.block_size();
+    if elems == 0 || !elems.is_multiple_of(block) {
+        return None;
+    }
+    // Rows keep the decode aligned to whole blocks.
+    let row = *dims.last()?;
+    if !row.is_multiple_of(block) || row == 0 {
+        return None;
+    }
+    let rows = elems / row;
+    let bytes_per_row = row / block * dtype.type_size();
+    if bytes.len() < rows * bytes_per_row {
+        return None;
+    }
+
+    macro_rules! decodifica {
+        ($blocco:ty, $conversione:expr) => {{
+            let mut out = vec![$conversione(0.0f32); elems];
+            out.par_chunks_mut(row * ROWS_PER_TASK)
+                .enumerate()
+                .for_each(|(i, dst)| {
+                    let first = i * ROWS_PER_TASK;
+                    let n = dst.len() / row;
+                    let src = &bytes[first * bytes_per_row..(first + n) * bytes_per_row];
+                    let blocks: &[$blocco] = unsafe {
+                        std::slice::from_raw_parts(
+                            src.as_ptr() as *const $blocco,
+                            src.len() / std::mem::size_of::<$blocco>(),
+                        )
+                    };
+                    let mut scratch = vec![0f32; dst.len()];
+                    <$blocco as GgmlType>::to_float(blocks, &mut scratch);
+                    for (o, v) in dst.iter_mut().zip(scratch.iter()) {
+                        *o = $conversione(*v);
+                    }
+                });
+            Some(candle_core::Tensor::from_vec(out, dims, device))
+        }};
+    }
+
+    const ROWS_PER_TASK: usize = 64;
+    use candle_core::quantized::k_quants as kq;
+    match (dtype, out_dtype) {
+        (GgmlDType::Q4K, candle_core::DType::BF16) => {
+            decodifica!(kq::BlockQ4K, half::bf16::from_f32)
+        }
+        (GgmlDType::Q6K, candle_core::DType::BF16) => {
+            decodifica!(kq::BlockQ6K, half::bf16::from_f32)
+        }
+        (GgmlDType::Q5K, candle_core::DType::BF16) => {
+            decodifica!(kq::BlockQ5K, half::bf16::from_f32)
+        }
+        (GgmlDType::Q8_0, candle_core::DType::BF16) => {
+            decodifica!(kq::BlockQ8_0, half::bf16::from_f32)
+        }
+        (GgmlDType::Q4_0, candle_core::DType::BF16) => {
+            decodifica!(kq::BlockQ4_0, half::bf16::from_f32)
+        }
+        _ => None,
+    }
+}
+
+fn index_raw(
+    shard: usize,
+    data_offset: u64,
+    infos: &HashMap<String, gguf_file::TensorInfo>,
+) -> FxHashMap<String, RawTensor> {
+    infos
+        .iter()
+        .map(|(name, info)| {
+            let (start, end) = raw_range(data_offset, info);
+            (
+                name.clone(),
+                RawTensor {
+                    shard,
+                    start,
+                    end,
+                    dtype: info.ggml_dtype,
+                    dims: info.shape.dims().to_vec(),
+                },
+            )
+        })
+        .collect()
+}
+
 fn parallelise_tensor_load(
     mmap: &Mmap,
     data_offset: u64,
@@ -420,6 +564,67 @@ mod tests {
     use super::*;
     use candle_core::Tensor;
     use candle_core::quantized::GgmlDType;
+
+    /// Contract: decoding a tensor's bytes in parallel gives exactly what
+    /// candle's own dequantiser gives.
+    ///
+    /// The fast path exists because candle's blits the tensor back to the host
+    /// and walks it on one thread: five of the six seconds a 12B checkpoint
+    /// takes to build. Faster is only worth having if it is the same, so this
+    /// compares the two element by element on every type the fast path claims.
+    #[test]
+    fn decoding_in_parallel_matches_candle() {
+        use candle_core::quantized::GgmlDType;
+        let dev = Device::Cpu;
+        for gtype in [
+            GgmlDType::Q4K,
+            GgmlDType::Q6K,
+            GgmlDType::Q5K,
+            GgmlDType::Q8_0,
+            GgmlDType::Q4_0,
+        ] {
+            // Rows of 512 so every supported block size divides them.
+            let (rows, row) = (200usize, 512usize);
+            let valori: Vec<f32> = (0..rows * row)
+                .map(|i| ((i % 97) as f32 - 48.0) * 0.021)
+                .collect();
+            let denso = Tensor::from_vec(valori, (rows, row), &dev).unwrap();
+            let qt = QTensor::quantize(&denso, gtype).unwrap();
+            let atteso: Vec<f32> = qt
+                .dequantize(&dev)
+                .unwrap()
+                .to_dtype(candle_core::DType::BF16)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<half::bf16>()
+                .unwrap()
+                .into_iter()
+                .map(f32::from)
+                .collect();
+
+            let bytes = qt.data().unwrap();
+            let ottenuto: Vec<f32> = dequantize_rows_parallel(
+                &bytes,
+                gtype,
+                &[rows, row],
+                candle_core::DType::BF16,
+                &dev,
+            )
+            .unwrap_or_else(|| panic!("{gtype:?} should take the fast path"))
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<half::bf16>()
+            .unwrap()
+            .into_iter()
+            .map(f32::from)
+            .collect();
+
+            assert_eq!(ottenuto.len(), atteso.len(), "{gtype:?}: length");
+            assert_eq!(ottenuto, atteso, "{gtype:?}: values differ from candle");
+        }
+    }
 
     /// Contract: `depermute_qk_rows` is the exact inverse of the
     /// `convert_hf_to_gguf.py` Llama-family permute

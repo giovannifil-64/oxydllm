@@ -6837,6 +6837,103 @@ mod quantized_matmul_floor {
         }
     }
 
+    /// How much of the machine's bandwidth candle's quantized matvec already
+    /// uses at a single token, which is what decides whether a matvec of this
+    /// crate's own could be worth writing.
+    ///
+    /// A matvec reads the whole weight and does one multiply per element, so it
+    /// is bandwidth bound and its ceiling is the machine's read rate. Two
+    /// references bracket that rate on work that cannot be elided: a dense BF16
+    /// matvec of the same shape, and a full reduction over a buffer of the same
+    /// size. The gap between the quantized matvec and them is all a
+    /// hand-written kernel could recover. Alongside it, the cost of one tiny
+    /// dtype conversion, which is the launch overhead the decode path pays
+    /// fourteen times per layer.
+    #[test]
+    #[ignore = "perf probe (requires macOS 26 / Metal 4)"]
+    fn quantized_matvec_bandwidth_headroom_probe() {
+        use std::time::Instant;
+        let Ok(dev) = Device::new_metal(0) else {
+            return;
+        };
+        let time = |f: &dyn Fn() -> Tensor| -> f64 {
+            for _ in 0..5 {
+                f().to_device(&Device::Cpu).unwrap();
+            }
+            let iters = 50;
+            let t = Instant::now();
+            let mut sink = Vec::with_capacity(iters);
+            for _ in 0..iters {
+                sink.push(f());
+            }
+            sink.last().unwrap().to_device(&Device::Cpu).unwrap();
+            t.elapsed().as_secs_f64() / iters as f64
+        };
+        let riempi = |rows: usize, cols: usize| -> Tensor {
+            let v: Vec<f32> = (0..rows * cols)
+                .map(|i| ((i % 29) as f32 - 14.0) * 0.031)
+                .collect();
+            Tensor::from_vec(v, (rows, cols), &dev).unwrap()
+        };
+        for dtype in [GgmlDType::Q4K, GgmlDType::Q6K] {
+            for (label, n, k) in [
+                ("ffn gate/up", 15360usize, 3840usize),
+                ("ffn down", 3840, 15360),
+            ] {
+                let w32 = riempi(n, k);
+                let bytes = QTensor::quantize(&w32, dtype)
+                    .unwrap()
+                    .data()
+                    .unwrap()
+                    .into_owned();
+                let peso_byte = bytes.len();
+                let qt = std::sync::Arc::new(
+                    crate::common::gguf_weights::qtensor_with_staged(
+                        dtype,
+                        &bytes,
+                        vec![n, k],
+                        &dev,
+                    )
+                    .unwrap()
+                    .0,
+                );
+                let candle = QMatMul::from_arc(qt).unwrap();
+
+                let x_bf = riempi(1, k).to_dtype(candle_core::DType::BF16).unwrap();
+                let x32 = x_bf.to_dtype(candle_core::DType::F32).unwrap();
+                let t_mv = time(&|| candle.forward(&x32).unwrap());
+                let t_conv = time(&|| x_bf.to_dtype(candle_core::DType::F32).unwrap());
+
+                let w_bf = w32
+                    .t()
+                    .unwrap()
+                    .contiguous()
+                    .unwrap()
+                    .to_dtype(candle_core::DType::BF16)
+                    .unwrap();
+                let t_dense = time(&|| x_bf.matmul(&w_bf).unwrap());
+                let dense_byte = n * k * 2;
+
+                let big = w32.to_dtype(candle_core::DType::BF16).unwrap();
+                let t_sum = time(&|| big.sum_all().unwrap());
+
+                let gb = |b: usize, t: f64| b as f64 / t / 1e9;
+                println!(
+                    "{dtype:?} {label:12} | matvec quantizzato {:7.1} us = {:5.1} GB/s | denso BF16 {:7.1} us = {:5.1} GB/s | somma {:7.1} us = {:5.1} GB/s | il quantizzato usa il {:3.0}% del miglior riferimento | una conversione {:5.1} us",
+                    t_mv * 1e6,
+                    gb(peso_byte, t_mv),
+                    t_dense * 1e6,
+                    gb(dense_byte, t_dense),
+                    t_sum * 1e6,
+                    gb(dense_byte, t_sum),
+                    gb(peso_byte, t_mv) / gb(dense_byte, t_dense).max(gb(dense_byte, t_sum))
+                        * 100.0,
+                    t_conv * 1e6,
+                );
+            }
+        }
+    }
+
     /// Contract: the quantized matmul this crate leans on stays fast enough to
     /// be worth leaning on.
     ///

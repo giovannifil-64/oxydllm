@@ -506,7 +506,10 @@ impl GatedDeltaNet {
                     "{prefix}.{name}.weight: expected out_features {expect_out}, got {got}"
                 );
             }
-            Ok(AnyLinear::Quantized(QLinear::from_arc(qt, dtype)?))
+            Ok(AnyLinear::Quantized(
+                QLinear::from_arc(qt, dtype)?
+                    .with_staged(gguf.staged(&format!("{prefix}.{name}.weight"))),
+            ))
         };
         let in_proj_qkv = qproj("attn_qkv", conv_dim)?;
         let in_proj_z = qproj("attn_gate", value_dim)?;
@@ -516,7 +519,10 @@ impl GatedDeltaNet {
         };
         let out_proj = {
             let qt = gguf.get(&format!("{prefix}.ssm_out.weight"))?;
-            AnyLinear::Quantized(QLinear::from_arc(qt, dtype)?)
+            AnyLinear::Quantized(
+                QLinear::from_arc(qt, dtype)?
+                    .with_staged(gguf.staged(&format!("{prefix}.ssm_out.weight"))),
+            )
         };
 
         let conv_raw = gguf

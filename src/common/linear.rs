@@ -8,6 +8,16 @@ use candle_core::quantized::{QMatMul, QTensor};
 use candle_core::{DType, Device, Result, Tensor};
 use std::sync::Arc;
 
+/// A GGUF weight the staged TensorOps GEMM reads where candle keeps it.
+#[cfg(feature = "metal")]
+pub use super::metal_ops::StagedWeight;
+
+/// Off Metal no kernel of this crate reads a quantized weight in place, so
+/// nothing can be one.
+#[cfg(not(feature = "metal"))]
+#[derive(Clone, Debug)]
+pub enum StagedWeight {}
+
 /// The token embedding table, kept in whatever form the checkpoint gave it.
 ///
 /// A quantized table stays quantized and hands back only the rows a batch asks
@@ -199,12 +209,16 @@ pub fn softmax_last_dim(x: &Tensor) -> Result<Tensor> {
 
 /// A quantized linear layer over GGUF `QTensor` weights.
 ///
-/// Defers the matmul to candle's `QMatMul`, which on Metal reaches roughly
-/// 3 TFLOPS on prefill shapes against the 0.4 this crate's own block-quant
-/// kernels managed, and wins at every batch size down to a single token. An
-/// optional `bias` is added and the output is produced in `out_dtype`.
+/// Small batches go to candle's `QMatMul`, which is memory bound down to a
+/// single token and serves decode. Large batches go to the staged TensorOps
+/// GEMM when the loader produced a [`StagedWeight`] for this weight: it reads
+/// the same buffer, takes the activations in their own dtype instead of
+/// through an F32 copy, and dequantizes one tile at a time on the way to the
+/// tensor units. An optional `bias` is added and the output is produced in
+/// `out_dtype`.
 pub struct QLinear {
     inner: QMatMul,
+    staged: Option<StagedWeight>,
     bias: Option<Tensor>,
     out_dtype: DType,
 }
@@ -221,16 +235,31 @@ impl QLinear {
     ) -> Result<Self> {
         Ok(Self {
             inner: QMatMul::from_arc(qtensor)?,
+            staged: None,
             bias,
             out_dtype,
         })
     }
 
+    /// Attaches the handle the staged GEMM reads this weight through, when the
+    /// loader produced one.
+    pub fn with_staged(mut self, staged: Option<StagedWeight>) -> Self {
+        self.staged = staged;
+        self
+    }
+
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let original_dims = x.dims().to_vec();
         let in_features = *original_dims.last().unwrap();
+        let batch_flat: usize = original_dims[..original_dims.len() - 1].iter().product();
 
-        let inner = &self.inner;
+        #[cfg(feature = "metal")]
+        if let Some(staged) = &self.staged {
+            let x_2d = x.reshape((batch_flat, in_features))?;
+            if let Some(out) = super::metal_ops::maybe_staged_quant_matmul(&x_2d, staged)? {
+                return self.finish(out, &original_dims);
+            }
+        }
 
         let x_f32_owned;
         let x_f32: &Tensor = if x.dtype() != DType::F32 {
@@ -239,31 +268,31 @@ impl QLinear {
         } else {
             x
         };
-
         let x_2d = if x_f32.rank() > 2 {
-            let batch_flat: usize = original_dims[..original_dims.len() - 1].iter().product();
             x_f32.reshape((batch_flat, in_features))?
         } else {
             x_f32.clone()
         };
+        let out = candle_core::Module::forward(&self.inner, &x_2d)?;
+        self.finish(out, &original_dims)
+    }
 
-        let out = candle_core::Module::forward(inner, &x_2d)?;
-
+    /// Gives `out` the leading dimensions of the input, the output dtype and
+    /// the bias.
+    fn finish(&self, out: Tensor, original_dims: &[usize]) -> Result<Tensor> {
         let out = if original_dims.len() > 2 {
             let out_features = out.dim(candle_core::D::Minus1)?;
-            let mut new_dims = original_dims;
+            let mut new_dims = original_dims.to_vec();
             *new_dims.last_mut().unwrap() = out_features;
             out.reshape(new_dims)?
         } else {
             out
         };
-
         let out = if out.dtype() != self.out_dtype {
             out.to_dtype(self.out_dtype)?
         } else {
             out
         };
-
         match &self.bias {
             Some(b) => out.broadcast_add(b),
             None => Ok(out),
@@ -492,6 +521,85 @@ impl AnyLinear {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Contract: a quantized linear answers the same with and without the
+    /// staged handle, on both sides of the batch-size threshold and on a
+    /// three-dimensional input.
+    ///
+    /// The handle changes which kernel runs, never what comes out. Below the
+    /// threshold the two share candle's path outright; above it the staged
+    /// GEMM reads the same buffer, so the outputs have to agree to the
+    /// precision of a BF16 activation path against an F32 one.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn a_staged_handle_changes_the_kernel_and_not_the_answer() {
+        let Ok(dev) = Device::new_metal(0) else {
+            return;
+        };
+        use candle_core::quantized::GgmlDType;
+        let (n, k) = (192usize, 512usize);
+        let w: Vec<f32> = (0..n * k)
+            .map(|i| ((i % 23) as f32 - 11.0) * 0.04)
+            .collect();
+        let w32 = Tensor::from_vec(w, (n, k), &dev).unwrap();
+        let bytes = candle_core::quantized::QTensor::quantize(&w32, GgmlDType::Q4K)
+            .unwrap()
+            .data()
+            .unwrap()
+            .into_owned();
+        let (qt, staged) = crate::common::gguf_weights::qtensor_with_staged(
+            GgmlDType::Q4K,
+            &bytes,
+            vec![n, k],
+            &dev,
+        )
+        .unwrap();
+        assert!(
+            staged.is_some(),
+            "a Q4_K weight with whole-block rows is stageable"
+        );
+        let qt = Arc::new(qt);
+        let plain = QLinear::from_arc(qt.clone(), DType::BF16).unwrap();
+        let routed = QLinear::from_arc(qt, DType::BF16)
+            .unwrap()
+            .with_staged(staged);
+
+        for m in [1usize, 8, super::super::metal_ops::MPP_GEMM_MIN_M, 200] {
+            let x: Vec<f32> = (0..m * k).map(|i| ((i % 17) as f32 - 8.0) * 0.05).collect();
+            let x = Tensor::from_vec(x, (1, m, k), &dev)
+                .unwrap()
+                .to_dtype(DType::BF16)
+                .unwrap();
+            let a = plain.forward(&x).unwrap();
+            let b = routed.forward(&x).unwrap();
+            assert_eq!(a.dims(), b.dims(), "m={m}: shape");
+            assert_eq!(b.dtype(), DType::BF16, "m={m}: output dtype");
+            let a = a
+                .to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            let b = b
+                .to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            let peak = a.iter().fold(0f32, |acc, v| acc.max(v.abs())).max(1e-6);
+            let worst = a
+                .iter()
+                .zip(&b)
+                .fold(0f32, |acc, (x, y)| acc.max((x - y).abs()));
+            assert!(
+                worst / peak < 0.02,
+                "m={m}: relative error {} between the two paths",
+                worst / peak
+            );
+        }
+    }
 
     /// Contract: gathering rows from the quantized table gives what
     /// materialising it and indexing would have given.

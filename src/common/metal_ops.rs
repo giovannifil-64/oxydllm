@@ -33,6 +33,7 @@
 //! Every op is Metal-only: the `cpu_fwd` implementations bail, so callers
 //! keep their own CPU fallback.
 
+use candle_core::quantized::GgmlDType;
 use candle_core::{
     CpuStorage, CustomOp1, CustomOp2, CustomOp3, D, DType, InplaceOp1, Layout, MetalStorage,
     Result, Shape, Tensor, backend::BackendStorage,
@@ -2809,18 +2810,40 @@ struct MppQuantMatmul {
     pack_dim: crate::common::awq::PackDim,
 }
 
-#[allow(dead_code)]
-/// Staged TensorOps GEMM against a GGUF Q4_K weight, kept in the block layout
-/// the file stores it in.
+/// A GGUF weight the staged TensorOps GEMM reads where candle keeps it.
 ///
-/// `weight` carries the raw superblocks as `u32` so the bytes reach the device
-/// through the ordinary tensor path; the kernel reads them as blocks and
-/// dequantizes a tile at a time into threadgroup memory. `n` and `k` are the
-/// weight's output and input widths, which the block buffer alone does not say.
-struct MppQ4kMatmul {
-    weight: Tensor,
+/// Candle's `QTensor` owns the Metal buffer behind a quantized weight and does
+/// not hand it out, so the loader takes this handle at the moment it builds
+/// the storage, before the `QTensor` wraps it. The buffer is shared, not
+/// copied: candle's quantized matmul keeps serving the small-M shapes of
+/// decode from the same bytes while the staged GEMM serves prefill, and the
+/// weights are read-only, so the two readers never disagree.
+///
+/// Only a layout the kernel understands becomes a handle: today the 256-wide
+/// Q4_K block on a two-dimensional weight whose rows are whole blocks.
+#[derive(Clone, Debug)]
+pub struct StagedWeight {
+    buffer: candle_metal_kernels::metal::Buffer,
     n: usize,
     k: usize,
+}
+
+impl StagedWeight {
+    /// Wraps `buffer` when the staged kernel covers `dtype` and `dims`.
+    pub fn new(
+        buffer: candle_metal_kernels::metal::Buffer,
+        dtype: GgmlDType,
+        dims: &[usize],
+    ) -> Option<Self> {
+        match (dtype, dims) {
+            (GgmlDType::Q4K, &[n, k]) if k.is_multiple_of(256) => Some(Self { buffer, n, k }),
+            _ => None,
+        }
+    }
+}
+
+struct MppQ4kMatmul {
+    weight: StagedWeight,
 }
 
 impl CustomOp1 for MppQ4kMatmul {
@@ -2844,27 +2867,19 @@ impl CustomOp1 for MppQ4kMatmul {
             candle_core::bail!("MppQ4kMatmul: x must be 2-D, got {x_dims:?}");
         }
         let (m, k) = (x_dims[0], x_dims[1]);
-        if k != self.k {
-            candle_core::bail!("MppQ4kMatmul: x k {k} != weight k {}", self.k);
-        }
-        if !k.is_multiple_of(256) {
-            candle_core::bail!("MppQ4kMatmul: k {k} is not a multiple of the 256-element block");
+        let (n, wk) = (self.weight.n, self.weight.k);
+        if k != wk {
+            candle_core::bail!("MppQ4kMatmul: x k {k} != weight k {wk}");
         }
 
         let device = x.device();
-        let out_elems = m * self.n;
+        let out_elems = m * n;
         let output = device.new_buffer(out_elems, DType::BF16, "mpp_q4k_matmul")?;
         let params = MppQuantGemmParams {
             m: m as i32,
-            n: self.n as i32,
+            n: n as i32,
             k: k as i32,
             group_shift: 0,
-        };
-
-        let w_sl = self.weight.storage_and_layout();
-        let w_buf = match &*w_sl.0 {
-            candle_core::Storage::Metal(ms) => ms.buffer(),
-            _ => candle_core::bail!("MppQ4kMatmul: weight must be Metal-resident"),
         };
 
         let pipeline = get_or_compile_mpp_pipeline(device.device(), "mpp_gemm_q4k_staged")?;
@@ -2872,13 +2887,13 @@ impl CustomOp1 for MppQ4kMatmul {
         let encoder = encoder.as_ref();
         encoder.set_compute_pipeline_state(&pipeline);
         encoder.set_input_buffer(0, Some(x.buffer()), x_l.start_offset() * 2);
-        encoder.set_input_buffer(1, Some(w_buf), w_sl.1.start_offset() * 4);
+        encoder.set_input_buffer(1, Some(&self.weight.buffer), 0);
         encoder.set_output_buffer(2, Some(&*output), 0);
         encoder.set_bytes(3, &params);
 
         encoder.dispatch_thread_groups(
             MTLSize {
-                width: self.n.div_ceil(MPP_GEMM_TILE),
+                width: n.div_ceil(MPP_GEMM_TILE),
                 height: m.div_ceil(MPP_GEMM_TILE * 2),
                 depth: 1,
             },
@@ -2891,23 +2906,50 @@ impl CustomOp1 for MppQ4kMatmul {
 
         Ok((
             MetalStorage::new(output, device.clone(), out_elems, DType::BF16),
-            Shape::from_dims(&[m, self.n]),
+            Shape::from_dims(&[m, n]),
         ))
     }
 }
 
-#[allow(dead_code)]
-/// Multiplies `x` by a GGUF Q4_K weight on the TensorOps path.
+/// Multiplies `x` by a GGUF Q4_K weight on the TensorOps path, one tile of the
+/// weight at a time through threadgroup memory, never materialising it.
 ///
 /// ## Errors
-/// Fails off-Metal, on non-BF16 or non-contiguous `x`, or on a shape the block
-/// layout cannot describe.
-pub fn mpp_q4k_matmul(x: &Tensor, weight: &Tensor, n: usize, k: usize) -> Result<Tensor> {
+/// Fails off-Metal, on non-BF16 or non-contiguous `x`, or when `x` does not
+/// have the weight's row length.
+pub fn mpp_q4k_matmul(x: &Tensor, weight: &StagedWeight) -> Result<Tensor> {
     x.apply_op1_no_bwd(&MppQ4kMatmul {
         weight: weight.clone(),
-        n,
-        k,
     })
+}
+
+/// `x @ weight^T` through the staged kernel where it is the better path, else
+/// `None` so the caller falls back to candle's quantized matmul.
+///
+/// The threshold on M is [`MPP_GEMM_MIN_M`], measured for the dense TensorOps
+/// GEMM against candle's dense GEMM. The crossover of the staged kernel
+/// against candle's quantized matmul has not been measured on its own; below
+/// the threshold candle serves decode, where it is memory bound and within
+/// reach of llama.cpp.
+pub fn maybe_staged_quant_matmul(x: &Tensor, weight: &StagedWeight) -> Result<Option<Tensor>> {
+    if x.dtype() != DType::BF16 {
+        return Ok(None);
+    }
+    let candle_core::Device::Metal(md) = x.device() else {
+        return Ok(None);
+    };
+    let dims = x.dims();
+    if dims.len() != 2 || dims[0] < MPP_GEMM_MIN_M || dims[1] != weight.k || !x.is_contiguous() {
+        return Ok(None);
+    }
+    if !mpp_gemm_available(md.device()) {
+        return Ok(None);
+    }
+    match mpp_q4k_matmul(x, weight) {
+        Ok(y) => Ok(Some(y)),
+        Err(_) if mpp_runtime_broken() => Ok(None),
+        Err(e) => Err(e),
+    }
 }
 
 impl CustomOp1 for MppQuantMatmul {
@@ -6599,17 +6641,14 @@ mod quantized_matmul_floor {
     use candle_core::quantized::{GgmlDType, QMatMul, QTensor};
     use candle_core::{Device, Module, Tensor};
 
-    /// Contract: the staged TensorOps GEMM against a GGUF Q4_K weight answers
-    /// what candle's quantized matmul answers.
+    /// Contract: the staged TensorOps GEMM reads a GGUF Q4_K weight through
+    /// the buffer candle keeps it in and answers what candle's quantized
+    /// matmul answers from that same buffer.
     ///
-    /// The staged path never materialises the weight: it dequantizes one tile
-    /// at a time into threadgroup memory and multiplies it on the tensor units,
-    /// which is the only way to reach that hardware without paying for a dense
-    /// copy of the weight. It is worth having only if the two agree, so this
-    /// compares them on a feed-forward shape and on a tail that leaves partial
-    /// tiles at both edges.
+    /// The weight is built the way the loader builds it, so one buffer has two
+    /// readers, and the shapes leave partial tiles at both edges.
     #[test]
-    fn the_staged_q4k_gemm_matches_candle() {
+    fn the_staged_q4k_gemm_matches_candle_on_a_shared_buffer() {
         let Ok(dev) = Device::new_metal(0) else {
             return;
         };
@@ -6618,13 +6657,25 @@ mod quantized_matmul_floor {
                 .map(|i| ((i % 29) as f32 - 14.0) * 0.031)
                 .collect();
             let w32 = Tensor::from_vec(w, (n, k), &dev).unwrap();
-            let qt = std::sync::Arc::new(QTensor::quantize(&w32, GgmlDType::Q4K).unwrap());
+            let bytes = QTensor::quantize(&w32, GgmlDType::Q4K)
+                .unwrap()
+                .data()
+                .unwrap()
+                .into_owned();
+            let (qt, staged) = crate::common::gguf_weights::qtensor_with_staged(
+                GgmlDType::Q4K,
+                &bytes,
+                vec![n, k],
+                &dev,
+            )
+            .unwrap();
+            let staged = staged.expect("a Q4_K weight with whole-block rows is stageable");
 
             let x: Vec<f32> = (0..m * k).map(|i| ((i % 13) as f32 - 6.0) * 0.05).collect();
             let x32 = Tensor::from_vec(x, (m, k), &dev).unwrap();
             let x_bf = x32.to_dtype(candle_core::DType::BF16).unwrap();
 
-            let atteso: Vec<f32> = QMatMul::from_arc(qt.clone())
+            let atteso: Vec<f32> = QMatMul::from_arc(std::sync::Arc::new(qt))
                 .unwrap()
                 .forward(&x32)
                 .unwrap()
@@ -6632,14 +6683,7 @@ mod quantized_matmul_floor {
                 .unwrap()
                 .to_vec1::<f32>()
                 .unwrap();
-
-            let blocchi = qt.data().unwrap();
-            let parole: Vec<u32> = blocchi
-                .chunks_exact(4)
-                .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                .collect();
-            let weight = Tensor::from_vec(parole.clone(), (parole.len(),), &dev).unwrap();
-            let ottenuto: Vec<f32> = crate::common::metal_ops::mpp_q4k_matmul(&x_bf, &weight, n, k)
+            let ottenuto: Vec<f32> = crate::common::metal_ops::mpp_q4k_matmul(&x_bf, &staged)
                 .unwrap()
                 .to_dtype(candle_core::DType::F32)
                 .unwrap()

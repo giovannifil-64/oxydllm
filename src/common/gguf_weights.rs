@@ -1,27 +1,31 @@
 //! Zero-copy loader and accessor for GGUF weight files.
 //!
 //! [`GgufWeights`] memory-maps one or more GGUF files, parses the header, and
-//! builds an `Arc<QTensor>` per tensor whose data points directly into the
-//! mapped pages (the mmaps are kept alive for the struct's lifetime). Tensor
-//! materialisation is parallelised with rayon. Besides tensor access it exposes
-//! typed getters over the GGUF `metadata` map.
+//! builds an `Arc<QTensor>` per tensor, plus, where a kernel of this crate can
+//! read a weight in the buffer candle keeps it in, the [`StagedWeight`] handle
+//! it reads through. Tensor materialisation is parallelised with rayon.
+//! Besides tensor access it exposes typed getters over the GGUF `metadata` map.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::sync::Arc;
 
+use crate::common::linear::StagedWeight;
 use anyhow::Context;
 use candle_core::Device;
-use candle_core::quantized::QTensor;
 use candle_core::quantized::gguf_file;
+use candle_core::quantized::{GgmlDType, QStorage, QTensor};
 use memmap2::Mmap;
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 
-/// A loaded GGUF model: quantized tensors by name, the raw metadata map, and the
-/// backing memory maps held alive so the tensor data stays valid.
+/// A loaded GGUF model: quantized tensors by name, the handles the staged
+/// GEMM reads some of them through, the raw metadata map, and the backing
+/// memory maps held alive so the tensor data stays valid.
 pub struct GgufWeights {
     tensors: FxHashMap<String, Arc<QTensor>>,
+    staged: FxHashMap<String, StagedWeight>,
     pub metadata: HashMap<String, gguf_file::Value>,
     _mmaps: Vec<Mmap>,
 }
@@ -67,7 +71,7 @@ impl GgufWeights {
             "GGUF mmap+header parsed"
         );
 
-        let tensors = parallelise_tensor_load(
+        let (tensors, staged) = parallelise_tensor_load(
             &file,
             mmap.len(),
             content.tensor_data_offset,
@@ -77,6 +81,7 @@ impl GgufWeights {
 
         Ok(Self {
             tensors,
+            staged,
             metadata: content.metadata,
             _mmaps: vec![mmap],
         })
@@ -96,6 +101,12 @@ impl GgufWeights {
     /// Returns the tensor named `name`, or `None` if it is absent.
     pub fn try_get(&self, name: &str) -> Option<Arc<QTensor>> {
         self.tensors.get(name).cloned()
+    }
+
+    /// Returns the handle the staged GEMM reads the tensor named `name`
+    /// through, or `None` where no kernel of this crate reads that layout.
+    pub fn staged(&self, name: &str) -> Option<StagedWeight> {
+        self.staged.get(name).cloned()
     }
 
     /// Total on-device size of all loaded tensors, in bytes.
@@ -190,6 +201,7 @@ impl GgufWeights {
             return Self::load(paths[0], device);
         }
         let mut tensors = FxHashMap::default();
+        let mut staged = FxHashMap::default();
         let mut metadata = HashMap::new();
         let mut mmaps = Vec::with_capacity(paths.len());
         let total_shards = paths.len();
@@ -220,7 +232,7 @@ impl GgufWeights {
                 );
             }
             total_tensors += content.tensor_infos.len();
-            let shard_tensors = parallelise_tensor_load(
+            let (shard_tensors, shard_staged) = parallelise_tensor_load(
                 &file,
                 mmap.len(),
                 content.tensor_data_offset,
@@ -229,6 +241,7 @@ impl GgufWeights {
             )
             .with_context(|| format!("Failed to load tensors from shard '{}'", path))?;
             tensors.extend(shard_tensors);
+            staged.extend(shard_staged);
             mmaps.push(mmap);
         }
         tracing::info!(
@@ -238,6 +251,7 @@ impl GgufWeights {
         );
         Ok(Self {
             tensors,
+            staged,
             metadata,
             _mmaps: mmaps,
         })
@@ -293,7 +307,7 @@ pub fn depermute_qk_rows(
     n_heads: usize,
     head_dim: usize,
     device: &Device,
-) -> candle_core::Result<QTensor> {
+) -> candle_core::Result<(QTensor, Option<StagedWeight>)> {
     let dims = qt.shape().dims().to_vec();
     if dims.len() != 2 || dims[0] != n_heads * head_dim || !head_dim.is_multiple_of(2) {
         candle_core::bail!(
@@ -322,31 +336,81 @@ pub fn depermute_qk_rows(
                 .copy_from_slice(&data[src * row_bytes..(src + 1) * row_bytes]);
         }
     }
-    candle_core::quantized::ggml_file::qtensor_from_ggml(dtype, &out, dims, device)
+    qtensor_with_staged(dtype, &out, dims, device)
 }
 
-/// Builds every tensor from the mmap in parallel (rayon), keyed by name.
+/// Builds a `QTensor` from GGUF block bytes and, where a kernel of this crate
+/// reads that layout in place, the handle it reads it through.
+///
+/// Candle's own loader does the first half and keeps the buffer to itself.
+/// Building the storage here, before the `QTensor` takes it, is the one moment
+/// the buffer is visible, and cloning it is a retain on the same allocation,
+/// not a copy. Off Metal there is no such kernel and the handle is `None`.
+///
+/// ## Errors
+/// Fails when `bytes` is not exactly `dims` worth of `dtype` blocks.
+pub fn qtensor_with_staged(
+    dtype: GgmlDType,
+    bytes: &[u8],
+    dims: Vec<usize>,
+    device: &Device,
+) -> candle_core::Result<(QTensor, Option<StagedWeight>)> {
+    let elems: usize = dims.iter().product();
+    let block = dtype.block_size();
+    if !elems.is_multiple_of(block) {
+        candle_core::bail!("tensor elements {elems} not divisible by block size {block}");
+    }
+    let expected = elems / block * dtype.type_size();
+    if bytes.len() != expected {
+        candle_core::bail!(
+            "tensor {dims:?} of {dtype:?} needs {expected} bytes, got {}",
+            bytes.len()
+        );
+    }
+    let storage = QStorage::from_data(Cow::Borrowed(bytes), device, dtype)?;
+    #[cfg(feature = "metal")]
+    let staged = match &storage {
+        QStorage::Metal(ms) => StagedWeight::new(ms.buffer().clone(), dtype, &dims),
+        _ => None,
+    };
+    #[cfg(not(feature = "metal"))]
+    let staged = None;
+    Ok((QTensor::new(storage, dims)?, staged))
+}
+
+/// Builds every tensor from the mmap in parallel (rayon), keyed by name, and
+/// beside them the staged handles of the tensors that have one.
+#[allow(clippy::type_complexity)]
 fn parallelise_tensor_load(
     file: &std::fs::File,
     file_len: usize,
     data_offset: u64,
     tensor_infos: &HashMap<String, gguf_file::TensorInfo>,
     device: &Device,
-) -> anyhow::Result<FxHashMap<String, Arc<QTensor>>> {
+) -> anyhow::Result<(
+    FxHashMap<String, Arc<QTensor>>,
+    FxHashMap<String, StagedWeight>,
+)> {
     let mut infos: Vec<(&String, &gguf_file::TensorInfo)> = tensor_infos.iter().collect();
     infos.sort_unstable_by_key(|(_, info)| info.offset);
-    let pairs: anyhow::Result<Vec<(String, Arc<QTensor>)>> = infos
+    let built: anyhow::Result<Vec<(String, Arc<QTensor>, Option<StagedWeight>)>> = infos
         .par_iter()
         .map(|(name, info)| {
-            let qt = build_qtensor(file, file_len, data_offset, info, device)
+            let (qt, staged) = build_qtensor(file, file_len, data_offset, info, device)
                 .with_context(|| format!("Failed to load GGUF tensor '{}'", name))?;
-            Ok(((*name).clone(), Arc::new(qt)))
+            Ok(((*name).clone(), Arc::new(qt), staged))
         })
         .collect();
-    let pairs = pairs?;
-    let mut tensors = FxHashMap::with_capacity_and_hasher(pairs.len(), Default::default());
-    tensors.extend(pairs);
-    Ok(tensors)
+    let built = built?;
+    let mut tensors = FxHashMap::with_capacity_and_hasher(built.len(), Default::default());
+    let mut staged = FxHashMap::default();
+    for (name, qt, handle) in built {
+        if let Some(handle) = handle {
+            staged.insert(name.clone(), handle);
+        }
+        tensors.insert(name, qt);
+    }
+    Ok((tensors, staged))
 }
 
 /// Builds one `QTensor` by reading its bytes from the file, validating the
@@ -364,7 +428,7 @@ fn build_qtensor(
     data_offset: u64,
     info: &gguf_file::TensorInfo,
     device: &Device,
-) -> anyhow::Result<QTensor> {
+) -> anyhow::Result<(QTensor, Option<StagedWeight>)> {
     let tensor_elems = info.shape.elem_count();
     let block_size = info.ggml_dtype.block_size();
     if !tensor_elems.is_multiple_of(block_size) {
@@ -393,20 +457,14 @@ fn build_qtensor(
         file.read_exact_at(&mut bytes, start as u64)
             .with_context(|| format!("reading tensor bytes at {start}"))?;
     }
-    let slice = &bytes[..];
     // Serialize Metal storage creation across the rayon workers: candle
     // 0.11's residency-set registration is not thread-safe (see
     // `weights::metal_alloc_lock`).
     let _guard = device
         .is_metal()
         .then(|| crate::common::weights::metal_alloc_lock().lock().unwrap());
-    candle_core::quantized::ggml_file::qtensor_from_ggml(
-        info.ggml_dtype,
-        slice,
-        info.shape.dims().to_vec(),
-        device,
-    )
-    .map_err(|e| anyhow::anyhow!("qtensor_from_ggml failed: {}", e))
+    qtensor_with_staged(info.ggml_dtype, &bytes, info.shape.dims().to_vec(), device)
+        .map_err(|e| anyhow::anyhow!("building the tensor failed: {}", e))
 }
 
 #[cfg(test)]
@@ -441,12 +499,69 @@ mod tests {
         let permuted_t = Tensor::from_vec(permuted, (n, k), &dev).unwrap();
         let qt = QTensor::quantize(&permuted_t, GgmlDType::F32).unwrap();
 
-        let restored = depermute_qk_rows(&qt, n_heads, head_dim, &dev).unwrap();
+        let (restored, _) = depermute_qk_rows(&qt, n_heads, head_dim, &dev).unwrap();
         let restored_t = restored.dequantize(&dev).unwrap();
 
         let a = restored_t.flatten_all().unwrap().to_vec1::<f32>().unwrap();
         let b = hf_t.flatten_all().unwrap().to_vec1::<f32>().unwrap();
         assert_eq!(a, b, "depermute must restore the HF row layout exactly");
+    }
+
+    /// Contract: a handle exists exactly for the layouts the staged kernel
+    /// reads, and never for the others.
+    ///
+    /// A handle for a layout the kernel does not understand would route a
+    /// matmul into garbage; a missing handle for one it does would only cost
+    /// speed. Both directions are pinned here on Metal, where the handle can
+    /// exist at all.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn a_staged_handle_exists_only_for_layouts_the_kernel_reads() {
+        let Ok(dev) = Device::new_metal(0) else {
+            return;
+        };
+        let quantize = |dims: (usize, usize), dtype: GgmlDType| {
+            let t = Tensor::zeros(dims, candle_core::DType::F32, &dev).unwrap();
+            QTensor::quantize(&t, dtype)
+                .unwrap()
+                .data()
+                .unwrap()
+                .into_owned()
+        };
+        let stageable = qtensor_with_staged(
+            GgmlDType::Q4K,
+            &quantize((64, 512), GgmlDType::Q4K),
+            vec![64, 512],
+            &dev,
+        )
+        .unwrap()
+        .1;
+        assert!(stageable.is_some(), "Q4_K with whole-block rows");
+
+        let other_dtype = qtensor_with_staged(
+            GgmlDType::Q6K,
+            &quantize((64, 512), GgmlDType::Q6K),
+            vec![64, 512],
+            &dev,
+        )
+        .unwrap()
+        .1;
+        assert!(other_dtype.is_none(), "Q6_K has no staged kernel yet");
+
+        let one_dimensional = qtensor_with_staged(
+            GgmlDType::Q4K,
+            &quantize((1, 512), GgmlDType::Q4K),
+            vec![512],
+            &dev,
+        )
+        .unwrap()
+        .1;
+        assert!(one_dimensional.is_none(), "a vector is not a matmul weight");
+
+        assert!(
+            qtensor_with_staged(GgmlDType::Q4K, &[0u8; 10], vec![64, 512], &dev).is_err(),
+            "the wrong number of bytes is refused"
+        );
     }
 
     #[test]

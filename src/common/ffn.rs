@@ -343,17 +343,21 @@ impl FeedForward {
                     up_out
                 );
             }
-            let gate = QLinear::from_arc(gate_qt, dtype)?;
-            let up = QLinear::from_arc(up_qt, dtype)?;
+            let gate = QLinear::from_arc(gate_qt, dtype)?
+                .with_staged(gguf.staged(&format!("{prefix}.ffn_gate.weight")));
+            let up = QLinear::from_arc(up_qt, dtype)?
+                .with_staged(gguf.staged(&format!("{prefix}.ffn_up.weight")));
             GateUpProjection::Separate {
                 gate: AnyLinear::Quantized(gate),
                 up: AnyLinear::Quantized(up),
             }
         } else if up_out == 2 * intermediate_size {
-            let packed = QLinear::from_arc(up_qt, dtype)?;
+            let packed = QLinear::from_arc(up_qt, dtype)?
+                .with_staged(gguf.staged(&format!("{prefix}.ffn_up.weight")));
             GateUpProjection::Packed(AnyLinear::Quantized(packed))
         } else if up_out == intermediate_size {
-            let up = QLinear::from_arc(up_qt, dtype)?;
+            let up = QLinear::from_arc(up_qt, dtype)?
+                .with_staged(gguf.staged(&format!("{prefix}.ffn_up.weight")));
             GateUpProjection::Simple(AnyLinear::Quantized(up))
         } else {
             candle_core::bail!(
@@ -363,7 +367,8 @@ impl FeedForward {
                 2 * intermediate_size
             );
         };
-        let down_proj = QLinear::from_arc(down_qt, dtype)?;
+        let down_proj = QLinear::from_arc(down_qt, dtype)?
+            .with_staged(gguf.staged(&format!("{prefix}.ffn_down.weight")));
 
         Ok(Self {
             gate_up,

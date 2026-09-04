@@ -519,11 +519,13 @@ impl StandardTransformer {
         let lm_head = match gguf.try_get("output.weight") {
             Some(qt) => AnyLinear::Quantized(
                 QLinear::from_arc(qt, dtype)
-                    .map_err(|e| anyhow::anyhow!("Failed to load output.weight: {e}"))?,
+                    .map_err(|e| anyhow::anyhow!("Failed to load output.weight: {e}"))?
+                    .with_staged(gguf.staged("output.weight")),
             ),
             None => AnyLinear::Quantized(
                 QLinear::from_arc(embed_qt.clone(), dtype)
-                    .map_err(|e| anyhow::anyhow!("tied lm_head from embedding: {e}"))?,
+                    .map_err(|e| anyhow::anyhow!("tied lm_head from embedding: {e}"))?
+                    .with_staged(gguf.staged("token_embd.weight")),
             ),
         };
 

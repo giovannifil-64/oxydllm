@@ -979,6 +979,15 @@ fn device_threadgroup_limit() -> usize {
 /// that is the part that matters, because the list used to double as the
 /// answer to "can this kernel run at all" and so refused head widths the
 /// kernel handles perfectly well. Gemma 4's global layers are 512 wide.
+///
+/// Whole multiples of eight come first, because the MMA kernel walks the tiles
+/// as `Br / 8` by `Bc / 8` simdgroup matrices of eight rows each and computes
+/// nothing outside them: a height of 21, which is what 2048 divided by a head
+/// width of 96 gives, left the last five query rows of every block untouched,
+/// and Phi-3, whose heads are 96 wide, answered garbage past a short prompt
+/// while every power-of-two width stayed correct. A height that is not a
+/// multiple of eight is still offered when nothing else fits, and the caller
+/// sends it to the portable kernel, which handles any height.
 fn fa_tile_sizes(head_dim: usize, dtype_bytes: usize) -> Option<(usize, usize)> {
     match head_dim {
         64 => return Some((32, 32)),
@@ -991,7 +1000,8 @@ fn fa_tile_sizes(head_dim: usize, dtype_bytes: usize) -> Option<(usize, usize)> 
     }
     let limit = device_threadgroup_limit();
     let br0 = (2048 / head_dim).max(1);
-    for br in [br0, br0 / 2, br0 / 4, 1] {
+    let whole = br0 / 8 * 8;
+    for br in [whole, whole / 2, 8, br0, br0 / 2, br0 / 4, 1] {
         if br == 0 {
             continue;
         }
@@ -1152,7 +1162,10 @@ impl CustomOp3 for FlashAttnPrefill {
         let dtype_bytes = q.dtype().size_in_bytes();
         let elem_count = b * h * t_q * d;
         let device = q.device();
-        let use_mma = metal_supports_mma(device.device()) && self.br >= 8 && self.bc >= 8;
+        let use_mma = metal_supports_mma(device.device())
+            && self.br.is_multiple_of(8)
+            && self.bc.is_multiple_of(8)
+            && d.is_multiple_of(8);
         let kernel_name: &'static str = match (q.dtype(), use_mma) {
             (DType::F32, true) => "flash_attention_prefill_mma_f32",
             (DType::F16, true) => "flash_attention_prefill_mma_f16",
@@ -3682,6 +3695,14 @@ mod fused_kernel_parity_tests {
     /// Naive full-materialization attention reference: expands GQA KV heads,
     /// applies the prefix-shifted causal mask, and softmaxes the full score
     /// matrix. `q` is `[B, H, T_q, D]`; `k`/`v` are `[B, H_kv, T_kv, D]`.
+    ///
+    /// The arithmetic runs in F32 whatever the inputs are, and the result is
+    /// handed back in their dtype. A reference that multiplied BF16 inputs in
+    /// BF16 rounded its scores to a step of four once they passed 512, which a
+    /// peaked softmax turns into a tie between two keys and a blend of two
+    /// value rows; the kernel, accumulating in F32, picked the right one and
+    /// was reported wrong by a third of the peak. The tolerance that hid this
+    /// was 0.35; against an exact reference the kernel sits under 0.007.
     fn naive_attention_reference(
         q: &Tensor,
         k: &Tensor,
@@ -3691,6 +3712,12 @@ mod fused_kernel_parity_tests {
         prefix_len: usize,
         window: usize,
     ) -> Result<Tensor> {
+        let out_dtype = q.dtype();
+        let (q, k, v) = (
+            &q.to_dtype(DType::F32)?,
+            &k.to_dtype(DType::F32)?,
+            &v.to_dtype(DType::F32)?,
+        );
         let (b, h, t_q, _d) = q.dims4()?;
         let (_, h_kv, t_kv, _) = k.dims4()?;
         let n_rep = h / h_kv;
@@ -3732,7 +3759,7 @@ mod fused_kernel_parity_tests {
         let masked = scores.broadcast_add(&mask)?;
 
         let attn = crate::common::linear::softmax_last_dim(&masked)?;
-        attn.matmul(&v_exp)
+        attn.matmul(&v_exp)?.to_dtype(out_dtype)
     }
 
     /// Shape of a Flash Attention parity test case.
@@ -3837,7 +3864,7 @@ mod fused_kernel_parity_tests {
     #[test]
     fn fuzz_flash_attention_matches_the_reference() {
         const F32_ABS: f32 = 1e-3;
-        const BF16_REL: f32 = 0.35;
+        const BF16_REL: f32 = 0.02;
 
         let Some(dev) = metal_device_or_skip() else {
             return;
@@ -3857,7 +3884,7 @@ mod fused_kernel_parity_tests {
             } else {
                 DType::BF16
             };
-            let d = [64usize, 128, 256, 512][next(0, 3)];
+            let d = [64usize, 80, 96, 128, 256, 512][next(0, 5)];
             let h_kv = [1usize, 2, 4][next(0, 2)];
             let h = h_kv * [1usize, 2, 4][next(0, 2)];
             let t_q = if seed % 5 == 0 { 1 } else { next(1, 384) };
@@ -4102,6 +4129,9 @@ mod fused_kernel_parity_tests {
             ),
             (16, 8, 256, 600, 64, 400, 128),
             (4, 1, 64, 300, 0, 200, 0),
+            (32, 32, 96, 512, 0, 400, 0),
+            (32, 32, 96, 512, 48, 400, 2047),
+            (8, 8, 80, 300, 16, 200, 0),
         ] {
             let t_q = len / 2;
             let mk = |n: usize, salt: usize| -> Vec<f32> {

@@ -645,8 +645,9 @@ impl StandardTransformer {
             for (i, slot) in real.iter_mut().enumerate() {
                 if !topo.layer_is_linear(i) {
                     *slot = Some(Arc::new(Mutex::new(
-                        BlockAllocator::new(
+                        BlockAllocator::growing(
                             num_kv_blocks,
+                            context_len.div_ceil(DEFAULT_BLOCK_SIZE).max(1),
                             DEFAULT_BLOCK_SIZE,
                             topo.per_layer
                                 .as_ref()

@@ -428,7 +428,8 @@ mod tests {
         (0..num_layers)
             .map(|_| {
                 Arc::new(Mutex::new(
-                    BlockAllocator::new(
+                    BlockAllocator::growing(
+                        num_blocks,
                         num_blocks,
                         DEFAULT_BLOCK_SIZE,
                         2,

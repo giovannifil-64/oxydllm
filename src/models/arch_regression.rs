@@ -232,7 +232,8 @@ mod tests {
 
         let allocators = (0..LAYERS)
             .map(|_| -> Result<SharedBlockAllocator> {
-                Ok(Arc::new(Mutex::new(BlockAllocator::new(
+                Ok(Arc::new(Mutex::new(BlockAllocator::growing(
+                    KV_BLOCKS,
                     KV_BLOCKS,
                     DEFAULT_BLOCK_SIZE,
                     KV_HEADS,

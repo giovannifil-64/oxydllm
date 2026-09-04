@@ -1174,7 +1174,8 @@ mod tests {
         let x_data: Vec<f32> = (0..seq_len * hidden).map(|v| v as f32 * 0.01).collect();
         let x = Tensor::from_vec(x_data, (1, seq_len, hidden), &device)?;
 
-        let allocator = Arc::new(Mutex::new(BlockAllocator::new(
+        let allocator = Arc::new(Mutex::new(BlockAllocator::growing(
+            16,
             16,
             DEFAULT_BLOCK_SIZE,
             n_kv_heads,
@@ -1220,7 +1221,8 @@ mod tests {
         let x_data: Vec<f32> = (0..seq_len * hidden).map(|v| v as f32 * 0.1).collect();
         let x = Tensor::from_vec(x_data, (1, seq_len, hidden), &device)?;
 
-        let allocator = Arc::new(Mutex::new(BlockAllocator::new(
+        let allocator = Arc::new(Mutex::new(BlockAllocator::growing(
+            16,
             16,
             DEFAULT_BLOCK_SIZE,
             n_kv_heads,

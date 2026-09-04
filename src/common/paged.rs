@@ -322,8 +322,8 @@ fn detect_system_memory_bytes() -> Option<usize> {
 
 enum KvPool {
     Full {
-        pool_k: Tensor,
-        pool_v: Tensor,
+        segments_k: Vec<Tensor>,
+        segments_v: Vec<Tensor>,
     },
     Quantized {
         packed_k: Vec<u8>,
@@ -386,11 +386,25 @@ impl ContigBufferPool {
     }
 }
 
+/// The KV blocks of one layer, materialised as they are taken.
+///
+/// The pool is granted a ceiling of blocks when the model loads and holds only
+/// what has been handed out, in segments of `segment_blocks`: a new segment is
+/// allocated the first time a block is asked for beyond the ones that exist,
+/// and nothing is ever copied, so memory follows the tokens actually in use
+/// rather than the worst case the ceiling allows. A ceiling of eight sequences
+/// at four thousand tokens used to be paid up front on a twelve-billion
+/// checkpoint, ten gigabytes beside seven of weights, and the prefill that
+/// followed found no room for its own buffers. Whoever schedules against this
+/// pool sees the ceiling, since a block not yet materialised is as free as one
+/// that is; the bytes resident are a separate figure.
 pub struct BlockAllocator {
     pool: KvPool,
     free_list: Vec<usize>,
     ref_counts: Vec<u32>,
     num_blocks: usize,
+    max_blocks: usize,
+    segment_blocks: usize,
     block_size: usize,
     n_kv_heads: usize,
     head_dim: usize,
@@ -409,8 +423,16 @@ pub struct StagedKvData<'a> {
 }
 
 impl BlockAllocator {
-    pub fn new(
-        num_blocks: usize,
+    /// A pool that may reach `max_blocks`, materialised `segment_blocks` at a
+    /// time as blocks are taken; the first segment is allocated here so a
+    /// device that cannot hold even that says so at load.
+    ///
+    /// ## Errors
+    /// Fails when the device cannot hold the first segment.
+    #[allow(clippy::too_many_arguments)]
+    pub fn growing(
+        max_blocks: usize,
+        segment_blocks: usize,
         block_size: usize,
         n_kv_heads: usize,
         head_dim: usize,
@@ -418,37 +440,29 @@ impl BlockAllocator {
         device: &Device,
         quantizer: Option<Arc<KvQuantizer>>,
     ) -> Result<Self> {
-        let total_slots = num_blocks * block_size;
-        let free_list = (0..num_blocks).rev().collect();
-        let ref_counts = vec![0u32; num_blocks];
-
+        let segment_blocks = segment_blocks.clamp(1, max_blocks.max(1));
         let pool = if let Some(q) = quantizer {
-            let key_bph = q.key_packed_bytes();
-            let value_bph = q.value_packed_bytes();
             KvPool::Quantized {
-                packed_k: vec![0u8; total_slots * n_kv_heads * key_bph],
-                packed_v: vec![0u8; total_slots * n_kv_heads * value_bph],
-                norms_k: vec![0f32; total_slots * n_kv_heads],
-                residual_norms_k: if q.qjl_quantization_enabled() {
-                    Some(vec![0f32; total_slots * n_kv_heads])
-                } else {
-                    None
-                },
-                norms_v: vec![0f32; total_slots * n_kv_heads],
+                packed_k: Vec::new(),
+                packed_v: Vec::new(),
+                norms_k: Vec::new(),
+                residual_norms_k: q.qjl_quantization_enabled().then(Vec::new),
+                norms_v: Vec::new(),
                 quantizer: q,
             }
         } else {
             KvPool::Full {
-                pool_k: Tensor::zeros((total_slots, n_kv_heads, head_dim), dtype, device)?,
-                pool_v: Tensor::zeros((total_slots, n_kv_heads, head_dim), dtype, device)?,
+                segments_k: Vec::new(),
+                segments_v: Vec::new(),
             }
         };
-
-        Ok(Self {
+        let mut this = Self {
             pool,
-            free_list,
-            ref_counts,
-            num_blocks,
+            free_list: Vec::new(),
+            ref_counts: Vec::new(),
+            num_blocks: 0,
+            max_blocks,
+            segment_blocks,
             block_size,
             n_kv_heads,
             head_dim,
@@ -456,7 +470,74 @@ impl BlockAllocator {
             device: device.clone(),
             contig_pool: ContigBufferPool::new(MAX_POOL_BUFFERS),
             sliding_window: None,
-        })
+        };
+        if max_blocks > 0 {
+            this.grow()?;
+        }
+        Ok(this)
+    }
+
+    /// Materialises the next segment, or what is left below the ceiling.
+    ///
+    /// ## Errors
+    /// Fails when the device cannot hold the segment; the pool is unchanged.
+    fn grow(&mut self) -> Result<()> {
+        let n = self.segment_blocks.min(self.max_blocks - self.num_blocks);
+        if n == 0 {
+            candle_core::bail!(
+                "KV cache memory exhausted: all {} blocks allocated",
+                self.max_blocks
+            );
+        }
+        let slots = n * self.block_size;
+        match &mut self.pool {
+            KvPool::Full {
+                segments_k,
+                segments_v,
+            } => {
+                let shape = (slots, self.n_kv_heads, self.head_dim);
+                let k = Tensor::zeros(shape, self.dtype, &self.device)?;
+                let v = Tensor::zeros(shape, self.dtype, &self.device)?;
+                segments_k.push(k);
+                segments_v.push(v);
+            }
+            KvPool::Quantized {
+                packed_k,
+                packed_v,
+                norms_k,
+                residual_norms_k,
+                norms_v,
+                quantizer,
+            } => {
+                let heads = slots * self.n_kv_heads;
+                packed_k.resize(packed_k.len() + heads * quantizer.key_packed_bytes(), 0);
+                packed_v.resize(packed_v.len() + heads * quantizer.value_packed_bytes(), 0);
+                norms_k.resize(norms_k.len() + heads, 0.0);
+                if let Some(r) = residual_norms_k.as_mut() {
+                    r.resize(r.len() + heads, 0.0);
+                }
+                norms_v.resize(norms_v.len() + heads, 0.0);
+            }
+        }
+        let first = self.num_blocks;
+        self.num_blocks += n;
+        self.ref_counts.resize(self.num_blocks, 0);
+        self.free_list.extend((first..self.num_blocks).rev());
+        tracing::trace!(
+            blocks = self.num_blocks,
+            ceiling = self.max_blocks,
+            resident_mb = self.pool_bytes() / (1024 * 1024),
+            "KV pool grew by a segment"
+        );
+        Ok(())
+    }
+
+    /// The segment a block lives in and the slot its first token has there.
+    fn locate(&self, block_id: usize) -> (usize, usize) {
+        (
+            block_id / self.segment_blocks,
+            (block_id % self.segment_blocks) * self.block_size,
+        )
     }
 
     /// Records the sliding window this layer attends over, so the caches built
@@ -474,11 +555,20 @@ impl BlockAllocator {
         self.sliding_window
     }
 
+    /// Hands out a block, materialising the next segment when every block
+    /// that exists is taken and the ceiling allows more.
+    ///
+    /// ## Errors
+    /// Fails when the ceiling is reached, or when the device cannot hold the
+    /// segment the block would come from.
     pub fn allocate(&mut self) -> Result<usize> {
+        if self.free_list.is_empty() {
+            self.grow()?;
+        }
         let id = self.free_list.pop().ok_or_else(|| {
             candle_core::Error::Msg(format!(
                 "KV cache memory exhausted: all {} blocks allocated",
-                self.num_blocks,
+                self.max_blocks,
             ))
         })?;
         self.ref_counts[id] = 1;
@@ -506,12 +596,15 @@ impl BlockAllocator {
         }
     }
 
+    /// Blocks that can still be taken: the free ones that exist plus every
+    /// one below the ceiling that does not yet.
     pub fn num_free(&self) -> usize {
-        self.free_list.len()
+        self.free_list.len() + (self.max_blocks - self.num_blocks)
     }
 
+    /// The ceiling, which is what the pool can serve.
     pub fn num_total(&self) -> usize {
-        self.num_blocks
+        self.max_blocks
     }
 
     pub fn block_size(&self) -> usize {
@@ -599,28 +692,33 @@ impl BlockAllocator {
         }
     }
 
-    pub fn pool_bytes(&self) -> usize {
+    /// Bytes one block costs on this pool.
+    fn bytes_per_block(&self) -> usize {
+        let heads = self.block_size * self.n_kv_heads;
         match &self.pool {
-            KvPool::Full { pool_k, pool_v } => {
-                pool_k.elem_count() * pool_k.dtype().size_in_bytes()
-                    + pool_v.elem_count() * pool_v.dtype().size_in_bytes()
-            }
+            KvPool::Full { .. } => 2 * heads * self.head_dim * self.dtype.size_in_bytes(),
             KvPool::Quantized {
-                packed_k,
-                packed_v,
-                norms_k,
+                quantizer,
                 residual_norms_k,
-                norms_v,
                 ..
             } => {
-                packed_k.len()
-                    + packed_v.len()
-                    + (norms_k.len()
-                        + residual_norms_k.as_ref().map_or(0, Vec::len)
-                        + norms_v.len())
-                        * std::mem::size_of::<f32>()
+                let norms = if residual_norms_k.is_some() { 3 } else { 2 };
+                heads
+                    * (quantizer.key_packed_bytes()
+                        + quantizer.value_packed_bytes()
+                        + norms * std::mem::size_of::<f32>())
             }
         }
+    }
+
+    /// Bytes resident now, for the blocks that exist.
+    pub fn pool_bytes(&self) -> usize {
+        self.num_blocks * self.bytes_per_block()
+    }
+
+    /// Bytes the pool may come to hold, which is what was reserved for it.
+    pub fn reserved_bytes(&self) -> usize {
+        self.max_blocks * self.bytes_per_block()
     }
 
     /// data_k, data_v shape: [n_tokens, n_kv_heads, head_dim]
@@ -632,10 +730,14 @@ impl BlockAllocator {
         data_v: &Tensor,
     ) -> Result<()> {
         let start = block_id * self.block_size + offset;
+        let (segment, local) = self.locate(block_id);
         match &mut self.pool {
-            KvPool::Full { pool_k, pool_v } => {
-                pool_k.slice_set(data_k, 0, start)?;
-                pool_v.slice_set(data_v, 0, start)?;
+            KvPool::Full {
+                segments_k,
+                segments_v,
+            } => {
+                segments_k[segment].slice_set(data_k, 0, local + offset)?;
+                segments_v[segment].slice_set(data_v, 0, local + offset)?;
             }
             KvPool::Quantized {
                 packed_k,
@@ -694,9 +796,49 @@ impl BlockAllocator {
     /// Returns (K, V) with shape [1, n_kv_heads, num_tokens, head_dim].
     pub fn gather(&self, slot_indices: &Tensor) -> Result<(Tensor, Tensor)> {
         match &self.pool {
-            KvPool::Full { pool_k, pool_v } => {
-                let k = pool_k.index_select(slot_indices, 0)?;
-                let v = pool_v.index_select(slot_indices, 0)?;
+            KvPool::Full {
+                segments_k,
+                segments_v,
+            } => {
+                let (k, v) = if segments_k.len() == 1 {
+                    (
+                        segments_k[0].index_select(slot_indices, 0)?,
+                        segments_v[0].index_select(slot_indices, 0)?,
+                    )
+                } else {
+                    // The tokens asked for sit in whichever segments their
+                    // blocks were taken from: read each segment's share in one
+                    // go, then put the rows back in the order they were asked.
+                    let slots: Vec<u32> = slot_indices.to_device(&Device::Cpu)?.to_vec1()?;
+                    let per_segment = (self.segment_blocks * self.block_size) as u32;
+                    let mut order: Vec<u32> = Vec::with_capacity(slots.len());
+                    let mut ks = Vec::new();
+                    let mut vs = Vec::new();
+                    for (segment, (sk, sv)) in segments_k.iter().zip(segments_v).enumerate() {
+                        let mut local = Vec::new();
+                        for (position, &slot) in slots.iter().enumerate() {
+                            if (slot / per_segment) as usize == segment {
+                                local.push(slot % per_segment);
+                                order.push(position as u32);
+                            }
+                        }
+                        if local.is_empty() {
+                            continue;
+                        }
+                        let idx = Tensor::from_vec(local.clone(), (local.len(),), &self.device)?;
+                        ks.push(sk.index_select(&idx, 0)?);
+                        vs.push(sv.index_select(&idx, 0)?);
+                    }
+                    let mut inverse = vec![0u32; order.len()];
+                    for (j, &position) in order.iter().enumerate() {
+                        inverse[position as usize] = j as u32;
+                    }
+                    let inverse = Tensor::from_vec(inverse, (order.len(),), &self.device)?;
+                    (
+                        Tensor::cat(&ks, 0)?.index_select(&inverse, 0)?,
+                        Tensor::cat(&vs, 0)?.index_select(&inverse, 0)?,
+                    )
+                };
                 let k = k.transpose(0, 1)?.unsqueeze(0)?;
                 let v = v.transpose(0, 1)?.unsqueeze(0)?;
                 Ok((k, v))
@@ -1404,6 +1546,91 @@ mod tests {
         assert_eq!(a, b);
     }
 
+    /// Contract: a pool holds only the blocks that have been taken, in whole
+    /// segments, and never more than its ceiling.
+    ///
+    /// Reserving the ceiling up front is what put ten gigabytes of cache
+    /// beside seven of weights for a single conversation and left the prefill
+    /// no room. Whoever schedules against the pool still sees the ceiling,
+    /// because a block not yet materialised is as free as one that is.
+    #[test]
+    fn a_pool_materialises_a_segment_at_a_time_up_to_its_ceiling() {
+        let dev = Device::Cpu;
+        let mut pool = BlockAllocator::growing(10, 4, 2, 1, 8, DType::F32, &dev, None).unwrap();
+        let per_block = BlockAllocator::growing(1, 1, 2, 1, 8, DType::F32, &dev, None)
+            .unwrap()
+            .reserved_bytes();
+        assert_eq!(pool.num_total(), 10, "the scheduler sees the ceiling");
+        assert_eq!(pool.num_free(), 10, "every block below the ceiling is free");
+        assert_eq!(
+            pool.pool_bytes(),
+            4 * per_block,
+            "one segment resident at load"
+        );
+        assert_eq!(
+            pool.reserved_bytes(),
+            10 * per_block,
+            "the budget is charged the ceiling"
+        );
+
+        let mut taken = Vec::new();
+        for expected_resident in [4, 4, 4, 4, 8, 8, 8, 8, 10, 10] {
+            taken.push(pool.allocate().unwrap());
+            assert_eq!(
+                pool.pool_bytes() / per_block,
+                expected_resident,
+                "after {} blocks taken",
+                taken.len()
+            );
+        }
+        assert_eq!(pool.num_free(), 0);
+        assert!(pool.allocate().is_err(), "the ceiling holds");
+        for id in taken {
+            pool.free(id);
+        }
+        assert_eq!(pool.num_free(), 10);
+        assert_eq!(pool.pool_bytes(), 10 * per_block, "what grew stays");
+    }
+
+    /// Contract: what was written into one segment reads back after another
+    /// has been added, and a gather that spans segments returns the tokens in
+    /// the order they were asked, whatever segment each lives in.
+    #[test]
+    fn a_gather_across_segments_returns_the_tokens_in_the_order_asked() {
+        let dev = Device::Cpu;
+        const BS: usize = 2;
+        const DIM: usize = 4;
+        let mut pool = BlockAllocator::growing(6, 2, BS, 1, DIM, DType::F32, &dev, None).unwrap();
+        let mut blocks = Vec::new();
+        for _ in 0..6 {
+            blocks.push(pool.allocate().unwrap());
+        }
+        assert_eq!(pool.pool_bytes() / (2 * BS * DIM * 4), 6, "three segments");
+        for (b, &id) in blocks.iter().enumerate() {
+            let data: Vec<f32> = (0..BS)
+                .flat_map(|t| vec![(b * BS + t) as f32; DIM])
+                .collect();
+            let t = Tensor::from_vec(data, (BS, 1, DIM), &dev).unwrap();
+            pool.write(id, 0, &t, &t).unwrap();
+        }
+        let asked: Vec<u32> = vec![11, 0, 5, 4, 10, 7, 2];
+        let idx = Tensor::from_vec(asked.clone(), (asked.len(),), &dev).unwrap();
+        let (k, _v) = pool.gather(&idx).unwrap();
+        let got: Vec<f32> = k
+            .squeeze(0)
+            .unwrap()
+            .squeeze(0)
+            .unwrap()
+            .narrow(1, 0, 1)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        let expected: Vec<f32> = asked.iter().map(|&s| s as f32).collect();
+        assert_eq!(got, expected, "rows must come back in the order asked");
+    }
+
     /// Contract: a windowed cache with a single KV head serves a second request
     /// on the same sequence.
     ///
@@ -1419,7 +1646,7 @@ mod tests {
         const W: usize = 12;
         const DIM: usize = 4;
         let alloc = Arc::new(Mutex::new(
-            BlockAllocator::new(256, 4, 1, DIM, DType::F32, &Device::Cpu, None)
+            BlockAllocator::growing(256, 256, 4, 1, DIM, DType::F32, &Device::Cpu, None)
                 .unwrap()
                 .with_sliding_window(Some(W)),
         ));
@@ -1470,7 +1697,7 @@ mod tests {
         for seed in 0u64..24 {
             let mut rng = Rng::new(seed ^ 0xF1_0E_57);
             let alloc = Arc::new(Mutex::new(
-                BlockAllocator::new(256, 4, HEADS, DIM, DType::F32, &Device::Cpu, None)
+                BlockAllocator::growing(256, 256, 4, HEADS, DIM, DType::F32, &Device::Cpu, None)
                     .unwrap()
                     .with_sliding_window(Some(W)),
             ));
@@ -1581,8 +1808,17 @@ mod tests {
 
     fn make_allocator(num_blocks: usize, block_size: usize) -> SharedBlockAllocator {
         Arc::new(Mutex::new(
-            BlockAllocator::new(num_blocks, block_size, 2, 4, DType::F32, &Device::Cpu, None)
-                .unwrap(),
+            BlockAllocator::growing(
+                num_blocks,
+                num_blocks,
+                block_size,
+                2,
+                4,
+                DType::F32,
+                &Device::Cpu,
+                None,
+            )
+            .unwrap(),
         ))
     }
 
@@ -1961,7 +2197,7 @@ mod tests {
     #[test]
     fn contig_buffer_growth_retires_old_to_pool() {
         let alloc = Arc::new(Mutex::new(
-            BlockAllocator::new(256, 4, 2, 4, DType::F32, &Device::Cpu, None).unwrap(),
+            BlockAllocator::growing(256, 256, 4, 2, 4, DType::F32, &Device::Cpu, None).unwrap(),
         ));
         let dev = Device::Cpu;
         let mut cache = PagedKvCache::new(Arc::clone(&alloc));
@@ -1987,10 +2223,10 @@ mod tests {
             4, 64, true,
         ));
         let alloc_q = Arc::new(Mutex::new(
-            BlockAllocator::new(4, 2, 2, 64, DType::F32, &Device::Cpu, Some(q)).unwrap(),
+            BlockAllocator::growing(4, 4, 2, 2, 64, DType::F32, &Device::Cpu, Some(q)).unwrap(),
         ));
         let alloc_f = Arc::new(Mutex::new(
-            BlockAllocator::new(4, 2, 2, 64, DType::F32, &Device::Cpu, None).unwrap(),
+            BlockAllocator::growing(4, 4, 2, 2, 64, DType::F32, &Device::Cpu, None).unwrap(),
         ));
         let q_bytes = alloc_q.lock().unwrap().pool_bytes();
         let f_bytes = alloc_f.lock().unwrap().pool_bytes();

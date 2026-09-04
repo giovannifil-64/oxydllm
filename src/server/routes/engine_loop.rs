@@ -1026,9 +1026,17 @@ mod metrics_loop_tests {
 
     impl StubModel {
         fn new(forced: u32, fail: bool) -> Self {
-            let alloc =
-                BlockAllocator::new(64, DEFAULT_BLOCK_SIZE, 1, 8, DType::F32, &Device::Cpu, None)
-                    .expect("alloc");
+            let alloc = BlockAllocator::growing(
+                64,
+                64,
+                DEFAULT_BLOCK_SIZE,
+                1,
+                8,
+                DType::F32,
+                &Device::Cpu,
+                None,
+            )
+            .expect("alloc");
             Self {
                 device: Device::Cpu,
                 allocators: vec![Arc::new(Mutex::new(alloc))],

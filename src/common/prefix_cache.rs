@@ -217,7 +217,8 @@ mod tests {
 
     fn allocator(blocks: usize) -> Vec<SharedBlockAllocator> {
         vec![Arc::new(Mutex::new(
-            BlockAllocator::new(
+            BlockAllocator::growing(
+                blocks,
                 blocks,
                 DEFAULT_BLOCK_SIZE,
                 1,

@@ -69,9 +69,10 @@ pub trait BatchModel {
         false
     }
 
-    /// Returns the total bytes allocated for KV caches across all layers.
-    /// Hybrid models alias one allocator across their linear layers; count
-    /// each distinct pool once.
+    /// Returns the bytes reserved for KV caches across all layers: what the
+    /// pools may come to hold, which is what the budget was charged for, not
+    /// what they hold now. Hybrid models alias one allocator across their
+    /// linear layers; count each distinct pool once.
     fn kv_cache_bytes(&self) -> usize {
         let mut seen: Vec<*const std::sync::Mutex<crate::common::paged::BlockAllocator>> =
             Vec::new();
@@ -86,7 +87,7 @@ pub trait BatchModel {
                     true
                 }
             })
-            .map(|a| a.lock().unwrap().pool_bytes())
+            .map(|a| a.lock().unwrap().reserved_bytes())
             .sum()
     }
 }

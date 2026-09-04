@@ -2809,6 +2809,107 @@ struct MppQuantMatmul {
     pack_dim: crate::common::awq::PackDim,
 }
 
+#[allow(dead_code)]
+/// Staged TensorOps GEMM against a GGUF Q4_K weight, kept in the block layout
+/// the file stores it in.
+///
+/// `weight` carries the raw superblocks as `u32` so the bytes reach the device
+/// through the ordinary tensor path; the kernel reads them as blocks and
+/// dequantizes a tile at a time into threadgroup memory. `n` and `k` are the
+/// weight's output and input widths, which the block buffer alone does not say.
+struct MppQ4kMatmul {
+    weight: Tensor,
+    n: usize,
+    k: usize,
+}
+
+impl CustomOp1 for MppQ4kMatmul {
+    fn name(&self) -> &'static str {
+        "mpp-q4k-matmul"
+    }
+
+    fn cpu_fwd(&self, _s: &CpuStorage, _l: &Layout) -> Result<(CpuStorage, Shape)> {
+        candle_core::bail!("MppQ4kMatmul: Metal-only")
+    }
+
+    fn metal_fwd(&self, x: &MetalStorage, x_l: &Layout) -> Result<(MetalStorage, Shape)> {
+        if x.dtype() != DType::BF16 {
+            candle_core::bail!("MppQ4kMatmul: BF16 only");
+        }
+        if !x_l.is_contiguous() {
+            candle_core::bail!("MppQ4kMatmul: x must be contiguous");
+        }
+        let x_dims = x_l.dims();
+        if x_dims.len() != 2 {
+            candle_core::bail!("MppQ4kMatmul: x must be 2-D, got {x_dims:?}");
+        }
+        let (m, k) = (x_dims[0], x_dims[1]);
+        if k != self.k {
+            candle_core::bail!("MppQ4kMatmul: x k {k} != weight k {}", self.k);
+        }
+        if !k.is_multiple_of(256) {
+            candle_core::bail!("MppQ4kMatmul: k {k} is not a multiple of the 256-element block");
+        }
+
+        let device = x.device();
+        let out_elems = m * self.n;
+        let output = device.new_buffer(out_elems, DType::BF16, "mpp_q4k_matmul")?;
+        let params = MppQuantGemmParams {
+            m: m as i32,
+            n: self.n as i32,
+            k: k as i32,
+            group_shift: 0,
+        };
+
+        let w_sl = self.weight.storage_and_layout();
+        let w_buf = match &*w_sl.0 {
+            candle_core::Storage::Metal(ms) => ms.buffer(),
+            _ => candle_core::bail!("MppQ4kMatmul: weight must be Metal-resident"),
+        };
+
+        let pipeline = get_or_compile_mpp_pipeline(device.device(), "mpp_gemm_q4k_staged")?;
+        let encoder = device.command_encoder()?;
+        let encoder = encoder.as_ref();
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_input_buffer(0, Some(x.buffer()), x_l.start_offset() * 2);
+        encoder.set_input_buffer(1, Some(w_buf), w_sl.1.start_offset() * 4);
+        encoder.set_output_buffer(2, Some(&*output), 0);
+        encoder.set_bytes(3, &params);
+
+        encoder.dispatch_thread_groups(
+            MTLSize {
+                width: self.n.div_ceil(MPP_GEMM_TILE),
+                height: m.div_ceil(MPP_GEMM_TILE * 2),
+                depth: 1,
+            },
+            MTLSize {
+                width: 128,
+                height: 1,
+                depth: 1,
+            },
+        );
+
+        Ok((
+            MetalStorage::new(output, device.clone(), out_elems, DType::BF16),
+            Shape::from_dims(&[m, self.n]),
+        ))
+    }
+}
+
+#[allow(dead_code)]
+/// Multiplies `x` by a GGUF Q4_K weight on the TensorOps path.
+///
+/// ## Errors
+/// Fails off-Metal, on non-BF16 or non-contiguous `x`, or on a shape the block
+/// layout cannot describe.
+pub fn mpp_q4k_matmul(x: &Tensor, weight: &Tensor, n: usize, k: usize) -> Result<Tensor> {
+    x.apply_op1_no_bwd(&MppQ4kMatmul {
+        weight: weight.clone(),
+        n,
+        k,
+    })
+}
+
 impl CustomOp1 for MppQuantMatmul {
     fn name(&self) -> &'static str {
         "mpp-quant-matmul"
@@ -6497,6 +6598,72 @@ pub fn sdpa_vector_sink(
 mod quantized_matmul_floor {
     use candle_core::quantized::{GgmlDType, QMatMul, QTensor};
     use candle_core::{Device, Module, Tensor};
+
+    /// Contract: the staged TensorOps GEMM against a GGUF Q4_K weight answers
+    /// what candle's quantized matmul answers.
+    ///
+    /// The staged path never materialises the weight: it dequantizes one tile
+    /// at a time into threadgroup memory and multiplies it on the tensor units,
+    /// which is the only way to reach that hardware without paying for a dense
+    /// copy of the weight. It is worth having only if the two agree, so this
+    /// compares them on a feed-forward shape and on a tail that leaves partial
+    /// tiles at both edges.
+    #[test]
+    fn the_staged_q4k_gemm_matches_candle() {
+        let Ok(dev) = Device::new_metal(0) else {
+            return;
+        };
+        for (n, k, m) in [(256usize, 512usize, 64usize), (200, 768, 37)] {
+            let w: Vec<f32> = (0..n * k)
+                .map(|i| ((i % 29) as f32 - 14.0) * 0.031)
+                .collect();
+            let w32 = Tensor::from_vec(w, (n, k), &dev).unwrap();
+            let qt = std::sync::Arc::new(QTensor::quantize(&w32, GgmlDType::Q4K).unwrap());
+
+            let x: Vec<f32> = (0..m * k).map(|i| ((i % 13) as f32 - 6.0) * 0.05).collect();
+            let x32 = Tensor::from_vec(x, (m, k), &dev).unwrap();
+            let x_bf = x32.to_dtype(candle_core::DType::BF16).unwrap();
+
+            let atteso: Vec<f32> = QMatMul::from_arc(qt.clone())
+                .unwrap()
+                .forward(&x32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+
+            let blocchi = qt.data().unwrap();
+            let parole: Vec<u32> = blocchi
+                .chunks_exact(4)
+                .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            let weight = Tensor::from_vec(parole.clone(), (parole.len(),), &dev).unwrap();
+            let ottenuto: Vec<f32> = crate::common::metal_ops::mpp_q4k_matmul(&x_bf, &weight, n, k)
+                .unwrap()
+                .to_dtype(candle_core::DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+
+            assert_eq!(ottenuto.len(), atteso.len(), "{n}x{k} m={m}: shape");
+            let peak = atteso
+                .iter()
+                .fold(0f32, |a: f32, &b: &f32| a.max(b.abs()))
+                .max(1e-6);
+            let worst = ottenuto
+                .iter()
+                .zip(atteso.iter())
+                .fold(0f32, |a: f32, (&x, &y): (&f32, &f32)| a.max((x - y).abs()));
+            assert!(
+                worst / peak < 0.02,
+                "{n}x{k} m={m}: relative error {} against candle",
+                worst / peak
+            );
+        }
+    }
 
     /// Contract: the quantized matmul this crate leans on stays fast enough to
     /// be worth leaning on.

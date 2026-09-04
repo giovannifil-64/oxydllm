@@ -2854,6 +2854,22 @@ impl StagedWeight {
             other => unreachable!("StagedWeight::new admits no {other:?}"),
         }
     }
+
+    /// The batch size from which the staged kernel beats candle's quantized
+    /// matmul on this block type, measured by `staged_quant_crossover_probe`
+    /// on the eight shapes of the reference checkpoint.
+    ///
+    /// The kernel stages the whole weight once per 128-row tile of the batch,
+    /// so its cost is flat from M=32 to M=128 and the crossover is where
+    /// candle's cost, linear in M, climbs past it: M=64 for Q4_K (level there,
+    /// 1.9-2.1x from 128 up) and M=128 for Q6_K, whose six-bit unpack costs
+    /// more per tile and leaves candle 10% ahead at 64.
+    fn min_m(&self) -> usize {
+        match self.dtype {
+            GgmlDType::Q6K => 128,
+            _ => MPP_GEMM_MIN_M,
+        }
+    }
 }
 
 struct MppStagedMatmul {
@@ -2940,11 +2956,9 @@ pub fn mpp_staged_matmul(x: &Tensor, weight: &StagedWeight) -> Result<Tensor> {
 /// `x @ weight^T` through the staged kernel where it is the better path, else
 /// `None` so the caller falls back to candle's quantized matmul.
 ///
-/// The threshold on M is [`MPP_GEMM_MIN_M`], measured for the dense TensorOps
-/// GEMM against candle's dense GEMM. The crossover of the staged kernel
-/// against candle's quantized matmul has not been measured on its own; below
-/// the threshold candle serves decode, where it is memory bound and within
-/// reach of llama.cpp.
+/// The batch size that decides is [`StagedWeight::min_m`], measured per block
+/// type. Below it candle serves, which covers decode, where its matvec is
+/// memory bound and within reach of llama.cpp.
 pub fn maybe_staged_quant_matmul(x: &Tensor, weight: &StagedWeight) -> Result<Option<Tensor>> {
     if x.dtype() != DType::BF16 {
         return Ok(None);
@@ -2953,7 +2967,7 @@ pub fn maybe_staged_quant_matmul(x: &Tensor, weight: &StagedWeight) -> Result<Op
         return Ok(None);
     };
     let dims = x.dims();
-    if dims.len() != 2 || dims[0] < MPP_GEMM_MIN_M || dims[1] != weight.k || !x.is_contiguous() {
+    if dims.len() != 2 || dims[0] < weight.min_m() || dims[1] != weight.k || !x.is_contiguous() {
         return Ok(None);
     }
     if !mpp_gemm_available(md.device()) {

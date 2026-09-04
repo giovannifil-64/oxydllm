@@ -574,13 +574,20 @@ impl GatedDeltaNet {
 
     /// Causal depthwise conv + SiLU on the packed stream [1, t, conv_dim].
     /// Returns (activated stream, new conv window [1, k-1, conv_dim]).
+    ///
+    /// What sits to the left of the stream is the only thing that changes
+    /// between a fresh prompt and its continuation: zeros for the first piece,
+    /// the tokens the previous piece ended on for every piece after it. A
+    /// single token is that same convolution with the shifts collapsed into one
+    /// dot product per channel, and it stays a case of its own because decode
+    /// runs it at every step.
     fn conv_forward(&self, qkv: &Tensor, prev_window: Option<&Tensor>) -> Result<(Tensor, Tensor)> {
         let (_, t, conv_dim) = qkv.dims3()?;
         let k = self.cfg.conv_kernel;
 
-        if let Some(window) = prev_window {
-            // Single-token decode: slide the window, one dot per channel.
-            debug_assert_eq!(t, 1, "conv window path requires t == 1");
+        if let Some(window) = prev_window
+            && t == 1
+        {
             let window = Tensor::cat(&[window, qkv], 1)?; // [1, k, c]
             let out = window
                 .broadcast_mul(&self.conv_w.unsqueeze(0)?)?
@@ -589,9 +596,11 @@ impl GatedDeltaNet {
             return Ok((silu(&out)?, new_window));
         }
 
-        // Fresh prefill: left-pad k-1 zeros, sum k shifted broadcast products.
-        let zeros = Tensor::zeros((1, k - 1, conv_dim), qkv.dtype(), qkv.device())?;
-        let padded = Tensor::cat(&[&zeros, qkv], 1)?; // [1, t+k-1, c]
+        let left = match prev_window {
+            Some(window) => window.clone(),
+            None => Tensor::zeros((1, k - 1, conv_dim), qkv.dtype(), qkv.device())?,
+        };
+        let padded = Tensor::cat(&[&left, qkv], 1)?; // [1, t+k-1, c]
         let mut acc: Option<Tensor> = None;
         for j in 0..k {
             let term = padded
@@ -643,12 +652,6 @@ impl GatedDeltaNet {
         let value_dim = la.num_v_heads * la.head_v_dim;
         let rep = la.num_v_heads / la.num_k_heads;
 
-        if state.is_some() && t > 1 {
-            // The engine never splits a prompt across forwards (prefill is
-            // whole-prompt, decode is single-token), so this cannot happen.
-            candle_core::bail!("GatedDeltaNet: multi-token continuation is not supported");
-        }
-
         let prev = state.as_ref().map(|s| &s.conv);
         let (qkv_act, new_conv) = self.conv_forward(qkv, prev)?;
         let qkv_f32 = qkv_act.to_dtype(DType::F32)?;
@@ -696,9 +699,17 @@ impl GatedDeltaNet {
         debug_probe("fwd.qkv_act", &qkv_act);
         debug_probe("fwd.g", g);
         debug_probe("fwd.v", &v);
+        // A prompt reaches this layer in as many pieces as the engine chose to
+        // cut it into, and the pieces after the first carry the state the ones
+        // before them left. The single-token step is the same recurrence with
+        // the chunked scan's bookkeeping stripped out, so it stays the decode
+        // path; every other length goes to the scan, which takes that state as
+        // the value it starts from.
         let (core, new_s) = match state.as_ref() {
             Some(st) if t == 1 => recurrent_delta_step(&q, &k, &v, g, beta, &st.s)?,
-            _ => chunk_gated_delta_rule(&q, &k, &v, g, beta, None, CHUNK_SIZE)?,
+            carried => {
+                chunk_gated_delta_rule(&q, &k, &v, g, beta, carried.map(|st| &st.s), CHUNK_SIZE)?
+            }
         };
         debug_probe("fwd.core", &core);
         *state = Some(RecurrentState {
@@ -1121,20 +1132,43 @@ mod tests {
         assert!(max_diff < 1e-5, "fused vs fallback max diff {max_diff}");
     }
 
-    /// Contract: a continuation with t > 1 (which the engine never produces)
-    /// fails loudly instead of silently corrupting the recurrence.
+    /// Contract: a prompt cut into pieces gives what the whole prompt gives.
+    ///
+    /// The engine cuts a long prompt into chunks, so every piece after the
+    /// first arrives with the recurrent state and the convolution window the
+    /// ones before it left. Both had been written for a prompt that arrives
+    /// whole: the scan started from nothing, throwing the earlier chunks away,
+    /// and the convolution took its single-token path and failed on the shape.
+    /// Qwen3.5 answered nothing to any prompt long enough to be cut.
     #[test]
-    fn multi_token_continuation_is_rejected() {
+    fn a_prompt_cut_into_pieces_gives_what_the_whole_prompt_gives() {
         let fx: Value = serde_json::from_str(FIXTURES).unwrap();
         let f = &fx["gdn_layer"];
         let (layer, hidden, t) = fixture_layer(f);
         let dev = Device::Cpu;
+        assert!(t >= 4, "the fixture must be long enough to cut");
 
         let x = Tensor::from_vec(vecf(&f["x_prefill"]), (1, t, hidden), &dev).unwrap();
-        let mut state: Option<RecurrentState> = None;
-        layer.forward_segment(&x, &mut state).unwrap();
+        let piatto = |x: &Tensor| -> Vec<f32> { x.flatten_all().unwrap().to_vec1().unwrap() };
 
-        let x2 = Tensor::zeros((1, 2, hidden), DType::F32, &dev).unwrap();
-        assert!(layer.forward_segment(&x2, &mut state).is_err());
+        let mut intero: Option<RecurrentState> = None;
+        let atteso = piatto(&layer.forward_segment(&x, &mut intero).unwrap());
+
+        for taglio in [1usize, 2, t / 2, t - 1] {
+            let mut state: Option<RecurrentState> = None;
+            let mut pezzi = Vec::new();
+            for (da, quanti) in [(0, taglio), (taglio, t - taglio)] {
+                let pezzo = x.narrow(1, da, quanti).unwrap();
+                pezzi.extend(piatto(&layer.forward_segment(&pezzo, &mut state).unwrap()));
+            }
+            let peggiore = atteso
+                .iter()
+                .zip(&pezzi)
+                .fold(0f32, |a, (x, y)| a.max((x - y).abs()));
+            assert!(
+                peggiore < 1e-4,
+                "cut at {taglio} of {t}: worst difference {peggiore} against the whole prompt"
+            );
+        }
     }
 }

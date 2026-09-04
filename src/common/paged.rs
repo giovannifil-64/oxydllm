@@ -1044,8 +1044,24 @@ impl PagedKvCache {
                         .as_ref()
                         .map_or((&dst_k, &dst_v), |(k, v, _)| (k, v));
                     if from_old > 0 {
-                        let old_k = src_k.narrow(2, start, from_old)?.contiguous()?;
-                        let old_v = src_v.narrow(2, start, from_old)?.contiguous()?;
+                        // The live tokens move to the front of a buffer that,
+                        // when the window still fits the one it has, is the
+                        // buffer they are read from. `contiguous` alone does
+                        // not detach them: a narrow of a single-KV-head buffer
+                        // already satisfies candle's contiguity rule, so it
+                        // hands back a view of the very storage about to be
+                        // written, and candle refuses the write. `copy` alone
+                        // does not either, since it keeps the layout it was
+                        // given and slice-set takes only contiguous sources.
+                        let detach = |t: &Tensor| -> Result<Tensor> {
+                            if t.is_contiguous() {
+                                t.copy()
+                            } else {
+                                t.contiguous()
+                            }
+                        };
+                        let old_k = detach(&src_k.narrow(2, start, from_old)?)?;
+                        let old_v = detach(&src_v.narrow(2, start, from_old)?)?;
                         dst_k.slice_set(&old_k, 2, 0)?;
                         dst_v.slice_set(&old_v, 2, 0)?;
                     }
@@ -1386,6 +1402,52 @@ mod tests {
         let a = safe_model_kv_ceiling(2 << 30);
         let b = safe_model_kv_ceiling(2 << 30);
         assert_eq!(a, b);
+    }
+
+    /// Contract: a windowed cache with a single KV head serves a second request
+    /// on the same sequence.
+    ///
+    /// When the window still fits the buffer it has, the compaction that slides
+    /// the live tokens to the front reads and writes that one buffer. With a
+    /// single KV head a narrow of it satisfies candle's contiguity rule, so
+    /// asking for a contiguous copy returned a view of the storage about to be
+    /// written and candle refused the write. Three checkpoints answered the
+    /// first request and failed the second: Gemma 4 E2B, Phi-3.5 mini and every
+    /// windowed model whose global layers keep one KV head.
+    #[test]
+    fn a_windowed_cache_with_one_kv_head_survives_a_second_request() {
+        const W: usize = 12;
+        const DIM: usize = 4;
+        let alloc = Arc::new(Mutex::new(
+            BlockAllocator::new(256, 4, 1, DIM, DType::F32, &Device::Cpu, None)
+                .unwrap()
+                .with_sliding_window(Some(W)),
+        ));
+        let mut cache = PagedKvCache::new(alloc);
+        let dev = Device::Cpu;
+        let mut atteso: Vec<f32> = Vec::new();
+        let mut next = 0f32;
+        // A prompt, its decode, then a second prompt on the same sequence: the
+        // shape that made the compaction read and write one buffer.
+        for n in [10usize, 1, 1, 1, 9, 1, 14, 1] {
+            let vals: Vec<f32> = (0..n).flat_map(|i| vec![next + i as f32; DIM]).collect();
+            next += n as f32;
+            let t = Tensor::from_vec(vals.clone(), (1, 1, n, DIM), &dev).unwrap();
+            cache.append(&t, &t).unwrap();
+            atteso.extend(vals);
+            let (k, _v) = cache.current().unwrap();
+            let visti: Vec<f32> = k.flatten_all().unwrap().to_vec1().unwrap();
+            assert!(
+                visti.len() >= W.min(atteso.len() / DIM) * DIM,
+                "after {n}: shorter than the window"
+            );
+            let coda = &atteso[atteso.len() - visti.len()..];
+            assert_eq!(
+                visti,
+                coda.to_vec(),
+                "after appending {n} the cache must show the most recent tokens"
+            );
+        }
     }
 
     /// Contract: a windowed cache always shows the last `window` tokens, exactly

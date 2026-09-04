@@ -169,8 +169,28 @@ pub fn parse(config_path: &str) -> Result<StandardTransformerConfig> {
     let moe_norm_topk_prob = v["norm_topk_prob"].as_bool();
     let moe_swiglu_limit = v["swiglu_limit"].as_f64();
 
-    let layer_types =
-        parse_string_array(&v["layer_types"]).filter(|x| x.len() == num_hidden_layers);
+    // A checkpoint states its per-layer attention either as a list of layer
+    // types or, in the Gemma 3 generation, as the period of the full-attention
+    // layers among the windowed ones: every `sliding_window_pattern`-th layer
+    // attends to everything, the rest to their window. Reading only the list
+    // gave the 1B checkpoint, which ships only the period, a window on all
+    // twenty-six layers and so no path longer than five hundred tokens.
+    let layer_types = parse_string_array(&v["layer_types"])
+        .filter(|x| x.len() == num_hidden_layers)
+        .or_else(|| {
+            let period = v["sliding_window_pattern"].as_u64()? as usize;
+            (period > 1 && sliding_window.is_some()).then(|| {
+                (0..num_hidden_layers)
+                    .map(|i| {
+                        if (i + 1).is_multiple_of(period) {
+                            "full_attention".to_string()
+                        } else {
+                            "sliding_attention".to_string()
+                        }
+                    })
+                    .collect()
+            })
+        });
     let global_head_dim = v["global_head_dim"]
         .as_u64()
         .map(|x| x as usize)
@@ -310,6 +330,11 @@ pub fn parse(config_path: &str) -> Result<StandardTransformerConfig> {
         })
         .or_else(|| arch_def.per_layer_sliding_windows(sliding_window, num_hidden_layers));
 
+    // Gemma 3 names the windowed layers' base `rope_local_base_freq` and keeps
+    // `rope_theta` for the full ones; later generations put both under
+    // `rope_parameters`. A windowed layer given the full layers' base rotates
+    // its short window far too slowly to separate the positions in it.
+    let local_rope_theta = sliding_rope_theta.or_else(|| v["rope_local_base_freq"].as_f64());
     let per_layer_rope_thetas = layer_types.as_ref().map(|types| {
         types
             .iter()
@@ -317,7 +342,7 @@ pub fn parse(config_path: &str) -> Result<StandardTransformerConfig> {
                 if layer_type == "full_attention" {
                     full_rope_theta.unwrap_or(rope_theta)
                 } else {
-                    sliding_rope_theta.unwrap_or(rope_theta)
+                    local_rope_theta.unwrap_or(rope_theta)
                 }
             })
             .collect::<Vec<_>>()
@@ -961,6 +986,55 @@ mod tests {
             cfg.per_layer_sliding_windows,
             Some(vec![Some(4096), None, Some(4096), None])
         );
+    }
+
+    /// Contract: a checkpoint that states its per-layer attention as a period
+    /// rather than a list gets the same geometry either way, and its windowed
+    /// layers get the local rope base.
+    ///
+    /// Gemma 3 ships `sliding_window_pattern` and no `layer_types`: every
+    /// sixth layer attends to everything, the rest to five hundred and twelve
+    /// tokens, and those windowed layers rotate on `rope_local_base_freq`.
+    /// Read as a list alone it came out windowed on all twenty-six layers with
+    /// one base, which left the 1B checkpoint no path longer than its window:
+    /// it answered garbage at eight hundred tokens and nothing at fifteen
+    /// hundred.
+    #[test]
+    fn a_window_period_places_the_full_attention_layers_and_the_local_rope_base() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("config.json");
+        let config = json!({
+            "architectures": ["Gemma3ForCausalLM"],
+            "hidden_size": 1152,
+            "intermediate_size": 6912,
+            "num_hidden_layers": 12,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 1,
+            "head_dim": 256,
+            "vocab_size": 262144,
+            "sliding_window": 512,
+            "sliding_window_pattern": 6,
+            "rope_theta": 1000000.0,
+            "rope_local_base_freq": 10000.0
+        });
+        fs::write(&config_path, serde_json::to_string_pretty(&config).unwrap()).unwrap();
+
+        let cfg = parse(config_path.to_string_lossy().as_ref()).unwrap();
+        let windows = cfg.per_layer_sliding_windows.expect("a window per layer");
+        let thetas = cfg.per_layer_rope_thetas.expect("a rope base per layer");
+        for layer in 0usize..12 {
+            let full = (layer + 1).is_multiple_of(6);
+            assert_eq!(
+                windows[layer],
+                if full { None } else { Some(512) },
+                "layer {layer} attention span"
+            );
+            assert_eq!(
+                thetas[layer],
+                if full { 1_000_000.0 } else { 10_000.0 },
+                "layer {layer} rope base"
+            );
+        }
     }
 
     /// Contract: the alternating pattern stays scoped to Gemma2; Gemma3

@@ -6874,21 +6874,22 @@ mod quantized_matmul_floor {
         }
     }
 
-    /// How much of the machine's bandwidth candle's quantized matvec already
-    /// uses at a single token, which is what decides whether a matvec of this
-    /// crate's own could be worth writing.
+    /// How fast candle's quantized matvec reads a weight at a single token,
+    /// against a dense BF16 matvec of the same shape.
     ///
-    /// A matvec reads the whole weight and does one multiply per element, so it
-    /// is bandwidth bound and its ceiling is the machine's read rate. Two
-    /// references bracket that rate on work that cannot be elided: a dense BF16
-    /// matvec of the same shape, and a full reduction over a buffer of the same
-    /// size. The gap between the quantized matvec and them is all a
-    /// hand-written kernel could recover. Alongside it, the cost of one tiny
-    /// dtype conversion, which is the launch overhead the decode path pays
-    /// fourteen times per layer.
+    /// The number to hold both against is the machine's own read rate, and
+    /// that has to be measured with a kernel of one's own, on random bytes,
+    /// with an explicit wait: a buffer of zeros is served from zero pages, a
+    /// buffer of one repeated value compresses, and a timing that syncs on a
+    /// scalar result can miss work still queued. Measured that way on the M5
+    /// this was written on, a flat stream reads at 120 GB/s, and the
+    /// quantized matvec below sits at two thirds to nine tenths of it; a
+    /// matvec of this crate's own reached the same rate on the wide shape and
+    /// no more on the narrow one, and lost two percent of decode end to end,
+    /// so it was not kept.
     #[test]
     #[ignore = "perf probe (requires macOS 26 / Metal 4)"]
-    fn quantized_matvec_bandwidth_headroom_probe() {
+    fn quantized_matvec_bandwidth_probe() {
         use std::time::Instant;
         let Ok(dev) = Device::new_metal(0) else {
             return;
@@ -6924,23 +6925,17 @@ mod quantized_matmul_floor {
                     .unwrap()
                     .into_owned();
                 let peso_byte = bytes.len();
-                let qt = std::sync::Arc::new(
-                    crate::common::gguf_weights::qtensor_with_staged(
-                        dtype,
-                        &bytes,
-                        vec![n, k],
-                        &dev,
-                    )
-                    .unwrap()
-                    .0,
-                );
-                let candle = QMatMul::from_arc(qt).unwrap();
-
+                let (qt, _) = crate::common::gguf_weights::qtensor_with_staged(
+                    dtype,
+                    &bytes,
+                    vec![n, k],
+                    &dev,
+                )
+                .unwrap();
+                let candle = QMatMul::from_arc(std::sync::Arc::new(qt)).unwrap();
                 let x_bf = riempi(1, k).to_dtype(candle_core::DType::BF16).unwrap();
                 let x32 = x_bf.to_dtype(candle_core::DType::F32).unwrap();
                 let t_mv = time(&|| candle.forward(&x32).unwrap());
-                let t_conv = time(&|| x_bf.to_dtype(candle_core::DType::F32).unwrap());
-
                 let w_bf = w32
                     .t()
                     .unwrap()
@@ -6949,92 +6944,15 @@ mod quantized_matmul_floor {
                     .to_dtype(candle_core::DType::BF16)
                     .unwrap();
                 let t_dense = time(&|| x_bf.matmul(&w_bf).unwrap());
-                let dense_byte = n * k * 2;
-
-                // A buffer far larger than any cache, so the reading is the
-                // memory's rate and not a cache's.
-                let grande =
-                    Tensor::zeros(512usize * 1024 * 1024, candle_core::DType::BF16, &dev).unwrap();
-                let t_sum = time(&|| grande.sum_all().unwrap())
-                    / (1024.0 * 1024.0 * 1024.0 / dense_byte as f64);
-
                 let gb = |b: usize, t: f64| b as f64 / t / 1e9;
                 println!(
-                    "{dtype:?} {label:12} | matvec quantizzato {:7.1} us = {:5.1} GB/s | denso BF16 {:7.1} us = {:5.1} GB/s | somma {:7.1} us = {:5.1} GB/s | il quantizzato usa il {:3.0}% del miglior riferimento | una conversione {:5.1} us",
+                    "{dtype:?} {label:12} | matvec quantizzato {:7.1} us = {:5.1} GB/s | denso BF16 {:7.1} us = {:5.1} GB/s",
                     t_mv * 1e6,
                     gb(peso_byte, t_mv),
                     t_dense * 1e6,
-                    gb(dense_byte, t_dense),
-                    t_sum * 1e6,
-                    gb(dense_byte, t_sum),
-                    gb(peso_byte, t_mv) / gb(dense_byte, t_dense).max(gb(dense_byte, t_sum))
-                        * 100.0,
-                    t_conv * 1e6,
+                    gb(n * k * 2, t_dense),
                 );
             }
-        }
-    }
-
-    /// What one layer's attention costs at a single token, against the time
-    /// reading its cache would take on its own.
-    ///
-    /// A decode step reads the whole cache and does one pass over it, so it is
-    /// bandwidth bound and the floor is the bytes divided by the read rate the
-    /// machine reaches when a kernel does nothing else, measured at 270 GB/s by
-    /// `quantized_matvec_bandwidth_headroom_probe`. The shapes are the two a
-    /// Gemma 4 12B layer has at a couple of thousand tokens: sixteen query
-    /// heads over eight key-value heads of two hundred and fifty six inside a
-    /// window, and over one key-value head of five hundred and twelve across
-    /// the whole prompt.
-    #[test]
-    #[ignore = "perf probe (requires macOS 26 / Metal 4)"]
-    fn decode_attention_against_its_bandwidth_floor_probe() {
-        use std::time::Instant;
-        let Ok(dev) = Device::new_metal(0) else {
-            return;
-        };
-        for (label, h, h_kv, d, kv) in [
-            ("finestra", 16usize, 8usize, 256usize, 1024usize),
-            ("globale", 16, 1, 512, 1700),
-        ] {
-            let mk = |dims: (usize, usize, usize, usize), salt: usize| -> Tensor {
-                let n = dims.0 * dims.1 * dims.2 * dims.3;
-                let v: Vec<f32> = (0..n)
-                    .map(|i| (((i + salt) % 19) as f32 - 9.0) * 0.05)
-                    .collect();
-                Tensor::from_vec(v, dims, &dev)
-                    .unwrap()
-                    .to_dtype(candle_core::DType::BF16)
-                    .unwrap()
-            };
-            let q = mk((1, h, 1, d), 1);
-            let k = mk((1, h_kv, kv, d), 7);
-            let v = mk((1, h_kv, kv, d), 13);
-            let scale = 1.0 / (d as f32).sqrt();
-
-            let run =
-                || crate::common::metal_ops::sdpa(&q, &k, &v, None, false, scale, 0.0).unwrap();
-            for _ in 0..5 {
-                run().to_device(&Device::Cpu).unwrap();
-            }
-            let iters = 200;
-            let t = Instant::now();
-            let mut sink = Vec::with_capacity(iters);
-            for _ in 0..iters {
-                sink.push(run());
-            }
-            sink.last().unwrap().to_device(&Device::Cpu).unwrap();
-            let per = t.elapsed().as_secs_f64() / iters as f64;
-
-            let byte = 2 * h_kv * kv * d * 2;
-            println!(
-                "{label:9} h={h} h_kv={h_kv} d={d} kv={kv} | cache {:5.2} MB | kernel {:7.1} us = {:6.1} GB/s | pavimento a 270 GB/s {:5.1} us | {:4.1}x il pavimento",
-                byte as f64 / 1e6,
-                per * 1e6,
-                byte as f64 / per / 1e9,
-                byte as f64 / 270e9 * 1e6,
-                per / (byte as f64 / 270e9)
-            );
         }
     }
 

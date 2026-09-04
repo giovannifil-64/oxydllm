@@ -538,7 +538,7 @@ mod tests {
         .1;
         assert!(stageable.is_some(), "Q4_K with whole-block rows");
 
-        let other_dtype = qtensor_with_staged(
+        let six_bit = qtensor_with_staged(
             GgmlDType::Q6K,
             &quantize((64, 512), GgmlDType::Q6K),
             vec![64, 512],
@@ -546,7 +546,17 @@ mod tests {
         )
         .unwrap()
         .1;
-        assert!(other_dtype.is_none(), "Q6_K has no staged kernel yet");
+        assert!(six_bit.is_some(), "Q6_K with whole-block rows");
+
+        let other_dtype = qtensor_with_staged(
+            GgmlDType::Q8_0,
+            &quantize((64, 512), GgmlDType::Q8_0),
+            vec![64, 512],
+            &dev,
+        )
+        .unwrap()
+        .1;
+        assert!(other_dtype.is_none(), "Q8_0 has no staged kernel");
 
         let one_dimensional = qtensor_with_staged(
             GgmlDType::Q4K,

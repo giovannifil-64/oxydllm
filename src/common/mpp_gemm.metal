@@ -205,6 +205,13 @@ typedef struct {
     uint8_t  qs[QK_K / 2];
 } block_q4_K;
 
+typedef struct {
+    uint8_t  ql[QK_K / 2];
+    uint8_t  qh[QK_K / 4];
+    int8_t   scales[QK_K / 16];
+    half     d;
+} block_q6_K;
+
 inline void q4k_scale_min(device const uint8_t* scales, uint j,
                           thread float& sc, thread float& m)
 {
@@ -217,7 +224,10 @@ inline void q4k_scale_min(device const uint8_t* scales, uint j,
     }
 }
 
-inline void q4k_stage_tile(
+// Each thread of the threadgroup dequantizes one column of the tile over 32
+// consecutive k, which is the span one Q4_K scale covers and one quarter of
+// the span a Q6_K half-block interleaves, so a thread never crosses a scale.
+inline void stage_tile(
     device block_q4_K* weight,
     threadgroup bfloat* sB,
     constant MppQuantGemmParams& p,
@@ -253,16 +263,58 @@ inline void q4k_stage_tile(
     }
 }
 
-kernel void mpp_gemm_q4k_staged(
-    device bfloat*      a       [[buffer(0)]],
-    device block_q4_K*  weight  [[buffer(1)]],
-    device bfloat*      d       [[buffer(2)]],
-    constant MppQuantGemmParams& p [[buffer(3)]],
-    uint2 tgid [[threadgroup_position_in_grid]],
-    uint  lid  [[thread_index_in_threadgroup]])
+// A Q6_K block holds two halves of 128 weights. Within a half, weight
+// g * 32 + l takes its low four bits from ql[(g & 1) * 32 + l], high or low
+// nibble by g >> 1, its top two bits from qh[l] shifted by 2 * g, and its
+// scale from scales[2 * g + l / 16], all offset by 32.
+inline void stage_tile(
+    device block_q6_K* weight,
+    threadgroup bfloat* sB,
+    constant MppQuantGemmParams& p,
+    int k0, int col0, int bk, int tn, uint lid)
 {
-    threadgroup bfloat sB[2][Q4K_BK * TN];
+    uint blocks_per_row = uint(p.k) / QK_K;
+    uint subs = (uint(bk) + 31u) / 32u;
+    uint total = uint(tn) * subs;
+    for (uint t = lid; t < total; t += 128u) {
+        uint col = t / subs;
+        uint sub = t % subs;
+        uint k_start = uint(k0) + sub * 32u;
+        device const block_q6_K* blk =
+            weight + (uint(col0) + col) * blocks_per_row + k_start / QK_K;
+        uint j0 = k_start % QK_K;
+        uint h = j0 / 128u;
+        uint g = (j0 % 128u) / 32u;
 
+        float d = float(blk->d);
+        device const uint8_t* ql = blk->ql + h * 64u + (g & 1u) * 32u;
+        device const uint8_t* qh = blk->qh + h * 32u;
+        device const int8_t* sc = blk->scales + h * 8u + 2u * g;
+        uint shift_l = (g >> 1) * 4u;
+        uint shift_h = 2u * g;
+        for (uint l = 0; l < 32u; ++l) {
+            uint kk = sub * 32u + l;
+            if (int(kk) >= bk) {
+                break;
+            }
+            uint low = (uint(ql[l]) >> shift_l) & 0xFu;
+            uint top = (uint(qh[l]) >> shift_h) & 3u;
+            int q = int(low | (top << 4)) - 32;
+            sB[kk * uint(TN) + col] = bfloat(d * float(sc[l / 16u]) * float(q));
+        }
+    }
+}
+
+template <typename Block>
+inline void gemm_staged(
+    device bfloat* a,
+    device Block* weight,
+    device bfloat* d,
+    constant MppQuantGemmParams& p,
+    threadgroup bfloat* sB0,
+    threadgroup bfloat* sB1,
+    uint2 tgid, uint lid)
+{
     constexpr auto desc = matmul2d_descriptor(
         Q4K_TM, TN, Q4K_BK, false, false, false, matmul2d_descriptor::mode::multiply_accumulate);
     matmul2d<desc, execution_simdgroups<4>> op;
@@ -286,19 +338,21 @@ kernel void mpp_gemm_q4k_staged(
         }
     }
 
-    q4k_stage_tile(weight, sB[0], p, 0, col0, min(Q4K_BK, p.k), tn, lid);
+    stage_tile(weight, sB0, p, 0, col0, min(Q4K_BK, p.k), tn, lid);
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     int slot = 0;
     for (int k0 = 0; k0 < p.k; k0 += Q4K_BK) {
         int bk = min(Q4K_BK, p.k - k0);
         int k1 = k0 + Q4K_BK;
+        threadgroup bfloat* cur = slot == 0 ? sB0 : sB1;
+        threadgroup bfloat* nxt = slot == 0 ? sB1 : sB0;
         if (k1 < p.k) {
-            q4k_stage_tile(weight, sB[1 - slot], p, k1, col0, min(Q4K_BK, p.k - k1), tn, lid);
+            stage_tile(weight, nxt, p, k1, col0, min(Q4K_BK, p.k - k1), tn, lid);
         }
 
         auto tA = tensor(a + row0 * p.k + k0, dextents<int, 2>{bk, tm}, array<int, 2>{1, p.k});
-        auto tB = tensor(sB[slot], dextents<int, 2>{tn, bk}, array<int, 2>{1, TN});
+        auto tB = tensor(cur, dextents<int, 2>{tn, bk}, array<int, 2>{1, TN});
         op.run(tA, tB, cT);
         threadgroup_barrier(mem_flags::mem_threadgroup);
         slot = 1 - slot;
@@ -315,6 +369,30 @@ kernel void mpp_gemm_q4k_staged(
             }
         }
     }
+}
+
+kernel void mpp_gemm_q4k_staged(
+    device bfloat*      a       [[buffer(0)]],
+    device block_q4_K*  weight  [[buffer(1)]],
+    device bfloat*      d       [[buffer(2)]],
+    constant MppQuantGemmParams& p [[buffer(3)]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint  lid  [[thread_index_in_threadgroup]])
+{
+    threadgroup bfloat sB[2][Q4K_BK * TN];
+    gemm_staged<block_q4_K>(a, weight, d, p, sB[0], sB[1], tgid, lid);
+}
+
+kernel void mpp_gemm_q6k_staged(
+    device bfloat*      a       [[buffer(0)]],
+    device block_q6_K*  weight  [[buffer(1)]],
+    device bfloat*      d       [[buffer(2)]],
+    constant MppQuantGemmParams& p [[buffer(3)]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint  lid  [[thread_index_in_threadgroup]])
+{
+    threadgroup bfloat sB[2][Q4K_BK * TN];
+    gemm_staged<block_q6_K>(a, weight, d, p, sB[0], sB[1], tgid, lid);
 }
 
 template<uint BITS, bool GPTQ>

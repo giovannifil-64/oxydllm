@@ -6728,6 +6728,101 @@ mod quantized_matmul_floor {
         }
     }
 
+    /// Where the staged GEMM overtakes candle's quantized matmul, on the shapes
+    /// the reference checkpoint actually runs and for both block types.
+    ///
+    /// Candle is timed the way production calls it, from BF16 activations
+    /// through the F32 copy `QLinear` makes; the staged kernel is timed on the
+    /// BF16 activations directly. The crossover this prints is what the
+    /// threshold in [`maybe_staged_quant_matmul`] should be set from.
+    #[test]
+    #[ignore = "perf probe (requires macOS 26 / Metal 4)"]
+    fn staged_quant_crossover_probe() {
+        use std::time::Instant;
+        let Ok(dev) = Device::new_metal(0) else {
+            return;
+        };
+        let shapes = [
+            ("ffn gate/up", 15360usize, 3840usize),
+            ("ffn down", 3840, 15360),
+            ("q sliding", 4096, 3840),
+            ("q global", 8192, 3840),
+            ("k/v sliding", 2048, 3840),
+            ("k global", 512, 3840),
+            ("o sliding", 3840, 4096),
+            ("o global", 3840, 8192),
+        ];
+        for dtype in [GgmlDType::Q4K, GgmlDType::Q6K] {
+            for (label, n, k) in shapes {
+                let w: Vec<f32> = (0..n * k)
+                    .map(|i| ((i % 29) as f32 - 14.0) * 0.031)
+                    .collect();
+                let w32 = Tensor::from_vec(w, (n, k), &dev).unwrap();
+                let bytes = QTensor::quantize(&w32, dtype)
+                    .unwrap()
+                    .data()
+                    .unwrap()
+                    .into_owned();
+                drop(w32);
+                let (qt, staged) = crate::common::gguf_weights::qtensor_with_staged(
+                    dtype,
+                    &bytes,
+                    vec![n, k],
+                    &dev,
+                )
+                .unwrap();
+                let staged = staged.unwrap();
+                let candle = QMatMul::from_arc(std::sync::Arc::new(qt)).unwrap();
+                let mut crossover = None;
+                for m in [1usize, 4, 8, 16, 32, 64, 128, 256, 512, 1024] {
+                    let x: Vec<f32> = (0..m * k).map(|i| ((i % 13) as f32 - 6.0) * 0.05).collect();
+                    let x_bf = Tensor::from_vec(x, (m, k), &dev)
+                        .unwrap()
+                        .to_dtype(candle_core::DType::BF16)
+                        .unwrap();
+                    let run_candle = || {
+                        candle
+                            .forward(&x_bf.to_dtype(candle_core::DType::F32).unwrap())
+                            .unwrap()
+                    };
+                    let run_staged =
+                        || crate::common::metal_ops::mpp_staged_matmul(&x_bf, &staged).unwrap();
+                    let time = |f: &dyn Fn() -> Tensor| -> f64 {
+                        for _ in 0..3 {
+                            f().to_device(&Device::Cpu).unwrap();
+                        }
+                        let iters = 10;
+                        let t = Instant::now();
+                        let mut sink = Vec::with_capacity(iters);
+                        for _ in 0..iters {
+                            sink.push(f());
+                        }
+                        sink.last().unwrap().to_device(&Device::Cpu).unwrap();
+                        t.elapsed().as_secs_f64() / iters as f64
+                    };
+                    let t_c = time(&run_candle).min(time(&run_candle));
+                    let t_s = time(&run_staged).min(time(&run_staged));
+                    if crossover.is_none() && t_s < t_c {
+                        crossover = Some(m);
+                    }
+                    let flops = 2.0 * m as f64 * n as f64 * k as f64;
+                    println!(
+                        "{dtype:?} {label:12} m={m:5}  candle {:8.1} us ({:5.2} TF)  staged {:8.1} us ({:5.2} TF)  {:.2}x",
+                        t_c * 1e6,
+                        flops / t_c / 1e12,
+                        t_s * 1e6,
+                        flops / t_s / 1e12,
+                        t_c / t_s
+                    );
+                }
+                println!(
+                    "{dtype:?} {label:12} staged overtakes candle from m={}",
+                    crossover.map_or("never".to_string(), |m| m.to_string())
+                );
+            }
+        }
+    }
+
     /// Contract: the quantized matmul this crate leans on stays fast enough to
     /// be worth leaning on.
     ///

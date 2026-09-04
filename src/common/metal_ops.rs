@@ -6944,8 +6944,12 @@ mod quantized_matmul_floor {
                 let t_dense = time(&|| x_bf.matmul(&w_bf).unwrap());
                 let dense_byte = n * k * 2;
 
-                let big = w32.to_dtype(candle_core::DType::BF16).unwrap();
-                let t_sum = time(&|| big.sum_all().unwrap());
+                // A buffer far larger than any cache, so the reading is the
+                // memory's rate and not a cache's.
+                let grande =
+                    Tensor::zeros(512usize * 1024 * 1024, candle_core::DType::BF16, &dev).unwrap();
+                let t_sum = time(&|| grande.sum_all().unwrap())
+                    / (1024.0 * 1024.0 * 1024.0 / dense_byte as f64);
 
                 let gb = |b: usize, t: f64| b as f64 / t / 1e9;
                 println!(
@@ -6961,6 +6965,69 @@ mod quantized_matmul_floor {
                     t_conv * 1e6,
                 );
             }
+        }
+    }
+
+    /// What one layer's attention costs at a single token, against the time
+    /// reading its cache would take on its own.
+    ///
+    /// A decode step reads the whole cache and does one pass over it, so it is
+    /// bandwidth bound and the floor is the bytes divided by the read rate the
+    /// machine reaches when a kernel does nothing else, measured at 270 GB/s by
+    /// `quantized_matvec_bandwidth_headroom_probe`. The shapes are the two a
+    /// Gemma 4 12B layer has at a couple of thousand tokens: sixteen query
+    /// heads over eight key-value heads of two hundred and fifty six inside a
+    /// window, and over one key-value head of five hundred and twelve across
+    /// the whole prompt.
+    #[test]
+    #[ignore = "perf probe (requires macOS 26 / Metal 4)"]
+    fn decode_attention_against_its_bandwidth_floor_probe() {
+        use std::time::Instant;
+        let Ok(dev) = Device::new_metal(0) else {
+            return;
+        };
+        for (label, h, h_kv, d, kv) in [
+            ("finestra", 16usize, 8usize, 256usize, 1024usize),
+            ("globale", 16, 1, 512, 1700),
+        ] {
+            let mk = |dims: (usize, usize, usize, usize), salt: usize| -> Tensor {
+                let n = dims.0 * dims.1 * dims.2 * dims.3;
+                let v: Vec<f32> = (0..n)
+                    .map(|i| (((i + salt) % 19) as f32 - 9.0) * 0.05)
+                    .collect();
+                Tensor::from_vec(v, dims, &dev)
+                    .unwrap()
+                    .to_dtype(candle_core::DType::BF16)
+                    .unwrap()
+            };
+            let q = mk((1, h, 1, d), 1);
+            let k = mk((1, h_kv, kv, d), 7);
+            let v = mk((1, h_kv, kv, d), 13);
+            let scale = 1.0 / (d as f32).sqrt();
+
+            let run =
+                || crate::common::metal_ops::sdpa(&q, &k, &v, None, false, scale, 0.0).unwrap();
+            for _ in 0..5 {
+                run().to_device(&Device::Cpu).unwrap();
+            }
+            let iters = 200;
+            let t = Instant::now();
+            let mut sink = Vec::with_capacity(iters);
+            for _ in 0..iters {
+                sink.push(run());
+            }
+            sink.last().unwrap().to_device(&Device::Cpu).unwrap();
+            let per = t.elapsed().as_secs_f64() / iters as f64;
+
+            let byte = 2 * h_kv * kv * d * 2;
+            println!(
+                "{label:9} h={h} h_kv={h_kv} d={d} kv={kv} | cache {:5.2} MB | kernel {:7.1} us = {:6.1} GB/s | pavimento a 270 GB/s {:5.1} us | {:4.1}x il pavimento",
+                byte as f64 / 1e6,
+                per * 1e6,
+                byte as f64 / per / 1e9,
+                byte as f64 / 270e9 * 1e6,
+                per / (byte as f64 / 270e9)
+            );
         }
     }
 

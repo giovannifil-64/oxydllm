@@ -1170,7 +1170,6 @@ fn load_standard_safetensors(
             kv_quant: opts.kv_quant,
             qjl_quantization: opts.qjl_quantization,
             weights_bytes: weights_size,
-            unified_memory: !device.is_cuda(),
             retry_cap,
         },
         opts.kv_budget,
@@ -1520,7 +1519,6 @@ fn load_batch_model_gguf(
             kv_quant: opts.kv_quant,
             qjl_quantization: opts.qjl_quantization,
             weights_bytes: weights_size,
-            unified_memory: !device.is_cuda(),
             retry_cap,
         },
         opts.kv_budget,
@@ -1613,7 +1611,6 @@ struct KvBlockParams {
     weights_bytes: usize,
     /// Whether the device shares memory with the CPU, which decides if
     /// automatic quantization is cheap enough to choose unprompted.
-    unified_memory: bool,
     /// Upper bound on pool bytes imposed by a previous attempt whose weights
     /// did not survive; `None` on the first try.
     retry_cap: Option<usize>,
@@ -1659,33 +1656,26 @@ fn kv_bytes_per_block(p: &KvBlockParams, mode: KvQuantMode) -> usize {
 
 /// Picks the storage mode for this model's KV blocks.
 ///
-/// An explicit mode is honoured as given. On [`KvQuantMode::Auto`] the pool
-/// stays unquantized whenever the capacity the model asks for already fits the
-/// safe ceiling, since exact blocks are both faster and simpler; when it does
-/// not fit, quantizing to [`KvQuantMode::Lossless`] buys roughly four times
-/// the capacity at quality the regression tests bound (softmax L1 and L2
-/// distance against the unquantized reference), which is a better trade than
-/// silently serving fewer sequences or truncating the context. It never
-/// escalates further on its own.
-fn resolve_kv_quant(p: &KvBlockParams, desired_blocks: usize, ceiling: usize) -> KvQuantMode {
+/// An explicit mode is honoured as given. [`KvQuantMode::Auto`] keeps exact
+/// blocks whatever the capacity asked for, and lets the pool be capped instead.
+///
+/// It used to quantize to [`KvQuantMode::Lossless`] when the request did not
+/// fit, on the strength of regression tests that bounded the softmax distance
+/// on synthetic keys. Real keys are not synthetic: after rotary embedding a
+/// handful of channels sit twenty to sixty times above the rest, the single
+/// norm a token's four-bit code is scaled by is set by those channels, and
+/// every other channel lands in the central bins. On such a key the score
+/// against a query is off by four to nine units, which a softmax turns into
+/// a different key entirely. Every model whose pool was quantized this way
+/// answered its first request, which reads the exact buffer, and garbage to
+/// its second, which reads the pool: Phi-3.5 said nothing at all and Qwen 2.5
+/// said `??,?. ? the?.` to a prompt it had just answered. A smaller pool
+/// serves fewer sequences at once; a quantized one serves them wrong.
+fn resolve_kv_quant(p: &KvBlockParams) -> KvQuantMode {
     if p.kv_quant != KvQuantMode::Auto {
         return p.kv_quant;
     }
-    // Quantized blocks are packed on the CPU. On unified memory that costs
-    // about 1% of decode throughput (32.6 vs 32.9 tok/s on Phi-3-mini), which
-    // is a bargain for four times the capacity; across a discrete GPU's bus it
-    // is a real transfer per write and nobody has measured it. Choosing it
-    // unprompted there would trade an unmeasured amount of speed for capacity,
-    // so that platform keeps exact blocks and a smaller pool until someone
-    // runs the numbers.
-    if !p.unified_memory {
-        return KvQuantMode::Off;
-    }
-    let exact = kv_bytes_per_block(p, KvQuantMode::Off);
-    if exact == 0 || desired_blocks.saturating_mul(exact) <= ceiling {
-        return KvQuantMode::Off;
-    }
-    KvQuantMode::Lossless
+    KvQuantMode::Off
 }
 
 /// The pool a model got, and the context that pool can actually serve.
@@ -1715,7 +1705,7 @@ fn compute_kv_blocks(p: &KvBlockParams, kv_budget: &GlobalKvBudget) -> anyhow::R
 
     let ceiling = crate::common::paged::safe_model_kv_ceiling(p.weights_bytes)
         .min(p.retry_cap.unwrap_or(usize::MAX));
-    let mode = resolve_kv_quant(p, desired_blocks.max(min_blocks), ceiling);
+    let mode = resolve_kv_quant(p);
     let per_block_bytes = kv_bytes_per_block(p, mode);
 
     if per_block_bytes == 0 {
@@ -1725,13 +1715,6 @@ fn compute_kv_blocks(p: &KvBlockParams, kv_budget: &GlobalKvBudget) -> anyhow::R
             mode,
             context_len: target_context,
         });
-    }
-
-    if p.kv_quant == KvQuantMode::Auto && mode != KvQuantMode::Off {
-        tracing::info!(
-            mode = mode.label(),
-            "KV blocks quantized automatically: the capacity this model asks for does not fit the safe memory share unquantized"
-        );
     }
 
     let desired_bytes = desired_blocks.max(min_blocks) * per_block_bytes;
@@ -1931,7 +1914,6 @@ mod kv_quant_decision_tests {
             kv_quant,
             qjl_quantization: false,
             weights_bytes,
-            unified_memory: true,
             retry_cap: None,
         }
     }
@@ -1941,9 +1923,9 @@ mod kv_quant_decision_tests {
     #[test]
     fn explicit_mode_is_honoured() {
         let p = params(KvQuantMode::Off, 36, 8 << 30);
-        assert_eq!(resolve_kv_quant(&p, 1 << 20, 0), KvQuantMode::Off);
+        assert_eq!(resolve_kv_quant(&p), KvQuantMode::Off);
         let p = params(KvQuantMode::Aggressive, 36, 0);
-        assert_eq!(resolve_kv_quant(&p, 1, usize::MAX), KvQuantMode::Aggressive);
+        assert_eq!(resolve_kv_quant(&p), KvQuantMode::Aggressive);
     }
 
     /// Contract: while the capacity the model wants fits the ceiling, blocks
@@ -1952,39 +1934,28 @@ mod kv_quant_decision_tests {
     #[test]
     fn auto_stays_exact_when_capacity_fits() {
         let p = params(KvQuantMode::Auto, 36, 0);
-        assert_eq!(resolve_kv_quant(&p, 1024, usize::MAX), KvQuantMode::Off);
+        assert_eq!(resolve_kv_quant(&p), KvQuantMode::Off);
     }
 
-    /// Contract: when it does not fit, auto quantizes instead of letting the
-    /// pool be capped, since lossless buys roughly four times the capacity at
-    /// quality the regression tests bound.
+    /// Contract: auto keeps exact blocks however tight the ceiling, and lets
+    /// the pool be capped rather than quantize on its own.
+    ///
+    /// Four-bit keys scaled by a single norm per token lose every channel but
+    /// the outliers, and a model served from them answers garbage to the
+    /// first request that reads the pool. A capped pool serves fewer
+    /// sequences; a quantized one serves them wrong.
     #[test]
-    fn auto_quantizes_rather_than_losing_capacity() {
+    fn auto_lets_the_pool_be_capped_rather_than_quantize() {
         let p = params(KvQuantMode::Auto, 36, 0);
-        let exact = kv_bytes_per_block(&p, KvQuantMode::Off);
-        let blocks = 1024;
-        let tight = blocks * exact / 2;
-        assert_eq!(resolve_kv_quant(&p, blocks, tight), KvQuantMode::Lossless);
+        assert_eq!(resolve_kv_quant(&p), KvQuantMode::Off);
     }
 
-    /// Contract: auto never trades quality on its own. Even when lossless
-    /// still does not fit, it stops there and lets the pool be capped rather
-    /// than silently selecting a lossy mode.
+    /// Contract: an explicit mode is honoured as asked, since asking for it is
+    /// accepting what it costs.
     #[test]
-    fn auto_never_escalates_past_lossless() {
-        let p = params(KvQuantMode::Auto, 36, 0);
-        assert_eq!(resolve_kv_quant(&p, 1 << 20, 1), KvQuantMode::Lossless);
-    }
-
-    /// Contract: a discrete GPU keeps exact blocks even when the pool is
-    /// tight. Packing runs on the CPU, so on that side of a bus it is a real
-    /// transfer per write and its cost has never been measured; choosing it
-    /// unprompted would trade an unknown amount of speed for capacity.
-    #[test]
-    fn auto_does_not_quantize_across_a_device_bus() {
-        let mut p = params(KvQuantMode::Auto, 36, 0);
-        p.unified_memory = false;
-        assert_eq!(resolve_kv_quant(&p, 1 << 20, 1), KvQuantMode::Off);
+    fn an_explicit_mode_is_honoured() {
+        let p = params(KvQuantMode::Lossless, 36, 0);
+        assert_eq!(resolve_kv_quant(&p), KvQuantMode::Lossless);
     }
 
     /// Contract: quantizing actually buys capacity, which is the whole reason

@@ -2217,6 +2217,236 @@ mod tests {
         assert_eq!(caps[0], first_cap);
     }
 
+    /// Contract: what a quantized cache writes into its pool for a prompt is
+    /// what the pool hands back for that prompt's slots, to the last
+    /// quantized value.
+    ///
+    /// The first request never reads the pool, it reads the buffer the tokens
+    /// were appended to; the second request, hitting the prefix cache, is
+    /// built from the pool alone. Every model whose cache was quantized
+    /// answered the first request and garbage to the second, so the two ends
+    /// of this round trip are compared against the quantizer applied directly,
+    /// which isolates the plumbing from the loss the quantization itself has.
+    #[test]
+    fn a_quantized_pool_hands_back_the_prompt_it_was_given() {
+        let dev = Device::Cpu;
+        const HEADS: usize = 2;
+        const DIM: usize = 64;
+        const T: usize = 40;
+        let q = Arc::new(super::super::kv_quant::KvQuantizer::new_with_qjl(
+            4, DIM, true,
+        ));
+        let alloc = Arc::new(Mutex::new(
+            BlockAllocator::growing(64, 64, 4, HEADS, DIM, DType::F32, &dev, Some(q.clone()))
+                .unwrap(),
+        ));
+        let mut cache = PagedKvCache::new(alloc.clone());
+        let value =
+            |t: usize, h: usize, d: usize| -> f32 { ((t * 7 + h * 3 + d) % 23) as f32 * 0.1 - 1.1 };
+        let mut laid = vec![0f32; HEADS * T * DIM];
+        for h in 0..HEADS {
+            for t in 0..T {
+                for d in 0..DIM {
+                    laid[(h * T + t) * DIM + d] = value(t, h, d);
+                }
+            }
+        }
+        let k = Tensor::from_vec(laid.clone(), (1, HEADS, T, DIM), &dev).unwrap();
+        let v = (&k * 0.5).unwrap();
+        cache.append(&k, &v).unwrap();
+        cache.flush_pending().unwrap();
+
+        let slots: Vec<u32> = cache.table.cached_slots[..T].to_vec();
+        let idx = Tensor::from_vec(slots, (T,), &dev).unwrap();
+        let (gk, gv) = alloc.lock().unwrap().gather(&idx).unwrap();
+        let gk: Vec<f32> = gk.flatten_all().unwrap().to_vec1().unwrap();
+        let gv: Vec<f32> = gv.flatten_all().unwrap().to_vec1().unwrap();
+
+        for h in 0..HEADS {
+            for t in 0..T {
+                let row: Vec<f32> = (0..DIM).map(|d| value(t, h, d)).collect();
+                let (pk, nk, rk) = q.quantize_key(&row);
+                let expected_k = q.dequantize_key(&pk, nk, rk);
+                let row_v: Vec<f32> = row.iter().map(|x| x * 0.5).collect();
+                let (pv, nv) = q.quantize(&row_v);
+                let expected_v = q.dequantize(&pv, nv);
+                let at = (h * T + t) * DIM;
+                assert_eq!(
+                    &gk[at..at + DIM],
+                    &expected_k[..],
+                    "key of token {t} head {h}"
+                );
+                assert_eq!(
+                    &gv[at..at + DIM],
+                    &expected_v[..],
+                    "value of token {t} head {h}"
+                );
+            }
+        }
+    }
+
+    /// Contract: a sequence that starts from blocks another sequence filled
+    /// reads them back the way the pool stored them, quantized pool included,
+    /// on the device and in the dtype the engine uses.
+    #[test]
+    fn a_quantized_prefix_is_read_back_by_the_sequence_that_reuses_it() {
+        quantized_prefix_round_trip(Device::Cpu, DType::F32);
+        if let Ok(metal) = Device::new_metal(0) {
+            quantized_prefix_round_trip(metal, DType::BF16);
+        }
+    }
+
+    fn quantized_prefix_round_trip(dev: Device, dtype: DType) {
+        const HEADS: usize = 2;
+        const DIM: usize = 64;
+        const BS: usize = 4;
+        const T: usize = 12;
+        let q = Arc::new(super::super::kv_quant::KvQuantizer::new_with_qjl(
+            4, DIM, true,
+        ));
+        let alloc = Arc::new(Mutex::new(
+            BlockAllocator::growing(16, 16, BS, HEADS, DIM, dtype, &dev, Some(q.clone())).unwrap(),
+        ));
+        let value =
+            |t: usize, h: usize, d: usize| -> f32 { ((t * 7 + h * 3 + d) % 23) as f32 * 0.1 - 1.1 };
+        let mut laid = vec![0f32; HEADS * T * DIM];
+        for h in 0..HEADS {
+            for t in 0..T {
+                for d in 0..DIM {
+                    laid[(h * T + t) * DIM + d] = value(t, h, d);
+                }
+            }
+        }
+        let k = Tensor::from_vec(laid, (1, HEADS, T, DIM), &dev)
+            .unwrap()
+            .to_dtype(dtype)
+            .unwrap();
+        let v = (&k * 0.5).unwrap();
+        let mut source = PagedKvCache::new(Arc::clone(&alloc));
+        source.append(&k, &v).unwrap();
+        source.flush_pending().unwrap();
+
+        let mut cache = PagedKvCache::new(Arc::clone(&alloc));
+        for b in 0..T / BS {
+            cache.prepopulate_block(source.block_id_at(b).unwrap());
+        }
+        cache.set_num_tokens(T);
+        let new_k = Tensor::ones((1, HEADS, 1, DIM), dtype, &dev).unwrap();
+        let (k_out, _v_out) = cache.append(&new_k, &new_k).unwrap();
+        assert_eq!(k_out.dims(), &[1, HEADS, T + 1, DIM]);
+        let got: Vec<f32> = k_out
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        for h in 0..HEADS {
+            for t in 0..T {
+                let row: Vec<f32> = (0..DIM).map(|d| value(t, h, d)).collect();
+                let rounded: Vec<f32> = Tensor::from_vec(row.clone(), DIM, &Device::Cpu)
+                    .unwrap()
+                    .to_dtype(dtype)
+                    .unwrap()
+                    .to_dtype(DType::F32)
+                    .unwrap()
+                    .to_vec1()
+                    .unwrap();
+                let (pk, nk, rk) = q.quantize_key(&rounded);
+                let expected = q.dequantize_key(&pk, nk, rk);
+                let at = (h * (T + 1) + t) * DIM;
+                let worst = got[at..at + DIM]
+                    .iter()
+                    .zip(&expected)
+                    .fold(0f32, |a, (x, y)| a.max((x - y).abs()));
+                assert!(
+                    worst < 2e-2,
+                    "{dtype:?} on {:?}: token {t} head {h}: worst difference {worst}",
+                    dev.location()
+                );
+            }
+        }
+    }
+
+    /// Contract: the second sequence a quantized pool serves reads its own
+    /// tokens, not the first sequence's.
+    #[test]
+    fn a_second_sequence_on_a_quantized_pool_reads_its_own_tokens() {
+        for (dev, dtype) in [
+            (Device::Cpu, DType::F32),
+            (Device::new_metal(0).unwrap_or(Device::Cpu), DType::BF16),
+        ] {
+            const HEADS: usize = 2;
+            const DIM: usize = 64;
+            const T: usize = 20;
+            let q = Arc::new(super::super::kv_quant::KvQuantizer::new_with_qjl(
+                4, DIM, false,
+            ));
+            let alloc = Arc::new(Mutex::new(
+                BlockAllocator::growing(64, 64, 4, HEADS, DIM, dtype, &dev, Some(q)).unwrap(),
+            ));
+            let prompt = |salt: f32| -> Tensor {
+                let v: Vec<f32> = (0..HEADS * T * DIM)
+                    .map(|i| ((i % 17) as f32 - 8.0) * 0.1 + salt)
+                    .collect();
+                Tensor::from_vec(v, (1, HEADS, T, DIM), &dev)
+                    .unwrap()
+                    .to_dtype(dtype)
+                    .unwrap()
+            };
+            let a = prompt(0.0);
+            let mut first = PagedKvCache::new(Arc::clone(&alloc));
+            first.append(&a, &a).unwrap();
+            first.flush_pending().unwrap();
+            first.clear();
+
+            let b = prompt(3.0);
+            let mut second = PagedKvCache::new(Arc::clone(&alloc));
+            let (k_out, _) = second.append(&b, &b).unwrap();
+            second.flush_pending().unwrap();
+            let got: Vec<f32> = k_out
+                .to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1()
+                .unwrap();
+            let want: Vec<f32> = b
+                .to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1()
+                .unwrap();
+            let worst = got
+                .iter()
+                .zip(&want)
+                .fold(0f32, |m, (x, y)| m.max((x - y).abs()));
+            assert!(
+                worst < 1e-3,
+                "{dtype:?} on {:?}: the second sequence read something else, worst {worst}",
+                dev.location()
+            );
+            let (k_cur, _) = second.current().unwrap();
+            let got: Vec<f32> = k_cur
+                .to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1()
+                .unwrap();
+            let worst = got
+                .iter()
+                .zip(&want)
+                .fold(0f32, |m, (x, y)| m.max((x - y).abs()));
+            assert!(
+                worst < 1e-3,
+                "{dtype:?} on {:?}: current() of the second sequence is wrong, worst {worst}",
+                dev.location()
+            );
+        }
+    }
+
     #[test]
     fn quantized_pool_reduces_memory() {
         let q = Arc::new(super::super::kv_quant::KvQuantizer::new_with_qjl(

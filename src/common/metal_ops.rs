@@ -2664,6 +2664,13 @@ struct MppGemmParams {
 /// match the kernel's tile constants.
 const MPP_GEMM_TILE: usize = 64;
 
+/// Rows of the activation and columns of the weight one threadgroup of the
+/// staged GEMM serves; must match `Q4K_TM` and `Q4K_TN` in the kernel source.
+/// The grid is derived from them, so a kernel retuned to another tile cannot
+/// leave rows or columns uncomputed.
+const MPP_STAGED_TM: usize = 128;
+const MPP_STAGED_TN: usize = 64;
+
 /// TensorOps BF16 GEMM `x [m, k] @ b [k, n]`, accepting `b` either
 /// contiguous (`nn` kernel) or as a transposed view with stride `[1, k]`
 /// (`nt` kernel).
@@ -2936,8 +2943,8 @@ impl CustomOp1 for MppStagedMatmul {
 
         encoder.dispatch_thread_groups(
             MTLSize {
-                width: n.div_ceil(MPP_GEMM_TILE),
-                height: m.div_ceil(MPP_GEMM_TILE * 2),
+                width: n.div_ceil(MPP_STAGED_TN),
+                height: m.div_ceil(MPP_STAGED_TM),
                 depth: 1,
             },
             MTLSize {
@@ -6717,7 +6724,12 @@ mod quantized_matmul_floor {
             eprintln!("TensorOps library unavailable on this GPU, skipping");
             return;
         }
-        let shapes = [(256usize, 512usize, 64usize), (200, 768, 37)];
+        // A batch taller than the tile height catches a grid that stops short.
+        let shapes = [
+            (256usize, 512usize, 64usize),
+            (200, 768, 37),
+            (192, 512, 300),
+        ];
         let dtypes = [GgmlDType::Q4K, GgmlDType::Q6K];
         for (dtype, (n, k, m)) in dtypes
             .iter()
@@ -6951,6 +6963,71 @@ mod quantized_matmul_floor {
                     gb(peso_byte, t_mv),
                     t_dense * 1e6,
                     gb(n * k * 2, t_dense),
+                );
+            }
+        }
+    }
+
+    /// The staged GEMM at the prefill chunk the pacer settles on, on the
+    /// feed-forward shapes, for both block types: the number the tile
+    /// constants in `mpp_gemm.metal` are tuned against.
+    #[test]
+    #[ignore = "perf probe (requires macOS 26 / Metal 4)"]
+    fn staged_gemm_at_the_chunk_probe() {
+        use std::time::Instant;
+        let Ok(dev) = Device::new_metal(0) else {
+            return;
+        };
+        let m = 1024usize;
+        for dtype in [GgmlDType::Q4K, GgmlDType::Q6K] {
+            for (label, n, k) in [
+                ("ffn gate/up", 15360usize, 3840usize),
+                ("ffn down", 3840, 15360),
+            ] {
+                let w: Vec<f32> = (0..n * k)
+                    .map(|i| ((i % 29) as f32 - 14.0) * 0.031)
+                    .collect();
+                let w32 = Tensor::from_vec(w, (n, k), &dev).unwrap();
+                let bytes = QTensor::quantize(&w32, dtype)
+                    .unwrap()
+                    .data()
+                    .unwrap()
+                    .into_owned();
+                drop(w32);
+                let staged = crate::common::gguf_weights::qtensor_with_staged(
+                    dtype,
+                    &bytes,
+                    vec![n, k],
+                    &dev,
+                )
+                .unwrap()
+                .1
+                .unwrap();
+                let x: Vec<f32> = (0..m * k).map(|i| ((i % 13) as f32 - 6.0) * 0.05).collect();
+                let x_bf = Tensor::from_vec(x, (m, k), &dev)
+                    .unwrap()
+                    .to_dtype(candle_core::DType::BF16)
+                    .unwrap();
+                let run = || crate::common::metal_ops::mpp_staged_matmul(&x_bf, &staged).unwrap();
+                for _ in 0..3 {
+                    run().to_device(&Device::Cpu).unwrap();
+                }
+                let mut best = f64::MAX;
+                for _ in 0..3 {
+                    let iters = 10;
+                    let t = Instant::now();
+                    let mut sink = Vec::with_capacity(iters);
+                    for _ in 0..iters {
+                        sink.push(run());
+                    }
+                    sink.last().unwrap().to_device(&Device::Cpu).unwrap();
+                    best = best.min(t.elapsed().as_secs_f64() / iters as f64);
+                }
+                let flops = 2.0 * m as f64 * n as f64 * k as f64;
+                println!(
+                    "{dtype:?} {label:12} m={m}: {:8.1} us = {:5.2} TFLOPS",
+                    best * 1e6,
+                    flops / best / 1e12
                 );
             }
         }

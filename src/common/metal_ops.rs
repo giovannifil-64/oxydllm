@@ -6710,6 +6710,13 @@ mod quantized_matmul_floor {
         let Ok(dev) = Device::new_metal(0) else {
             return;
         };
+        // The production path asks the same question before routing anything
+        // here; a GPU without the TensorOps library takes candle's path.
+        if !matches!(&dev, Device::Metal(md) if crate::common::metal_ops::mpp_gemm_available(md.device()))
+        {
+            eprintln!("TensorOps library unavailable on this GPU, skipping");
+            return;
+        }
         let shapes = [(256usize, 512usize, 64usize), (200, 768, 37)];
         let dtypes = [GgmlDType::Q4K, GgmlDType::Q6K];
         for (dtype, (n, k, m)) in dtypes

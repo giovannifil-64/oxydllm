@@ -502,7 +502,10 @@ mod gguf {
             DecoderWrapper, byte_fallback::ByteFallback, byte_level::ByteLevel as ByteLevelDecoder,
             fuse::Fuse, sequence::Sequence as DecoderSequence,
         },
-        models::bpe::{BPE, Vocab},
+        models::{
+            bpe::{BPE, Vocab},
+            unigram::Unigram,
+        },
         normalizers::{NormalizerWrapper, replace::Replace, unicode::NFC},
         pre_tokenizers::PreTokenizerWrapper,
         processors::sequence::Sequence as ProcessorSequence,
@@ -539,6 +542,18 @@ mod gguf {
                 v.to_string()
                     .map(|s| s.to_string())
                     .map_err(|e| anyhow::anyhow!("`{name}` element is not a string: {e}"))
+            })
+            .collect()
+    }
+
+    fn value_to_f32_array(v: &gguf_file::Value, name: &str) -> Result<Vec<f32>> {
+        let arr = v
+            .to_vec()
+            .map_err(|e| anyhow::anyhow!("`{name}` is not an array: {e}"))?;
+        arr.iter()
+            .map(|v| {
+                v.to_f32()
+                    .map_err(|e| anyhow::anyhow!("`{name}` element is not a float: {e}"))
             })
             .collect()
     }
@@ -716,7 +731,13 @@ mod gguf {
             .to_string()
             .map_err(|e| anyhow::anyhow!("tokenizer.ggml.model: {e}"))?
             .to_lowercase();
-        if model_kind != "gpt2" && model_kind != "gemma4" {
+        // `llama` is what the converters write for a SentencePiece vocabulary,
+        // the one every Llama 1 and 2 era checkpoint carries. It reaches the
+        // same pipeline `gemma4` does, since both spell a space as U+2581 and
+        // fall back to bytes; what differs is only which of the two models the
+        // file gives enough to build.
+        let sentencepiece = model_kind == "gemma4" || model_kind == "llama";
+        if model_kind != "gpt2" && !sentencepiece {
             anyhow::bail!("unsupported tokenizer model `{model_kind}`");
         }
 
@@ -724,34 +745,77 @@ mod gguf {
             metadata_value(ct, "tokenizer.ggml.tokens")?,
             "tokenizer.ggml.tokens",
         )?;
-        let vocab: Vocab = tokens
-            .iter()
-            .enumerate()
-            .map(|(i, t)| (t.clone(), i as u32))
-            .collect();
-        let merges = merges_from_value(metadata_value(ct, "tokenizer.ggml.merges")?)?;
+        // Either spelling of the key: the converters disagree on it.
+        let unk_token = [
+            "tokenizer.ggml.unk_token_id",
+            "tokenizer.ggml.unknown_token_id",
+        ]
+        .iter()
+        .find_map(|key| metadata_value(ct, key).ok())
+        .and_then(|val| value_to_u32(val).ok())
+        .and_then(|id| tokens.get(id as usize).cloned());
+        let byte_fallback = match metadata_value(ct, "tokenizer.ggml.byte_fallback") {
+            Ok(val) => val.to_bool().map_err(|e| anyhow::anyhow!("{e}"))?,
+            // A vocabulary that spells the bytes it cannot compose falls back
+            // to them whether or not the file says so.
+            Err(_) => tokens.iter().any(|t| t == "<0x0A>"),
+        };
 
-        let mut builder = BPE::builder().vocab_and_merges(vocab, merges);
-
-        if let Ok(val) = metadata_value(ct, "tokenizer.ggml.unk_token_id") {
-            let token_id = value_to_u32(val)?;
-            if let Some(token) = tokens.get(token_id as usize) {
-                builder = builder.unk_token(token.clone());
+        let mut tokenizer = match merges_from_value(metadata_value(ct, "tokenizer.ggml.merges")?) {
+            Ok(merges) => {
+                let vocab: Vocab = tokens
+                    .iter()
+                    .enumerate()
+                    .map(|(i, t)| (t.clone(), i as u32))
+                    .collect();
+                let mut builder = BPE::builder()
+                    .vocab_and_merges(vocab, merges)
+                    .byte_fallback(byte_fallback);
+                if let Some(token) = unk_token.clone() {
+                    builder = builder.unk_token(token);
+                }
+                if let Ok(val) = metadata_value(ct, "tokenizer.ggml.ignore_merges") {
+                    builder =
+                        builder.ignore_merges(val.to_bool().map_err(|e| anyhow::anyhow!("{e}"))?);
+                }
+                Tokenizer::new(
+                    builder
+                        .build()
+                        .map_err(|e| anyhow::anyhow!("BPE build: {e}"))?,
+                )
             }
-        }
-        if let Ok(val) = metadata_value(ct, "tokenizer.ggml.byte_fallback") {
-            builder = builder.byte_fallback(val.to_bool().map_err(|e| anyhow::anyhow!("{e}"))?);
-        }
-        if let Ok(val) = metadata_value(ct, "tokenizer.ggml.ignore_merges") {
-            builder = builder.ignore_merges(val.to_bool().map_err(|e| anyhow::anyhow!("{e}"))?);
-        }
+            // No merge list: a SentencePiece file states the scores instead,
+            // and the pieces are picked to maximise their sum rather than
+            // merged pairwise.
+            Err(e) if sentencepiece => {
+                let scores = value_to_f32_array(
+                    metadata_value(ct, "tokenizer.ggml.scores")
+                        .map_err(|_| anyhow::anyhow!("neither merges nor scores: {e}"))?,
+                    "tokenizer.ggml.scores",
+                )?;
+                if scores.len() != tokens.len() {
+                    anyhow::bail!(
+                        "tokenizer.ggml.scores has {} entries for {} tokens",
+                        scores.len(),
+                        tokens.len()
+                    );
+                }
+                let vocab: Vec<(String, f64)> = tokens
+                    .iter()
+                    .cloned()
+                    .zip(scores.iter().map(|s| *s as f64))
+                    .collect();
+                let unk_id = unk_token
+                    .as_ref()
+                    .and_then(|t| tokens.iter().position(|x| x == t));
+                let unigram = Unigram::from(vocab, unk_id, byte_fallback)
+                    .map_err(|e| anyhow::anyhow!("Unigram build: {e}"))?;
+                Tokenizer::new(unigram)
+            }
+            Err(e) => return Err(e),
+        };
 
-        let bpe = builder
-            .build()
-            .map_err(|e| anyhow::anyhow!("BPE build: {e}"))?;
-        let mut tokenizer = Tokenizer::new(bpe);
-
-        let pipeline = if model_kind == "gemma4" {
+        let pipeline = if sentencepiece {
             sentencepiece_pipeline()?
         } else {
             let pre = metadata_value(ct, "tokenizer.ggml.pre")
@@ -847,6 +911,44 @@ mod gguf {
 #[cfg(test)]
 mod gemma4_tokenizer_tests {
     use super::*;
+
+    /// Contract: a SentencePiece vocabulary from a GGUF round-trips the text it
+    /// is given and spells a space the way SentencePiece does.
+    ///
+    /// `llama` is the model name every Llama 1 and 2 era converter writes, and
+    /// refusing it left those checkpoints unloadable however complete they
+    /// were. Round-tripping is the property that catches the ways this can go
+    /// wrong without a reference vocabulary at hand: a normalizer that keeps
+    /// U+2581 in the output, a missing byte fallback that drops what no token
+    /// spells, an off-by-one between tokens and scores.
+    ///
+    /// Needs the checkpoint; run with
+    /// `cargo test a_sentencepiece_gguf_vocabulary_round_trips -- --ignored`.
+    #[test]
+    #[ignore]
+    fn a_sentencepiece_gguf_vocabulary_round_trips() {
+        let gguf = format!(
+            "{}/.oxydllm/models/TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF/tinyllama-1.1b-chat-v1.0.Q4_0.gguf",
+            std::env::var("HOME").unwrap()
+        );
+        if !std::path::Path::new(&gguf).exists() {
+            eprintln!("checkpoint assente, salto");
+            return;
+        }
+        let tok = Tokenizer::from_gguf_file(&gguf).expect("tokenizer from a SentencePiece GGUF");
+        for text in [
+            "Hello world",
+            "double  space and punctuation!",
+            "Il pesce e' ottimo, pero' costa caro.",
+            "numbers 1234567890 and 3.14159",
+            "emoji \u{1f600} and symbols \u{2603}",
+        ] {
+            let ids = tok.encode(text).expect("encode");
+            assert!(!ids.is_empty(), "no ids for {text:?}");
+            let back = tok.decode(&ids).expect("decode");
+            assert_eq!(back.trim(), text.trim(), "round trip differs for {text:?}");
+        }
+    }
 
     /// Contract: the tokenizer built from a GGUF gives the same token ids as the
     /// checkpoint's own `tokenizer.json`.

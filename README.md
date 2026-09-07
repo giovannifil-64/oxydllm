@@ -223,7 +223,7 @@ Pick by architecture (the compute-capability table above maps each one to its GP
 - `oxydllm-linux-arm64-cuda-blackwell-desktop.tar.gz`: Blackwell Desktop (sm_121)
 
 ## Usage
-Download a model from HuggingFace using the `user/model` repo ID. For GGUF repos, an interactive prompt lists available quantizations and lets you pick one; variants already on disk are shown with a check mark and excluded from the numbered choices. Use `--variant Q4_K_M` to skip the prompt, `--token` for gated models, and `--name` to save under a custom local name instead of the default `user/model` path.
+Download a model from HuggingFace using the `user/model` repo ID. For GGUF repos, an interactive prompt lists available quantizations and lets you pick one; variants already on disk are shown with a check mark and excluded from the numbered choices. Use `--variant Q4_K_M` to skip the prompt, `--token` for gated models, and `--name` to save under a custom local name instead of the default `user/model` path. A download that stops, whether the machine slept, the network dropped or the process was killed, resumes from the bytes already on disk: a stalled connection is reopened on its own, and re-running the same `pull` after a shutdown picks up where it stopped. `--force` starts from zero.
 ```bash
 oxydllm pull Qwen/Qwen3-4B-GGUF
 oxydllm pull Qwen/Qwen3-4B-GGUF --variant Q4_K_M

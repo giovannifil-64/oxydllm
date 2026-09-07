@@ -1,6 +1,6 @@
-use std::io::{BufRead, Read, Write};
+use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 const HF_ENDPOINT: &str = "https://huggingface.co";
 
@@ -337,6 +337,16 @@ pub fn pull(config: &PullConfig) -> anyhow::Result<()> {
         .timeout(None)
         .user_agent(concat!("oxydllm/", env!("CARGO_PKG_VERSION")))
         .build()?;
+    // The file bodies go through the asynchronous client because only its
+    // builder has a read timeout, which is what turns a connection left
+    // hanging by a sleep or a dropped network into an attempt to reconnect.
+    let fetcher = reqwest::Client::builder()
+        .read_timeout(Duration::from_secs(READ_STALL_SECS))
+        .user_agent(concat!("oxydllm/", env!("CARGO_PKG_VERSION")))
+        .build()?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
 
     print!("Fetching file list...");
     std::io::stdout().flush().ok();
@@ -353,7 +363,7 @@ pub fn pull(config: &PullConfig) -> anyhow::Result<()> {
         .any(|(f, _)| f.ends_with(".safetensors"));
     let mut download_safetensors = false;
 
-    let gguf_to_download: Vec<String> = if gguf_files.is_empty() {
+    let gguf_to_download: Vec<(String, u64)> = if gguf_files.is_empty() {
         download_safetensors = true;
         Vec::new()
     } else {
@@ -411,8 +421,7 @@ pub fn pull(config: &PullConfig) -> anyhow::Result<()> {
             );
             Vec::new()
         } else {
-            let variant_filenames: Vec<String> =
-                chosen.files.iter().map(|(f, _)| f.clone()).collect();
+            let variant_files = chosen.files.clone();
 
             // The header states every tensor's quantization and sits at the
             // start of the file, so a range request settles in seconds what a
@@ -420,7 +429,7 @@ pub fn pull(config: &PullConfig) -> anyhow::Result<()> {
             // that mix a handful of undecodable tensors into an otherwise
             // ordinary quantization, and refusing after 15 GB have arrived is
             // the worst moment to find out.
-            if let Some(first) = variant_filenames.first() {
+            if let Some((first, _)) = variant_files.first() {
                 let url = format!("{}/{}/resolve/main/{}", HF_ENDPOINT, config.repo_id, first);
                 let verdict =
                     crate::models::gguf_probe::probe_remote(&client, &url, config.token.as_deref());
@@ -432,10 +441,14 @@ pub fn pull(config: &PullConfig) -> anyhow::Result<()> {
                 }
             }
 
-            if dest.exists() {
+            // A file already there is picked up where it stopped, unless the
+            // caller asked to start over.
+            if dest.exists() && config.force {
                 for (f, _) in &chosen.files {
                     let _ = std::fs::remove_file(dest.join(f));
                 }
+            }
+            if dest.exists() {
                 let _ = std::fs::remove_file(dest.join("gguf.index"));
             }
 
@@ -462,7 +475,7 @@ pub fn pull(config: &PullConfig) -> anyhow::Result<()> {
                     }
                 );
             }
-            variant_filenames
+            variant_files
         }
     };
 
@@ -475,13 +488,12 @@ pub fn pull(config: &PullConfig) -> anyhow::Result<()> {
             println!("Removing existing model at {}...", dest.display());
             std::fs::remove_dir_all(&dest)?;
         } else if is_incomplete_download(&dest) {
-            // Resume at file granularity: drop only files whose size doesn't
-            // match the upstream listing; complete files are skipped by the
-            // to_download filter below.
+            // A file shorter than upstream is picked up where it stopped; one
+            // longer than upstream is not a prefix of anything and starts over.
             println!("Resuming interrupted download...");
             for (name, size) in &metadata_files {
                 let p = dest.join(name);
-                if *size > 0 && p.exists() && p.metadata().map(|m| m.len()).unwrap_or(0) != *size {
+                if *size > 0 && p.exists() && p.metadata().map(|m| m.len()).unwrap_or(0) > *size {
                     let _ = std::fs::remove_file(&p);
                 }
             }
@@ -495,13 +507,16 @@ pub fn pull(config: &PullConfig) -> anyhow::Result<()> {
         }
     }
 
-    let mut to_download: Vec<String> = metadata_files
+    let complete = |name: &str, size: u64| -> bool {
+        let p = dest.join(name);
+        p.exists() && (size == 0 || p.metadata().map(|m| m.len()).unwrap_or(0) == size)
+    };
+    let mut to_download: Vec<(String, u64)> = metadata_files
         .into_iter()
-        .map(|(f, _)| f)
-        .filter(|f| !dest.join(f).exists())
+        .filter(|(f, size)| !complete(f, *size))
         .collect();
     to_download.extend(gguf_to_download.iter().cloned());
-    to_download.sort_by_key(|f| if f.ends_with(".json") { 0u8 } else { 1u8 });
+    to_download.sort_by_key(|(f, _)| if f.ends_with(".json") { 0u8 } else { 1u8 });
 
     if to_download.is_empty() {
         anyhow::bail!(
@@ -515,12 +530,18 @@ pub fn pull(config: &PullConfig) -> anyhow::Result<()> {
 
     let mut downloaded_files: Vec<String> = Vec::new();
     let mut failed_file: Option<String> = None;
-    for filename in &to_download {
+    for (filename, size) in &to_download {
+        let url = format!(
+            "{}/{}/resolve/main/{}",
+            HF_ENDPOINT, config.repo_id, filename
+        );
         match download_file(
-            &client,
+            &runtime,
+            &fetcher,
+            &url,
             &config.repo_id,
-            filename,
-            &dest,
+            &dest.join(filename),
+            (*size > 0).then_some(*size),
             config.token.as_deref(),
         ) {
             Ok(()) => downloaded_files.push(filename.clone()),
@@ -532,12 +553,11 @@ pub fn pull(config: &PullConfig) -> anyhow::Result<()> {
         }
     }
 
-    if let Some(failed) = failed_file {
-        // Keep completed files so a retry resumes from them; drop only the
-        // truncated in-flight file.
-        let _ = std::fs::remove_file(dest.join(&failed));
+    if failed_file.is_some() {
+        // Every file stays as it is, the interrupted one included: the next
+        // run picks it up where it stopped.
         anyhow::bail!(
-            "Download incomplete ({} of {} files done). Re-run the same pull to resume.",
+            "Download incomplete ({} of {} files done). Re-run the same pull to resume from where it stopped.",
             downloaded_files.len(),
             to_download.len()
         );
@@ -545,8 +565,8 @@ pub fn pull(config: &PullConfig) -> anyhow::Result<()> {
 
     let new_shards: Vec<&str> = gguf_to_download
         .iter()
-        .filter(|f| f.to_lowercase().ends_with(".gguf"))
-        .map(|f| f.as_str())
+        .filter(|(f, _)| f.to_lowercase().ends_with(".gguf"))
+        .map(|(f, _)| f.as_str())
         .collect();
 
     if !new_shards.is_empty() {
@@ -628,47 +648,180 @@ fn is_relevant_file(f: &str) -> bool {
         || l.ends_with(".jinja")
 }
 
+/// Connection attempts per file. A body stops arriving when the machine
+/// sleeps or the network drops; each attempt asks for the bytes past those
+/// already on disk, so nothing already fetched is fetched twice.
+const DOWNLOAD_ATTEMPTS: usize = 5;
+
+/// Seconds without a byte after which the connection is given up and the
+/// next attempt made.
+const READ_STALL_SECS: u64 = 60;
+
+/// Pause between attempts.
+const RETRY_PAUSE: Duration = Duration::from_secs(2);
+
+/// Why a fetch stopped: something a fresh connection can fix, or not.
+enum FetchError {
+    Transient(anyhow::Error),
+    Fatal(anyhow::Error),
+}
+
+/// Fetches `url` into `dest_path`, resuming from the bytes already there.
+///
+/// A file whose length already equals `expected` is not requested at all.
+/// Otherwise the request asks for the range past the file's end: a `206`
+/// appends, a `200` from a server that ignored the range starts the file
+/// over, and a `416` means the server holds nothing past that offset, so the
+/// file is complete if its length is upstream's and wrong otherwise. A body
+/// that stops short or a connection that goes quiet for [`READ_STALL_SECS`]
+/// costs an attempt, not the bytes on disk.
+///
+/// ## Errors
+/// Fails on an HTTP status that a retry cannot change, or when
+/// [`DOWNLOAD_ATTEMPTS`] connections all stopped short.
 fn download_file(
-    client: &reqwest::blocking::Client,
+    runtime: &tokio::runtime::Runtime,
+    client: &reqwest::Client,
+    url: &str,
     repo_id: &str,
-    filename: &str,
-    dest: &Path,
+    dest_path: &Path,
+    expected: Option<u64>,
     token: Option<&str>,
 ) -> anyhow::Result<()> {
-    let url = format!("{}/{}/resolve/main/{}", HF_ENDPOINT, repo_id, filename);
-    let mut builder = client.get(&url);
+    let label = truncate_label(
+        &dest_path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        40,
+    );
+    let mut attempt = 1;
+    loop {
+        let have = dest_path.metadata().map(|m| m.len()).unwrap_or(0);
+        if have > 0 && expected == Some(have) {
+            print_progress(&label, have, expected, true);
+            println!();
+            return Ok(());
+        }
+        match runtime.block_on(fetch_from(
+            client, url, repo_id, dest_path, have, expected, token, &label,
+        )) {
+            Ok(()) => return Ok(()),
+            Err(FetchError::Fatal(e)) => return Err(e),
+            Err(FetchError::Transient(e)) if attempt < DOWNLOAD_ATTEMPTS => {
+                attempt += 1;
+                println!();
+                println!("  {label}: {e}; reconnecting ({attempt}/{DOWNLOAD_ATTEMPTS})");
+                std::thread::sleep(RETRY_PAUSE);
+            }
+            Err(FetchError::Transient(e)) => {
+                return Err(e.context(format!(
+                    "{DOWNLOAD_ATTEMPTS} connections stopped short; what arrived is kept for the next run"
+                )));
+            }
+        }
+    }
+}
+
+/// The `total` of a `Content-Range: bytes a-b/total` header.
+fn content_range_total(resp: &reqwest::Response) -> Option<u64> {
+    resp.headers()
+        .get(reqwest::header::CONTENT_RANGE)?
+        .to_str()
+        .ok()?
+        .rsplit('/')
+        .next()?
+        .parse()
+        .ok()
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn fetch_from(
+    client: &reqwest::Client,
+    url: &str,
+    repo_id: &str,
+    dest_path: &Path,
+    have: u64,
+    expected: Option<u64>,
+    token: Option<&str>,
+    label: &str,
+) -> Result<(), FetchError> {
+    let mut builder = client.get(url);
     if let Some(tok) = token {
         builder = builder.bearer_auth(tok);
     }
-    let resp = builder.send()?;
+    if have > 0 {
+        builder = builder.header(reqwest::header::RANGE, format!("bytes={have}-"));
+    }
+    let mut resp = builder
+        .send()
+        .await
+        .map_err(|e| FetchError::Transient(e.into()))?;
     let status = resp.status().as_u16();
-    check_status(status, repo_id)?;
-
-    let total_bytes = resp.content_length();
-    let dest_path = dest.join(filename);
-    let mut out = std::fs::File::create(&dest_path)?;
-
-    let label = truncate_label(filename, 40);
-    let mut downloaded: u64 = 0;
-    let mut last_tick = Instant::now();
-    let mut body = resp;
-    let mut buf = vec![0u8; 64 * 1024];
-
-    loop {
-        let n = body.read(&mut buf)?;
-        if n == 0 {
-            break;
+    let (mut out, mut downloaded, total) = match status {
+        206 => (
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(dest_path)
+                .map_err(|e| FetchError::Fatal(e.into()))?,
+            have,
+            content_range_total(&resp).or(expected),
+        ),
+        416 => {
+            let total = content_range_total(&resp);
+            if total == Some(have) || (total.is_none() && expected == Some(have)) {
+                print_progress(label, have, Some(have), true);
+                println!();
+                return Ok(());
+            }
+            let _ = std::fs::remove_file(dest_path);
+            return Err(FetchError::Transient(anyhow::anyhow!(
+                "upstream holds {} bytes and the file on disk {have}; starting it over",
+                total.map_or_else(|| "?".to_string(), |t| t.to_string())
+            )));
         }
-        out.write_all(&buf[..n])?;
-        downloaded += n as u64;
+        200 => (
+            std::fs::File::create(dest_path).map_err(|e| FetchError::Fatal(e.into()))?,
+            0,
+            resp.content_length().or(expected),
+        ),
+        other => return Err(FetchError::Fatal(check_status(other, repo_id).unwrap_err())),
+    };
 
-        if last_tick.elapsed().as_millis() >= 100 {
-            print_progress(&label, downloaded, total_bytes, false);
-            last_tick = Instant::now();
+    let mut last_tick = Instant::now();
+    loop {
+        match resp.chunk().await {
+            Ok(Some(chunk)) => {
+                out.write_all(&chunk)
+                    .map_err(|e| FetchError::Fatal(e.into()))?;
+                downloaded += chunk.len() as u64;
+                if last_tick.elapsed().as_millis() >= 100 {
+                    print_progress(label, downloaded, total, false);
+                    last_tick = Instant::now();
+                }
+            }
+            Ok(None) => break,
+            Err(e) => {
+                out.flush().ok();
+                return Err(FetchError::Transient(anyhow::anyhow!(
+                    "connection lost at {} of {}: {e}",
+                    fmt_size(downloaded),
+                    total.map_or_else(|| "?".to_string(), fmt_size)
+                )));
+            }
         }
     }
-
-    print_progress(&label, downloaded, total_bytes, true);
+    out.flush().map_err(|e| FetchError::Fatal(e.into()))?;
+    if let Some(t) = total
+        && downloaded != t
+    {
+        return Err(FetchError::Transient(anyhow::anyhow!(
+            "body ended at {} of {}",
+            fmt_size(downloaded),
+            fmt_size(t)
+        )));
+    }
+    print_progress(label, downloaded, total, true);
     println!();
     Ok(())
 }
@@ -959,6 +1112,163 @@ mod tests {
         assert_eq!(fmt_size(1024), "1KB");
         assert_eq!(fmt_size(1024 * 1024), "1.0MB");
         assert!(fmt_size(2 * 1024 * 1024 * 1024).contains("GB"));
+    }
+
+    /// A one-file HTTP server for the download contracts: serves `body` at
+    /// any path, honouring `Range` unless told to ignore it, and once closes
+    /// the connection after `cut_once` bytes of body. Records the offset each
+    /// request asked to start from.
+    fn serve(
+        body: Vec<u8>,
+        honour_range: bool,
+        cut_once: Option<usize>,
+    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<u64>>>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/model.gguf", listener.local_addr().unwrap());
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = asked.clone();
+        std::thread::spawn(move || {
+            let mut cut = cut_once;
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else {
+                    break;
+                };
+                let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+                let mut start = 0u64;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                    if let Some(v) = line.to_ascii_lowercase().strip_prefix("range: bytes=") {
+                        start = v.trim().trim_end_matches('-').parse().unwrap();
+                    }
+                }
+                seen.lock().unwrap().push(start);
+                let len = body.len() as u64;
+                let (head, payload): (String, &[u8]) = if !honour_range || start == 0 {
+                    (
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n"
+                        ),
+                        &body[..],
+                    )
+                } else if start >= len {
+                    (
+                        format!(
+                            "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */{len}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        ),
+                        &[],
+                    )
+                } else {
+                    (
+                        format!(
+                            "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {start}-{}/{len}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            len - 1,
+                            len - start
+                        ),
+                        &body[start as usize..],
+                    )
+                };
+                stream.write_all(head.as_bytes()).unwrap();
+                let n = match cut.take() {
+                    Some(c) if c < payload.len() => c,
+                    _ => payload.len(),
+                };
+                stream.write_all(&payload[..n]).unwrap();
+                stream.flush().ok();
+            }
+        });
+        (url, asked)
+    }
+
+    fn fetch(url: &str, dest: &Path, expected: Option<u64>) -> anyhow::Result<()> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .read_timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        download_file(&runtime, &client, url, "test/repo", dest, expected, None)
+    }
+
+    fn body() -> Vec<u8> {
+        (0..5000u32).map(|i| (i * 7 % 251) as u8).collect()
+    }
+
+    /// Contract: a file left half done is completed by asking upstream only
+    /// for the bytes past its end, so a pull that stopped resumes where it
+    /// stopped instead of starting over.
+    #[test]
+    fn a_partial_file_is_completed_from_where_it_stopped() {
+        let body = body();
+        let (url, asked) = serve(body.clone(), true, None);
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("model.gguf");
+        std::fs::write(&dest, &body[..1000]).unwrap();
+        fetch(&url, &dest, Some(5000)).unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), body);
+        assert_eq!(*asked.lock().unwrap(), vec![1000]);
+    }
+
+    /// Contract: a file already of upstream's length is not requested at all.
+    #[test]
+    fn a_complete_file_is_not_fetched_again() {
+        let body = body();
+        let (url, asked) = serve(body.clone(), true, None);
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("model.gguf");
+        std::fs::write(&dest, &body).unwrap();
+        fetch(&url, &dest, Some(5000)).unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), body);
+        assert!(asked.lock().unwrap().is_empty());
+    }
+
+    /// Contract: a server that answers a range request with the whole file
+    /// gets the file written from the start, not appended to.
+    #[test]
+    fn a_server_that_ignores_the_range_starts_the_file_over() {
+        let body = body();
+        let (url, asked) = serve(body.clone(), false, None);
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("model.gguf");
+        std::fs::write(&dest, &body[..1000]).unwrap();
+        fetch(&url, &dest, Some(5000)).unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), body);
+        assert_eq!(*asked.lock().unwrap(), vec![1000]);
+    }
+
+    /// Contract: a connection that drops mid-body, which is what a sleeping
+    /// machine or a failing network looks like, is reopened for the bytes
+    /// still missing and the file comes out whole.
+    #[test]
+    fn a_dropped_connection_is_picked_up_where_it_stopped() {
+        let body = body();
+        let (url, asked) = serve(body.clone(), true, Some(2000));
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("model.gguf");
+        fetch(&url, &dest, Some(5000)).unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), body);
+        assert_eq!(*asked.lock().unwrap(), vec![0, 2000]);
+    }
+
+    /// Contract: a file longer than upstream's is no prefix of it and is
+    /// fetched from the start rather than trusted.
+    #[test]
+    fn a_file_longer_than_upstream_starts_over() {
+        let body = body();
+        let (url, asked) = serve(body.clone(), true, None);
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("model.gguf");
+        let mut longer = body.clone();
+        longer.extend_from_slice(&[9u8; 100]);
+        std::fs::write(&dest, &longer).unwrap();
+        fetch(&url, &dest, Some(5000)).unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), body);
+        assert_eq!(*asked.lock().unwrap(), vec![5100, 0]);
     }
 
     #[test]

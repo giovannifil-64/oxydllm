@@ -620,7 +620,7 @@ mod tests {
         let Device::Metal(md) = &dev else {
             return;
         };
-        if !crate::common::metal_ops::mpp_gemm_available(md.device()) {
+        if !crate::common::metal_ops::mpp_owned_kernels_available(md.device()) {
             return;
         }
         let (n, k) = (192usize, 512usize);

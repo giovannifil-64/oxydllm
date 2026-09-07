@@ -2616,6 +2616,32 @@ pub fn mpp_gemm_available(device: &candle_metal_kernels::metal::Device) -> bool 
     mpp_library(device).is_some()
 }
 
+/// Whether this GPU builds every kernel the weights candle cannot serve need:
+/// the staged GEMM, both matvecs and the gather of each kind.
+///
+/// The library compiling is not enough. A virtualized GPU can compile the
+/// source and still refuse a pipeline over cooperative tensors, and a weight
+/// that only these kernels decode has no other path, so the loader asks this
+/// before holding one and refuses the file when the answer is no. The
+/// pipelines built here are the ones the forward uses, cached.
+pub fn mpp_owned_kernels_available(device: &candle_metal_kernels::metal::Device) -> bool {
+    if !mpp_gemm_available(device) {
+        return false;
+    }
+    [WeightKind::Iq4Nl, WeightKind::Iq4Xs, WeightKind::Iq3S]
+        .into_iter()
+        .flat_map(|kind| {
+            [
+                Some(kind.staged_kernel()),
+                kind.matvec_kernel(false),
+                kind.matvec_kernel(true),
+                kind.gather_kernel(),
+            ]
+        })
+        .flatten()
+        .all(|name| get_or_compile_mpp_pipeline(device, name).is_ok())
+}
+
 /// Builds `kernel_name` from the TensorOps library on first use and caches
 /// the pipeline per device.
 ///
@@ -2928,6 +2954,25 @@ impl WeightKind {
         }
     }
 
+    /// The staged GEMM kernel that reads this kind at prefill.
+    fn staged_kernel(self) -> &'static str {
+        match self {
+            Self::Q4_0 => "mpp_gemm_q4_0_staged",
+            Self::Q4_1 => "mpp_gemm_q4_1_staged",
+            Self::Q5_0 => "mpp_gemm_q5_0_staged",
+            Self::Q5_1 => "mpp_gemm_q5_1_staged",
+            Self::Q8_0 => "mpp_gemm_q8_0_staged",
+            Self::Q2K => "mpp_gemm_q2k_staged",
+            Self::Q3K => "mpp_gemm_q3k_staged",
+            Self::Q4K => "mpp_gemm_q4k_staged",
+            Self::Q5K => "mpp_gemm_q5k_staged",
+            Self::Q6K => "mpp_gemm_q6k_staged",
+            Self::Iq4Nl => "mpp_gemm_iq4_nl_staged",
+            Self::Iq4Xs => "mpp_gemm_iq4_xs_staged",
+            Self::Iq3S => "mpp_gemm_iq3_s_staged",
+        }
+    }
+
     /// The kernel that multiplies one activation row, or a batch of up to
     /// [`MPP_MATVEC_MAX_M`], by a weight of a kind candle cannot serve; the
     /// kinds candle serves have candle's matvec.
@@ -3019,21 +3064,7 @@ impl StagedWeight {
     }
 
     fn kernel(&self) -> &'static str {
-        match self.kind {
-            WeightKind::Q4_0 => "mpp_gemm_q4_0_staged",
-            WeightKind::Q4_1 => "mpp_gemm_q4_1_staged",
-            WeightKind::Q5_0 => "mpp_gemm_q5_0_staged",
-            WeightKind::Q5_1 => "mpp_gemm_q5_1_staged",
-            WeightKind::Q8_0 => "mpp_gemm_q8_0_staged",
-            WeightKind::Q2K => "mpp_gemm_q2k_staged",
-            WeightKind::Q3K => "mpp_gemm_q3k_staged",
-            WeightKind::Q4K => "mpp_gemm_q4k_staged",
-            WeightKind::Q5K => "mpp_gemm_q5k_staged",
-            WeightKind::Q6K => "mpp_gemm_q6k_staged",
-            WeightKind::Iq4Nl => "mpp_gemm_iq4_nl_staged",
-            WeightKind::Iq4Xs => "mpp_gemm_iq4_xs_staged",
-            WeightKind::Iq3S => "mpp_gemm_iq3_s_staged",
-        }
+        self.kind.staged_kernel()
     }
 
     /// The batch size from which the staged kernel beats candle's quantized
@@ -7868,8 +7899,8 @@ pub(crate) mod owned_weights {
         let Ok(dev) = Device::new_metal(0) else {
             return;
         };
-        if !matches!(&dev, Device::Metal(md) if mpp_gemm_available(md.device())) {
-            eprintln!("TensorOps library unavailable on this GPU, skipping");
+        if !matches!(&dev, Device::Metal(md) if mpp_owned_kernels_available(md.device())) {
+            eprintln!("this GPU does not build the owned kernels, skipping");
             return;
         }
         for (kind, n, k) in [
@@ -7909,7 +7940,7 @@ pub(crate) mod owned_weights {
         let Device::Metal(md) = &dev else {
             return;
         };
-        if !mpp_gemm_available(md.device()) {
+        if !mpp_owned_kernels_available(md.device()) {
             return;
         }
         let (vocab, k) = (64usize, 512usize);

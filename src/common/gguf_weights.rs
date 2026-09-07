@@ -680,8 +680,8 @@ fn build_owned(
     let Device::Metal(md) = device else {
         anyhow::bail!("{name} weights are decoded on Metal only");
     };
-    if !crate::common::metal_ops::mpp_gemm_available(md.device()) {
-        anyhow::bail!("{name} weights need the TensorOps library, which this GPU does not have");
+    if !crate::common::metal_ops::mpp_owned_kernels_available(md.device()) {
+        anyhow::bail!("this GPU does not build the kernels that decode {name} weights");
     }
     let [n, k] = entry.dims[..] else {
         anyhow::bail!(
@@ -877,6 +877,18 @@ mod tests {
 
         #[cfg(feature = "metal")]
         if let Ok(dev) = Device::new_metal(0) {
+            let Device::Metal(md) = &dev else {
+                unreachable!()
+            };
+            if !crate::common::metal_ops::mpp_owned_kernels_available(md.device()) {
+                let err = match GgufWeights::load(&path_str, &dev) {
+                    Ok(_) => String::from("loaded"),
+                    Err(e) => format!("{e:#}"),
+                };
+                assert!(err.contains("does not build the kernels"), "{err}");
+                std::fs::remove_file(&path).ok();
+                return;
+            }
             let w = GgufWeights::load(&path_str, &dev).unwrap();
             let weight = w.linear_weight("blk.0.ffn_down.weight").unwrap();
             assert!(matches!(weight, LinearWeight::Owned(_)), "{weight:?}");

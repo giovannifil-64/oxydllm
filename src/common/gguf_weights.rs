@@ -548,15 +548,15 @@ mod tests {
         .1;
         assert!(six_bit.is_some(), "Q6_K with whole-block rows");
 
-        let other_dtype = qtensor_with_staged(
-            GgmlDType::Q8_0,
-            &quantize((64, 512), GgmlDType::Q8_0),
+        let dense = qtensor_with_staged(
+            GgmlDType::F16,
+            &quantize((64, 512), GgmlDType::F16),
             vec![64, 512],
             &dev,
         )
         .unwrap()
         .1;
-        assert!(other_dtype.is_none(), "Q8_0 has no staged kernel");
+        assert!(dense.is_none(), "a dense weight is not staged");
 
         let one_dimensional = qtensor_with_staged(
             GgmlDType::Q4K,

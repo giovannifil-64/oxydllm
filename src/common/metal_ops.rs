@@ -2839,8 +2839,8 @@ struct MppQuantMatmul {
 /// decode from the same bytes while the staged GEMM serves prefill, and the
 /// weights are read-only, so the two readers never disagree.
 ///
-/// Only a layout a kernel understands becomes a handle: the 256-wide Q4_K
-/// and Q6_K blocks on a two-dimensional weight whose rows are whole blocks.
+/// Only a layout a kernel understands becomes a handle: every GGUF block
+/// quantization on a two-dimensional weight whose rows are whole blocks.
 #[derive(Clone, Debug)]
 pub struct StagedWeight {
     buffer: candle_metal_kernels::metal::Buffer,
@@ -2856,8 +2856,19 @@ impl StagedWeight {
         dtype: GgmlDType,
         dims: &[usize],
     ) -> Option<Self> {
-        match (dtype, dims) {
-            (GgmlDType::Q4K | GgmlDType::Q6K, &[n, k]) if k.is_multiple_of(256) => Some(Self {
+        let block = match dtype {
+            GgmlDType::Q4_0
+            | GgmlDType::Q4_1
+            | GgmlDType::Q5_0
+            | GgmlDType::Q5_1
+            | GgmlDType::Q8_0 => 32,
+            GgmlDType::Q2K | GgmlDType::Q3K | GgmlDType::Q4K | GgmlDType::Q5K | GgmlDType::Q6K => {
+                256
+            }
+            _ => return None,
+        };
+        match dims {
+            &[n, k] if k.is_multiple_of(block) => Some(Self {
                 buffer,
                 dtype,
                 n,
@@ -2869,7 +2880,15 @@ impl StagedWeight {
 
     fn kernel(&self) -> &'static str {
         match self.dtype {
+            GgmlDType::Q4_0 => "mpp_gemm_q4_0_staged",
+            GgmlDType::Q4_1 => "mpp_gemm_q4_1_staged",
+            GgmlDType::Q5_0 => "mpp_gemm_q5_0_staged",
+            GgmlDType::Q5_1 => "mpp_gemm_q5_1_staged",
+            GgmlDType::Q8_0 => "mpp_gemm_q8_0_staged",
+            GgmlDType::Q2K => "mpp_gemm_q2k_staged",
+            GgmlDType::Q3K => "mpp_gemm_q3k_staged",
             GgmlDType::Q4K => "mpp_gemm_q4k_staged",
+            GgmlDType::Q5K => "mpp_gemm_q5k_staged",
             GgmlDType::Q6K => "mpp_gemm_q6k_staged",
             other => unreachable!("StagedWeight::new admits no {other:?}"),
         }
@@ -2877,17 +2896,19 @@ impl StagedWeight {
 
     /// The batch size from which the staged kernel beats candle's quantized
     /// matmul on this block type, measured by `staged_quant_crossover_probe`
-    /// on the eight shapes of the reference checkpoint.
+    /// on the shapes of the reference checkpoint.
     ///
     /// The kernel stages the whole weight once per 128-row tile of the batch,
     /// so its cost is flat from M=32 to M=128 and the crossover is where
-    /// candle's cost, linear in M, climbs past it: M=64 for Q4_K (level there,
-    /// 1.9-2.1x from 128 up) and M=128 for Q6_K, whose six-bit unpack costs
-    /// more per tile and leaves candle 10% ahead at 64.
+    /// candle's cost, linear in M, climbs past it. The four-bit and five-bit
+    /// blocks of 32, and Q4_K with its word-wise stager, are level with candle
+    /// at 64 and 1.8-2.0x ahead from 128; the rest cost more to unpack per
+    /// tile and leave candle a few percent ahead at 64, so they wait for 128.
     fn min_m(&self) -> usize {
         match self.dtype {
-            GgmlDType::Q6K => 128,
-            _ => MPP_GEMM_MIN_M,
+            GgmlDType::Q4_0 | GgmlDType::Q4_1 | GgmlDType::Q5_0 | GgmlDType::Q5_1 => MPP_GEMM_MIN_M,
+            GgmlDType::Q4K => MPP_GEMM_MIN_M,
+            _ => 128,
         }
     }
 }
@@ -6730,7 +6751,18 @@ mod quantized_matmul_floor {
             (200, 768, 37),
             (192, 512, 300),
         ];
-        let dtypes = [GgmlDType::Q4K, GgmlDType::Q6K];
+        let dtypes = [
+            GgmlDType::Q4_0,
+            GgmlDType::Q4_1,
+            GgmlDType::Q5_0,
+            GgmlDType::Q5_1,
+            GgmlDType::Q8_0,
+            GgmlDType::Q2K,
+            GgmlDType::Q3K,
+            GgmlDType::Q4K,
+            GgmlDType::Q5K,
+            GgmlDType::Q6K,
+        ];
         for (dtype, (n, k, m)) in dtypes
             .iter()
             .flat_map(|d| shapes.iter().map(move |s| (*d, *s)))

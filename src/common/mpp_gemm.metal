@@ -215,6 +215,182 @@ typedef struct {
 } block_q6_K;
 
 inline void q4k_scale_min(device const uint8_t* scales, uint j,
+                          thread float& sc, thread float& m);
+
+// The remaining GGUF block layouts, as ggml lays them out. The blocks of 32
+// carry one scale, and for the `_1` variants one offset, ahead of their
+// quants; the K blocks of 256 carry sub-block scales in their own packings.
+// Several are not a multiple of four bytes long, so every read below that is
+// not known to be aligned goes through packed bytes.
+typedef struct { half d; uint8_t qs[16]; } block_q4_0;
+typedef struct { half d; half m; uint8_t qs[16]; } block_q4_1;
+typedef struct { half d; uint8_t qh[4]; uint8_t qs[16]; } block_q5_0;
+typedef struct { half d; half m; uint8_t qh[4]; uint8_t qs[16]; } block_q5_1;
+typedef struct { half d; int8_t qs[32]; } block_q8_0;
+typedef struct { uint8_t scales[16]; uint8_t qs[64]; half d; half dmin; } block_q2_K;
+typedef struct { uint8_t hmask[32]; uint8_t qs[64]; uint8_t scales[12]; half d; } block_q3_K;
+typedef struct { half d; half dmin; uint8_t scales[12]; uint8_t qh[32]; uint8_t qs[128]; } block_q5_K;
+
+inline constexpr uint block_elems(device const block_q4_0*) { return 32u; }
+inline constexpr uint block_elems(device const block_q4_1*) { return 32u; }
+inline constexpr uint block_elems(device const block_q5_0*) { return 32u; }
+inline constexpr uint block_elems(device const block_q5_1*) { return 32u; }
+inline constexpr uint block_elems(device const block_q8_0*) { return 32u; }
+inline constexpr uint block_elems(device const block_q2_K*) { return QK_K; }
+inline constexpr uint block_elems(device const block_q3_K*) { return QK_K; }
+inline constexpr uint block_elems(device const block_q5_K*) { return QK_K; }
+
+inline uint le_word(device const uint8_t* b) {
+    return uint(b[0]) | (uint(b[1]) << 8) | (uint(b[2]) << 16) | (uint(b[3]) << 24);
+}
+
+// Each `dequant32` writes the weights `j0 .. j0 + limit` of one block to
+// `out[i * stride]`, which is one column of the staged tile.
+inline void dequant32(device const block_q4_0* blk, uint j0, threadgroup bfloat* out, uint stride, uint limit) {
+    const float d = float(blk->d);
+    for (uint i = 0; i < limit; ++i) {
+        const uint j = j0 + i;
+        const uint byte = uint(blk->qs[j % 16u]);
+        const uint q = j < 16u ? (byte & 0xFu) : (byte >> 4);
+        out[i * stride] = bfloat(d * (float(q) - 8.0f));
+    }
+}
+
+inline void dequant32(device const block_q4_1* blk, uint j0, threadgroup bfloat* out, uint stride, uint limit) {
+    const float d = float(blk->d);
+    const float m = float(blk->m);
+    for (uint i = 0; i < limit; ++i) {
+        const uint j = j0 + i;
+        const uint byte = uint(blk->qs[j % 16u]);
+        const uint q = j < 16u ? (byte & 0xFu) : (byte >> 4);
+        out[i * stride] = bfloat(d * float(q) + m);
+    }
+}
+
+inline void dequant32(device const block_q5_0* blk, uint j0, threadgroup bfloat* out, uint stride, uint limit) {
+    const float d = float(blk->d);
+    const uint qh = le_word(blk->qh);
+    for (uint i = 0; i < limit; ++i) {
+        const uint j = j0 + i;
+        const uint byte = uint(blk->qs[j % 16u]);
+        const uint nib = j < 16u ? (byte & 0xFu) : (byte >> 4);
+        const uint q = nib | (((qh >> j) & 1u) << 4);
+        out[i * stride] = bfloat(d * (float(q) - 16.0f));
+    }
+}
+
+inline void dequant32(device const block_q5_1* blk, uint j0, threadgroup bfloat* out, uint stride, uint limit) {
+    const float d = float(blk->d);
+    const float m = float(blk->m);
+    const uint qh = le_word(blk->qh);
+    for (uint i = 0; i < limit; ++i) {
+        const uint j = j0 + i;
+        const uint byte = uint(blk->qs[j % 16u]);
+        const uint nib = j < 16u ? (byte & 0xFu) : (byte >> 4);
+        const uint q = nib | (((qh >> j) & 1u) << 4);
+        out[i * stride] = bfloat(d * float(q) + m);
+    }
+}
+
+inline void dequant32(device const block_q8_0* blk, uint j0, threadgroup bfloat* out, uint stride, uint limit) {
+    const float d = float(blk->d);
+    for (uint i = 0; i < limit; ++i) {
+        out[i * stride] = bfloat(d * float(blk->qs[j0 + i]));
+    }
+}
+
+// Q2_K: two bits per weight, four groups of thirty-two per half of the
+// block sharing a byte with a shift of two per group; a four-bit scale and a
+// four-bit offset per sixteen weights.
+inline void dequant32(device const block_q2_K* blk, uint j0, threadgroup bfloat* out, uint stride, uint limit) {
+    const float d = float(blk->d);
+    const float dmin = float(blk->dmin);
+    const uint h = j0 / 128u;
+    const uint jj = (j0 % 128u) / 32u;
+    const uint shift = 2u * jj;
+    device const uint8_t* q = blk->qs + h * 32u;
+    for (uint i = 0; i < limit; ++i) {
+        const uint sc = uint(blk->scales[h * 8u + 2u * jj + i / 16u]);
+        const float dl = d * float(sc & 0xFu);
+        const float ml = dmin * float(sc >> 4);
+        out[i * stride] = bfloat(dl * float((uint(q[i]) >> shift) & 3u) - ml);
+    }
+}
+
+// Q3_K: two low bits in `qs` as Q2_K lays them, a third bit in `hmask` at
+// bit `4 * half + group` of the weight's byte, and sixteen six-bit scales
+// packed into twelve bytes the way ggml unpacks them.
+inline void dequant32(device const block_q3_K* blk, uint j0, threadgroup bfloat* out, uint stride, uint limit) {
+    const float d = float(blk->d);
+    const uint kmask1 = 0x03030303u;
+    const uint kmask2 = 0x0f0f0f0fu;
+    uint aux0 = le_word(blk->scales);
+    uint aux1 = le_word(blk->scales + 4);
+    const uint tmp = le_word(blk->scales + 8);
+    const uint aux2 = ((aux0 >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
+    const uint aux3 = ((aux1 >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
+    aux0 = (aux0 & kmask2) | (((tmp >> 0) & kmask1) << 4);
+    aux1 = (aux1 & kmask2) | (((tmp >> 2) & kmask1) << 4);
+    const uint aux[4] = {aux0, aux1, aux2, aux3};
+    const uint h = j0 / 128u;
+    const uint jj = (j0 % 128u) / 32u;
+    const uint shift = 2u * jj;
+    const uint m = 1u << (h * 4u + jj);
+    device const uint8_t* q = blk->qs + h * 32u;
+    for (uint i = 0; i < limit; ++i) {
+        const uint is = h * 8u + 2u * jj + i / 16u;
+        const int scale = int((aux[is / 4u] >> (8u * (is % 4u))) & 0xFFu) - 32;
+        const int low = int((uint(q[i]) >> shift) & 3u);
+        const int val = low - ((uint(blk->hmask[i]) & m) ? 0 : 4);
+        out[i * stride] = bfloat(d * float(scale) * float(val));
+    }
+}
+
+// Q5_K: Q4_K's nibbles and scales, with a fifth bit per weight in `qh` at bit
+// `2 * span + half` of the weight's byte.
+inline void dequant32(device const block_q5_K* blk, uint j0, threadgroup bfloat* out, uint stride, uint limit) {
+    const uint g = j0 / 64u;
+    const uint half_ = (j0 % 64u) / 32u;
+    float sc, mn;
+    q4k_scale_min(blk->scales, 2u * g + half_, sc, mn);
+    const float dl = float(blk->d) * sc;
+    const float ml = float(blk->dmin) * mn;
+    const uint u = 1u << (2u * g + half_);
+    device const uint8_t* ql = blk->qs + g * 32u;
+    for (uint i = 0; i < limit; ++i) {
+        const uint byte = uint(ql[i]);
+        const uint nib = half_ ? (byte >> 4) : (byte & 0xFu);
+        const uint q = nib + ((uint(blk->qh[i]) & u) ? 16u : 0u);
+        out[i * stride] = bfloat(dl * float(q) - ml);
+    }
+}
+
+// The stager every block type without a hand-tuned one shares: one thread
+// per column and thirty-two-weight span of the tile, as the Q4_K and Q6_K
+// stagers do, with the block's own `dequant32` filling the span.
+template <typename Block>
+inline void stage_tile(
+    device Block* weight,
+    threadgroup bfloat* sB,
+    constant MppQuantGemmParams& p,
+    int k0, int col0, int bk, int tn, int tn_stride, uint lid)
+{
+    const uint be = block_elems(weight);
+    const uint blocks_per_row = uint(p.k) / be;
+    const uint subs = (uint(bk) + 31u) / 32u;
+    const uint total = uint(tn) * subs;
+    for (uint t = lid; t < total; t += 128u) {
+        const uint col = t / subs;
+        const uint sub = t % subs;
+        const uint k_start = uint(k0) + sub * 32u;
+        device const Block* blk = weight + (uint(col0) + col) * blocks_per_row + k_start / be;
+        const uint j0 = k_start % be;
+        const int limit = min(32, bk - int(sub * 32u));
+        dequant32(blk, j0, sB + sub * 32u * uint(tn_stride) + col, uint(tn_stride), uint(limit));
+    }
+}
+
+inline void q4k_scale_min(device const uint8_t* scales, uint j,
                           thread float& sc, thread float& m)
 {
     if (j < 4u) {
@@ -396,6 +572,28 @@ kernel void mpp_gemm_q4k_staged(
     threadgroup bfloat sB[2][Q4K_BK * Q4K_TN];
     gemm_staged<block_q4_K, Q4K_TN, Q4K_BK>(a, weight, d, p, sB[0], sB[1], tgid, lid);
 }
+
+#define MPP_STAGED_KERNEL(NAME, BLOCK, BK)                                      \
+kernel void NAME(                                                              \
+    device bfloat*      a       [[buffer(0)]],                                 \
+    device BLOCK*       weight  [[buffer(1)]],                                 \
+    device bfloat*      d       [[buffer(2)]],                                 \
+    constant MppQuantGemmParams& p [[buffer(3)]],                              \
+    uint2 tgid [[threadgroup_position_in_grid]],                               \
+    uint  lid  [[thread_index_in_threadgroup]])                                \
+{                                                                              \
+    threadgroup bfloat sB[2][BK * Q4K_TN];                                     \
+    gemm_staged<BLOCK, Q4K_TN, BK>(a, weight, d, p, sB[0], sB[1], tgid, lid);  \
+}
+
+MPP_STAGED_KERNEL(mpp_gemm_q4_0_staged, block_q4_0, Q4K_BK)
+MPP_STAGED_KERNEL(mpp_gemm_q4_1_staged, block_q4_1, Q4K_BK)
+MPP_STAGED_KERNEL(mpp_gemm_q5_0_staged, block_q5_0, Q4K_BK)
+MPP_STAGED_KERNEL(mpp_gemm_q5_1_staged, block_q5_1, Q4K_BK)
+MPP_STAGED_KERNEL(mpp_gemm_q8_0_staged, block_q8_0, Q4K_BK)
+MPP_STAGED_KERNEL(mpp_gemm_q2k_staged, block_q2_K, Q4K_BK)
+MPP_STAGED_KERNEL(mpp_gemm_q3k_staged, block_q3_K, Q4K_BK)
+MPP_STAGED_KERNEL(mpp_gemm_q5k_staged, block_q5_K, Q4K_BK)
 
 kernel void mpp_gemm_q6k_staged(
     device bfloat*      a       [[buffer(0)]],

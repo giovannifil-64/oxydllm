@@ -2855,12 +2855,105 @@ struct MppQuantMatmul {
 /// decode from the same bytes while the staged GEMM serves prefill, and the
 /// weights are read-only, so the two readers never disagree.
 ///
+/// A GGUF block quantization this crate's kernels read, including the
+/// importance-quantized ones candle has no name for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WeightKind {
+    Q4_0,
+    Q4_1,
+    Q5_0,
+    Q5_1,
+    Q8_0,
+    Q2K,
+    Q3K,
+    Q4K,
+    Q5K,
+    Q6K,
+    Iq4Nl,
+    Iq4Xs,
+    Iq3S,
+}
+
+impl WeightKind {
+    /// The kind a candle block type maps to, or `None` for a dense type.
+    pub fn from_candle(dtype: GgmlDType) -> Option<Self> {
+        Some(match dtype {
+            GgmlDType::Q4_0 => Self::Q4_0,
+            GgmlDType::Q4_1 => Self::Q4_1,
+            GgmlDType::Q5_0 => Self::Q5_0,
+            GgmlDType::Q5_1 => Self::Q5_1,
+            GgmlDType::Q8_0 => Self::Q8_0,
+            GgmlDType::Q2K => Self::Q2K,
+            GgmlDType::Q3K => Self::Q3K,
+            GgmlDType::Q4K => Self::Q4K,
+            GgmlDType::Q5K => Self::Q5K,
+            GgmlDType::Q6K => Self::Q6K,
+            _ => return None,
+        })
+    }
+
+    /// The kind a ggml type id names when candle has no name for it: the
+    /// importance-quantized types this crate decodes on its own.
+    pub fn from_ggml_id_iq(id: u32) -> Option<Self> {
+        match id {
+            20 => Some(Self::Iq4Nl),
+            21 => Some(Self::Iq3S),
+            23 => Some(Self::Iq4Xs),
+            _ => None,
+        }
+    }
+
+    /// Weights per block.
+    pub fn block_elems(self) -> usize {
+        match self {
+            Self::Q4_0 | Self::Q4_1 | Self::Q5_0 | Self::Q5_1 | Self::Q8_0 | Self::Iq4Nl => 32,
+            _ => 256,
+        }
+    }
+
+    /// Bytes per block.
+    pub fn block_bytes(self) -> usize {
+        match self {
+            Self::Q4_0 | Self::Iq4Nl => 18,
+            Self::Q4_1 => 20,
+            Self::Q5_0 => 22,
+            Self::Q5_1 => 24,
+            Self::Q8_0 => 34,
+            Self::Q2K => 84,
+            Self::Q3K | Self::Iq3S => 110,
+            Self::Q4K => 144,
+            Self::Q5K => 176,
+            Self::Q6K => 210,
+            Self::Iq4Xs => 136,
+        }
+    }
+
+    /// The kernel that multiplies a few activation rows by a weight of a kind
+    /// candle cannot serve; the kinds candle serves have candle's matvec.
+    fn matvec_kernel(self) -> Option<&'static str> {
+        match self {
+            Self::Iq4Nl => Some("mpp_mv_iq4_nl"),
+            Self::Iq4Xs => Some("mpp_mv_iq4_xs"),
+            Self::Iq3S => Some("mpp_mv_iq3_s"),
+            _ => None,
+        }
+    }
+}
+
+/// Activation rows the owned matvec takes at once; must match `MV_MAX_M` in
+/// the kernel source. From the next row up the staged GEMM serves.
+const MPP_MATVEC_MAX_M: usize = 8;
+
+/// Output rows one threadgroup of the owned matvec computes, one per
+/// simdgroup; must match `MV_ROWS` in the kernel source.
+const MPP_MATVEC_ROWS: usize = 4;
+
 /// Only a layout a kernel understands becomes a handle: every GGUF block
 /// quantization on a two-dimensional weight whose rows are whole blocks.
 #[derive(Clone, Debug)]
 pub struct StagedWeight {
     buffer: candle_metal_kernels::metal::Buffer,
-    dtype: GgmlDType,
+    kind: WeightKind,
     n: usize,
     k: usize,
 }
@@ -2872,41 +2965,60 @@ impl StagedWeight {
         dtype: GgmlDType,
         dims: &[usize],
     ) -> Option<Self> {
-        let block = match dtype {
-            GgmlDType::Q4_0
-            | GgmlDType::Q4_1
-            | GgmlDType::Q5_0
-            | GgmlDType::Q5_1
-            | GgmlDType::Q8_0 => 32,
-            GgmlDType::Q2K | GgmlDType::Q3K | GgmlDType::Q4K | GgmlDType::Q5K | GgmlDType::Q6K => {
-                256
-            }
-            _ => return None,
-        };
+        Self::of_kind(buffer, WeightKind::from_candle(dtype)?, dims)
+    }
+
+    /// Wraps `buffer` as a weight of `kind` when `dims` is a two-dimensional
+    /// weight whose rows are whole blocks.
+    pub fn of_kind(
+        buffer: candle_metal_kernels::metal::Buffer,
+        kind: WeightKind,
+        dims: &[usize],
+    ) -> Option<Self> {
         match dims {
-            &[n, k] if k.is_multiple_of(block) => Some(Self {
-                buffer,
-                dtype,
-                n,
-                k,
-            }),
+            &[n, k] if k.is_multiple_of(kind.block_elems()) => Some(Self { buffer, kind, n, k }),
             _ => None,
         }
     }
 
+    /// The kind of block the weight is stored in.
+    pub fn kind(&self) -> WeightKind {
+        self.kind
+    }
+
+    /// Rows and columns of the weight.
+    pub fn dims(&self) -> (usize, usize) {
+        (self.n, self.k)
+    }
+
+    /// The weight's block bytes, read back from the device.
+    ///
+    /// The buffer is shared storage written once on the host, so its contents
+    /// are the bytes the loader gave it.
+    pub fn bytes(&self) -> Vec<u8> {
+        let len = self.n * self.k / self.kind.block_elems() * self.kind.block_bytes();
+        let mut out = vec![0u8; len];
+        unsafe {
+            std::ptr::copy_nonoverlapping(self.buffer.contents(), out.as_mut_ptr(), len);
+        }
+        out
+    }
+
     fn kernel(&self) -> &'static str {
-        match self.dtype {
-            GgmlDType::Q4_0 => "mpp_gemm_q4_0_staged",
-            GgmlDType::Q4_1 => "mpp_gemm_q4_1_staged",
-            GgmlDType::Q5_0 => "mpp_gemm_q5_0_staged",
-            GgmlDType::Q5_1 => "mpp_gemm_q5_1_staged",
-            GgmlDType::Q8_0 => "mpp_gemm_q8_0_staged",
-            GgmlDType::Q2K => "mpp_gemm_q2k_staged",
-            GgmlDType::Q3K => "mpp_gemm_q3k_staged",
-            GgmlDType::Q4K => "mpp_gemm_q4k_staged",
-            GgmlDType::Q5K => "mpp_gemm_q5k_staged",
-            GgmlDType::Q6K => "mpp_gemm_q6k_staged",
-            other => unreachable!("StagedWeight::new admits no {other:?}"),
+        match self.kind {
+            WeightKind::Q4_0 => "mpp_gemm_q4_0_staged",
+            WeightKind::Q4_1 => "mpp_gemm_q4_1_staged",
+            WeightKind::Q5_0 => "mpp_gemm_q5_0_staged",
+            WeightKind::Q5_1 => "mpp_gemm_q5_1_staged",
+            WeightKind::Q8_0 => "mpp_gemm_q8_0_staged",
+            WeightKind::Q2K => "mpp_gemm_q2k_staged",
+            WeightKind::Q3K => "mpp_gemm_q3k_staged",
+            WeightKind::Q4K => "mpp_gemm_q4k_staged",
+            WeightKind::Q5K => "mpp_gemm_q5k_staged",
+            WeightKind::Q6K => "mpp_gemm_q6k_staged",
+            WeightKind::Iq4Nl => "mpp_gemm_iq4_nl_staged",
+            WeightKind::Iq4Xs => "mpp_gemm_iq4_xs_staged",
+            WeightKind::Iq3S => "mpp_gemm_iq3_s_staged",
         }
     }
 
@@ -2920,10 +3032,15 @@ impl StagedWeight {
     /// blocks of 32, and Q4_K with its word-wise stager, are level with candle
     /// at 64 and 1.8-2.0x ahead from 128; the rest cost more to unpack per
     /// tile and leave candle a few percent ahead at 64, so they wait for 128.
+    /// A kind candle cannot serve has the owned matvec below this and nothing
+    /// else, so it hands over as soon as the matvec's rows run out.
     fn min_m(&self) -> usize {
-        match self.dtype {
-            GgmlDType::Q4_0 | GgmlDType::Q4_1 | GgmlDType::Q5_0 | GgmlDType::Q5_1 => MPP_GEMM_MIN_M,
-            GgmlDType::Q4K => MPP_GEMM_MIN_M,
+        match self.kind {
+            WeightKind::Q4_0 | WeightKind::Q4_1 | WeightKind::Q5_0 | WeightKind::Q5_1 => {
+                MPP_GEMM_MIN_M
+            }
+            WeightKind::Q4K => MPP_GEMM_MIN_M,
+            WeightKind::Iq4Nl | WeightKind::Iq4Xs | WeightKind::Iq3S => MPP_MATVEC_MAX_M + 1,
             _ => 128,
         }
     }
@@ -3034,6 +3151,109 @@ pub fn maybe_staged_quant_matmul(x: &Tensor, weight: &StagedWeight) -> Result<Op
         Ok(y) => Ok(Some(y)),
         Err(_) if mpp_runtime_broken() => Ok(None),
         Err(e) => Err(e),
+    }
+}
+
+/// `x [m, k] @ weight^T` for up to [`MPP_MATVEC_MAX_M`] rows of `x` by a
+/// weight only this crate's kernels decode, one simdgroup per output row.
+struct MppOwnedMatvec {
+    weight: StagedWeight,
+}
+
+impl CustomOp1 for MppOwnedMatvec {
+    fn name(&self) -> &'static str {
+        "mpp-owned-matvec"
+    }
+
+    fn cpu_fwd(&self, _s: &CpuStorage, _l: &Layout) -> Result<(CpuStorage, Shape)> {
+        candle_core::bail!("MppOwnedMatvec: Metal-only")
+    }
+
+    fn metal_fwd(&self, x: &MetalStorage, x_l: &Layout) -> Result<(MetalStorage, Shape)> {
+        if x.dtype() != DType::BF16 {
+            candle_core::bail!("MppOwnedMatvec: BF16 only");
+        }
+        if !x_l.is_contiguous() {
+            candle_core::bail!("MppOwnedMatvec: x must be contiguous");
+        }
+        let x_dims = x_l.dims();
+        if x_dims.len() != 2 {
+            candle_core::bail!("MppOwnedMatvec: x must be 2-D, got {x_dims:?}");
+        }
+        let (m, k) = (x_dims[0], x_dims[1]);
+        let (n, wk) = (self.weight.n, self.weight.k);
+        if k != wk {
+            candle_core::bail!("MppOwnedMatvec: x k {k} != weight k {wk}");
+        }
+        if m == 0 || m > MPP_MATVEC_MAX_M {
+            candle_core::bail!("MppOwnedMatvec: {m} rows, takes 1 to {MPP_MATVEC_MAX_M}");
+        }
+        let Some(kernel) = self.weight.kind.matvec_kernel() else {
+            candle_core::bail!("MppOwnedMatvec: {:?} is served by candle", self.weight.kind);
+        };
+
+        let device = x.device();
+        let out_elems = m * n;
+        let output = device.new_buffer(out_elems, DType::BF16, "mpp_owned_matvec")?;
+        let params = MppQuantGemmParams {
+            m: m as i32,
+            n: n as i32,
+            k: k as i32,
+            group_shift: 0,
+        };
+
+        let pipeline = get_or_compile_mpp_pipeline(device.device(), kernel)?;
+        let encoder = device.command_encoder()?;
+        let encoder = encoder.as_ref();
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_input_buffer(0, Some(x.buffer()), x_l.start_offset() * 2);
+        encoder.set_input_buffer(1, Some(&self.weight.buffer), 0);
+        encoder.set_output_buffer(2, Some(&*output), 0);
+        encoder.set_bytes(3, &params);
+        encoder.dispatch_thread_groups(
+            MTLSize {
+                width: n.div_ceil(MPP_MATVEC_ROWS),
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: 32 * MPP_MATVEC_ROWS,
+                height: 1,
+                depth: 1,
+            },
+        );
+
+        Ok((
+            MetalStorage::new(output, device.clone(), out_elems, DType::BF16),
+            Shape::from_dims(&[m, n]),
+        ))
+    }
+}
+
+/// `x @ weight^T` for a weight only this crate's kernels decode: the matvec
+/// up to [`MPP_MATVEC_MAX_M`] rows, the staged GEMM above. Takes `x` in any
+/// dtype and answers in BF16.
+///
+/// ## Errors
+/// Fails off-Metal, when the TensorOps library is unavailable, or when `x` is
+/// not two-dimensional with the weight's row length.
+pub fn mpp_owned_matmul(x: &Tensor, weight: &StagedWeight) -> Result<Tensor> {
+    let x = if x.dtype() == DType::BF16 {
+        x.clone()
+    } else {
+        x.to_dtype(DType::BF16)?
+    };
+    let x = if x.is_contiguous() {
+        x
+    } else {
+        x.contiguous()?
+    };
+    if x.dim(0)? < weight.min_m() {
+        x.apply_op1_no_bwd(&MppOwnedMatvec {
+            weight: weight.clone(),
+        })
+    } else {
+        mpp_staged_matmul(&x, weight)
     }
 }
 
@@ -7240,6 +7460,38 @@ mod quantized_matmul_floor {
         );
     }
 
+    /// Whether the TensorOps library compiles on this device, and the
+    /// compiler's message when it does not.
+    ///
+    /// The production path treats a library that fails to compile as absent
+    /// and takes candle's, and the contracts skip; a kernel edit that broke the
+    /// source would therefore show up as nothing at all. This is where the
+    /// message can be read.
+    #[test]
+    #[ignore = "diagnostic (prints the Metal compiler's verdict)"]
+    fn the_tensor_ops_library_compiles_here() {
+        let Ok(dev) = Device::new_metal(0) else {
+            return;
+        };
+        let candle_core::Device::Metal(md) = &dev else {
+            return;
+        };
+        use objc2_foundation::NSString;
+        use objc2_metal::{MTLCompileOptions, MTLDevice, MTLLanguageVersion};
+        let opts = MTLCompileOptions::new();
+        opts.setLanguageVersion(MTLLanguageVersion::Version4_0);
+        match md.device().as_ref().newLibraryWithSource_options_error(
+            &NSString::from_str(crate::common::metal_ops::MPP_GEMM_SOURCE),
+            Some(&opts),
+        ) {
+            Ok(_) => eprintln!("the TensorOps library compiles"),
+            Err(e) => panic!(
+                "the TensorOps library does not compile: {}",
+                e.localizedDescription()
+            ),
+        }
+    }
+
     /// Contract: the quantized matmul this crate leans on stays fast enough to
     /// be worth leaning on.
     ///
@@ -7416,6 +7668,208 @@ mod decode_batch_scaling_tests {
                     "head {head} dim {x}: got {got}, expected {expect}"
                 );
             }
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod owned_weights {
+    use super::*;
+    use crate::common::iq_quant;
+    use candle_core::{DType, Device, Tensor};
+
+    fn f16_bits(v: f32) -> u16 {
+        let b = v.to_bits();
+        let exp = ((b >> 23) & 0xff) as i32 - 127 + 15;
+        assert!((1..31).contains(&exp), "{v} is not a normal half");
+        ((b >> 16) & 0x8000) as u16 | ((exp as u16) << 10) | ((b >> 13) & 0x3ff) as u16
+    }
+
+    /// Random block bytes for an `n` by `k` weight of `kind`, with each block's
+    /// scale in the range real files use so nothing overflows.
+    pub(crate) fn synthetic(kind: WeightKind, n: usize, k: usize, seed: u64) -> Vec<u8> {
+        let blocks = n * k / kind.block_elems();
+        let bb = kind.block_bytes();
+        let mut s = seed;
+        let mut next = move || {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (s >> 33) as u8
+        };
+        let mut out: Vec<u8> = (0..blocks * bb).map(|_| next()).collect();
+        for b in 0..blocks {
+            let d = f16_bits(0.002 + 0.03 * f32::from(next()) / 255.0);
+            out[b * bb..b * bb + 2].copy_from_slice(&d.to_le_bytes());
+        }
+        out
+    }
+
+    /// The weight `bytes` hold, by the CPU reference.
+    pub(crate) fn dense(kind: WeightKind, bytes: &[u8], n: usize, k: usize) -> Vec<f32> {
+        let mut out = vec![0f32; n * k];
+        match kind {
+            WeightKind::Iq4Nl => iq_quant::dequantize_iq4_nl(bytes, &mut out),
+            WeightKind::Iq4Xs => iq_quant::dequantize_iq4_xs(bytes, &mut out),
+            WeightKind::Iq3S => iq_quant::dequantize_iq3_s(bytes, &mut out),
+            other => panic!("{other:?} is candle's"),
+        }
+        out
+    }
+
+    fn worst_relative(atteso: &[f32], ottenuto: &[f32]) -> f32 {
+        assert_eq!(atteso.len(), ottenuto.len());
+        let peak = atteso.iter().fold(0f32, |a, v| a.max(v.abs())).max(1e-6);
+        atteso
+            .iter()
+            .zip(ottenuto)
+            .fold(0f32, |a, (x, y)| a.max((x - y).abs()))
+            / peak
+    }
+
+    fn check(dev: &Device, kind: WeightKind, bytes: &[u8], n: usize, k: usize) {
+        let Device::Metal(md) = dev else {
+            return;
+        };
+        let cpu = Device::Cpu;
+        let w = Tensor::from_vec(dense(kind, bytes, n, k), (n, k), &cpu).unwrap();
+        let buffer = md.new_buffer_with_data(bytes).unwrap();
+        let staged = StagedWeight::of_kind((*buffer).clone(), kind, &[n, k]).unwrap();
+        for m in [1usize, 3, MPP_MATVEC_MAX_M, MPP_MATVEC_MAX_M + 1, 64, 200] {
+            let x: Vec<f32> = (0..m * k).map(|i| ((i % 13) as f32 - 6.0) * 0.05).collect();
+            let x_bf = Tensor::from_vec(x, (m, k), &cpu)
+                .unwrap()
+                .to_dtype(DType::BF16)
+                .unwrap();
+            let atteso = x_bf
+                .to_dtype(DType::F32)
+                .unwrap()
+                .matmul(&w.t().unwrap())
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            let ottenuto = mpp_owned_matmul(&x_bf.to_device(dev).unwrap(), &staged)
+                .unwrap()
+                .to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            let err = worst_relative(&atteso, &ottenuto);
+            assert!(
+                err < 0.02,
+                "{kind:?} {n}x{k} m={m}: relative error {err} against the CPU reference"
+            );
+        }
+    }
+
+    /// Contract: on every kind candle cannot serve, both of this crate's
+    /// paths, the matvec below its row limit and the staged GEMM from there
+    /// up, answer what the CPU reference decoder says the weight is, on random
+    /// blocks and on blocks taken from a published file.
+    ///
+    /// The two decoders were written apart, one in Rust from ggml's row
+    /// dequantizer and one in Metal for the kernels, so agreement between them
+    /// is agreement about the format and not about a shared mistake.
+    #[test]
+    fn the_owned_kernels_agree_with_the_cpu_reference() {
+        let Ok(dev) = Device::new_metal(0) else {
+            return;
+        };
+        if !matches!(&dev, Device::Metal(md) if mpp_gemm_available(md.device())) {
+            eprintln!("TensorOps library unavailable on this GPU, skipping");
+            return;
+        }
+        for (kind, n, k) in [
+            (WeightKind::Iq4Nl, 256usize, 512usize),
+            (WeightKind::Iq4Nl, 200, 736),
+            (WeightKind::Iq4Xs, 256, 512),
+            (WeightKind::Iq4Xs, 200, 768),
+            (WeightKind::Iq3S, 192, 512),
+            (WeightKind::Iq3S, 130, 1280),
+        ] {
+            check(&dev, kind, &synthetic(kind, n, k, 7 + n as u64), n, k);
+        }
+        for (kind, bytes, n, k) in [
+            (
+                WeightKind::Iq4Xs,
+                iq_quant::FIXTURE_IQ4_XS,
+                16usize,
+                256usize,
+            ),
+            (WeightKind::Iq4Nl, iq_quant::FIXTURE_IQ4_NL, 16, 32),
+            (WeightKind::Iq3S, iq_quant::FIXTURE_IQ3_S, 16, 256),
+        ] {
+            check(&dev, kind, bytes, n, k);
+        }
+    }
+
+    /// How the owned matvec reads against candle's Q4_K matvec on the shapes
+    /// a 27B layer has, at a single token.
+    ///
+    /// Both are bound by reading the weight once, so the fair number is the
+    /// bytes each reads over the time it takes. Candle's is the path every
+    /// other decode goes through and the floor a kind of its own must not fall
+    /// far below.
+    #[test]
+    #[ignore = "perf probe (requires macOS 26 / Metal 4)"]
+    fn owned_matvec_against_candle_s_probe() {
+        use candle_core::quantized::{GgmlDType, QMatMul, QTensor};
+        use std::time::Instant;
+        let Ok(dev) = Device::new_metal(0) else {
+            return;
+        };
+        let Device::Metal(md) = &dev else {
+            return;
+        };
+        let time = |f: &dyn Fn() -> Tensor| -> f64 {
+            for _ in 0..5 {
+                f().to_device(&Device::Cpu).unwrap();
+            }
+            let iters = 50;
+            let t = Instant::now();
+            let mut sink = Vec::with_capacity(iters);
+            for _ in 0..iters {
+                sink.push(f());
+            }
+            sink.last().unwrap().to_device(&Device::Cpu).unwrap();
+            t.elapsed().as_secs_f64() / iters as f64
+        };
+        for (n, k) in [(5120usize, 5120usize), (5120, 17408), (17408, 5120)] {
+            for kind in [WeightKind::Iq4Xs, WeightKind::Iq4Nl, WeightKind::Iq3S] {
+                let bytes = synthetic(kind, n, k, 11);
+                let buffer = md.new_buffer_with_data(&bytes).unwrap();
+                let staged = StagedWeight::of_kind((*buffer).clone(), kind, &[n, k]).unwrap();
+                let x: Vec<f32> = (0..k).map(|i| ((i % 13) as f32 - 6.0) * 0.05).collect();
+                let x_bf = Tensor::from_vec(x.clone(), (1, k), &dev)
+                    .unwrap()
+                    .to_dtype(DType::BF16)
+                    .unwrap();
+                let t_own = time(&|| mpp_owned_matmul(&x_bf, &staged).unwrap());
+                println!(
+                    "{kind:?} {n}x{k} | matvec proprio {:7.1} us = {:5.1} GB/s",
+                    t_own * 1e6,
+                    bytes.len() as f64 / t_own / 1e9
+                );
+            }
+            let w: Vec<f32> = (0..n * k)
+                .map(|i| ((i % 29) as f32 - 14.0) * 0.031)
+                .collect();
+            let qt = QTensor::quantize(&Tensor::from_vec(w, (n, k), &dev).unwrap(), GgmlDType::Q4K)
+                .unwrap();
+            let peso = qt.storage_size_in_bytes();
+            let candle = QMatMul::from_arc(std::sync::Arc::new(qt)).unwrap();
+            let x: Vec<f32> = (0..k).map(|i| ((i % 13) as f32 - 6.0) * 0.05).collect();
+            let x32 = Tensor::from_vec(x, (1, k), &dev).unwrap();
+            let t_candle = time(&|| candle_core::Module::forward(&candle, &x32).unwrap());
+            println!(
+                "Q4K   {n}x{k} | matvec candle  {:7.1} us = {:5.1} GB/s",
+                t_candle * 1e6,
+                peso as f64 / t_candle / 1e9
+            );
         }
     }
 }

@@ -597,9 +597,9 @@ pub fn find_gguf_file(dir: &Path) -> Option<std::path::PathBuf> {
 /// the caller to fill with the whole shard group. Returns `None` when the
 /// file cannot be read as GGUF.
 fn discover_gguf_model(id: &str, gguf_path: &Path) -> Option<DiscoveredModel> {
-    use candle_core::quantized::gguf_file;
-    let mut file = std::fs::File::open(gguf_path).ok()?;
-    let content = gguf_file::Content::read(&mut file).ok()?;
+    let content = crate::common::gguf_header::GgufHeader::read(gguf_path)
+        .ok()?
+        .content;
 
     let arch = content
         .metadata

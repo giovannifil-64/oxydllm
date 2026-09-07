@@ -485,7 +485,7 @@ The following options are shared between `start` and `run`:
 `--models-dir`, `--devices`, `--max-context-len`, `--kv-quant`, `--allow-cpu`.
 
 ## Known Limitations and Work in Progress
-- GGUF compatibility: MoE GGUF checkpoints are not yet wired, and a GGUF whose tensors use quantizations candle cannot decode is refused before the download rather than after it.
+- GGUF compatibility: MoE GGUF checkpoints are not yet wired. The importance-quantized types IQ4_XS, IQ4_NL and IQ3_S load through the engine's own kernels, which covers unsloth's UD-Q*_K_M and UD-Q*_K_XL builds; a GGUF holding any other IQ or ternary type is refused before the download rather than after it.
 - Thinking mode is template-dependent: `enable_thinking` is applied only when the tokenizer chat template supports it.
 - Byte-level tokenizers: Streaming decode uses incremental buffering; occasional model-specific Unicode artifacts can still appear.
 - Tool / schema adherence is model-dependent: the OpenAI-compatible request fields, response shapes, and streaming semantics are implemented server-side, but local models can still ignore tool instructions or emit invalid JSON / tool arguments.

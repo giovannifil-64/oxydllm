@@ -314,11 +314,11 @@ impl FeedForward {
     ) -> Result<Self> {
         let prefix = format!("blk.{}", layer_idx);
 
-        let up_qt = gguf.get(&format!("{prefix}.ffn_up.weight"))?;
-        let up_out = up_qt.shape().dims()[0];
+        let up = gguf.linear_weight(&format!("{prefix}.ffn_up.weight"))?;
+        let up_out = up.out_features();
 
-        let down_qt = gguf.get(&format!("{prefix}.ffn_down.weight"))?;
-        let down_in = down_qt.shape().dims()[1];
+        let down = gguf.linear_weight(&format!("{prefix}.ffn_down.weight"))?;
+        let down_in = down.in_features();
         if down_in != intermediate_size {
             candle_core::bail!(
                 "GGUF ffn_down shape mismatch at {prefix}: expected dim1={}, got {}",
@@ -327,8 +327,9 @@ impl FeedForward {
             );
         }
 
-        let gate_up = if let Some(gate_qt) = gguf.try_get(&format!("{prefix}.ffn_gate.weight")) {
-            let gate_out = gate_qt.shape().dims()[0];
+        let gate_name = format!("{prefix}.ffn_gate.weight");
+        let gate_up = if let Some(gate) = gguf.try_linear_weight(&gate_name) {
+            let gate_out = gate.out_features();
             if gate_out != intermediate_size {
                 candle_core::bail!(
                     "GGUF ffn_gate shape mismatch at {prefix}: expected dim0={}, got {}",
@@ -343,21 +344,17 @@ impl FeedForward {
                     up_out
                 );
             }
-            let gate = QLinear::from_arc(gate_qt, dtype)?
-                .with_staged(gguf.staged(&format!("{prefix}.ffn_gate.weight")));
-            let up = QLinear::from_arc(up_qt, dtype)?
-                .with_staged(gguf.staged(&format!("{prefix}.ffn_up.weight")));
+            let gate = QLinear::from_gguf(gate, None, dtype)?;
+            let up = QLinear::from_gguf(up, None, dtype)?;
             GateUpProjection::Separate {
                 gate: AnyLinear::Quantized(gate),
                 up: AnyLinear::Quantized(up),
             }
         } else if up_out == 2 * intermediate_size {
-            let packed = QLinear::from_arc(up_qt, dtype)?
-                .with_staged(gguf.staged(&format!("{prefix}.ffn_up.weight")));
+            let packed = QLinear::from_gguf(up, None, dtype)?;
             GateUpProjection::Packed(AnyLinear::Quantized(packed))
         } else if up_out == intermediate_size {
-            let up = QLinear::from_arc(up_qt, dtype)?
-                .with_staged(gguf.staged(&format!("{prefix}.ffn_up.weight")));
+            let up = QLinear::from_gguf(up, None, dtype)?;
             GateUpProjection::Simple(AnyLinear::Quantized(up))
         } else {
             candle_core::bail!(
@@ -367,8 +364,7 @@ impl FeedForward {
                 2 * intermediate_size
             );
         };
-        let down_proj = QLinear::from_arc(down_qt, dtype)?
-            .with_staged(gguf.staged(&format!("{prefix}.ffn_down.weight")));
+        let down_proj = QLinear::from_gguf(down, None, dtype)?;
 
         Ok(Self {
             gate_up,

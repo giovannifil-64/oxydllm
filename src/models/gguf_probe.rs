@@ -7,8 +7,7 @@
 //! matters because publishers ship "dynamic" builds that mix quantizations per
 //! tensor: unsloth's `UD-*` and AtomicChat's `AD-*` variants of Qwen3.8-27B put
 //! importance-quantization types next to ordinary K-quants, and a single tensor
-//! in a format candle cannot decode rejects the entire file. One of those
-//! builds carries exactly one such tensor out of 866.
+//! in a format the engine cannot decode rejects the entire file.
 //!
 //! [`inspect_header`] parses bytes already in hand; [`probe_remote`] fetches
 //! them over HTTP. Both are best-effort by design: a probe that cannot reach the
@@ -16,41 +15,14 @@
 //! [`HeaderVerdict::Unknown`] so a download proceeds rather than being blocked
 //! by a diagnostic.
 
+use crate::common::gguf_header::type_name;
 use std::collections::BTreeMap;
 
-/// Quantizations candle can decode, mirroring its own `GgmlDType::from_u32`,
-/// which is crate-private. Numbers are the ggml type ids.
-const SUPPORTED_TYPES: &[u32] = &[0, 1, 2, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 30];
-
-/// Names for the ggml type ids; ids absent here are reported numerically.
-const TYPE_NAMES: &[(u32, &str)] = &[
-    (0, "F32"),
-    (1, "F16"),
-    (2, "Q4_0"),
-    (3, "Q4_1"),
-    (6, "Q5_0"),
-    (7, "Q5_1"),
-    (8, "Q8_0"),
-    (9, "Q8_1"),
-    (10, "Q2_K"),
-    (11, "Q3_K"),
-    (12, "Q4_K"),
-    (13, "Q5_K"),
-    (14, "Q6_K"),
-    (15, "Q8_K"),
-    (30, "BF16"),
-    (16, "IQ2_XXS"),
-    (17, "IQ2_XS"),
-    (18, "IQ3_XXS"),
-    (19, "IQ1_S"),
-    (20, "IQ4_NL"),
-    (21, "IQ3_S"),
-    (22, "IQ2_S"),
-    (23, "IQ4_XS"),
-    (29, "IQ1_M"),
-    (34, "TQ1_0"),
-    (35, "TQ2_0"),
-    (39, "MXFP4"),
+/// Quantizations the engine decodes: the ones candle names, and the
+/// importance-quantized ones this crate's own kernels read. Numbers are the
+/// ggml type ids.
+const SUPPORTED_TYPES: &[u32] = &[
+    0, 1, 2, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 20, 21, 23, 30,
 ];
 
 /// What a file holds, tensor by tensor, as the header states it.
@@ -131,19 +103,10 @@ impl HeaderVerdict {
             .join(", ");
         Some(format!(
             "this file stores tensors in quantizations the engine cannot decode: {list}. \
-             These come from the importance-quantization family, which mixed-precision \
-             builds use heavily; the same label from a publisher that quantizes uniformly, \
-             or any variant without a UD, AD or IQ marker in its name, will usually load"
+             The same label from a publisher that quantizes uniformly, or a variant \
+             without a UD, AD or IQ marker in its name, will usually load"
         ))
     }
-}
-
-fn type_name(id: u32) -> String {
-    TYPE_NAMES
-        .iter()
-        .find(|(k, _)| *k == id)
-        .map(|(_, n)| (*n).to_string())
-        .unwrap_or_else(|| format!("type {id}"))
 }
 
 /// A cursor that refuses to read past the bytes it was given, so a truncated
@@ -404,7 +367,7 @@ mod tests {
             ("token_embd.weight".to_string(), 14),
             ("blk.0.attn_q.weight".to_string(), 12),
             ("blk.0.attn_k.weight".to_string(), 12),
-            ("blk.0.ffn_down.weight".to_string(), 23),
+            ("blk.0.ffn_down.weight".to_string(), 16),
             ("output.weight".to_string(), 8),
         ];
         let verdict = inspect_header(&header_named(&tensors));
@@ -414,13 +377,13 @@ mod tests {
             ..
         } = &verdict
         else {
-            panic!("an IQ4_XS tensor must make the file unreadable, got {verdict:?}");
+            panic!("an IQ2_XXS tensor must make the file unreadable, got {verdict:?}");
         };
-        assert_eq!(offenders.get("IQ4_XS"), Some(&1));
+        assert_eq!(offenders.get("IQ2_XXS"), Some(&1));
         assert_eq!(composition.tensors, 5);
         assert_eq!(
             composition.line(),
-            "5 tensors: Q4_K 2, IQ4_XS 1, Q6_K 1, Q8_0 1; token_embd Q6_K; output Q8_0"
+            "5 tensors: Q4_K 2, IQ2_XXS 1, Q6_K 1, Q8_0 1; token_embd Q6_K; output Q8_0"
         );
         let loadable = inspect_header(&header(&[12, 12, 14]));
         assert_eq!(
@@ -496,28 +459,42 @@ mod tests {
     }
 
     /// Contract: one undecodable tensor among many condemns the file, because
-    /// the loader cannot skip it. AtomicChat's AD-Q4_K_M carries exactly one
-    /// IQ4_XS tensor out of 866 and is unusable for that reason alone.
+    /// the loader cannot skip it.
     #[test]
     fn a_single_bad_tensor_is_enough() {
         let mut types = vec![12u32; 40];
-        types.push(23);
+        types.push(16);
         match inspect_header(&header(&types)) {
             HeaderVerdict::Unreadable { offenders, .. } => {
-                assert_eq!(offenders.get("IQ4_XS"), Some(&1));
+                assert_eq!(offenders.get("IQ2_XXS"), Some(&1));
             }
             other => panic!("expected Unreadable, got {other:?}"),
         }
+    }
+
+    /// Contract: the importance-quantized types this crate's kernels decode
+    /// make a file loadable, so a mixed-precision build that uses only them
+    /// beside the K-quants is not turned away. unsloth's UD-Q4_K_M files hold
+    /// exactly these three.
+    #[test]
+    fn the_importance_types_the_engine_decodes_load() {
+        let v = inspect_header(&header(&[23, 20, 21, 12, 14]));
+        assert!(matches!(v, HeaderVerdict::Loadable { .. }), "{v:?}");
+        assert_eq!(
+            v.composition_line().as_deref(),
+            Some("5 tensors: IQ3_S 1, IQ4_NL 1, IQ4_XS 1, Q4_K 1, Q6_K 1")
+        );
+        assert!(v.refusal().is_none());
     }
 
     /// Contract: the refusal names every offending quantization with its count,
     /// so the reader can tell a stray tensor from a wholesale rebuild.
     #[test]
     fn refusal_names_each_offending_type() {
-        let v = inspect_header(&header(&[23, 23, 21, 12]));
+        let v = inspect_header(&header(&[16, 16, 19, 12]));
         let msg = v.refusal().expect("a refusal");
-        assert!(msg.contains("IQ4_XS (2)"), "{msg}");
-        assert!(msg.contains("IQ3_S (1)"), "{msg}");
+        assert!(msg.contains("IQ2_XXS (2)"), "{msg}");
+        assert!(msg.contains("IQ1_S (1)"), "{msg}");
         // The advice must not name the very label the caller asked for: in
         // these repositories "Q4_K_M" is itself the mixed-precision build.
         assert!(!msg.contains("such as Q4_K_M"), "{msg}");

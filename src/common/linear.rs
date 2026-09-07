@@ -3,6 +3,7 @@ use crate::common::awq::PackDim;
 #[cfg(any(feature = "metal", test))]
 use crate::common::awq::{AwqRawTensors, dequantize_awq};
 use crate::common::awq::{QuantWeight, dequantize_quant};
+use crate::common::gguf_weights::LinearWeight;
 use crate::common::weights::apply_scale_inv;
 use candle_core::quantized::{QMatMul, QTensor};
 use candle_core::{DType, Device, Result, Tensor};
@@ -217,28 +218,46 @@ pub fn softmax_last_dim(x: &Tensor) -> Result<Tensor> {
 /// tensor units. An optional `bias` is added and the output is produced in
 /// `out_dtype`.
 pub struct QLinear {
-    inner: QMatMul,
+    inner: GgufMatmul,
     staged: Option<StagedWeight>,
     bias: Option<Tensor>,
     out_dtype: DType,
 }
 
-impl QLinear {
-    pub fn from_arc(qtensor: Arc<QTensor>, out_dtype: DType) -> Result<Self> {
-        Self::from_arc_with_bias(qtensor, None, out_dtype)
-    }
+/// Who multiplies by the weight: candle, or this crate's kernels alone for a
+/// weight candle cannot hold.
+enum GgufMatmul {
+    Candle(QMatMul),
+    Owned(StagedWeight),
+}
 
+impl QLinear {
     pub fn from_arc_with_bias(
         qtensor: Arc<QTensor>,
         bias: Option<Tensor>,
         out_dtype: DType,
     ) -> Result<Self> {
         Ok(Self {
-            inner: QMatMul::from_arc(qtensor)?,
+            inner: GgufMatmul::Candle(QMatMul::from_arc(qtensor)?),
             staged: None,
             bias,
             out_dtype,
         })
+    }
+
+    /// A layer over a weight as the GGUF loader holds it, in either form.
+    pub fn from_gguf(weight: LinearWeight, bias: Option<Tensor>, out_dtype: DType) -> Result<Self> {
+        match weight {
+            LinearWeight::Candle { tensor, staged } => {
+                Ok(Self::from_arc_with_bias(tensor, bias, out_dtype)?.with_staged(staged))
+            }
+            LinearWeight::Owned(w) => Ok(Self {
+                inner: GgufMatmul::Owned(w),
+                staged: None,
+                bias,
+                out_dtype,
+            }),
+        }
     }
 
     /// Attaches the handle the staged GEMM reads this weight through, when the
@@ -252,6 +271,20 @@ impl QLinear {
         let original_dims = x.dims().to_vec();
         let in_features = *original_dims.last().unwrap();
         let batch_flat: usize = original_dims[..original_dims.len() - 1].iter().product();
+
+        let inner = match &self.inner {
+            GgufMatmul::Candle(inner) => inner,
+            GgufMatmul::Owned(w) => {
+                #[cfg(feature = "metal")]
+                {
+                    let x_2d = x.reshape((batch_flat, in_features))?;
+                    let out = super::metal_ops::mpp_owned_matmul(&x_2d, w)?;
+                    return self.finish(out, &original_dims);
+                }
+                #[cfg(not(feature = "metal"))]
+                match *w {}
+            }
+        };
 
         #[cfg(feature = "metal")]
         if let Some(staged) = &self.staged {
@@ -273,7 +306,7 @@ impl QLinear {
         } else {
             x_f32.clone()
         };
-        let out = candle_core::Module::forward(&self.inner, &x_2d)?;
+        let out = candle_core::Module::forward(inner, &x_2d)?;
         self.finish(out, &original_dims)
     }
 
@@ -522,6 +555,87 @@ impl AnyLinear {
 mod tests {
     use super::*;
 
+    /// Contract: a layer over a weight candle cannot hold answers through this
+    /// crate's kernels alone, on a three-dimensional input, in the output
+    /// dtype, with its bias, and agrees with the CPU reference decoder to the
+    /// precision of a BF16 path.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn a_weight_candle_cannot_hold_answers_through_the_engine_s_kernels() {
+        use crate::common::metal_ops::owned_weights::{dense, synthetic};
+        use crate::common::metal_ops::{StagedWeight, WeightKind};
+        let Ok(dev) = Device::new_metal(0) else {
+            return;
+        };
+        let Device::Metal(md) = &dev else {
+            return;
+        };
+        if !crate::common::metal_ops::mpp_gemm_available(md.device()) {
+            return;
+        }
+        let (n, k) = (192usize, 512usize);
+        let kind = WeightKind::Iq4Xs;
+        let bytes = synthetic(kind, n, k, 3);
+        let w = Tensor::from_vec(dense(kind, &bytes, n, k), (n, k), &Device::Cpu).unwrap();
+        let bias: Vec<f32> = (0..n).map(|i| (i % 7) as f32 * 0.1).collect();
+        let bias_t = Tensor::from_vec(bias, n, &Device::Cpu).unwrap();
+        let buffer = md.new_buffer_with_data(&bytes).unwrap();
+        let staged = StagedWeight::of_kind((*buffer).clone(), kind, &[n, k]).unwrap();
+        let layer = QLinear::from_gguf(
+            LinearWeight::Owned(staged),
+            Some(
+                bias_t
+                    .to_device(&dev)
+                    .unwrap()
+                    .to_dtype(DType::BF16)
+                    .unwrap(),
+            ),
+            DType::BF16,
+        )
+        .unwrap();
+
+        for m in [1usize, 9, 200] {
+            let x: Vec<f32> = (0..m * k).map(|i| ((i % 17) as f32 - 8.0) * 0.05).collect();
+            let x_bf = Tensor::from_vec(x, (1, m, k), &Device::Cpu)
+                .unwrap()
+                .to_dtype(DType::BF16)
+                .unwrap();
+            let atteso = x_bf
+                .to_dtype(DType::F32)
+                .unwrap()
+                .reshape((m, k))
+                .unwrap()
+                .matmul(&w.t().unwrap())
+                .unwrap()
+                .broadcast_add(&bias_t)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            let out = layer.forward(&x_bf.to_device(&dev).unwrap()).unwrap();
+            assert_eq!(out.dims(), [1, m, n], "m={m}: shape");
+            assert_eq!(out.dtype(), DType::BF16, "m={m}: dtype");
+            let ottenuto = out
+                .to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            let peak = atteso.iter().fold(0f32, |a, v| a.max(v.abs())).max(1e-6);
+            let worst = atteso
+                .iter()
+                .zip(&ottenuto)
+                .fold(0f32, |a, (x, y)| a.max((x - y).abs()));
+            assert!(
+                worst / peak < 0.02,
+                "m={m}: relative error {}",
+                worst / peak
+            );
+        }
+    }
+
     /// Contract: a quantized linear answers the same with and without the
     /// staged handle, on both sides of the batch-size threshold and on a
     /// three-dimensional input.
@@ -559,8 +673,8 @@ mod tests {
             "a Q4_K weight with whole-block rows is stageable"
         );
         let qt = Arc::new(qt);
-        let plain = QLinear::from_arc(qt.clone(), DType::BF16).unwrap();
-        let routed = QLinear::from_arc(qt, DType::BF16)
+        let plain = QLinear::from_arc_with_bias(qt.clone(), None, DType::BF16).unwrap();
+        let routed = QLinear::from_arc_with_bias(qt, None, DType::BF16)
             .unwrap()
             .with_staged(staged);
 

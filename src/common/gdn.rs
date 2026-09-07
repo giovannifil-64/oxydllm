@@ -499,17 +499,14 @@ impl GatedDeltaNet {
         let conv_dim = 2 * key_dim + value_dim;
 
         let qproj = |name: &str, expect_out: usize| -> Result<AnyLinear> {
-            let qt = gguf.get(&format!("{prefix}.{name}.weight"))?;
-            let got = qt.shape().dims()[0];
+            let w = gguf.linear_weight(&format!("{prefix}.{name}.weight"))?;
+            let got = w.out_features();
             if got != expect_out {
                 candle_core::bail!(
                     "{prefix}.{name}.weight: expected out_features {expect_out}, got {got}"
                 );
             }
-            Ok(AnyLinear::Quantized(
-                QLinear::from_arc(qt, dtype)?
-                    .with_staged(gguf.staged(&format!("{prefix}.{name}.weight"))),
-            ))
+            Ok(AnyLinear::Quantized(QLinear::from_gguf(w, None, dtype)?))
         };
         let in_proj_qkv = qproj("attn_qkv", conv_dim)?;
         let in_proj_z = qproj("attn_gate", value_dim)?;
@@ -517,13 +514,11 @@ impl GatedDeltaNet {
             b: qproj("ssm_beta", la.num_v_heads)?,
             a: qproj("ssm_alpha", la.num_v_heads)?,
         };
-        let out_proj = {
-            let qt = gguf.get(&format!("{prefix}.ssm_out.weight"))?;
-            AnyLinear::Quantized(
-                QLinear::from_arc(qt, dtype)?
-                    .with_staged(gguf.staged(&format!("{prefix}.ssm_out.weight"))),
-            )
-        };
+        let out_proj = AnyLinear::Quantized(QLinear::from_gguf(
+            gguf.linear_weight(&format!("{prefix}.ssm_out.weight"))?,
+            None,
+            dtype,
+        )?);
 
         let conv_raw = gguf
             .get(&format!("{prefix}.ssm_conv1d.weight"))?

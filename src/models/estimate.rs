@@ -1,6 +1,7 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+use crate::common::gguf_header::{GgufHeader, TensorEntry, type_name};
 use anyhow::Result;
 use candle_core::quantized::gguf_file;
 
@@ -91,23 +92,22 @@ fn estimate_local_gguf(gguf_path: &Path, ctx_len: usize, num_seqs: usize) -> Res
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "Unknown".to_string());
 
-    let mut file = std::fs::File::open(gguf_path)
-        .map_err(|e| anyhow::anyhow!("Cannot open {}: {}", gguf_path.display(), e))?;
-    let content = gguf_file::Content::read(&mut file)
-        .map_err(|e| anyhow::anyhow!("Cannot parse GGUF header: {}", e))?;
+    let header = GgufHeader::read(gguf_path)
+        .map_err(|e| anyhow::anyhow!("Cannot parse GGUF header: {e}"))?;
+    let content = &header.content;
 
     let arch =
-        meta_string(&content, "general.architecture").unwrap_or_else(|| "unknown".to_string());
+        meta_string(content, "general.architecture").unwrap_or_else(|| "unknown".to_string());
     let prefix = &arch;
 
     let weights_bytes = std::fs::metadata(gguf_path)?.len() as usize;
 
     let filename = gguf_path.file_name().unwrap_or_default().to_string_lossy();
     let quant_str = extract_quant_from_filename(&filename)
-        .or_else(|| detect_quant_from_content(&content))
+        .or_else(|| detect_quant_from_header(&header))
         .unwrap_or_else(|| "unknown".to_string());
 
-    let geometry = read_geometry_from_content(&content, prefix).ok();
+    let geometry = read_geometry_from_content(content, prefix).ok();
 
     println!();
     println!("  Model    {}", model_name);
@@ -607,34 +607,15 @@ fn is_quant_segment(seg: &str) -> bool {
     }
 }
 
-fn detect_quant_from_content(content: &gguf_file::Content) -> Option<String> {
-    let info = content
-        .tensor_infos
-        .get("blk.0.ffn_down.weight")
-        .or_else(|| content.tensor_infos.get("blk.0.attn_q.weight"))?;
-    Some(ggml_dtype_label(&format!("{:?}", info.ggml_dtype)))
+/// The weight whose type stands for the file's: the first layer's down
+/// projection, or its query projection where there is none.
+fn leading_weight(header: &GgufHeader) -> Option<&TensorEntry> {
+    let find = |name: &str| header.tensors.iter().find(|e| e.name == name);
+    find("blk.0.ffn_down.weight").or_else(|| find("blk.0.attn_q.weight"))
 }
 
-fn ggml_dtype_label(debug: &str) -> String {
-    match debug {
-        "F32" => "F32",
-        "F16" => "F16",
-        "BF16" => "BF16",
-        "Q4_0" => "Q4_0",
-        "Q4_1" => "Q4_1",
-        "Q5_0" => "Q5_0",
-        "Q5_1" => "Q5_1",
-        "Q8_0" => "Q8_0",
-        "Q8_1" => "Q8_1",
-        "Q2K" => "Q2_K",
-        "Q3K" => "Q3_K",
-        "Q4K" => "Q4_K",
-        "Q5K" => "Q5_K",
-        "Q6K" => "Q6_K",
-        "Q8K" => "Q8_K",
-        other => other,
-    }
-    .to_string()
+fn detect_quant_from_header(header: &GgufHeader) -> Option<String> {
+    leading_weight(header).map(|e| type_name(e.type_id))
 }
 
 /// The quality a quantization label typically retains against FP16, as a
@@ -710,28 +691,18 @@ fn best_recommendation(files: &[(String, u64)]) -> Option<&str> {
 /// Approximate expansion factor from GGUF on-disk size to F32 loaded size.
 /// On CPU every tensor is dequantized to F32 at load (Q4_K_M ≈ 7×, Q8_0 ≈ 4×).
 pub fn gguf_cpu_expansion(gguf_path: &Path) -> f64 {
-    let mut file = match std::fs::File::open(gguf_path) {
-        Ok(f) => f,
-        Err(_) => return 7.0,
+    let Ok(header) = GgufHeader::read(gguf_path) else {
+        return 7.0;
     };
-    let content = match gguf_file::Content::read(&mut file) {
-        Ok(c) => c,
-        Err(_) => return 7.0,
-    };
-    let dtype_debug = content
-        .tensor_infos
-        .get("blk.0.ffn_down.weight")
-        .or_else(|| content.tensor_infos.get("blk.0.attn_q.weight"))
-        .map(|info| format!("{:?}", info.ggml_dtype));
-    match dtype_debug.as_deref() {
-        Some("F32") => 1.0,
-        Some("F16") | Some("BF16") => 2.0,
-        Some("Q8_0") | Some("Q8K") => 4.0,
-        Some("Q6K") => 5.0,
-        Some("Q5_0") | Some("Q5_1") | Some("Q5K") => 6.0,
-        Some("Q4_0") | Some("Q4_1") | Some("Q4K") => 7.5,
-        Some("Q3K") => 10.0,
-        Some("Q2K") => 13.0,
+    match leading_weight(&header).map(|e| e.type_id) {
+        Some(0) => 1.0,
+        Some(1 | 30) => 2.0,
+        Some(8 | 15) => 4.0,
+        Some(14) => 5.0,
+        Some(6 | 7 | 13) => 6.0,
+        Some(2 | 3 | 12 | 20 | 23) => 7.5,
+        Some(11 | 21) => 10.0,
+        Some(10) => 13.0,
         _ => 7.0,
     }
 }

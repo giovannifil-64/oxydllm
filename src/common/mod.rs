@@ -62,7 +62,10 @@ pub mod config;
 pub mod expert_stream;
 pub mod ffn;
 pub mod gdn;
+pub mod gguf_header;
 pub mod gguf_weights;
+#[cfg(test)]
+pub mod iq_quant;
 pub mod kv_quant;
 pub mod linear;
 pub mod mask;

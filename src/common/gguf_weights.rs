@@ -8,9 +8,9 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::io::Cursor;
 use std::sync::Arc;
 
+use crate::common::gguf_header::{GgufHeader, TensorEntry, candle_dtype, type_name};
 use crate::common::linear::StagedWeight;
 use anyhow::Context;
 use candle_core::Device;
@@ -26,8 +26,75 @@ use rustc_hash::FxHashMap;
 pub struct GgufWeights {
     tensors: FxHashMap<String, Arc<QTensor>>,
     staged: FxHashMap<String, StagedWeight>,
+    owned: FxHashMap<String, StagedWeight>,
     pub metadata: HashMap<String, gguf_file::Value>,
     _mmaps: Vec<Mmap>,
+}
+
+/// A linear weight as the loader holds it.
+#[derive(Clone, Debug)]
+pub enum LinearWeight {
+    /// Candle's tensor, with the handle the staged GEMM reads it through where
+    /// a kernel of this crate reads that layout.
+    Candle {
+        tensor: Arc<QTensor>,
+        staged: Option<StagedWeight>,
+    },
+    /// A weight in a layout candle has no name for, decoded by this crate's
+    /// kernels alone.
+    Owned(StagedWeight),
+}
+
+impl LinearWeight {
+    /// Rows of the weight: the output features.
+    pub fn out_features(&self) -> usize {
+        self.dims().0
+    }
+
+    /// Columns of the weight: the input features.
+    pub fn in_features(&self) -> usize {
+        self.dims().1
+    }
+
+    fn dims(&self) -> (usize, usize) {
+        match self {
+            Self::Candle { tensor, .. } => {
+                let d = tensor.shape().dims();
+                (d[0], d.get(1).copied().unwrap_or(1))
+            }
+            Self::Owned(w) => owned_dims(w),
+        }
+    }
+
+    /// Bytes an owned weight holds on the device.
+    fn owned_bytes(w: &StagedWeight) -> usize {
+        #[cfg(feature = "metal")]
+        {
+            let (n, k) = w.dims();
+            n * k / w.kind().block_elems() * w.kind().block_bytes()
+        }
+        #[cfg(not(feature = "metal"))]
+        match *w {}
+    }
+}
+
+/// The kind of an owned weight, named.
+fn owned_kind(w: &StagedWeight) -> String {
+    #[cfg(feature = "metal")]
+    {
+        format!("{:?}", w.kind())
+    }
+    #[cfg(not(feature = "metal"))]
+    match *w {}
+}
+
+fn owned_dims(w: &StagedWeight) -> (usize, usize) {
+    #[cfg(feature = "metal")]
+    {
+        w.dims()
+    }
+    #[cfg(not(feature = "metal"))]
+    match *w {}
 }
 
 /// Reads any of GGUF's integer widths as a `u32`.
@@ -60,29 +127,29 @@ impl GgufWeights {
         let mmap = unsafe { Mmap::map(&file) }
             .with_context(|| format!("Failed to mmap GGUF file: {}", path))?;
 
-        let mut cursor = Cursor::new(&mmap[..]);
-        let content = gguf_file::Content::read(&mut cursor)
-            .map_err(|e| anyhow::anyhow!("Failed to parse GGUF header: {}", e))?;
+        let header = GgufHeader::parse(&mmap[..])
+            .map_err(|e| anyhow::anyhow!("Failed to parse GGUF header: {e}"))?;
 
         tracing::info!(
-            tensors = content.tensor_infos.len(),
-            metadata_entries = content.metadata.len(),
+            tensors = header.tensors.len(),
+            metadata_entries = header.content.metadata.len(),
             file_bytes = mmap.len(),
             "GGUF mmap+header parsed"
         );
 
-        let (tensors, staged) = parallelise_tensor_load(
+        let (tensors, staged, owned) = parallelise_tensor_load(
             &file,
             mmap.len(),
-            content.tensor_data_offset,
-            &content.tensor_infos,
+            header.content.tensor_data_offset,
+            &header.tensors,
             device,
         )?;
 
         Ok(Self {
             tensors,
             staged,
-            metadata: content.metadata,
+            owned,
+            metadata: header.content.metadata,
             _mmaps: vec![mmap],
         })
     }
@@ -92,10 +159,37 @@ impl GgufWeights {
     /// ## Errors
     /// Fails if no tensor with that name exists.
     pub fn get(&self, name: &str) -> candle_core::Result<Arc<QTensor>> {
-        self.tensors
-            .get(name)
-            .cloned()
+        self.tensors.get(name).cloned().ok_or_else(|| {
+            candle_core::Error::Msg(match self.owned.get(name) {
+                Some(w) => format!(
+                    "GGUF tensor {name} is {}, which this engine decodes only as a linear weight",
+                    owned_kind(w)
+                ),
+                None => format!("GGUF tensor not found: {}", name),
+            })
+        })
+    }
+
+    /// Returns the tensor named `name` as a linear weight, in whichever form
+    /// the loader holds it.
+    ///
+    /// ## Errors
+    /// Fails if no tensor with that name exists.
+    pub fn linear_weight(&self, name: &str) -> candle_core::Result<LinearWeight> {
+        self.try_linear_weight(name)
             .ok_or_else(|| candle_core::Error::Msg(format!("GGUF tensor not found: {}", name)))
+    }
+
+    /// Returns the tensor named `name` as a linear weight, or `None` if it is
+    /// absent.
+    pub fn try_linear_weight(&self, name: &str) -> Option<LinearWeight> {
+        if let Some(tensor) = self.tensors.get(name) {
+            return Some(LinearWeight::Candle {
+                tensor: tensor.clone(),
+                staged: self.staged.get(name).cloned(),
+            });
+        }
+        self.owned.get(name).cloned().map(LinearWeight::Owned)
     }
 
     /// Returns the tensor named `name`, or `None` if it is absent.
@@ -103,18 +197,19 @@ impl GgufWeights {
         self.tensors.get(name).cloned()
     }
 
-    /// Returns the handle the staged GEMM reads the tensor named `name`
-    /// through, or `None` where no kernel of this crate reads that layout.
-    pub fn staged(&self, name: &str) -> Option<StagedWeight> {
-        self.staged.get(name).cloned()
-    }
-
     /// Total on-device size of all loaded tensors, in bytes.
     pub fn total_size_bytes(&self) -> usize {
-        self.tensors
+        let candle: usize = self
+            .tensors
             .values()
             .map(|qt| qt.storage_size_in_bytes())
-            .sum()
+            .sum();
+        candle
+            + self
+                .owned
+                .values()
+                .map(LinearWeight::owned_bytes)
+                .sum::<usize>()
     }
 
     /// Reads metadata `key` as a `u32`.
@@ -202,6 +297,7 @@ impl GgufWeights {
         }
         let mut tensors = FxHashMap::default();
         let mut staged = FxHashMap::default();
+        let mut owned = FxHashMap::default();
         let mut metadata = HashMap::new();
         let mut mmaps = Vec::with_capacity(paths.len());
         let total_shards = paths.len();
@@ -211,37 +307,37 @@ impl GgufWeights {
                 .with_context(|| format!("Failed to open GGUF shard: {}", path))?;
             let mmap = unsafe { Mmap::map(&file) }
                 .with_context(|| format!("Failed to mmap GGUF shard: {}", path))?;
-            let mut cursor = Cursor::new(&mmap[..]);
-            let content = gguf_file::Content::read(&mut cursor)
-                .map_err(|e| anyhow::anyhow!("Failed to parse GGUF shard '{}': {}", path, e))?;
+            let header = GgufHeader::parse(&mmap[..])
+                .map_err(|e| anyhow::anyhow!("Failed to parse GGUF shard '{}': {e}", path))?;
             if shard_idx == 0 {
-                metadata = content.metadata.clone();
+                metadata = header.content.metadata.clone();
                 tracing::info!(
                     shard = shard_idx + 1,
                     total_shards,
-                    tensors = content.tensor_infos.len(),
-                    metadata_entries = content.metadata.len(),
+                    tensors = header.tensors.len(),
+                    metadata_entries = header.content.metadata.len(),
                     "GGUF shard mmap+header parsed"
                 );
             } else {
                 tracing::info!(
                     shard = shard_idx + 1,
                     total_shards,
-                    tensors = content.tensor_infos.len(),
+                    tensors = header.tensors.len(),
                     "GGUF shard mmap+header parsed"
                 );
             }
-            total_tensors += content.tensor_infos.len();
-            let (shard_tensors, shard_staged) = parallelise_tensor_load(
+            total_tensors += header.tensors.len();
+            let (shard_tensors, shard_staged, shard_owned) = parallelise_tensor_load(
                 &file,
                 mmap.len(),
-                content.tensor_data_offset,
-                &content.tensor_infos,
+                header.content.tensor_data_offset,
+                &header.tensors,
                 device,
             )
             .with_context(|| format!("Failed to load tensors from shard '{}'", path))?;
             tensors.extend(shard_tensors);
             staged.extend(shard_staged);
+            owned.extend(shard_owned);
             mmaps.push(mmap);
         }
         tracing::info!(
@@ -252,6 +348,7 @@ impl GgufWeights {
         Ok(Self {
             tensors,
             staged,
+            owned,
             metadata,
             _mmaps: mmaps,
         })
@@ -303,28 +400,43 @@ impl GgufWeights {
 /// Fails if the tensor is not 2-D, its row count is not `n_heads * head_dim`
 /// with an even `head_dim`, or the rebuilt tensor cannot be constructed.
 pub fn depermute_qk_rows(
-    qt: &QTensor,
+    weight: &LinearWeight,
     n_heads: usize,
     head_dim: usize,
     device: &Device,
-) -> candle_core::Result<(QTensor, Option<StagedWeight>)> {
-    let dims = qt.shape().dims().to_vec();
-    if dims.len() != 2 || dims[0] != n_heads * head_dim || !head_dim.is_multiple_of(2) {
+) -> candle_core::Result<LinearWeight> {
+    let (rows, k) = match weight {
+        LinearWeight::Candle { tensor, .. } => {
+            let dims = tensor.shape().dims();
+            if dims.len() != 2 {
+                candle_core::bail!("depermute_qk_rows: shape {dims:?} is not a matrix");
+            }
+            (dims[0], dims[1])
+        }
+        LinearWeight::Owned(w) => owned_dims(w),
+    };
+    if rows != n_heads * head_dim || !head_dim.is_multiple_of(2) {
         candle_core::bail!(
-            "depermute_qk_rows: shape {dims:?} incompatible with {n_heads} heads x {head_dim} dims"
+            "depermute_qk_rows: shape [{rows}, {k}] incompatible with {n_heads} heads x {head_dim} dims"
         );
     }
-    let k = dims[1];
-    let dtype = qt.dtype();
-    if !k.is_multiple_of(dtype.block_size()) {
-        candle_core::bail!(
-            "depermute_qk_rows: row length {k} not divisible by {:?} block size {}",
-            dtype,
-            dtype.block_size()
-        );
-    }
-    let row_bytes = k / dtype.block_size() * dtype.type_size();
-    let data = qt.data()?;
+    let (data, row_bytes) = match weight {
+        LinearWeight::Candle { tensor, .. } => {
+            let dtype = tensor.dtype();
+            if !k.is_multiple_of(dtype.block_size()) {
+                candle_core::bail!(
+                    "depermute_qk_rows: row length {k} not divisible by {:?} block size {}",
+                    dtype,
+                    dtype.block_size()
+                );
+            }
+            (
+                tensor.data()?.into_owned(),
+                k / dtype.block_size() * dtype.type_size(),
+            )
+        }
+        LinearWeight::Owned(w) => owned_rows(w, k)?,
+    };
     let mut out = vec![0u8; data.len()];
     let half = head_dim / 2;
     for h in 0..n_heads {
@@ -336,7 +448,57 @@ pub fn depermute_qk_rows(
                 .copy_from_slice(&data[src * row_bytes..(src + 1) * row_bytes]);
         }
     }
-    qtensor_with_staged(dtype, &out, dims, device)
+    match weight {
+        LinearWeight::Candle { tensor, .. } => {
+            let (qt, staged) = qtensor_with_staged(tensor.dtype(), &out, vec![rows, k], device)?;
+            Ok(LinearWeight::Candle {
+                tensor: Arc::new(qt),
+                staged,
+            })
+        }
+        LinearWeight::Owned(w) => owned_from_rows(w, &out, rows, k, device),
+    }
+}
+
+/// The bytes of an owned weight and the length of one of its rows.
+fn owned_rows(w: &StagedWeight, k: usize) -> candle_core::Result<(Vec<u8>, usize)> {
+    #[cfg(feature = "metal")]
+    {
+        Ok((
+            w.bytes(),
+            k / w.kind().block_elems() * w.kind().block_bytes(),
+        ))
+    }
+    #[cfg(not(feature = "metal"))]
+    {
+        let _ = k;
+        match *w {}
+    }
+}
+
+/// An owned weight of the same kind as `like` over `bytes`.
+fn owned_from_rows(
+    like: &StagedWeight,
+    bytes: &[u8],
+    rows: usize,
+    k: usize,
+    device: &Device,
+) -> candle_core::Result<LinearWeight> {
+    #[cfg(feature = "metal")]
+    {
+        let Device::Metal(md) = device else {
+            candle_core::bail!("an owned weight lives on Metal");
+        };
+        let buffer = md.new_buffer_with_data(bytes)?;
+        StagedWeight::of_kind((*buffer).clone(), like.kind(), &[rows, k])
+            .map(LinearWeight::Owned)
+            .ok_or_else(|| candle_core::Error::Msg("owned weight rows are not whole blocks".into()))
+    }
+    #[cfg(not(feature = "metal"))]
+    {
+        let _ = (bytes, rows, k, device);
+        match *like {}
+    }
 }
 
 /// Builds a `QTensor` from GGUF block bytes and, where a kernel of this crate
@@ -378,43 +540,60 @@ pub fn qtensor_with_staged(
     Ok((QTensor::new(storage, dims)?, staged))
 }
 
-/// Builds every tensor from the mmap in parallel (rayon), keyed by name, and
-/// beside them the staged handles of the tensors that have one.
+/// Builds every tensor from the file in parallel (rayon), keyed by name: the
+/// tensors candle holds, beside them the staged handles of those a kernel of
+/// this crate reads in place, and apart the weights only this crate decodes.
 #[allow(clippy::type_complexity)]
 fn parallelise_tensor_load(
     file: &std::fs::File,
     file_len: usize,
     data_offset: u64,
-    tensor_infos: &HashMap<String, gguf_file::TensorInfo>,
+    entries: &[TensorEntry],
     device: &Device,
 ) -> anyhow::Result<(
     FxHashMap<String, Arc<QTensor>>,
     FxHashMap<String, StagedWeight>,
+    FxHashMap<String, StagedWeight>,
 )> {
-    let mut infos: Vec<(&String, &gguf_file::TensorInfo)> = tensor_infos.iter().collect();
-    infos.sort_unstable_by_key(|(_, info)| info.offset);
-    let built: anyhow::Result<Vec<(String, Arc<QTensor>, Option<StagedWeight>)>> = infos
+    let mut infos: Vec<&TensorEntry> = entries.iter().collect();
+    infos.sort_unstable_by_key(|e| e.offset);
+    let built: anyhow::Result<Vec<(String, Built)>> = infos
         .par_iter()
-        .map(|(name, info)| {
-            let (qt, staged) = build_qtensor(file, file_len, data_offset, info, device)
-                .with_context(|| format!("Failed to load GGUF tensor '{}'", name))?;
-            Ok(((*name).clone(), Arc::new(qt), staged))
+        .map(|entry| {
+            let built = build_tensor(file, file_len, data_offset, entry, device)
+                .with_context(|| format!("Failed to load GGUF tensor '{}'", entry.name))?;
+            Ok((entry.name.clone(), built))
         })
         .collect();
     let built = built?;
     let mut tensors = FxHashMap::with_capacity_and_hasher(built.len(), Default::default());
     let mut staged = FxHashMap::default();
-    for (name, qt, handle) in built {
-        if let Some(handle) = handle {
-            staged.insert(name.clone(), handle);
+    let mut owned = FxHashMap::default();
+    for (name, b) in built {
+        match b {
+            Built::Candle(qt, handle) => {
+                if let Some(handle) = handle {
+                    staged.insert(name.clone(), handle);
+                }
+                tensors.insert(name, Arc::new(qt));
+            }
+            Built::Owned(w) => {
+                owned.insert(name, w);
+            }
         }
-        tensors.insert(name, qt);
     }
-    Ok((tensors, staged))
+    Ok((tensors, staged, owned))
 }
 
-/// Builds one `QTensor` by reading its bytes from the file, validating the
-/// element count against the block size and that the range lies within it.
+/// One tensor as the loader built it.
+enum Built {
+    Candle(QTensor, Option<StagedWeight>),
+    #[cfg_attr(not(feature = "metal"), allow(dead_code))]
+    Owned(StagedWeight),
+}
+
+/// Reads `size_in_bytes` of one tensor from the file, checking the range lies
+/// within it.
 ///
 /// The bytes are read rather than taken from the map on purpose. Reading is what
 /// the device does well: a plain sequential read of a 7 GB checkpoint takes a
@@ -422,24 +601,14 @@ fn parallelise_tensor_load(
 /// lock the Metal allocation needs, took seven. Reading also keeps the page
 /// cache out of it, which matters because materialising the tensors allocates
 /// as much memory again and would evict whatever the file had warmed.
-fn build_qtensor(
+fn read_tensor_bytes(
     file: &std::fs::File,
     file_len: usize,
     data_offset: u64,
-    info: &gguf_file::TensorInfo,
-    device: &Device,
-) -> anyhow::Result<(QTensor, Option<StagedWeight>)> {
-    let tensor_elems = info.shape.elem_count();
-    let block_size = info.ggml_dtype.block_size();
-    if !tensor_elems.is_multiple_of(block_size) {
-        anyhow::bail!(
-            "tensor elements {} not divisible by block size {}",
-            tensor_elems,
-            block_size
-        );
-    }
-    let size_in_bytes = tensor_elems / block_size * info.ggml_dtype.type_size();
-    let start = (data_offset + info.offset) as usize;
+    entry: &TensorEntry,
+    size_in_bytes: usize,
+) -> anyhow::Result<Vec<u8>> {
+    let start = (data_offset + entry.offset) as usize;
     let end = start
         .checked_add(size_in_bytes)
         .ok_or_else(|| anyhow::anyhow!("tensor offset overflow"))?;
@@ -452,19 +621,101 @@ fn build_qtensor(
         );
     }
     let mut bytes = vec![0u8; size_in_bytes];
-    {
-        use std::os::unix::fs::FileExt;
-        file.read_exact_at(&mut bytes, start as u64)
-            .with_context(|| format!("reading tensor bytes at {start}"))?;
+    use std::os::unix::fs::FileExt;
+    file.read_exact_at(&mut bytes, start as u64)
+        .with_context(|| format!("reading tensor bytes at {start}"))?;
+    Ok(bytes)
+}
+
+/// Builds one tensor: candle's `QTensor` for a type candle names, validating
+/// the element count against the block size, or an owned weight for a type
+/// only this crate decodes.
+fn build_tensor(
+    file: &std::fs::File,
+    file_len: usize,
+    data_offset: u64,
+    entry: &TensorEntry,
+    device: &Device,
+) -> anyhow::Result<Built> {
+    let tensor_elems: usize = entry.dims.iter().product();
+    if let Some(dtype) = candle_dtype(entry.type_id) {
+        let block_size = dtype.block_size();
+        if !tensor_elems.is_multiple_of(block_size) {
+            anyhow::bail!(
+                "tensor elements {} not divisible by block size {}",
+                tensor_elems,
+                block_size
+            );
+        }
+        let size_in_bytes = tensor_elems / block_size * dtype.type_size();
+        let bytes = read_tensor_bytes(file, file_len, data_offset, entry, size_in_bytes)?;
+        // Serialize Metal storage creation across the rayon workers: candle
+        // 0.11's residency-set registration is not thread-safe (see
+        // `weights::metal_alloc_lock`).
+        let _guard = device
+            .is_metal()
+            .then(|| crate::common::weights::metal_alloc_lock().lock().unwrap());
+        let (qt, staged) = qtensor_with_staged(dtype, &bytes, entry.dims.clone(), device)
+            .map_err(|e| anyhow::anyhow!("building the tensor failed: {}", e))?;
+        return Ok(Built::Candle(qt, staged));
     }
-    // Serialize Metal storage creation across the rayon workers: candle
-    // 0.11's residency-set registration is not thread-safe (see
-    // `weights::metal_alloc_lock`).
-    let _guard = device
-        .is_metal()
-        .then(|| crate::common::weights::metal_alloc_lock().lock().unwrap());
-    qtensor_with_staged(info.ggml_dtype, &bytes, info.shape.dims().to_vec(), device)
-        .map_err(|e| anyhow::anyhow!("building the tensor failed: {}", e))
+    build_owned(file, file_len, data_offset, entry, device)
+}
+
+/// Builds a weight in a type candle has no name for, which this crate's
+/// kernels decode on Metal as a two-dimensional linear weight.
+#[cfg(feature = "metal")]
+fn build_owned(
+    file: &std::fs::File,
+    file_len: usize,
+    data_offset: u64,
+    entry: &TensorEntry,
+    device: &Device,
+) -> anyhow::Result<Built> {
+    use crate::common::metal_ops::WeightKind;
+    let name = type_name(entry.type_id);
+    let Some(kind) = WeightKind::from_ggml_id_iq(entry.type_id) else {
+        anyhow::bail!("tensor type {name} is one this engine does not decode");
+    };
+    let Device::Metal(md) = device else {
+        anyhow::bail!("{name} weights are decoded on Metal only");
+    };
+    if !crate::common::metal_ops::mpp_gemm_available(md.device()) {
+        anyhow::bail!("{name} weights need the TensorOps library, which this GPU does not have");
+    }
+    let [n, k] = entry.dims[..] else {
+        anyhow::bail!(
+            "tensor is {name} with shape {:?}; this engine decodes {name} only as a matrix",
+            entry.dims
+        );
+    };
+    if !k.is_multiple_of(kind.block_elems()) {
+        anyhow::bail!(
+            "row length {k} not divisible by {name} block size {}",
+            kind.block_elems()
+        );
+    }
+    let size_in_bytes = n * k / kind.block_elems() * kind.block_bytes();
+    let bytes = read_tensor_bytes(file, file_len, data_offset, entry, size_in_bytes)?;
+    let _guard = crate::common::weights::metal_alloc_lock().lock().unwrap();
+    let buffer = md.new_buffer_with_data(&bytes)?;
+    StagedWeight::of_kind((*buffer).clone(), kind, &[n, k])
+        .map(Built::Owned)
+        .ok_or_else(|| anyhow::anyhow!("{name} weight rows are not whole blocks"))
+}
+
+#[cfg(not(feature = "metal"))]
+fn build_owned(
+    _file: &std::fs::File,
+    _file_len: usize,
+    _data_offset: u64,
+    entry: &TensorEntry,
+    _device: &Device,
+) -> anyhow::Result<Built> {
+    anyhow::bail!(
+        "tensor type {} is decoded on Metal only",
+        type_name(entry.type_id)
+    )
 }
 
 #[cfg(test)]
@@ -499,7 +750,16 @@ mod tests {
         let permuted_t = Tensor::from_vec(permuted, (n, k), &dev).unwrap();
         let qt = QTensor::quantize(&permuted_t, GgmlDType::F32).unwrap();
 
-        let (restored, _) = depermute_qk_rows(&qt, n_heads, head_dim, &dev).unwrap();
+        let interleaved = LinearWeight::Candle {
+            tensor: Arc::new(qt),
+            staged: None,
+        };
+        let LinearWeight::Candle {
+            tensor: restored, ..
+        } = depermute_qk_rows(&interleaved, n_heads, head_dim, &dev).unwrap()
+        else {
+            panic!("a candle weight comes back as one");
+        };
         let restored_t = restored.dequantize(&dev).unwrap();
 
         let a = restored_t.flatten_all().unwrap().to_vec1::<f32>().unwrap();
@@ -578,7 +838,54 @@ mod tests {
     fn depermute_qk_rows_rejects_bad_geometry() {
         let dev = Device::Cpu;
         let t = Tensor::zeros((16, 32), candle_core::DType::F32, &dev).unwrap();
-        let qt = QTensor::quantize(&t, GgmlDType::F32).unwrap();
+        let qt = LinearWeight::Candle {
+            tensor: Arc::new(QTensor::quantize(&t, GgmlDType::F32).unwrap()),
+            staged: None,
+        };
         assert!(depermute_qk_rows(&qt, 3, 8, &dev).is_err());
+    }
+
+    /// Contract: a file holding a weight in a type candle cannot name loads on
+    /// Metal, hands that weight out as a linear weight of the stated shape and
+    /// refuses it as a tensor by naming its kind; off Metal it says so.
+    #[test]
+    fn a_weight_candle_cannot_name_loads_as_a_linear_weight() {
+        let (n, k) = (64usize, 512usize);
+        let dims: [u64; 2] = [k as u64, n as u64];
+        let tensors: [(&str, &[u64], u32); 2] = [
+            ("blk.0.ffn_down.weight", &dims, 23),
+            ("output_norm.weight", &[8], 0),
+        ];
+        let kv = [(
+            "general.architecture",
+            gguf_file::Value::String("qwen3".into()),
+        )];
+        let weight_bytes = n * k / 256 * 136;
+        let mut data: Vec<u8> = (0..weight_bytes).map(|i| (i * 7 % 251) as u8).collect();
+        data.extend_from_slice(&[0u8; 32]);
+        let file = crate::common::gguf_header::tests::gguf_bytes(&kv, &tensors, &data);
+        let path = std::env::temp_dir().join(format!("oxydllm-iq-{}.gguf", std::process::id()));
+        std::fs::write(&path, &file).unwrap();
+        let path_str = path.to_string_lossy().into_owned();
+
+        let cpu = GgufWeights::load(&path_str, &Device::Cpu);
+        let msg = match cpu {
+            Ok(_) => String::from("loaded"),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(msg.contains("Metal only"), "{msg}");
+
+        #[cfg(feature = "metal")]
+        if let Ok(dev) = Device::new_metal(0) {
+            let w = GgufWeights::load(&path_str, &dev).unwrap();
+            let weight = w.linear_weight("blk.0.ffn_down.weight").unwrap();
+            assert!(matches!(weight, LinearWeight::Owned(_)), "{weight:?}");
+            assert_eq!((weight.out_features(), weight.in_features()), (n, k));
+            let err = w.get("blk.0.ffn_down.weight").unwrap_err().to_string();
+            assert!(err.contains("Iq4Xs"), "{err}");
+            assert_eq!(w.total_size_bytes(), weight_bytes + 32);
+            assert!(w.get("output_norm.weight").is_ok());
+        }
+        std::fs::remove_file(&path).ok();
     }
 }

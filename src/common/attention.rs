@@ -454,7 +454,8 @@ impl Attention {
                 None => Ok(None),
             }
         };
-        let qkv = if let Some(qkv_qt) = gguf.try_get(&format!("{prefix}.attn_qkv.weight")) {
+        let qkv = if let Some(qkv_w) = gguf.try_linear_weight(&format!("{prefix}.attn_qkv.weight"))
+        {
             // Known gated GGUF archs (qwen35) ship separate q/k/v on full
             // layers; a fused-qkv gated checkpoint would need its own q split
             // and would mis-validate below, fail loudly instead.
@@ -466,7 +467,7 @@ impl Attention {
             let q_dim = cfg.n_heads * hd;
             let kv_dim = cfg.n_kv_heads * hd;
             let expected = q_dim + 2 * kv_dim;
-            let got = qkv_qt.shape().dims()[0];
+            let got = qkv_w.out_features();
             if got != expected {
                 candle_core::bail!(
                     "GGUF attn_qkv shape mismatch at {}: expected dim0={}, got {}",
@@ -476,41 +477,30 @@ impl Attention {
                 );
             }
             let qkv_bias = load_bias(&format!("{prefix}.attn_qkv.bias"))?;
-            QkvProjection::Fused(AnyLinear::Quantized(
-                QLinear::from_arc_with_bias(qkv_qt, qkv_bias, dtype)?
-                    .with_staged(gguf.staged(&format!("{prefix}.attn_qkv.weight"))),
-            ))
+            QkvProjection::Fused(AnyLinear::Quantized(QLinear::from_gguf(
+                qkv_w, qkv_bias, dtype,
+            )?))
         } else {
             let v_bias = load_bias(&format!("{prefix}.attn_v.bias"))?;
             // Llama-family GGUFs store q/k rows interleaved for llama.cpp's
             // paired RoPE; restore the HF layout our split-half RoPE expects.
             let restore = |name: String, heads: usize| -> Result<QLinear> {
                 let bias = load_bias(&format!("{name}.bias"))?;
-                let weight = format!("{name}.weight");
-                let (qt, staged) = if cfg.gguf_qk_permuted {
-                    let interleaved = gguf.get(&weight)?;
-                    let (qt, staged) = crate::common::gguf_weights::depermute_qk_rows(
-                        &interleaved,
-                        heads,
-                        hd,
-                        device,
-                    )?;
-                    (std::sync::Arc::new(qt), staged)
+                let weight = gguf.linear_weight(&format!("{name}.weight"))?;
+                let weight = if cfg.gguf_qk_permuted {
+                    crate::common::gguf_weights::depermute_qk_rows(&weight, heads, hd, device)?
                 } else {
-                    (gguf.get(&weight)?, gguf.staged(&weight))
+                    weight
                 };
-                Ok(QLinear::from_arc_with_bias(qt, bias, dtype)?.with_staged(staged))
+                QLinear::from_gguf(weight, bias, dtype)
             };
             let q_proj = restore(format!("{prefix}.attn_q"), cfg.n_heads)?;
             let k_proj = restore(format!("{prefix}.attn_k"), cfg.n_kv_heads)?;
             // A missing value projection is not a broken file: Gemma 4's global
             // layers publish none, because the value is the key there.
             let v_name = format!("{prefix}.attn_v.weight");
-            let v_proj = match gguf.try_get(&v_name) {
-                Some(qt) => Some(AnyLinear::Quantized(
-                    QLinear::from_arc_with_bias(qt, v_bias, dtype)?
-                        .with_staged(gguf.staged(&v_name)),
-                )),
+            let v_proj = match gguf.try_linear_weight(&v_name) {
+                Some(w) => Some(AnyLinear::Quantized(QLinear::from_gguf(w, v_bias, dtype)?)),
                 None => None,
             };
             QkvProjection::Separate {
@@ -521,8 +511,7 @@ impl Attention {
         };
         let o_bias = load_bias(&format!("{prefix}.attn_output.bias"))?;
         let o_name = format!("{prefix}.attn_output.weight");
-        let o_proj = QLinear::from_arc_with_bias(gguf.get(&o_name)?, o_bias, dtype)?
-            .with_staged(gguf.staged(&o_name));
+        let o_proj = QLinear::from_gguf(gguf.linear_weight(&o_name)?, o_bias, dtype)?;
 
         let q_norm = if cfg.qk_norm {
             let qt = gguf.get(&format!("{prefix}.attn_q_norm.weight"))?;

@@ -292,7 +292,7 @@ fn gguf_model_id_keys(model_id: &str) -> Vec<&str> {
 ///
 /// Fails when the directory holds several variants and none matches,
 /// listing the available ids.
-fn select_gguf_paths(
+pub(crate) fn select_gguf_paths(
     dir: &Path,
     model_id: &str,
     all_gguf_paths: Vec<PathBuf>,

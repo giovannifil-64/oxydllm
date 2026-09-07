@@ -18,7 +18,7 @@ pub fn run_estimate(args: &EstimateArgs) -> Result<()> {
     let local_path = resolve_local_path(&args.model, &args.models_dir);
 
     if let Some(path) = local_path {
-        estimate_local(&path, args.context_len, args.num_sequences)
+        estimate_local(&path, &args.model, args.context_len, args.num_sequences)
     } else if args.model.contains('/') {
         estimate_remote(
             &args.model,
@@ -46,8 +46,8 @@ fn resolve_local_path(model: &str, models_dir: &Path) -> Option<PathBuf> {
     crate::models::loader::resolve_model_path(models_dir, model)
 }
 
-fn estimate_local(dir: &Path, ctx_len: usize, num_seqs: usize) -> Result<()> {
-    if let Some(gguf_path) = crate::models::loader::find_gguf_file(dir) {
+fn estimate_local(dir: &Path, model_id: &str, ctx_len: usize, num_seqs: usize) -> Result<()> {
+    if let Some(gguf_path) = gguf_file_for(dir, model_id)? {
         return estimate_local_gguf(&gguf_path, ctx_len, num_seqs);
     }
     let has_st = std::fs::read_dir(dir)?.any(|e| {
@@ -64,6 +64,24 @@ fn estimate_local(dir: &Path, ctx_len: usize, num_seqs: usize) -> Result<()> {
         return estimate_local_safetensors(dir, ctx_len, num_seqs);
     }
     anyhow::bail!("No GGUF or safetensors files found in {}", dir.display())
+}
+
+/// The GGUF file `model_id` names inside `dir`, chosen the way the server
+/// chooses it, so an estimate describes the variant that would load. A folder
+/// holding several variants used to answer for whichever file came first:
+/// asked about a Q5_K_M, the estimate reported the Q4_K_M beside it.
+///
+/// ## Errors
+/// Fails when the folder holds several variants and none matches the id.
+fn gguf_file_for(dir: &Path, model_id: &str) -> Result<Option<PathBuf>> {
+    let Some(all) = crate::models::loader::find_gguf_files(dir) else {
+        return Ok(None);
+    };
+    if all.is_empty() {
+        return Ok(None);
+    }
+    let chosen = crate::models::loader::select_gguf_paths(dir, model_id, all)?;
+    Ok(chosen.into_iter().next())
 }
 
 fn estimate_local_gguf(gguf_path: &Path, ctx_len: usize, num_seqs: usize) -> Result<()> {
@@ -851,6 +869,28 @@ mod tests {
     /// Contract: a label with a publisher's suffix shows its base's figure as
     /// a floor, a plain label shows its own, and a label nobody can place
     /// stays a question mark.
+    /// Contract: an estimate of a variant inside a folder of several
+    /// describes that variant's file, not the first file in the folder.
+    #[test]
+    fn an_estimate_names_the_variant_it_was_asked_about() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in [
+            "Qwen3-4B-Q4_K_M.gguf",
+            "Qwen3-4B-Q5_K_M.gguf",
+            "Qwen3-4B-Q6_K.gguf",
+        ] {
+            std::fs::write(dir.path().join(name), b"").unwrap();
+        }
+        let chosen = gguf_file_for(dir.path(), "Qwen/Qwen3-4B-Q5_K_M")
+            .unwrap()
+            .expect("a matching variant");
+        assert_eq!(chosen.file_name().unwrap(), "Qwen3-4B-Q5_K_M.gguf");
+        assert!(
+            gguf_file_for(dir.path(), "Qwen/Qwen3-4B-Q8_0").is_err(),
+            "a variant the folder does not hold is an error, not the first file"
+        );
+    }
+
     #[test]
     fn a_suffixed_label_shows_the_floor_of_its_base() {
         assert_eq!(quant_accuracy_str("Q4_K_M"), "~98.5%");

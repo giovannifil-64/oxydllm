@@ -964,6 +964,231 @@ inline void mpp_fa_impl(
     }
 }
 
+// A head too wide for one pass: the output accumulator of a 32-query block at
+// 512 wide is 64 KB of registers per simdgroup and the V tile 32 KB of
+// threadgroup memory, twice what either can take. So the block is 16 queries,
+// the head is walked in two halves of 256, and the two halves of the output
+// accumulate side by side: the scores need the whole width and are summed
+// over the halves, Q is staged once since every key block multiplies it, and
+// K and V are read at half width where they lie through strided views. The
+// key block is 128 wide, which measured best of 64, 128 and 256 on the shape
+// of Gemma 4's global layers, the reason this exists: 512 wide, one sixth of
+// the layers, and until now on the path that materialises every score, which
+// this beats by 3.3x there.
+template<int D, int BR, int BC>
+inline void mpp_fa_wide_impl(
+    device bfloat* q,
+    device bfloat* k,
+    device bfloat* v,
+    device bfloat* o,
+    constant MppFaParams& p,
+    threadgroup float* tg_m,
+    threadgroup float* tg_l,
+    threadgroup float* tg_a,
+    threadgroup float* tg_r,
+    threadgroup bfloat* tg_p,
+    threadgroup bfloat* tg_q,
+    uint2 tgid,
+    uint lane)
+{
+    constexpr int DC = D / 2;
+    constexpr auto desc_s = matmul2d_descriptor(
+        BR, BC, DC, false, true, false, matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<desc_s, execution_simdgroup> op_s;
+    constexpr auto desc_o = matmul2d_descriptor(
+        BR, DC, BC, false, false, false, matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<desc_o, execution_simdgroup> op_o;
+
+    int q0 = int(tgid.x) * BR;
+    if (q0 >= p.t_q) {
+        return;
+    }
+    int br = min(BR, p.t_q - q0);
+    int bh = int(tgid.y);
+    int b = bh / p.h;
+    int hh = bh % p.h;
+    int hkv = hh / (p.h / p.h_kv);
+
+    device bfloat* qp = q + ((size_t(b) * p.h + hh) * p.t_q + q0) * D;
+    size_t kv_stride = size_t(p.kv_head_stride);
+    device bfloat* kb = k + (size_t(b) * p.h_kv + hkv) * kv_stride;
+    device bfloat* vb = v + (size_t(b) * p.h_kv + hkv) * kv_stride;
+
+    // Q is read once into threadgroup memory: every key block multiplies it.
+    for (uint i = lane; i < uint(BR * D); i += 32u) {
+        uint row = i / uint(D);
+        tg_q[i] = (int(row) < br) ? qp[i] : bfloat(0.0f);
+    }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    auto tQ0 = tensor(tg_q, dextents<int, 2>{DC, br}, array<int, 2>{1, D});
+    auto tQ1 = tensor(tg_q + DC, dextents<int, 2>{DC, br}, array<int, 2>{1, D});
+    auto tP = tensor(tg_p, dextents<int, 2>{BC, BR}, array<int, 2>{1, BC});
+    auto tVshape = tensor(vb, dextents<int, 2>{DC, BC}, array<int, 2>{1, D});
+
+    auto sT = op_s.template get_destination_cooperative_tensor<decltype(tQ0), decltype(tQ0), float>();
+    auto oT0 = op_o.template get_destination_cooperative_tensor<decltype(tP), decltype(tVshape), float>();
+    auto oT1 = op_o.template get_destination_cooperative_tensor<decltype(tP), decltype(tVshape), float>();
+#pragma clang loop unroll(full)
+    for (uint16_t i = 0; i < oT0.get_capacity(); ++i) {
+        if (oT0.is_valid_element(i)) {
+            oT0[i] = 0.0f;
+            oT1[i] = 0.0f;
+        }
+    }
+    for (uint r = lane; r < uint(BR); r += 32u) {
+        tg_m[r] = -INFINITY;
+        tg_l[r] = 0.0f;
+    }
+
+    int kv_max = min(p.t_kv, p.prefix_len + q0 + br);
+    int kv_min = 0;
+    if (p.window > 0) {
+        int oldest = p.prefix_len + q0 - p.window + 1;
+        if (oldest > 0) {
+            kv_min = (oldest / BC) * BC;
+        }
+    }
+    for (int kv0 = kv_min; kv0 < kv_max; kv0 += BC) {
+        int bc = min(BC, p.t_kv - kv0);
+
+#pragma clang loop unroll(full)
+        for (uint16_t i = 0; i < sT.get_capacity(); ++i) {
+            if (sT.is_valid_element(i)) {
+                sT[i] = 0.0f;
+            }
+        }
+        auto tK0 = tensor(kb + size_t(kv0) * D, dextents<int, 2>{DC, bc}, array<int, 2>{1, D});
+        auto tK1 = tensor(kb + size_t(kv0) * D + DC, dextents<int, 2>{DC, bc}, array<int, 2>{1, D});
+        op_s.run(tQ0, tK0, sT);
+        op_s.run(tQ1, tK1, sT);
+
+#pragma clang loop unroll(full)
+        for (uint16_t i = 0; i < sT.get_capacity(); ++i) {
+            if (sT.is_valid_element(i)) {
+                auto idx = sT.get_multidimensional_index(i);
+                int n = int(idx[0]);
+                int m = int(idx[1]);
+                float val = sT[i] * p.scale;
+                int q_pos = p.prefix_len + q0 + m;
+                int kv_pos = kv0 + n;
+                // A key past the end of the cache is not a key: its column
+                // of P must be zero, since V is read at that extent and not
+                // zero-filled beyond it.
+                if (n >= bc || kv_pos > q_pos || (p.window > 0 && q_pos >= kv_pos + p.window)) {
+                    val = -INFINITY;
+                }
+                sT[i] = val;
+            }
+        }
+
+        auto rT = op_s.template get_row_reduction_destination_cooperative_tensor<
+            decltype(tQ0), decltype(tQ0), float>();
+        reduce_rows(sT, rT, reduction_operation::max,
+                    reduction_operation_identity<float>::max_identity);
+#pragma clang loop unroll(full)
+        for (uint16_t i = 0; i < rT.get_capacity(); ++i) {
+            if (rT.is_valid_element(i)) {
+                auto idx = rT.get_multidimensional_index(i);
+                tg_r[idx[0]] = rT[i];
+            }
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint r = lane; r < uint(BR); r += 32u) {
+            float m_new = max(tg_m[r], tg_r[r]);
+            tg_a[r] = (tg_m[r] == -INFINITY) ? 0.0f : exp(tg_m[r] - m_new);
+            tg_m[r] = m_new;
+        }
+        for (uint i = lane; i < uint(BR * BC); i += 32u) {
+            tg_p[i] = bfloat(0.0f);
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+
+#pragma clang loop unroll(full)
+        for (uint16_t i = 0; i < sT.get_capacity(); ++i) {
+            if (sT.is_valid_element(i)) {
+                auto idx = sT.get_multidimensional_index(i);
+                int n = int(idx[0]);
+                int m = int(idx[1]);
+                float pv = (sT[i] == -INFINITY) ? 0.0f : exp(sT[i] - tg_m[m]);
+                sT[i] = pv;
+                tg_p[m * BC + n] = bfloat(pv);
+            }
+        }
+
+        auto rsT = op_s.template get_row_reduction_destination_cooperative_tensor<
+            decltype(tQ0), decltype(tQ0), float>();
+        reduce_rows(sT, rsT, reduction_operation::sum, 0.0f);
+#pragma clang loop unroll(full)
+        for (uint16_t i = 0; i < rsT.get_capacity(); ++i) {
+            if (rsT.is_valid_element(i)) {
+                auto idx = rsT.get_multidimensional_index(i);
+                tg_r[idx[0]] = rsT[i];
+            }
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint r = lane; r < uint(BR); r += 32u) {
+            tg_l[r] = tg_l[r] * tg_a[r] + tg_r[r];
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+
+#pragma clang loop unroll(full)
+        for (uint16_t i = 0; i < oT0.get_capacity(); ++i) {
+            if (oT0.is_valid_element(i)) {
+                auto idx = oT0.get_multidimensional_index(i);
+                oT0[i] *= tg_a[idx[1]];
+                oT1[i] *= tg_a[idx[1]];
+            }
+        }
+        // V is read where it lies, a half at a time, through the same kind
+        // of strided view K is: staging it would copy the whole head's V
+        // through threadgroup memory once per query block.
+        auto tV0 = tensor(vb + size_t(kv0) * D, dextents<int, 2>{DC, bc}, array<int, 2>{1, D});
+        auto tV1 = tensor(vb + size_t(kv0) * D + DC, dextents<int, 2>{DC, bc}, array<int, 2>{1, D});
+        op_o.run(tP, tV0, oT0);
+        op_o.run(tP, tV1, oT1);
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+#pragma clang loop unroll(full)
+    for (uint16_t i = 0; i < oT0.get_capacity(); ++i) {
+        if (oT0.is_valid_element(i)) {
+            auto idx = oT0.get_multidimensional_index(i);
+            int dd = int(idx[0]);
+            int m = int(idx[1]);
+            if (m < br) {
+                float denom = tg_l[m];
+                float inv = (denom > 0.0f) ? 1.0f / denom : 0.0f;
+                size_t at = ((size_t(b) * p.h + hh) * p.t_q + q0 + m) * D + dd;
+                o[at] = bfloat(oT0[i] * inv);
+                o[at + DC] = bfloat(oT1[i] * inv);
+            }
+        }
+    }
+}
+
+#define MPP_FA_WIDE_KERNEL(NAME, D, BR, BC)                                    \
+kernel void NAME(                                                              \
+    device bfloat* q [[buffer(0)]],                                            \
+    device bfloat* k [[buffer(1)]],                                            \
+    device bfloat* v [[buffer(2)]],                                            \
+    device bfloat* o [[buffer(3)]],                                            \
+    constant MppFaParams& p [[buffer(4)]],                                     \
+    uint2 tgid [[threadgroup_position_in_grid]],                               \
+    uint lane [[thread_index_in_threadgroup]])                                 \
+{                                                                              \
+    threadgroup float tg_m[BR];                                                \
+    threadgroup float tg_l[BR];                                                \
+    threadgroup float tg_a[BR];                                                \
+    threadgroup float tg_r[BR];                                                \
+    threadgroup bfloat tg_p[BR * BC];                                          \
+    threadgroup bfloat tg_q[BR * D];                                           \
+    mpp_fa_wide_impl<D, BR, BC>(q, k, v, o, p, tg_m, tg_l, tg_a, tg_r, tg_p, tg_q, tgid, lane); \
+}
+
+MPP_FA_WIDE_KERNEL(mpp_fa_bf16_d512, 512, 16, 128)
+
 #define MPP_FA_KERNEL(NAME, D)                                                 \
 kernel void NAME(                                                              \
     device bfloat* q [[buffer(0)]],                                            \

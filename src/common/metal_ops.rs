@@ -1485,7 +1485,7 @@ pub fn flash_attention_metal_prefill(
     let head_dim = q.dim(D::Minus1)?;
     if q.dtype() == DType::BF16
         && softcap.unwrap_or(0.0) == 0.0
-        && matches!(head_dim, 64 | 128 | 256)
+        && matches!(head_dim, 64 | 128 | 256 | 512)
         && let candle_core::Device::Metal(md) = q.device()
         && mpp_gemm_available(md.device())
     {
@@ -3301,8 +3301,14 @@ impl CustomOp3 for MppFlashAttn {
             64 => "mpp_fa_bf16_d64",
             128 => "mpp_fa_bf16_d128",
             256 => "mpp_fa_bf16_d256",
+            512 => "mpp_fa_bf16_d512",
             other => candle_core::bail!("MppFlashAttn: unsupported head_dim {other}"),
         };
+        // The wide head runs 16 queries per block so its two output halves fit
+        // the registers a simdgroup has; must match the `BR` of the kernels.
+        // Measured on the global layers' shape at 32 queries the two
+        // accumulators spill and the block takes twenty times longer.
+        let queries_per_block = if d == 512 { 16 } else { 32 };
 
         let device = q.device();
         let elem_count = b * h * t_q * d;
@@ -3330,7 +3336,7 @@ impl CustomOp3 for MppFlashAttn {
 
         encoder.dispatch_thread_groups(
             MTLSize {
-                width: t_q.div_ceil(32),
+                width: t_q.div_ceil(queries_per_block),
                 height: b * h,
                 depth: 1,
             },
@@ -7100,6 +7106,98 @@ mod quantized_matmul_floor {
                 );
             }
         }
+    }
+
+    /// The global layers of Gemma 4 at the shape a prompt gives them: sixteen
+    /// query heads over one key-value head of 512, a chunk of 1024 queries on
+    /// top of a prefix, through the fused kernel and through the path the
+    /// model took before it existed, scores materialised and softmaxed.
+    #[test]
+    #[ignore = "perf probe (requires macOS 26 / Metal 4)"]
+    fn wide_head_attention_probe() {
+        use std::time::Instant;
+        let Ok(dev) = Device::new_metal(0) else {
+            return;
+        };
+        let (h, h_kv, d, t_q, prefix) = (16usize, 1usize, 512usize, 1024usize, 634usize);
+        let t_kv = t_q + prefix;
+        let mk = |dims: (usize, usize, usize, usize), salt: usize| -> Tensor {
+            let n = dims.0 * dims.1 * dims.2 * dims.3;
+            let v: Vec<f32> = (0..n)
+                .map(|i| (((i + salt) % 19) as f32 - 9.0) * 0.05)
+                .collect();
+            Tensor::from_vec(v, dims, &dev)
+                .unwrap()
+                .to_dtype(candle_core::DType::BF16)
+                .unwrap()
+        };
+        let q = mk((1, h, t_q, d), 1);
+        let k = mk((1, h_kv, t_kv, d), 7);
+        let v = mk((1, h_kv, t_kv, d), 13);
+        let scale = 1.0 / (d as f32).sqrt();
+        let time = |f: &dyn Fn() -> Tensor| -> f64 {
+            for _ in 0..3 {
+                f().to_device(&Device::Cpu).unwrap();
+            }
+            let iters = 10;
+            let t = Instant::now();
+            let mut sink = Vec::with_capacity(iters);
+            for _ in 0..iters {
+                sink.push(f());
+            }
+            sink.last().unwrap().to_device(&Device::Cpu).unwrap();
+            t.elapsed().as_secs_f64() / iters as f64
+        };
+        let fused = || {
+            crate::common::metal_ops::flash_attention_metal_prefill(
+                &q, &k, &v, scale, None, prefix, 0,
+            )
+            .unwrap()
+        };
+        let naive = || {
+            let kx = k.repeat((1, h, 1, 1)).unwrap();
+            let vx = v.repeat((1, h, 1, 1)).unwrap();
+            let s = (q
+                .matmul(&kx.transpose(2, 3).unwrap().contiguous().unwrap())
+                .unwrap()
+                * scale as f64)
+                .unwrap();
+            let mask = crate::common::mask::causal_mask_prefixed(t_q, t_kv, &dev)
+                .unwrap()
+                .to_dtype(s.dtype())
+                .unwrap();
+            let s = s.broadcast_add(&mask).unwrap();
+            let p = crate::common::linear::softmax_last_dim(&s).unwrap();
+            p.matmul(&vx).unwrap()
+        };
+        let a = fused()
+            .to_dtype(candle_core::DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let b = naive()
+            .to_dtype(candle_core::DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let peak = b.iter().fold(0f32, |m, x| m.max(x.abs())).max(1e-6);
+        let worst = a
+            .iter()
+            .zip(&b)
+            .fold(0f32, |m, (x, y)| m.max((x - y).abs()));
+        let t_f = time(&fused);
+        let t_n = time(&naive);
+        println!(
+            "testa 512, h={h} h_kv={h_kv} t_q={t_q} prefix={prefix}: fuso {:7.2} ms | percorso generico {:7.2} ms | {:.2}x | scarto relativo {:.4}",
+            t_f * 1e3,
+            t_n * 1e3,
+            t_n / t_f,
+            worst / peak
+        );
     }
 
     /// Contract: the quantized matmul this crate leans on stays fast enough to

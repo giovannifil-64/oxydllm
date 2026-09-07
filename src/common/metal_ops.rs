@@ -1527,7 +1527,9 @@ pub fn flash_attention_metal_available(head_dim: usize, dtype: DType, _window: u
     fa_tile_sizes(head_dim, dtype.size_in_bytes()).is_some()
 }
 
-/// Whether this head width reaches the hardware simdgroup path.
+/// Whether this head width reaches a hardware matrix path on `device`: the
+/// tensor-unit kernels where the device has them and the width is one they
+/// serve, else the simdgroup kernel where its query tile stays whole.
 ///
 /// A width wide enough to force a query tile shorter than eight rows falls back
 /// to the portable kernel inside, and the two are not interchangeable: measured
@@ -1535,8 +1537,22 @@ pub fn flash_attention_metal_available(head_dim: usize, dtype: DType, _window: u
 /// portable kernel against 10 ms through the naive path, while the same width
 /// at one token takes 2 ms against 9 ms. So the portable kernel is worth having
 /// for decode and worth avoiding for prefill, and callers need to know which
-/// one they would get.
-pub fn flash_attention_uses_hardware_path(head_dim: usize, dtype: DType) -> bool {
+/// one they would get. The tensor-unit path is asked first because it is what
+/// [`flash_attention_metal_prefill`] tries first: a 512-wide head reaches it in
+/// BF16 on an M5, and asking the simdgroup kernel alone said no and kept Gemma
+/// 4's global layers on the naive path while a kernel built for them sat idle.
+pub fn flash_attention_uses_hardware_path(
+    head_dim: usize,
+    dtype: DType,
+    device: &candle_core::Device,
+) -> bool {
+    if dtype == DType::BF16
+        && matches!(head_dim, 64 | 128 | 256 | 512)
+        && let candle_core::Device::Metal(md) = device
+        && mpp_gemm_available(md.device())
+    {
+        return true;
+    }
     matches!(fa_tile_sizes(head_dim, dtype.size_in_bytes()), Some((br, bc)) if br >= 8 && bc >= 8)
 }
 
@@ -4216,6 +4232,30 @@ mod fused_kernel_parity_tests {
                 "d={d} len={len} window={window}: the view and its copy must agree"
             );
         }
+    }
+
+    /// Contract: a 512-wide head in BF16 is reported as reaching a hardware
+    /// path wherever the tensor-unit kernels are available, since one was
+    /// built for it; the simdgroup kernel alone cannot tile that width whole,
+    /// and reporting from it alone kept the wide layers on the naive path.
+    #[test]
+    fn a_wide_head_reaches_the_hardware_path_where_the_tensor_units_are() {
+        let Some(dev) = metal_device_or_skip() else {
+            return;
+        };
+        let candle_core::Device::Metal(md) = &dev else {
+            return;
+        };
+        if !mpp_gemm_available(md.device()) {
+            eprintln!("TensorOps library unavailable on this GPU, skipping");
+            return;
+        }
+        assert!(flash_attention_uses_hardware_path(512, DType::BF16, &dev));
+        assert!(flash_attention_uses_hardware_path(256, DType::BF16, &dev));
+        assert!(
+            !flash_attention_uses_hardware_path(512, DType::F32, &dev),
+            "F32 has no tensor-unit kernel and no whole tile at 512"
+        );
     }
 
     /// Contract: a window at least as wide as the sequence masks exactly what no

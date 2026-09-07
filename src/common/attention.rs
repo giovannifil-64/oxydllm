@@ -821,7 +821,11 @@ impl Attention {
             let use_metal_fa = metal_fa_base_ok
                 && self.sinks.is_none()
                 && if seg.num_tokens > 1 {
-                    super::metal_ops::flash_attention_uses_hardware_path(self.head_dim, q.dtype())
+                    super::metal_ops::flash_attention_uses_hardware_path(
+                        self.head_dim,
+                        q.dtype(),
+                        device,
+                    )
                 } else {
                     !sdpa_base_ok
                 }

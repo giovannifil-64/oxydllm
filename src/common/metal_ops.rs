@@ -6727,12 +6727,17 @@ mod quantized_matmul_floor {
     use candle_core::quantized::{GgmlDType, QMatMul, QTensor};
     use candle_core::{Device, Module, Tensor};
 
-    /// Contract: the staged TensorOps GEMM reads a GGUF Q4_K or Q6_K weight
-    /// through the buffer candle keeps it in and answers what candle's
-    /// quantized matmul answers from that same buffer.
+    /// Contract: the staged TensorOps GEMM reads a GGUF weight of any block
+    /// type through the buffer candle keeps it in and answers what candle
+    /// answers from that same buffer, by two independent routes.
     ///
+    /// The first reference is candle's quantized matmul, which unpacks the
+    /// blocks in its own kernel; the second is candle's dequantisation to F32
+    /// followed by a dense matmul, which shares no code with the first. A
+    /// stager that misread a bit would have to agree with both by accident.
     /// The weight is built the way the loader builds it, so one buffer has two
-    /// readers, and the shapes leave partial tiles at both edges.
+    /// readers, and the shapes leave partial tiles at both edges and a batch
+    /// taller than the tile.
     #[test]
     fn the_staged_gemm_matches_candle_on_a_shared_buffer() {
         let Ok(dev) = Device::new_metal(0) else {
@@ -6785,6 +6790,13 @@ mod quantized_matmul_floor {
             let x32 = Tensor::from_vec(x, (m, k), &dev).unwrap();
             let x_bf = x32.to_dtype(candle_core::DType::BF16).unwrap();
 
+            let dense: Vec<f32> = x32
+                .matmul(&qt.dequantize(&dev).unwrap().t().unwrap())
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
             let atteso: Vec<f32> = QMatMul::from_arc(std::sync::Arc::new(qt))
                 .unwrap()
                 .forward(&x32)
@@ -6819,6 +6831,20 @@ mod quantized_matmul_floor {
                 worst / peak < 0.02,
                 "{dtype:?} {n}x{k} m={m}: relative error {} against candle",
                 worst / peak
+            );
+            let worst_dense = ottenuto
+                .iter()
+                .zip(dense.iter())
+                .fold(0f32, |a: f32, (&x, &y): (&f32, &f32)| a.max((x - y).abs()));
+            assert!(
+                worst_dense / peak < 0.02,
+                "{dtype:?} {n}x{k} m={m}: relative error {} against the dequantised weight",
+                worst_dense / peak
+            );
+            eprintln!(
+                "parity {dtype:?} {n}x{k} m={m}: {:.5} vs qmatmul, {:.5} vs dequantised",
+                worst / peak,
+                worst_dense / peak
             );
         }
     }
@@ -7011,7 +7037,18 @@ mod quantized_matmul_floor {
             return;
         };
         let m = 1024usize;
-        for dtype in [GgmlDType::Q4K, GgmlDType::Q6K] {
+        for dtype in [
+            GgmlDType::Q4_0,
+            GgmlDType::Q4_1,
+            GgmlDType::Q5_0,
+            GgmlDType::Q5_1,
+            GgmlDType::Q8_0,
+            GgmlDType::Q2K,
+            GgmlDType::Q3K,
+            GgmlDType::Q4K,
+            GgmlDType::Q5K,
+            GgmlDType::Q6K,
+        ] {
             for (label, n, k) in [
                 ("ffn gate/up", 15360usize, 3840usize),
                 ("ffn down", 3840, 15360),

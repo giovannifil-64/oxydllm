@@ -244,38 +244,72 @@ inline uint le_word(device const uint8_t* b) {
     return uint(b[0]) | (uint(b[1]) << 8) | (uint(b[2]) << 16) | (uint(b[3]) << 24);
 }
 
+inline uchar4 ld4u(device const uint8_t* p) {
+    return uchar4(*(device const packed_uchar4*)p);
+}
+
+inline char4 ld4s(device const int8_t* p) {
+    return char4(*(device const packed_char4*)p);
+}
+
 // Each `dequant32` writes the weights `j0 .. j0 + limit` of one block to
-// `out[i * stride]`, which is one column of the staged tile.
+// `out[i * stride]`, which is one column of the staged tile. The bytes come in
+// four at a time through packed loads, which take any address: several of
+// these blocks are 18, 22, 34 or 110 bytes long, so a four-byte load at a
+// block boundary is unaligned every other block. A block of 32 is one span,
+// so `j0` is zero for those and the span is the block.
 inline void dequant32(device const block_q4_0* blk, uint j0, threadgroup bfloat* out, uint stride, uint limit) {
     const float d = float(blk->d);
-    for (uint i = 0; i < limit; ++i) {
-        const uint j = j0 + i;
-        const uint byte = uint(blk->qs[j % 16u]);
-        const uint q = j < 16u ? (byte & 0xFu) : (byte >> 4);
-        out[i * stride] = bfloat(d * (float(q) - 8.0f));
+    for (uint c = 0; c < 4u; ++c) {
+        const uchar4 b = ld4u(blk->qs + 4u * c);
+        for (uint i = 0; i < 4u; ++i) {
+            const uint lo = 4u * c + i;
+            const uint hi = lo + 16u;
+            if (lo < limit) {
+                out[lo * stride] = bfloat(d * (float(b[i] & 0xFu) - 8.0f));
+            }
+            if (hi < limit) {
+                out[hi * stride] = bfloat(d * (float(b[i] >> 4) - 8.0f));
+            }
+        }
     }
 }
 
 inline void dequant32(device const block_q4_1* blk, uint j0, threadgroup bfloat* out, uint stride, uint limit) {
     const float d = float(blk->d);
     const float m = float(blk->m);
-    for (uint i = 0; i < limit; ++i) {
-        const uint j = j0 + i;
-        const uint byte = uint(blk->qs[j % 16u]);
-        const uint q = j < 16u ? (byte & 0xFu) : (byte >> 4);
-        out[i * stride] = bfloat(d * float(q) + m);
+    for (uint c = 0; c < 4u; ++c) {
+        const uchar4 b = ld4u(blk->qs + 4u * c);
+        for (uint i = 0; i < 4u; ++i) {
+            const uint lo = 4u * c + i;
+            const uint hi = lo + 16u;
+            if (lo < limit) {
+                out[lo * stride] = bfloat(d * float(b[i] & 0xFu) + m);
+            }
+            if (hi < limit) {
+                out[hi * stride] = bfloat(d * float(b[i] >> 4) + m);
+            }
+        }
     }
 }
 
 inline void dequant32(device const block_q5_0* blk, uint j0, threadgroup bfloat* out, uint stride, uint limit) {
     const float d = float(blk->d);
     const uint qh = le_word(blk->qh);
-    for (uint i = 0; i < limit; ++i) {
-        const uint j = j0 + i;
-        const uint byte = uint(blk->qs[j % 16u]);
-        const uint nib = j < 16u ? (byte & 0xFu) : (byte >> 4);
-        const uint q = nib | (((qh >> j) & 1u) << 4);
-        out[i * stride] = bfloat(d * (float(q) - 16.0f));
+    for (uint c = 0; c < 4u; ++c) {
+        const uchar4 b = ld4u(blk->qs + 4u * c);
+        for (uint i = 0; i < 4u; ++i) {
+            const uint lo = 4u * c + i;
+            const uint hi = lo + 16u;
+            if (lo < limit) {
+                const uint q = (b[i] & 0xFu) | (((qh >> lo) & 1u) << 4);
+                out[lo * stride] = bfloat(d * (float(q) - 16.0f));
+            }
+            if (hi < limit) {
+                const uint q = (b[i] >> 4) | (((qh >> hi) & 1u) << 4);
+                out[hi * stride] = bfloat(d * (float(q) - 16.0f));
+            }
+        }
     }
 }
 
@@ -283,19 +317,33 @@ inline void dequant32(device const block_q5_1* blk, uint j0, threadgroup bfloat*
     const float d = float(blk->d);
     const float m = float(blk->m);
     const uint qh = le_word(blk->qh);
-    for (uint i = 0; i < limit; ++i) {
-        const uint j = j0 + i;
-        const uint byte = uint(blk->qs[j % 16u]);
-        const uint nib = j < 16u ? (byte & 0xFu) : (byte >> 4);
-        const uint q = nib | (((qh >> j) & 1u) << 4);
-        out[i * stride] = bfloat(d * float(q) + m);
+    for (uint c = 0; c < 4u; ++c) {
+        const uchar4 b = ld4u(blk->qs + 4u * c);
+        for (uint i = 0; i < 4u; ++i) {
+            const uint lo = 4u * c + i;
+            const uint hi = lo + 16u;
+            if (lo < limit) {
+                const uint q = (b[i] & 0xFu) | (((qh >> lo) & 1u) << 4);
+                out[lo * stride] = bfloat(d * float(q) + m);
+            }
+            if (hi < limit) {
+                const uint q = (b[i] >> 4) | (((qh >> hi) & 1u) << 4);
+                out[hi * stride] = bfloat(d * float(q) + m);
+            }
+        }
     }
 }
 
 inline void dequant32(device const block_q8_0* blk, uint j0, threadgroup bfloat* out, uint stride, uint limit) {
     const float d = float(blk->d);
-    for (uint i = 0; i < limit; ++i) {
-        out[i * stride] = bfloat(d * float(blk->qs[j0 + i]));
+    for (uint c = 0; c < 8u; ++c) {
+        const char4 b = ld4s(blk->qs + 4u * c);
+        for (uint i = 0; i < 4u; ++i) {
+            const uint e = 4u * c + i;
+            if (e < limit) {
+                out[e * stride] = bfloat(d * float(b[i]));
+            }
+        }
     }
 }
 
@@ -308,12 +356,24 @@ inline void dequant32(device const block_q2_K* blk, uint j0, threadgroup bfloat*
     const uint h = j0 / 128u;
     const uint jj = (j0 % 128u) / 32u;
     const uint shift = 2u * jj;
+    const uint sc0 = uint(blk->scales[h * 8u + 2u * jj]);
+    const uint sc1 = uint(blk->scales[h * 8u + 2u * jj + 1u]);
+    const float dl0 = d * float(sc0 & 0xFu);
+    const float ml0 = dmin * float(sc0 >> 4);
+    const float dl1 = d * float(sc1 & 0xFu);
+    const float ml1 = dmin * float(sc1 >> 4);
     device const uint8_t* q = blk->qs + h * 32u;
-    for (uint i = 0; i < limit; ++i) {
-        const uint sc = uint(blk->scales[h * 8u + 2u * jj + i / 16u]);
-        const float dl = d * float(sc & 0xFu);
-        const float ml = dmin * float(sc >> 4);
-        out[i * stride] = bfloat(dl * float((uint(q[i]) >> shift) & 3u) - ml);
+    for (uint c = 0; c < 8u; ++c) {
+        const uchar4 b = ld4u(q + 4u * c);
+        const bool first = c < 4u;
+        const float dl = first ? dl0 : dl1;
+        const float ml = first ? ml0 : ml1;
+        for (uint i = 0; i < 4u; ++i) {
+            const uint e = 4u * c + i;
+            if (e < limit) {
+                out[e * stride] = bfloat(dl * float((b[i] >> shift) & 3u) - ml);
+            }
+        }
     }
 }
 
@@ -336,13 +396,22 @@ inline void dequant32(device const block_q3_K* blk, uint j0, threadgroup bfloat*
     const uint jj = (j0 % 128u) / 32u;
     const uint shift = 2u * jj;
     const uint m = 1u << (h * 4u + jj);
+    const uint is0 = h * 8u + 2u * jj;
+    const float s0 = d * float(int((aux[is0 / 4u] >> (8u * (is0 % 4u))) & 0xFFu) - 32);
+    const float s1 = d * float(int((aux[(is0 + 1u) / 4u] >> (8u * ((is0 + 1u) % 4u))) & 0xFFu) - 32);
     device const uint8_t* q = blk->qs + h * 32u;
-    for (uint i = 0; i < limit; ++i) {
-        const uint is = h * 8u + 2u * jj + i / 16u;
-        const int scale = int((aux[is / 4u] >> (8u * (is % 4u))) & 0xFFu) - 32;
-        const int low = int((uint(q[i]) >> shift) & 3u);
-        const int val = low - ((uint(blk->hmask[i]) & m) ? 0 : 4);
-        out[i * stride] = bfloat(d * float(scale) * float(val));
+    for (uint c = 0; c < 8u; ++c) {
+        const uchar4 b = ld4u(q + 4u * c);
+        const uchar4 hm = ld4u(blk->hmask + 4u * c);
+        const float sc = c < 4u ? s0 : s1;
+        for (uint i = 0; i < 4u; ++i) {
+            const uint e = 4u * c + i;
+            if (e < limit) {
+                const int low = int((b[i] >> shift) & 3u);
+                const int val = low - ((hm[i] & m) ? 0 : 4);
+                out[e * stride] = bfloat(sc * float(val));
+            }
+        }
     }
 }
 
@@ -356,12 +425,18 @@ inline void dequant32(device const block_q5_K* blk, uint j0, threadgroup bfloat*
     const float dl = float(blk->d) * sc;
     const float ml = float(blk->dmin) * mn;
     const uint u = 1u << (2u * g + half_);
+    const uint shift = half_ * 4u;
     device const uint8_t* ql = blk->qs + g * 32u;
-    for (uint i = 0; i < limit; ++i) {
-        const uint byte = uint(ql[i]);
-        const uint nib = half_ ? (byte >> 4) : (byte & 0xFu);
-        const uint q = nib + ((uint(blk->qh[i]) & u) ? 16u : 0u);
-        out[i * stride] = bfloat(dl * float(q) - ml);
+    for (uint c = 0; c < 8u; ++c) {
+        const uchar4 b = ld4u(ql + 4u * c);
+        const uchar4 hq = ld4u(blk->qh + 4u * c);
+        for (uint i = 0; i < 4u; ++i) {
+            const uint e = 4u * c + i;
+            if (e < limit) {
+                const uint q = ((b[i] >> shift) & 0xFu) + ((hq[i] & u) ? 16u : 0u);
+                out[e * stride] = bfloat(dl * float(q) - ml);
+            }
+        }
     }
 }
 

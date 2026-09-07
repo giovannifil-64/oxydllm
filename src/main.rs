@@ -144,7 +144,7 @@ Commands:
   list                         List all locally available models
   start                        Start the HTTP inference server
   run       <model-name>       Interactive chat in terminal
-  estimate <model>             Estimate memory footprint and accuracy
+  estimate <model>             Estimate memory footprint and typical quality
 
 Download options (pull):
   --models-dir <DIR>           Destination directory (default: ~/.oxydllm/models/)

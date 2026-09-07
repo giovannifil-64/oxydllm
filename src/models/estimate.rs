@@ -135,7 +135,7 @@ fn estimate_local_safetensors(dir: &Path, ctx_len: usize, num_seqs: usize) -> Re
             (
                 weights_bytes * 2,
                 "FP8 (E4M3, block-scaled) safetensors  (Metal: dequantized to BF16 at load, 2× file size; streamed experts stay F8)".to_string(),
-                "Accuracy ~lossless  (FP8 weights, near-bf16 quality)",
+                "Quality ~lossless  (FP8 weights, near-bf16 quality)",
             )
         } else if is_packed_int_method(&qi.method)
             && let Some(expansion) = awq_qweight_expansion(qi.bits.unwrap_or(4))
@@ -166,26 +166,26 @@ fn estimate_local_safetensors(dir: &Path, ctx_len: usize, num_seqs: usize) -> Re
             (
                 runtime_bytes,
                 label,
-                "Accuracy ~lossy  (AWQ-calibrated 4-bit weights, near-fp16 quality)",
+                "Quality ~lossy  (AWQ-calibrated 4-bit weights, near-fp16 quality)",
             )
         } else {
             (
                 weights_bytes,
                 format!("{} safetensors  (unsupported variant)", qi.method),
-                "Accuracy unknown",
+                "Quality unknown",
             )
         }
     } else if is_fp8 {
         (
             weights_bytes * 2,
             format!("{dtype_str} safetensors  (Metal: dequantized to BF16 at load, 2× file size)"),
-            "Accuracy 100%  (full-precision weights)",
+            "Quality 100%  (full-precision weights)",
         )
     } else {
         (
             weights_bytes,
             format!("{dtype_str} safetensors"),
-            "Accuracy 100%  (full-precision weights)",
+            "Quality 100%  (full-precision weights)",
         )
     };
 
@@ -281,7 +281,7 @@ fn estimate_remote(
         println!();
         let kv_header = format!("  {:>9}", "KV cache");
         println!(
-            "  {:<26}  {:>9}{kv_header}  {:>10}  Accuracy",
+            "  {:<26}  {:>9}{kv_header}  {:>10}  Quality",
             "Format", "Weights", "Total"
         );
         println!("  {}", "─".repeat(72));
@@ -541,7 +541,10 @@ fn print_weights_kv_total(
 
 fn print_accuracy_line(quant: &str) {
     if let Some((pct, desc)) = quant_accuracy(quant) {
-        println!("  Accuracy {}  ({})", pct, desc);
+        println!(
+            "  Quality {}  ({}; typical for the label, not measured on this model)",
+            pct, desc
+        );
     }
     println!();
 }
@@ -616,6 +619,16 @@ fn ggml_dtype_label(debug: &str) -> String {
     .to_string()
 }
 
+/// The quality a quantization label typically retains against FP16, as a
+/// rule of thumb, with a phrase for the estimate report.
+///
+/// This is a lookup by label, not a measurement: nothing here reads the file or
+/// runs the model. It ranks the families reasonably and says nothing reliable
+/// about a given checkpoint, since a small model loses far more at two bits
+/// than a large one, and since publishers do not agree on what a label holds:
+/// unsloth's "Q4_K_M" of a 27B keeps three quarters of its tensors in IQ4_XS.
+/// The header of the chosen variant is what says what a file holds, and
+/// [`crate::models::gguf_probe`] reads it before a download.
 fn quant_accuracy(quant: &str) -> Option<(&'static str, &'static str)> {
     match quant.to_uppercase().as_str() {
         "IQ1_S" | "IQ1_M" => Some(("~92%", "extremely aggressive, strong degradation")),
@@ -639,8 +652,24 @@ fn quant_accuracy(quant: &str) -> Option<(&'static str, &'static str)> {
     }
 }
 
-pub fn quant_accuracy_str(quant: &str) -> &'static str {
-    quant_accuracy(quant).map(|(pct, _)| pct).unwrap_or("?")
+/// The typical quality of `quant`, or of its base label with a floor marker
+/// when the label carries a suffix the table does not list.
+///
+/// Publishers append `_L`, `_XL` and the like to a base quantization to say
+/// that some tensors are kept at higher precision, so the base's figure is a
+/// floor for the variant, not an unknown. A label nobody can place stays `?`.
+pub fn quant_accuracy_str(quant: &str) -> String {
+    if let Some((pct, _)) = quant_accuracy(quant) {
+        return pct.to_string();
+    }
+    let upper = quant.to_uppercase();
+    if let Some((base, suffix)) = upper.rsplit_once('_')
+        && matches!(suffix, "L" | "XL" | "M" | "S")
+        && let Some((pct, _)) = quant_accuracy(base)
+    {
+        return format!(">={pct}");
+    }
+    "?".to_string()
 }
 
 fn best_recommendation(files: &[(String, u64)]) -> Option<&str> {
@@ -812,5 +841,22 @@ fn fmt_bytes(bytes: usize) -> String {
         format!("{:.0} KB", bytes as f64 / KB as f64)
     } else {
         format!("{} B", bytes)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Contract: a label with a publisher's suffix shows its base's figure as
+    /// a floor, a plain label shows its own, and a label nobody can place
+    /// stays a question mark.
+    #[test]
+    fn a_suffixed_label_shows_the_floor_of_its_base() {
+        assert_eq!(quant_accuracy_str("Q4_K_M"), "~98.5%");
+        assert_eq!(quant_accuracy_str("Q4_K_XL"), ">=~98.5%");
+        assert_eq!(quant_accuracy_str("Q6_K_M"), ">=~99.5%");
+        assert_eq!(quant_accuracy_str("q2_k_l"), ">=~95%");
+        assert_eq!(quant_accuracy_str("TQ1_0"), "?");
     }
 }

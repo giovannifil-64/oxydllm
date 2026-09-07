@@ -187,7 +187,7 @@ fn select_variant<'a>(
     }
 
     println!(
-        "  {:>2}  {:<16}  {:>10}  {:>5}  Accuracy",
+        "  {:>2}  {:<16}  {:>10}  {:>5}  Quality",
         "#", "Format", "Size", "Files"
     );
     println!("  {}", "─".repeat(56));
@@ -215,6 +215,9 @@ fn select_variant<'a>(
             star,
         );
     }
+    println!(
+        "  Quality is typical for the label, not measured on this model; >= marks a suffix kept above its base. The chosen variant's header is read before download."
+    );
     println!();
 
     let default = recommended_idx.map(|i| i + 1).unwrap_or(1);
@@ -421,6 +424,9 @@ pub fn pull(config: &PullConfig) -> anyhow::Result<()> {
                 let url = format!("{}/{}/resolve/main/{}", HF_ENDPOINT, config.repo_id, first);
                 let verdict =
                     crate::models::gguf_probe::probe_remote(&client, &url, config.token.as_deref());
+                if let Some(line) = verdict.composition_line() {
+                    println!("  Header: {line}");
+                }
                 if let Some(reason) = verdict.refusal() {
                     anyhow::bail!("{} cannot be used: {reason}", chosen.quant_name);
                 }

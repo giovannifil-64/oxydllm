@@ -882,10 +882,11 @@ kernel void mpp_gemm_q6k_staged(
 
 // One simdgroup per output row for a weight candle cannot serve: each lane
 // takes a span of thirty-two weights, decodes it into registers with the
-// block's own `dequant32`, and dots it with the same span of every activation
-// row; the lanes' partial sums meet in a simd reduction. It reads the weight
-// once, which is what a matvec is bound by.
-template <typename Block>
+// block's own `dequant32`, and dots it with the same span of up to M
+// activation rows read four at a time; the lanes' partial sums meet in a simd
+// reduction. M is a compile-time bound so the accumulators stay in registers;
+// rows past `p.m` are skipped.
+template <typename Block, uint M>
 inline void matvec_owned(
     device const bfloat* a,
     device const Block* weight,
@@ -903,32 +904,42 @@ inline void matvec_owned(
     const uint m = uint(p.m);
     const uint spans = k / 32u;
     device const Block* wrow = weight + row * (k / BE);
-    float acc[MV_MAX_M];
-    for (uint r = 0; r < MV_MAX_M; ++r) {
+    float acc[M];
+#pragma clang loop unroll(full)
+    for (uint r = 0; r < M; ++r) {
         acc[r] = 0.0f;
     }
     for (uint s = lane; s < spans; s += 32u) {
         float w[32];
         dequant32(wrow + s / SPB, (s % SPB) * 32u, w, 1u, 32u);
-        device const bfloat* xa = a + s * 32u;
-        for (uint r = 0; r < m; ++r) {
-            device const bfloat* xr = xa + r * k;
-            float sum = 0.0f;
-            for (uint i = 0; i < 32u; ++i) {
-                sum += w[i] * float(xr[i]);
+        device const bfloat4* xa = (device const bfloat4*)(a + s * 32u);
+#pragma clang loop unroll(full)
+        for (uint r = 0; r < M; ++r) {
+            if (r < m) {
+                device const bfloat4* xr = xa + r * (k / 4u);
+                float sum = 0.0f;
+#pragma clang loop unroll(full)
+                for (uint i = 0; i < 8u; ++i) {
+                    const float4 x4 = float4(xr[i]);
+                    sum += w[4u * i] * x4.x + w[4u * i + 1u] * x4.y
+                         + w[4u * i + 2u] * x4.z + w[4u * i + 3u] * x4.w;
+                }
+                acc[r] += sum;
             }
-            acc[r] += sum;
         }
     }
-    for (uint r = 0; r < m; ++r) {
-        const float v = simd_sum(acc[r]);
-        if (lane == 0u) {
-            d[r * uint(p.n) + row] = bfloat(v);
+#pragma clang loop unroll(full)
+    for (uint r = 0; r < M; ++r) {
+        if (r < m) {
+            const float v = simd_sum(acc[r]);
+            if (lane == 0u) {
+                d[r * uint(p.n) + row] = bfloat(v);
+            }
         }
     }
 }
 
-#define MPP_MATVEC_KERNEL(NAME, BLOCK)                                         \
+#define MPP_MATVEC_KERNEL(NAME, BLOCK, M)                                      \
 kernel void NAME(                                                              \
     device const bfloat* a       [[buffer(0)]],                                \
     device const BLOCK*  weight  [[buffer(1)]],                                \
@@ -938,12 +949,61 @@ kernel void NAME(                                                              \
     uint sg   [[simdgroup_index_in_threadgroup]],                              \
     uint lane [[thread_index_in_simdgroup]])                                   \
 {                                                                              \
-    matvec_owned<BLOCK>(a, weight, d, p, tg, sg, lane);                        \
+    matvec_owned<BLOCK, M>(a, weight, d, p, tg, sg, lane);                     \
 }
 
-MPP_MATVEC_KERNEL(mpp_mv_iq4_nl, block_iq4_nl)
-MPP_MATVEC_KERNEL(mpp_mv_iq4_xs, block_iq4_xs)
-MPP_MATVEC_KERNEL(mpp_mv_iq3_s, block_iq3_s)
+MPP_MATVEC_KERNEL(mpp_mv_iq4_nl, block_iq4_nl, 1)
+MPP_MATVEC_KERNEL(mpp_mv_iq4_xs, block_iq4_xs, 1)
+MPP_MATVEC_KERNEL(mpp_mv_iq3_s, block_iq3_s, 1)
+MPP_MATVEC_KERNEL(mpp_mv_iq4_nl_batch, block_iq4_nl, MV_MAX_M)
+MPP_MATVEC_KERNEL(mpp_mv_iq4_xs_batch, block_iq4_xs, MV_MAX_M)
+MPP_MATVEC_KERNEL(mpp_mv_iq3_s_batch, block_iq3_s, MV_MAX_M)
+
+// Rows of a table candle cannot serve, gathered for the token embedding: one
+// simdgroup per token, each lane decoding spans of the row into BF16.
+template <typename Block>
+inline void gather_owned(
+    device const uint* tokens,
+    device const Block* table,
+    device bfloat* out,
+    constant MppQuantGemmParams& p,
+    uint tg, uint sg, uint lane)
+{
+    const uint t = tg * MV_ROWS + sg;
+    if (t >= uint(p.m)) {
+        return;
+    }
+    constexpr uint BE = block_elems((device const Block*)0);
+    constexpr uint SPB = BE / 32u;
+    const uint k = uint(p.k);
+    const uint row = min(tokens[t], uint(p.n) - 1u);
+    device const Block* wrow = table + row * (k / BE);
+    device bfloat* orow = out + t * k;
+    for (uint s = lane; s < k / 32u; s += 32u) {
+        float w[32];
+        dequant32(wrow + s / SPB, (s % SPB) * 32u, w, 1u, 32u);
+        for (uint i = 0; i < 32u; ++i) {
+            orow[s * 32u + i] = bfloat(w[i]);
+        }
+    }
+}
+
+#define MPP_GATHER_KERNEL(NAME, BLOCK)                                         \
+kernel void NAME(                                                              \
+    device const uint*   tokens  [[buffer(0)]],                                \
+    device const BLOCK*  table   [[buffer(1)]],                                \
+    device bfloat*       out     [[buffer(2)]],                                \
+    constant MppQuantGemmParams& p [[buffer(3)]],                              \
+    uint tg   [[threadgroup_position_in_grid]],                                \
+    uint sg   [[simdgroup_index_in_threadgroup]],                              \
+    uint lane [[thread_index_in_simdgroup]])                                   \
+{                                                                              \
+    gather_owned<BLOCK>(tokens, table, out, p, tg, sg, lane);                  \
+}
+
+MPP_GATHER_KERNEL(mpp_embed_iq4_nl, block_iq4_nl)
+MPP_GATHER_KERNEL(mpp_embed_iq4_xs, block_iq4_xs)
+MPP_GATHER_KERNEL(mpp_embed_iq3_s, block_iq3_s)
 
 template<uint BITS, bool GPTQ>
 inline void mpp_gemm_quant_impl(

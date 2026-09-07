@@ -506,15 +506,11 @@ impl StandardTransformer {
             }
         };
 
-        let embed_qt = gguf
-            .get("token_embd.weight")
+        let embed_w = gguf
+            .linear_weight("token_embd.weight")
             .map_err(|e| anyhow::anyhow!("Missing token_embd.weight: {e}"))?;
-        let vocab_size = embed_qt.shape().dims()[0];
-        let embed_tokens = if Embedding::can_gather(embed_qt.dtype()) {
-            Embedding::quantized(embed_qt.clone(), dtype)
-        } else {
-            Embedding::from_qtensor(&embed_qt, device, dtype)?
-        };
+        let vocab_size = embed_w.out_features();
+        let embed_tokens = Embedding::from_gguf(&embed_w, device, dtype)?;
 
         let lm_head = match gguf.try_linear_weight("output.weight") {
             Some(w) => AnyLinear::Quantized(
@@ -522,7 +518,7 @@ impl StandardTransformer {
                     .map_err(|e| anyhow::anyhow!("Failed to load output.weight: {e}"))?,
             ),
             None => AnyLinear::Quantized(
-                QLinear::from_gguf(gguf.linear_weight("token_embd.weight")?, None, dtype)
+                QLinear::from_gguf(embed_w, None, dtype)
                     .map_err(|e| anyhow::anyhow!("tied lm_head from embedding: {e}"))?,
             ),
         };

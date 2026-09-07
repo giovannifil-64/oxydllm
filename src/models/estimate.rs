@@ -114,6 +114,11 @@ fn estimate_local_gguf(gguf_path: &Path, ctx_len: usize, num_seqs: usize) -> Res
     println!("  File     {}", gguf_path.display());
     println!("  Arch     {}", arch);
     println!("  Format   {}", quant_str);
+    let mut composition = crate::models::gguf_probe::Composition::default();
+    for e in &header.tensors {
+        composition.add(&e.name, e.type_id);
+    }
+    println!("  Tensors  {}", composition.line());
     println!();
     print_weights_kv_total(weights_bytes, geometry.as_ref(), ctx_len, num_seqs);
     print_accuracy_line(&quant_str);

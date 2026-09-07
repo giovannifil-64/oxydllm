@@ -27,8 +27,20 @@ pub enum StagedWeight {}
 /// the dequantisation up front: five seconds on the checkpoint that motivated
 /// this, against a per-forward gather that reads a few thousand rows.
 pub enum Embedding {
-    Dense { weight: Tensor },
-    Quantized { table: Arc<QTensor>, dtype: DType },
+    Dense {
+        weight: Tensor,
+    },
+    Quantized {
+        table: Arc<QTensor>,
+        dtype: DType,
+    },
+    /// A table in a layout candle has no name for, gathered by this crate's
+    /// own kernel.
+    #[cfg_attr(not(feature = "metal"), allow(dead_code))]
+    Owned {
+        table: StagedWeight,
+        dtype: DType,
+    },
 }
 
 impl Embedding {
@@ -39,6 +51,31 @@ impl Embedding {
     /// Keeps the table quantized and gathers rows from it per forward.
     pub fn quantized(table: Arc<QTensor>, dtype: DType) -> Self {
         Self::Quantized { table, dtype }
+    }
+
+    /// The table as the GGUF loader holds it: gathered from where it lies when
+    /// a kernel can, materialised when none can.
+    pub fn from_gguf(weight: &LinearWeight, device: &Device, dtype: DType) -> Result<Self> {
+        match weight {
+            LinearWeight::Candle { tensor, .. } => {
+                if Self::can_gather(tensor.dtype()) {
+                    Ok(Self::quantized(tensor.clone(), dtype))
+                } else {
+                    Self::from_qtensor(tensor, device, dtype)
+                }
+            }
+            LinearWeight::Owned(table) => {
+                #[cfg(feature = "metal")]
+                {
+                    Ok(Self::Owned {
+                        table: table.clone(),
+                        dtype,
+                    })
+                }
+                #[cfg(not(feature = "metal"))]
+                match *table {}
+            }
+        }
     }
 
     /// Whether rows can be gathered from a table of this type without
@@ -61,6 +98,19 @@ impl Embedding {
                 let hidden = table.shape().dims()[1];
                 let rows = table.embedding(&flat)?.to_dtype(*dtype)?;
                 rows.reshape((batch, seq, hidden))
+            }
+            Self::Owned { table, dtype } => {
+                #[cfg(feature = "metal")]
+                {
+                    let rows =
+                        super::metal_ops::mpp_owned_gather(&flat, table)?.to_dtype(*dtype)?;
+                    rows.reshape((batch, seq, table.dims().1))
+                }
+                #[cfg(not(feature = "metal"))]
+                {
+                    let _ = dtype;
+                    match *table {}
+                }
             }
         }
     }

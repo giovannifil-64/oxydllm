@@ -2928,13 +2928,27 @@ impl WeightKind {
         }
     }
 
-    /// The kernel that multiplies a few activation rows by a weight of a kind
-    /// candle cannot serve; the kinds candle serves have candle's matvec.
-    fn matvec_kernel(self) -> Option<&'static str> {
+    /// The kernel that multiplies one activation row, or a batch of up to
+    /// [`MPP_MATVEC_MAX_M`], by a weight of a kind candle cannot serve; the
+    /// kinds candle serves have candle's matvec.
+    fn matvec_kernel(self, batch: bool) -> Option<&'static str> {
+        match (self, batch) {
+            (Self::Iq4Nl, false) => Some("mpp_mv_iq4_nl"),
+            (Self::Iq4Xs, false) => Some("mpp_mv_iq4_xs"),
+            (Self::Iq3S, false) => Some("mpp_mv_iq3_s"),
+            (Self::Iq4Nl, true) => Some("mpp_mv_iq4_nl_batch"),
+            (Self::Iq4Xs, true) => Some("mpp_mv_iq4_xs_batch"),
+            (Self::Iq3S, true) => Some("mpp_mv_iq3_s_batch"),
+            _ => None,
+        }
+    }
+
+    /// The kernel that gathers rows of a table of a kind candle cannot serve.
+    fn gather_kernel(self) -> Option<&'static str> {
         match self {
-            Self::Iq4Nl => Some("mpp_mv_iq4_nl"),
-            Self::Iq4Xs => Some("mpp_mv_iq4_xs"),
-            Self::Iq3S => Some("mpp_mv_iq3_s"),
+            Self::Iq4Nl => Some("mpp_embed_iq4_nl"),
+            Self::Iq4Xs => Some("mpp_embed_iq4_xs"),
+            Self::Iq3S => Some("mpp_embed_iq3_s"),
             _ => None,
         }
     }
@@ -3188,7 +3202,7 @@ impl CustomOp1 for MppOwnedMatvec {
         if m == 0 || m > MPP_MATVEC_MAX_M {
             candle_core::bail!("MppOwnedMatvec: {m} rows, takes 1 to {MPP_MATVEC_MAX_M}");
         }
-        let Some(kernel) = self.weight.kind.matvec_kernel() else {
+        let Some(kernel) = self.weight.kind.matvec_kernel(m > 1) else {
             candle_core::bail!("MppOwnedMatvec: {:?} is served by candle", self.weight.kind);
         };
 
@@ -3228,6 +3242,81 @@ impl CustomOp1 for MppOwnedMatvec {
             Shape::from_dims(&[m, n]),
         ))
     }
+}
+
+/// Rows `tokens` of a table only this crate's kernels decode, one simdgroup
+/// per token, decoded straight to BF16.
+struct MppOwnedGather {
+    table: StagedWeight,
+}
+
+impl CustomOp1 for MppOwnedGather {
+    fn name(&self) -> &'static str {
+        "mpp-owned-gather"
+    }
+
+    fn cpu_fwd(&self, _s: &CpuStorage, _l: &Layout) -> Result<(CpuStorage, Shape)> {
+        candle_core::bail!("MppOwnedGather: Metal-only")
+    }
+
+    fn metal_fwd(&self, t: &MetalStorage, t_l: &Layout) -> Result<(MetalStorage, Shape)> {
+        if t.dtype() != DType::U32 {
+            candle_core::bail!("MppOwnedGather: tokens must be U32, got {:?}", t.dtype());
+        }
+        if !t_l.is_contiguous() || t_l.dims().len() != 1 {
+            candle_core::bail!("MppOwnedGather: tokens must be a contiguous vector");
+        }
+        let m = t_l.dims()[0];
+        let (n, k) = (self.table.n, self.table.k);
+        let Some(kernel) = self.table.kind.gather_kernel() else {
+            candle_core::bail!("MppOwnedGather: {:?} is served by candle", self.table.kind);
+        };
+        let device = t.device();
+        let out_elems = m * k;
+        let output = device.new_buffer(out_elems, DType::BF16, "mpp_owned_gather")?;
+        let params = MppQuantGemmParams {
+            m: m as i32,
+            n: n as i32,
+            k: k as i32,
+            group_shift: 0,
+        };
+        let pipeline = get_or_compile_mpp_pipeline(device.device(), kernel)?;
+        let encoder = device.command_encoder()?;
+        let encoder = encoder.as_ref();
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_input_buffer(0, Some(t.buffer()), t_l.start_offset() * 4);
+        encoder.set_input_buffer(1, Some(&self.table.buffer), 0);
+        encoder.set_output_buffer(2, Some(&*output), 0);
+        encoder.set_bytes(3, &params);
+        encoder.dispatch_thread_groups(
+            MTLSize {
+                width: m.div_ceil(MPP_MATVEC_ROWS),
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: 32 * MPP_MATVEC_ROWS,
+                height: 1,
+                depth: 1,
+            },
+        );
+        Ok((
+            MetalStorage::new(output, device.clone(), out_elems, DType::BF16),
+            Shape::from_dims(&[m, k]),
+        ))
+    }
+}
+
+/// The rows `tokens` name in a table only this crate's kernels decode, as a
+/// `[tokens, width]` BF16 tensor. A token past the table's last row reads
+/// that last row.
+///
+/// ## Errors
+/// Fails off-Metal or when `tokens` is not a contiguous U32 vector.
+pub fn mpp_owned_gather(tokens: &Tensor, table: &StagedWeight) -> Result<Tensor> {
+    tokens.apply_op1_no_bwd(&MppOwnedGather {
+        table: table.clone(),
+    })
 }
 
 /// `x @ weight^T` for a weight only this crate's kernels decode: the matvec
@@ -7804,6 +7893,47 @@ pub(crate) mod owned_weights {
             (WeightKind::Iq3S, iq_quant::FIXTURE_IQ3_S, 16, 256),
         ] {
             check(&dev, kind, bytes, n, k);
+        }
+    }
+
+    /// Contract: the token embedding over a table candle cannot serve hands
+    /// back, for a batch of token ids in any shape, exactly the rows the CPU
+    /// reference decodes, in the model's dtype, and reads the last row for an
+    /// id past the table rather than memory past it.
+    #[test]
+    fn an_owned_table_hands_back_the_rows_the_tokens_name() {
+        use crate::common::linear::Embedding;
+        let Ok(dev) = Device::new_metal(0) else {
+            return;
+        };
+        let Device::Metal(md) = &dev else {
+            return;
+        };
+        if !mpp_gemm_available(md.device()) {
+            return;
+        }
+        let (vocab, k) = (64usize, 512usize);
+        for kind in [WeightKind::Iq4Xs, WeightKind::Iq4Nl, WeightKind::Iq3S] {
+            let bytes = synthetic(kind, vocab, k, 19);
+            let table = dense(kind, &bytes, vocab, k);
+            let buffer = md.new_buffer_with_data(&bytes).unwrap();
+            let staged = StagedWeight::of_kind((*buffer).clone(), kind, &[vocab, k]).unwrap();
+            let embedding = Embedding::Owned {
+                table: staged,
+                dtype: DType::F32,
+            };
+            let ids: [u32; 6] = [3, 0, 63, 3, 17, 1000];
+            let tokens = Tensor::from_slice(&ids, (2, 3), &dev).unwrap();
+            let out = embedding.forward(&tokens).unwrap();
+            assert_eq!(out.dims(), [2, 3, k], "{kind:?}: shape");
+            assert_eq!(out.dtype(), DType::F32, "{kind:?}: dtype");
+            let got = out.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+            for (i, id) in ids.iter().enumerate() {
+                let row = (*id as usize).min(vocab - 1);
+                let atteso = &table[row * k..(row + 1) * k];
+                let err = worst_relative(atteso, &got[i * k..(i + 1) * k]);
+                assert!(err < 0.01, "{kind:?} token {id}: relative error {err}");
+            }
         }
     }
 

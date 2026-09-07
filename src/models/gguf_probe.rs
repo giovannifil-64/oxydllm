@@ -40,6 +40,18 @@ pub struct Composition {
 }
 
 impl Composition {
+    /// Counts one tensor of ggml type `type_id` named `name`.
+    pub fn add(&mut self, name: &str, type_id: u32) {
+        let tname = type_name(type_id);
+        self.tensors += 1;
+        *self.by_type.entry(tname.clone()).or_default() += 1;
+        if name == "token_embd.weight" {
+            self.embedding = Some(tname);
+        } else if name == "output.weight" {
+            self.output = Some(tname);
+        }
+    }
+
     /// One line: the count per type, most numerous first, then the types of
     /// the token embedding and the output projection where the file has them.
     pub fn line(&self) -> String {
@@ -204,17 +216,10 @@ pub fn inspect_header(bytes: &[u8]) -> HeaderVerdict {
         let (Some(dtype), Some(_offset)) = (c.u32(), c.u64()) else {
             return HeaderVerdict::Unknown;
         };
-        let tname = type_name(dtype);
         if !SUPPORTED_TYPES.contains(&dtype) {
-            *offenders.entry(tname.clone()).or_default() += 1;
+            *offenders.entry(type_name(dtype)).or_default() += 1;
         }
-        composition.tensors += 1;
-        *composition.by_type.entry(tname.clone()).or_default() += 1;
-        if name == "token_embd.weight" {
-            composition.embedding = Some(tname.clone());
-        } else if name == "output.weight" {
-            composition.output = Some(tname);
-        }
+        composition.add(&name, dtype);
     }
 
     if offenders.is_empty() {

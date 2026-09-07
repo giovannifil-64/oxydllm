@@ -473,3 +473,131 @@ pub(crate) mod tests {
         assert!(GgufHeader::parse(&bytes[..header_len]).is_ok());
     }
 }
+
+#[cfg(test)]
+mod probes {
+    /// Prints every scalar metadata entry of the GGUF file named by
+    /// `OXYDLLM_GGUF`, and the shapes of the first layer's tensors, so two
+    /// checkpoints of one architecture can be set side by side.
+    /// Contract, on whatever GGUF files the models directory holds: this
+    /// crate's header reader and candle's agree on every metadata entry,
+    /// every tensor candle can name, and the data offset. Skips files candle
+    /// refuses, which are the reason this reader exists.
+    #[test]
+    #[ignore = "diagnostic (walks ~/.oxydllm/models)"]
+    fn the_two_readers_agree_on_every_local_file() {
+        let root = std::env::var("OXYDLLM_MODELS_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| {
+                std::path::PathBuf::from(std::env::var("HOME").unwrap()).join(".oxydllm/models")
+            });
+        let mut files = Vec::new();
+        let mut stack = vec![root];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+                let p = entry.path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else if p.extension().and_then(|x| x.to_str()) == Some("gguf") {
+                    files.push(p);
+                }
+            }
+        }
+        files.sort();
+        for path in files {
+            let ours = super::GgufHeader::read(&path).unwrap();
+            let mut file = std::fs::File::open(&path).unwrap();
+            let theirs = match candle_core::quantized::gguf_file::Content::read(&mut file) {
+                Ok(c) => c,
+                Err(e) => {
+                    println!(
+                        "{}: candle refuses it ({e}), {} tensors read here",
+                        path.display(),
+                        ours.tensors.len()
+                    );
+                    continue;
+                }
+            };
+            assert_eq!(
+                ours.content.tensor_data_offset,
+                theirs.tensor_data_offset,
+                "{}",
+                path.display()
+            );
+            assert_eq!(
+                ours.content.metadata.len(),
+                theirs.metadata.len(),
+                "{}",
+                path.display()
+            );
+            for (k, v) in &theirs.metadata {
+                assert_eq!(
+                    format!("{:?}", ours.content.metadata[k]),
+                    format!("{v:?}"),
+                    "{}: {k}",
+                    path.display()
+                );
+            }
+            assert_eq!(
+                ours.content.tensor_infos.len(),
+                theirs.tensor_infos.len(),
+                "{}",
+                path.display()
+            );
+            assert_eq!(
+                ours.tensors.len(),
+                theirs.tensor_infos.len(),
+                "{}",
+                path.display()
+            );
+            for (k, v) in &theirs.tensor_infos {
+                let o = &ours.content.tensor_infos[k];
+                assert_eq!(
+                    (o.ggml_dtype, o.shape.dims(), o.offset),
+                    (v.ggml_dtype, v.shape.dims(), v.offset),
+                    "{}: {k}",
+                    path.display()
+                );
+            }
+            println!(
+                "{}: {} tensors, {} metadata entries, identical",
+                path.display(),
+                ours.tensors.len(),
+                ours.content.metadata.len()
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "diagnostic (reads the file named by OXYDLLM_GGUF)"]
+    fn dump_gguf_header_probe() {
+        let Ok(path) = std::env::var("OXYDLLM_GGUF") else {
+            return;
+        };
+        let header = super::GgufHeader::read(&path).unwrap();
+        let mut keys: Vec<&String> = header.content.metadata.keys().collect();
+        keys.sort();
+        for k in keys {
+            let v = &header.content.metadata[k];
+            match v {
+                candle_core::quantized::gguf_file::Value::Array(items) if items.len() > 80 => {
+                    println!("{k} = [{} items]", items.len())
+                }
+                other => println!("{k} = {other:?}"),
+            }
+        }
+        let mut blk0: Vec<&super::TensorEntry> = header
+            .tensors
+            .iter()
+            .filter(|e| {
+                e.name.starts_with("blk.0.")
+                    || e.name.starts_with("blk.3.")
+                    || !e.name.starts_with("blk.")
+            })
+            .collect();
+        blk0.sort_by(|a, b| a.name.cmp(&b.name));
+        for e in blk0 {
+            println!("{} {:?} {}", e.name, e.dims, super::type_name(e.type_id));
+        }
+    }
+}

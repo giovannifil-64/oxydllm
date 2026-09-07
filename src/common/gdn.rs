@@ -976,8 +976,19 @@ mod tests {
         ins("A_log", vecf(&f["a_log"]), vec![nv]);
         ins("dt_bias", vecf(&f["dt_bias"]), vec![nv]);
         ins("norm.weight", vecf(&f["norm_w"]), vec![dv]);
-        let weights = ModelWeights::from_tensors(tensors);
+        (layer_from_hf(tensors, nk, nv, dk, dv, conv_k), hidden, t)
+    }
 
+    /// A layer from tensors under HuggingFace's names and in its head order.
+    fn layer_from_hf(
+        tensors: rustc_hash::FxHashMap<String, Tensor>,
+        nk: usize,
+        nv: usize,
+        dk: usize,
+        dv: usize,
+        conv_k: usize,
+    ) -> GatedDeltaNet {
+        let weights = ModelWeights::from_tensors(tensors);
         let cfg = BlockConfig {
             n_heads: 1,
             n_kv_heads: 1,
@@ -1004,7 +1015,160 @@ mod tests {
             rotary_dim: None,
             gguf_qk_permuted: false,
         };
-        (GatedDeltaNet::load(&cfg, 0, &weights).unwrap(), hidden, t)
+        GatedDeltaNet::load(&cfg, 0, &weights).unwrap()
+    }
+
+    /// Contract: a layer whose V heads come in llama.cpp's tiled order answers
+    /// what the same layer in HuggingFace's grouped order answers, at a
+    /// value-to-key head ratio of three, which is Qwen3.8's and which no
+    /// checkpoint had exercised. The converter reorders every tensor with a
+    /// V-head axis by one rule, tiled index `(h % r) * nk + h / r` for grouped
+    /// head `h`, and this layer's tiled expansion has to be that rule's
+    /// inverse at any ratio, on the prefill and on the cached step after it.
+    #[test]
+    fn tiled_and_grouped_v_heads_agree_at_a_ratio_of_three() {
+        use rustc_hash::FxHashMap;
+        let (hidden, nk, nv, dk, dv, conv_k, t) =
+            (16usize, 2usize, 6usize, 4usize, 4usize, 4usize, 7usize);
+        let r = nv / nk;
+        let dev = Device::Cpu;
+        let mut seed = 17u64;
+        let mut rnd = |n: usize, scale: f32| -> Vec<f32> {
+            (0..n)
+                .map(|_| {
+                    seed = seed
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    ((seed >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * scale
+                })
+                .collect()
+        };
+        let key_dim = nk * dk;
+        let value_dim = nv * dv;
+        let conv_dim = 2 * key_dim + value_dim;
+        let tiled_of = |h: usize| (h % r) * nk + h / r;
+        // Rows of a `[nv * hd, cols]` matrix, or entries of a vector when
+        // `cols` is one, moved from grouped to tiled head order.
+        let by_rows = |src: &[f32], hd: usize, cols: usize| -> Vec<f32> {
+            let mut out = vec![0f32; src.len()];
+            for h in 0..nv {
+                for i in 0..hd {
+                    let s = (h * hd + i) * cols;
+                    let d = (tiled_of(h) * hd + i) * cols;
+                    out[d..d + cols].copy_from_slice(&src[s..s + cols]);
+                }
+            }
+            out
+        };
+        // Columns of a `[rows, nv * hd]` matrix moved the same way.
+        let by_cols = |src: &[f32], rows: usize, hd: usize| -> Vec<f32> {
+            let width = nv * hd;
+            let mut out = vec![0f32; src.len()];
+            for row in 0..rows {
+                for h in 0..nv {
+                    for i in 0..hd {
+                        out[row * width + tiled_of(h) * hd + i] = src[row * width + h * hd + i];
+                    }
+                }
+            }
+            out
+        };
+
+        let w_qkv = rnd(conv_dim * hidden, 0.6);
+        let w_z = rnd(value_dim * hidden, 0.6);
+        let w_b = rnd(nv * hidden, 0.6);
+        let w_a = rnd(nv * hidden, 0.6);
+        let w_out = rnd(hidden * value_dim, 0.6);
+        let conv_w = rnd(conv_dim * conv_k, 0.6);
+        let a_log = rnd(nv, 1.0);
+        let dt_bias = rnd(nv, 1.0);
+        let norm_w = rnd(dv, 0.5).iter().map(|v| v + 1.0).collect::<Vec<f32>>();
+
+        let mut w_qkv_tiled = w_qkv.clone();
+        w_qkv_tiled[2 * key_dim * hidden..].copy_from_slice(&by_rows(
+            &w_qkv[2 * key_dim * hidden..],
+            dv,
+            hidden,
+        ));
+        let mut conv_tiled = conv_w.clone();
+        conv_tiled[2 * key_dim * conv_k..].copy_from_slice(&by_rows(
+            &conv_w[2 * key_dim * conv_k..],
+            dv,
+            conv_k,
+        ));
+
+        let build = |qkv: &[f32],
+                     z: &[f32],
+                     b: &[f32],
+                     a: &[f32],
+                     out: &[f32],
+                     conv: &[f32],
+                     al: &[f32],
+                     dt: &[f32]| {
+            let mut tensors = FxHashMap::default();
+            let mut ins = |name: &str, data: &[f32], shape: Vec<usize>| {
+                tensors.insert(
+                    format!("model.layers.0.linear_attn.{name}"),
+                    Tensor::from_vec(data.to_vec(), shape, &dev).unwrap(),
+                );
+            };
+            ins("in_proj_qkv.weight", qkv, vec![conv_dim, hidden]);
+            ins("in_proj_z.weight", z, vec![value_dim, hidden]);
+            ins("in_proj_b.weight", b, vec![nv, hidden]);
+            ins("in_proj_a.weight", a, vec![nv, hidden]);
+            ins("out_proj.weight", out, vec![hidden, value_dim]);
+            ins("conv1d.weight", conv, vec![conv_dim, 1, conv_k]);
+            ins("A_log", al, vec![nv]);
+            ins("dt_bias", dt, vec![nv]);
+            ins("norm.weight", &norm_w, vec![dv]);
+            layer_from_hf(tensors, nk, nv, dk, dv, conv_k)
+        };
+        let grouped = build(&w_qkv, &w_z, &w_b, &w_a, &w_out, &conv_w, &a_log, &dt_bias);
+        let mut tiled = build(
+            &w_qkv_tiled,
+            &by_rows(&w_z, dv, hidden),
+            &by_rows(&w_b, 1, hidden),
+            &by_rows(&w_a, 1, hidden),
+            &by_cols(&w_out, hidden, dv),
+            &conv_tiled,
+            &by_rows(&a_log, 1, 1),
+            &by_rows(&dt_bias, 1, 1),
+        );
+        tiled.v_heads_tiled = true;
+
+        let x = Tensor::from_vec(rnd(t * hidden, 2.0), (1, t, hidden), &dev).unwrap();
+        let x1 = Tensor::from_vec(rnd(hidden, 2.0), (1, 1, hidden), &dev).unwrap();
+        let (mut sg, mut st): (Option<RecurrentState>, Option<RecurrentState>) = (None, None);
+        let og = grouped.forward_segment(&x, &mut sg).unwrap();
+        let ot = tiled.forward_segment(&x, &mut st).unwrap();
+        let vg = og.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        assert_close(&ot, &vg, 1e-4, "prefill: tiled against grouped");
+        let og1 = grouped.forward_segment(&x1, &mut sg).unwrap();
+        let ot1 = tiled.forward_segment(&x1, &mut st).unwrap();
+        let vg1 = og1.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        assert_close(&ot1, &vg1, 1e-4, "step: tiled against grouped");
+        let peak = vg.iter().fold(0f32, |a, v| a.max(v.abs()));
+        assert!(
+            peak > 1e-3,
+            "the layer must produce something to compare ({peak})"
+        );
+
+        // The same tensors read in the wrong order must not agree, or the
+        // contract above would be checking nothing.
+        tiled.v_heads_tiled = false;
+        let mut sw: Option<RecurrentState> = None;
+        let ow = tiled
+            .forward_segment(&x, &mut sw)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let worst = ow
+            .iter()
+            .zip(&vg)
+            .fold(0f32, |a, (p, q)| a.max((p - q).abs()));
+        assert!(worst > 1e-3, "the head order has to matter ({worst})");
     }
 
     /// Contract: the full layer (projections, causal conv, delta rule, gated

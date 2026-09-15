@@ -117,7 +117,11 @@ fn scan_model_entry(
     models: &mut Vec<DiscoveredModel>,
 ) -> bool {
     let config_path = path.join("config.json");
-    if config_path.exists() {
+    let gguf_paths = find_gguf_files(path);
+    // Weights decide, as they do for the loader: a config.json beside GGUF
+    // files describes the model those files quantize, not a safetensors
+    // checkpoint, and listing it as one showed no size and hid the variants.
+    if config_path.exists() && (gguf_paths.is_none() || has_safetensors(path)) {
         let raw = match std::fs::read_to_string(&config_path) {
             Ok(r) => r,
             Err(_) => return false,
@@ -163,7 +167,7 @@ fn scan_model_entry(
         return true;
     }
 
-    if let Some(gguf_paths) = find_gguf_files(path) {
+    if let Some(gguf_paths) = gguf_paths {
         let mut stem_groups: std::collections::HashMap<String, Vec<std::path::PathBuf>> =
             std::collections::HashMap::new();
         for gguf_path in &gguf_paths {
@@ -1782,6 +1786,84 @@ fn compute_kv_blocks(p: &KvBlockParams, kv_budget: &GlobalKvBudget) -> anyhow::R
         mode,
         context_len,
     })
+}
+
+#[cfg(test)]
+mod discovery_tests {
+    use super::*;
+    use candle_core::quantized::gguf_file::Value;
+
+    fn gguf(arch: &str) -> Vec<u8> {
+        let kv = [
+            ("general.architecture", Value::String(arch.into())),
+            (&format!("{arch}.block_count")[..], Value::U32(2)),
+        ];
+        let tensors: [(&str, &[u64], u32); 1] = [("token_embd.weight", &[8, 4], 0)];
+        crate::common::gguf_header::tests::gguf_bytes(&kv, &tensors, &[0u8; 128])
+    }
+
+    /// Contract: a folder of GGUF files lists one entry per variant with the
+    /// variant's own size and architecture, whether or not the publisher put
+    /// a config.json beside them, which most quantization repositories do.
+    /// Listing such a folder by its config.json showed one entry with no size
+    /// and hid the variants the loader would happily run.
+    #[test]
+    fn a_gguf_folder_with_a_config_lists_its_variants() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("TheBloke").join("Tiny-GGUF");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("config.json"),
+            r#"{"architectures":["LlamaForCausalLM"]}"#,
+        )
+        .unwrap();
+        let bytes = gguf("llama");
+        std::fs::write(dir.join("tiny.Q4_0.gguf"), &bytes).unwrap();
+        std::fs::write(dir.join("tiny.Q4_K_M.gguf"), &bytes).unwrap();
+
+        let mut models = discover_models(root.path());
+        models.sort_by(|a, b| a.id.cmp(&b.id));
+        assert_eq!(models.len(), 2, "{models:?}");
+        for m in &models {
+            assert_eq!(m.architecture, "llama (GGUF)");
+            assert_eq!(m.size_bytes, bytes.len());
+            assert!(m.id.starts_with("TheBloke/"), "{}", m.id);
+        }
+    }
+
+    /// Contract: real safetensors weights make the folder one model under
+    /// its config.json, even next to a GGUF file; a config.json alone still
+    /// lists as one entry of unknown size.
+    #[test]
+    fn safetensors_weights_and_a_bare_config_list_as_before() {
+        let root = tempfile::tempdir().unwrap();
+        let st = root.path().join("dense");
+        std::fs::create_dir_all(&st).unwrap();
+        std::fs::write(
+            st.join("config.json"),
+            r#"{"architectures":["LlamaForCausalLM"]}"#,
+        )
+        .unwrap();
+        std::fs::write(st.join("model.safetensors"), [7u8; 100]).unwrap();
+        std::fs::write(st.join("tiny.Q4_0.gguf"), gguf("llama")).unwrap();
+        let bare = root.path().join("bare");
+        std::fs::create_dir_all(&bare).unwrap();
+        std::fs::write(
+            bare.join("config.json"),
+            r#"{"architectures":["LlamaForCausalLM"]}"#,
+        )
+        .unwrap();
+
+        let mut models = discover_models(root.path());
+        models.sort_by(|a, b| a.id.cmp(&b.id));
+        let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, ["bare", "dense"], "{models:?}");
+        assert_eq!(models[0].size_bytes, 0);
+        assert_eq!(
+            (models[1].architecture.as_str(), models[1].size_bytes),
+            ("LlamaForCausalLM", 100)
+        );
+    }
 }
 
 #[cfg(test)]

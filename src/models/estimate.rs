@@ -590,7 +590,7 @@ pub fn extract_quant_from_filename(filename: &str) -> Option<String> {
         .strip_suffix(".gguf")
         .unwrap_or(filename);
 
-    stem.split('-')
+    stem.split(['-', '.'])
         .rfind(|seg| is_quant_segment(seg))
         .map(|seg| seg.to_uppercase())
 }

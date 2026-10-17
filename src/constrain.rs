@@ -108,7 +108,16 @@ pub struct JsonMachine {
     stack: u128,
     depth: u8,
     state: S,
+    /// Consecutive whitespace bytes accepted so far, capped at
+    /// [`MAX_WHITESPACE_RUN`].
+    ws_run: u8,
 }
+
+/// The longest run of whitespace the automaton accepts between tokens of the
+/// document. Unbounded, a model that rates a newline above the opening brace
+/// spends its whole budget on newlines, as TinyLlama did under a schema; the
+/// bound is the reference grammar's, two line breaks and twenty spaces.
+pub const MAX_WHITESPACE_RUN: u8 = 22;
 
 const LITERALS: [&[u8]; 3] = [b"true", b"false", b"null"];
 
@@ -121,6 +130,7 @@ impl JsonMachine {
         Self {
             stack: 0,
             depth: 0,
+            ws_run: 0,
             state: match mode {
                 // A leading `{` is forced by only accepting object-start
                 // bytes in ObjTop; reuse Value with a post-filter instead of
@@ -242,9 +252,13 @@ impl JsonMachine {
     pub fn step_ev(&mut self, b: u8, mode: JsonMode) -> Option<Events> {
         let before_state = self.state;
         let before_depth = self.depth;
+        if is_ws(b) && self.ws_run >= MAX_WHITESPACE_RUN {
+            return None;
+        }
         if !self.step_inner(b, mode) {
             return None;
         }
+        self.ws_run = if is_ws(b) { self.ws_run + 1 } else { 0 };
         let mut ev: Events = 0;
         let value_started =
             matches!(before_state, S::Value | S::ArrFirst) && !is_ws(b) && b != b']';
@@ -272,7 +286,7 @@ impl JsonMachine {
                 }
             }
             b',' => {
-                if matches!(before_state, S::ObjNext) {
+                if matches!(self.state, S::ObjComma) {
                     ev |= EV_OBJ_COMMA;
                 }
             }
@@ -701,43 +715,44 @@ pub struct TokenByteTable {
 }
 
 impl TokenByteTable {
-    /// Builds the table from a byte-level BPE tokenizer via the GPT-2
-    /// unicode-to-byte alphabet. Returns `None` when the vocabulary does not
-    /// look byte-level (e.g. SentencePiece), in which case constrained
-    /// decoding is unavailable and callers fall back to post-hoc validation.
+    /// Builds the table from a byte-level BPE vocabulary, whose tokens spell
+    /// bytes in the GPT-2 unicode alphabet, or from a SentencePiece one,
+    /// whose pieces are their own UTF-8 with `▁` for a space and `<0xNN>` for
+    /// a raw byte; the vocabulary's own space token tells the two apart.
+    /// Returns `None` when the reading covers less than nine tenths of the
+    /// vocabulary, in which case constrained decoding is unavailable and
+    /// callers fall back to post-hoc validation.
     pub fn build(tokenizer: &crate::tokenizer::Tokenizer) -> Option<Arc<Self>> {
-        let char_to_byte = gpt2_char_to_byte();
         let vocab_size = tokenizer.vocab_size();
+        let tokens: Vec<Option<String>> = (0..vocab_size as u32)
+            .map(|id| tokenizer.id_to_token(id))
+            .collect();
+        let count = |pred: fn(&str) -> bool| tokens.iter().flatten().filter(|t| pred(t)).count();
+        let sentencepiece = count(|t| t.contains('▁')) > count(|t| t.starts_with('Ġ'));
+        let char_to_byte = gpt2_char_to_byte();
+        let to_bytes = |tok: &str| -> Option<Vec<u8>> {
+            if !sentencepiece {
+                return tok
+                    .chars()
+                    .map(|ch| char_to_byte.get(&ch).copied())
+                    .collect();
+            }
+            match tok.strip_prefix("<0x").and_then(|t| t.strip_suffix('>')) {
+                Some(hex) if hex.len() == 2 => u8::from_str_radix(hex, 16).ok().map(|b| vec![b]),
+                _ => Some(tok.replace('▁', " ").into_bytes()),
+            }
+        };
         let special: std::collections::HashSet<u32> =
             tokenizer.special_token_id_values().into_iter().collect();
         let mut bytes: Vec<Option<Vec<u8>>> = Vec::with_capacity(vocab_size);
         let mut mapped = 0usize;
-        for id in 0..vocab_size as u32 {
-            if special.contains(&id) {
-                bytes.push(None);
-                continue;
-            }
-            let Some(tok) = tokenizer.id_to_token(id) else {
-                bytes.push(None);
-                continue;
+        for (id, tok) in tokens.iter().enumerate() {
+            let entry = match tok {
+                Some(tok) if !special.contains(&(id as u32)) => to_bytes(tok),
+                _ => None,
             };
-            let mut out = Vec::with_capacity(tok.len());
-            let mut ok = true;
-            for ch in tok.chars() {
-                match char_to_byte.get(&ch) {
-                    Some(&b) => out.push(b),
-                    None => {
-                        ok = false;
-                        break;
-                    }
-                }
-            }
-            if ok {
-                mapped += 1;
-                bytes.push(Some(out));
-            } else {
-                bytes.push(None);
-            }
+            mapped += usize::from(entry.is_some());
+            bytes.push(entry);
         }
         if (mapped as f64) < vocab_size as f64 * 0.9 {
             return None;
@@ -1393,9 +1408,47 @@ mod tests {
         );
     }
 
+    /// Contract: a number is the one scalar with no terminator of its own,
+    /// so the comma that ends it is also the comma that opens the next key;
+    /// when the schema has no key left, that comma is refused like any other.
+    ///
+    /// The comma event was derived from the state before the byte, which for
+    /// a number is still "in number", so the key-availability check never
+    /// ran: after `{"a":36,` only whitespace was allowed, the sequence burned
+    /// its token budget and finished `length` with invalid JSON.
+    #[test]
+    fn a_comma_after_the_last_numeric_property_is_refused() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {"a": {"type": "integer"}},
+            "required": ["a"],
+            "additionalProperties": false
+        });
+        let mut c = guided(&schema);
+        assert!(walk_str(&mut c, r#"{"a":36"#));
+        let allowed = c.allowed(97);
+        assert!(allowed[(b'}' - 0x20) as usize], "the object may close");
+        assert!(
+            !allowed[(b',' - 0x20) as usize],
+            "no key is left to follow a comma"
+        );
+        assert!(!walk_str(&mut c, ","));
+        assert!(walk_str(&mut c, "}"));
+        assert!(c.machine.accepting());
+
+        let mut c = guided(&person_schema());
+        assert!(walk_str(&mut c, r#"{"name":"Ada","age":36"#));
+        assert!(walk_str(&mut c, ","), "keys remain, the comma is fine");
+        assert!(walk_str(&mut c, r#""color":"red","tags":[]"#));
+        assert!(!walk_str(&mut c, ","), "every key is used");
+        assert!(walk_str(&mut c, "}"));
+        assert!(c.machine.accepting());
+    }
+
     /// Contract (soundness + strictness): random mask-guided generation with
     /// single-byte tokens is never stuck (some token or stop is always
-    /// allowed) and every accepted document parses and satisfies the schema.
+    /// allowed), never dead-ends into a whitespace-only mask, and every
+    /// accepted document parses and satisfies the schema.
     #[test]
     fn fuzz_guided_walks_always_valid() {
         let schema = person_schema();
@@ -1415,6 +1468,11 @@ mod tests {
                 assert!(
                     !choices.is_empty(),
                     "stuck at {:?}",
+                    String::from_utf8_lossy(&out)
+                );
+                assert!(
+                    choices.iter().any(|&i| i != 0 && i != 95),
+                    "dead end, only whitespace allowed after {:?}",
                     String::from_utf8_lossy(&out)
                 );
                 rng = rng
@@ -1438,7 +1496,10 @@ mod tests {
                 .as_object()
                 .unwrap_or_else(|| panic!("not an object: {text:?}"));
             assert!(obj["name"].is_string(), "{text:?}");
-            assert!(obj["age"].is_i64() || obj["age"].is_u64(), "{text:?}");
+            assert!(
+                obj["age"].is_number(),
+                "age is a number; one wider than u64 parses as f64: {text:?}"
+            );
             if let Some(color) = obj.get("color") {
                 assert!(
                     ["red", "green", "blue"].contains(&color.as_str().unwrap_or("")),
@@ -1493,5 +1554,86 @@ mod tests {
         c.advance(3);
         let a = c.allowed(6);
         assert_eq!(a, vec![false, false, false, false, false, true]);
+    }
+    /// Contract: a SentencePiece vocabulary, whose pieces carry `▁` for a
+    /// space and `<0xNN>` for a raw byte, gets a byte table like a byte-level
+    /// one, so constrained decoding reaches the Llama 2, Gemma, Phi-3 and
+    /// TinyLlama tokenizers instead of silently falling back to validation.
+    #[test]
+    fn a_sentencepiece_vocabulary_gets_a_byte_table() {
+        use tokenizers::models::wordlevel::WordLevel;
+        let mut pieces: Vec<String> = [
+            "<unk>", "<s>", "</s>", "<0x41>", "<0x7B>", "▁{", "▁\"", "name", "\":", "▁", "}", "▁▁x",
+        ]
+        .iter()
+        .map(|p| p.to_string())
+        .collect();
+        pieces.extend((0..20).map(|i| format!("piece{i}")));
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let model = WordLevel::builder()
+            .vocab(
+                pieces
+                    .iter()
+                    .enumerate()
+                    .map(|(i, p)| (p.clone(), i as u32))
+                    .collect(),
+            )
+            .unk_token("<unk>".to_string())
+            .build()
+            .expect("wordlevel");
+        let mut inner = tokenizers::Tokenizer::new(model);
+        let _ = inner.add_special_tokens(vec![
+            tokenizers::AddedToken::from("<s>", true),
+            tokenizers::AddedToken::from("</s>", true),
+        ]);
+        inner
+            .save(tmp.path().join("tokenizer.json"), false)
+            .expect("save tokenizer");
+        std::fs::write(
+            tmp.path().join("tokenizer_config.json"),
+            r#"{"bos_token": "<s>", "eos_token": "</s>"}"#,
+        )
+        .expect("write config");
+        let tok = crate::tokenizer::Tokenizer::from_dir(tmp.path().to_str().expect("utf-8"))
+            .expect("load tokenizer");
+        let table = TokenByteTable::build(&tok).expect("a sentencepiece table");
+        assert_eq!(
+            table.bytes[3].as_deref(),
+            Some(&b"A"[..]),
+            "<0x41> is the byte"
+        );
+        assert_eq!(table.bytes[4].as_deref(), Some(&b"{"[..]));
+        assert_eq!(
+            table.bytes[5].as_deref(),
+            Some(&b" {"[..]),
+            "a leading space"
+        );
+        assert_eq!(table.bytes[11].as_deref(), Some(&b"  x"[..]));
+        assert!(
+            table.bytes[1].is_none(),
+            "specials never appear in constrained output"
+        );
+    }
+    /// Contract: whitespace between tokens is bounded, so a model that rates
+    /// a newline above the opening brace is forced into the document once
+    /// the bound is spent instead of burning its budget on newlines, and the
+    /// bound resets at every non-whitespace byte.
+    #[test]
+    fn a_run_of_whitespace_is_bounded() {
+        let mut m = JsonMachine::new(JsonMode::Object);
+        for _ in 0..MAX_WHITESPACE_RUN {
+            assert!(m.step(b'\n', JsonMode::Object));
+        }
+        assert!(
+            !m.step(b'\n', JsonMode::Object),
+            "one newline past the bound"
+        );
+        assert!(!m.step(b' ', JsonMode::Object), "nor a space");
+        assert!(m.step(b'{', JsonMode::Object), "the brace is still open");
+        for _ in 0..MAX_WHITESPACE_RUN {
+            assert!(m.step(b' ', JsonMode::Object));
+        }
+        assert!(!m.step(b' ', JsonMode::Object));
+        assert!(m.step(b'}', JsonMode::Object));
     }
 }

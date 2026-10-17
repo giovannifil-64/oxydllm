@@ -490,7 +490,7 @@ fn owned_from_rows(
             candle_core::bail!("an owned weight lives on Metal");
         };
         let buffer = md.new_buffer_with_data(bytes)?;
-        StagedWeight::of_kind((*buffer).clone(), like.kind(), &[rows, k])
+        StagedWeight::of_kind(buffer, like.kind(), &[rows, k])
             .map(LinearWeight::Owned)
             .ok_or_else(|| candle_core::Error::Msg("owned weight rows are not whole blocks".into()))
     }
@@ -532,7 +532,7 @@ pub fn qtensor_with_staged(
     let storage = QStorage::from_data(Cow::Borrowed(bytes), device, dtype)?;
     #[cfg(feature = "metal")]
     let staged = match &storage {
-        QStorage::Metal(ms) => StagedWeight::new(ms.buffer().clone(), dtype, &dims),
+        QStorage::Metal(ms) => StagedWeight::new(Arc::new(ms.buffer().clone()), dtype, &dims),
         _ => None,
     };
     #[cfg(not(feature = "metal"))]
@@ -699,7 +699,7 @@ fn build_owned(
     let bytes = read_tensor_bytes(file, file_len, data_offset, entry, size_in_bytes)?;
     let _guard = crate::common::weights::metal_alloc_lock().lock().unwrap();
     let buffer = md.new_buffer_with_data(&bytes)?;
-    StagedWeight::of_kind((*buffer).clone(), kind, &[n, k])
+    StagedWeight::of_kind(buffer, kind, &[n, k])
         .map(Built::Owned)
         .ok_or_else(|| anyhow::anyhow!("{name} weight rows are not whole blocks"))
 }
@@ -754,11 +754,10 @@ mod tests {
             tensor: Arc::new(qt),
             staged: None,
         };
-        let LinearWeight::Candle {
-            tensor: restored, ..
-        } = depermute_qk_rows(&interleaved, n_heads, head_dim, &dev).unwrap()
-        else {
-            panic!("a candle weight comes back as one");
+        let restored = match depermute_qk_rows(&interleaved, n_heads, head_dim, &dev).unwrap() {
+            LinearWeight::Candle { tensor, .. } => tensor,
+            #[cfg(feature = "metal")]
+            LinearWeight::Owned(_) => panic!("a candle weight comes back as one"),
         };
         let restored_t = restored.dequantize(&dev).unwrap();
 

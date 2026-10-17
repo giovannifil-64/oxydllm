@@ -293,34 +293,64 @@ fn tojson_filter(
 ) -> std::result::Result<Value, minijinja::Error> {
     let indent: Option<u32> = kwargs.get("indent")?;
     kwargs.assert_all_used()?;
-    let json_string = serde_json::to_string(&value).map_err(|e| {
+    let mut buf = Vec::new();
+    let written = match indent {
+        Some(n) => {
+            let indent_str = " ".repeat(n as usize);
+            let fmt = serde_json::ser::PrettyFormatter::with_indent(indent_str.as_bytes());
+            value.serialize(&mut serde_json::Serializer::with_formatter(&mut buf, fmt))
+        }
+        None => value.serialize(&mut serde_json::Serializer::with_formatter(
+            &mut buf,
+            PythonSpacing,
+        )),
+    };
+    written.map_err(|e| {
         minijinja::Error::new(
             minijinja::ErrorKind::InvalidOperation,
             format!("tojson serialization failed: {e}"),
         )
     })?;
-    let result = if let Some(n) = indent {
-        let parsed: serde_json::Value = serde_json::from_str(&json_string).map_err(|e| {
-            minijinja::Error::new(
-                minijinja::ErrorKind::InvalidOperation,
-                format!("tojson re-parse failed: {e}"),
-            )
-        })?;
-        let indent_str = " ".repeat(n as usize);
-        let fmt = serde_json::ser::PrettyFormatter::with_indent(indent_str.as_bytes());
-        let mut buf = Vec::new();
-        let mut ser = serde_json::Serializer::with_formatter(&mut buf, fmt);
-        serde::Serialize::serialize(&parsed, &mut ser).map_err(|e| {
-            minijinja::Error::new(
-                minijinja::ErrorKind::InvalidOperation,
-                format!("tojson pretty-print failed: {e}"),
-            )
-        })?;
-        String::from_utf8(buf).unwrap_or(json_string)
-    } else {
-        json_string
-    };
-    Ok(Value::from(result))
+    Ok(Value::from(String::from_utf8_lossy(&buf).into_owned()))
+}
+
+/// Writes JSON with Python's default `json.dumps` separators, a space after
+/// every comma and colon, which is what the transformers `tojson` filter and
+/// llama.cpp produce and therefore the spacing models saw tool definitions
+/// in during training.
+struct PythonSpacing;
+
+impl serde_json::ser::Formatter for PythonSpacing {
+    fn begin_array_value<W: ?Sized + std::io::Write>(
+        &mut self,
+        writer: &mut W,
+        first: bool,
+    ) -> std::io::Result<()> {
+        if first {
+            Ok(())
+        } else {
+            writer.write_all(b", ")
+        }
+    }
+
+    fn begin_object_key<W: ?Sized + std::io::Write>(
+        &mut self,
+        writer: &mut W,
+        first: bool,
+    ) -> std::io::Result<()> {
+        if first {
+            Ok(())
+        } else {
+            writer.write_all(b", ")
+        }
+    }
+
+    fn begin_object_value<W: ?Sized + std::io::Write>(
+        &mut self,
+        writer: &mut W,
+    ) -> std::io::Result<()> {
+        writer.write_all(b": ")
+    }
 }
 
 fn raise_exception(msg: String) -> Result<Value, minijinja::Error> {
@@ -372,6 +402,31 @@ mod tests {
         .expect("template should render");
 
         assert_eq!(rendered, "user: hello");
+    }
+
+    /// Contract: `tojson` renders with Python's default spacing and in the
+    /// request's key order, which is how transformers and llama.cpp render
+    /// tool definitions and how models saw them in training; the indented
+    /// form keeps the pretty layout.
+    #[test]
+    fn tojson_renders_like_python_json_dumps() {
+        let source = r#"{"type": "function", "function": {"name": "f", "parameters": {"type": "object", "properties": {"z": {"type": "string"}, "a": {"enum": ["x", "y"]}}, "required": ["z"]}}}"#;
+        let tools: serde_json::Value =
+            serde_json::from_str(&format!("[{source}]")).expect("valid json");
+        let opts = || TemplateOptions {
+            tools: Some(tools.clone()),
+            ..Default::default()
+        };
+        let rendered = apply_chat_template("{{ tools[0] | tojson }}", &[], opts()).expect("render");
+        assert_eq!(rendered, source);
+
+        let indented = apply_chat_template(
+            "{{ tools[0].function.parameters.required | tojson(indent=2) }}",
+            &[],
+            opts(),
+        )
+        .expect("render");
+        assert_eq!(indented, "[\n  \"z\"\n]");
     }
 
     /// Contract: tool-call `arguments` reach the template as a MAPPING, not

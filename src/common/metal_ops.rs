@@ -3009,9 +3009,17 @@ const MPP_MATVEC_ROWS: usize = 4;
 
 /// Only a layout a kernel understands becomes a handle: every GGUF block
 /// quantization on a two-dimensional weight whose rows are whole blocks.
+///
+/// The handle holds the `Arc` candle's buffer pool hands out, not a bare
+/// `Buffer`. The pool treats any buffer whose `Arc` count has fallen to one
+/// as free, whatever objc retains exist on it, so a handle that dropped the
+/// `Arc` left its weight open to being overwritten by the next allocation of
+/// a compatible size until the next drain. Weights candle also holds as a
+/// `QTensor` are covered by that tensor's own `Arc`; weights only this crate
+/// decodes are covered by nothing else.
 #[derive(Clone, Debug)]
 pub struct StagedWeight {
-    buffer: candle_metal_kernels::metal::Buffer,
+    buffer: std::sync::Arc<candle_metal_kernels::metal::Buffer>,
     kind: WeightKind,
     n: usize,
     k: usize,
@@ -3020,7 +3028,7 @@ pub struct StagedWeight {
 impl StagedWeight {
     /// Wraps `buffer` when a staged kernel covers `dtype` and `dims`.
     pub fn new(
-        buffer: candle_metal_kernels::metal::Buffer,
+        buffer: std::sync::Arc<candle_metal_kernels::metal::Buffer>,
         dtype: GgmlDType,
         dims: &[usize],
     ) -> Option<Self> {
@@ -3030,7 +3038,7 @@ impl StagedWeight {
     /// Wraps `buffer` as a weight of `kind` when `dims` is a two-dimensional
     /// weight whose rows are whole blocks.
     pub fn of_kind(
-        buffer: candle_metal_kernels::metal::Buffer,
+        buffer: std::sync::Arc<candle_metal_kernels::metal::Buffer>,
         kind: WeightKind,
         dims: &[usize],
     ) -> Option<Self> {
@@ -3136,7 +3144,7 @@ impl CustomOp1 for MppStagedMatmul {
         let encoder = encoder.as_ref();
         encoder.set_compute_pipeline_state(&pipeline);
         encoder.set_input_buffer(0, Some(x.buffer()), x_l.start_offset() * 2);
-        encoder.set_input_buffer(1, Some(&self.weight.buffer), 0);
+        encoder.set_input_buffer(1, Some(&*self.weight.buffer), 0);
         encoder.set_output_buffer(2, Some(&*output), 0);
         encoder.set_bytes(3, &params);
 
@@ -3177,7 +3185,9 @@ pub fn mpp_staged_matmul(x: &Tensor, weight: &StagedWeight) -> Result<Tensor> {
 ///
 /// The batch size that decides is [`StagedWeight::min_m`], measured per block
 /// type. Below it candle serves, which covers decode, where its matvec is
-/// memory bound and within reach of llama.cpp.
+/// memory bound and within reach of llama.cpp. The one exception is a single
+/// row of a Q2_K weight, which goes to the crate's own matvec because candle's
+/// is launched for twice the rows it has (see [`GgufQ2kMatvec`]).
 pub fn maybe_staged_quant_matmul(x: &Tensor, weight: &StagedWeight) -> Result<Option<Tensor>> {
     if x.dtype() != DType::BF16 {
         return Ok(None);
@@ -3186,7 +3196,17 @@ pub fn maybe_staged_quant_matmul(x: &Tensor, weight: &StagedWeight) -> Result<Op
         return Ok(None);
     };
     let dims = x.dims();
-    if dims.len() != 2 || dims[0] < weight.min_m() || dims[1] != weight.k || !x.is_contiguous() {
+    if dims.len() != 2 || dims[1] != weight.k || !x.is_contiguous() {
+        return Ok(None);
+    }
+    if dims[0] == 1 && weight.kind == WeightKind::Q2K {
+        return x
+            .apply_op1_no_bwd(&GgufQ2kMatvec {
+                weight: weight.clone(),
+            })
+            .map(Some);
+    }
+    if dims[0] < weight.min_m() {
         return Ok(None);
     }
     if !mpp_gemm_available(md.device()) {
@@ -3252,7 +3272,7 @@ impl CustomOp1 for MppOwnedMatvec {
         let encoder = encoder.as_ref();
         encoder.set_compute_pipeline_state(&pipeline);
         encoder.set_input_buffer(0, Some(x.buffer()), x_l.start_offset() * 2);
-        encoder.set_input_buffer(1, Some(&self.weight.buffer), 0);
+        encoder.set_input_buffer(1, Some(&*self.weight.buffer), 0);
         encoder.set_output_buffer(2, Some(&*output), 0);
         encoder.set_bytes(3, &params);
         encoder.dispatch_thread_groups(
@@ -3271,6 +3291,89 @@ impl CustomOp1 for MppOwnedMatvec {
         Ok((
             MetalStorage::new(output, device.clone(), out_elems, DType::BF16),
             Shape::from_dims(&[m, n]),
+        ))
+    }
+}
+
+/// Rows one threadgroup of the crate's single-row GGUF gemv kernels covers,
+/// two simdgroups of four rows; must match `GGUF_N_SIMDGROUP * GGUF_N_DST`
+/// in the kernel source.
+const GGUF_GEMV_ROWS_PER_TG: usize = 8;
+
+/// Kernel argument block for the single-row GGUF gemv kernels; must match
+/// `GgufParams` in `quant_kernels.metal`.
+#[repr(C)]
+struct GgufParams {
+    in_features: u32,
+    out_features: u32,
+}
+
+/// `x [1, k] @ weight^T` for a Q2_K weight through the crate's own
+/// `gguf_q2k_gemv_bf16`, in place of candle's `kernel_mul_mv_q2_K_f32`.
+///
+/// candle launches that kernel with one threadgroup per four rows while the
+/// kernel takes eight rows per threadgroup and guards neither its loads nor
+/// its stores, so the second half of every launch reads past the weight and
+/// writes past the output. A Q2_K model answered NaN to every prompt; under
+/// Metal shader validation the same forward was clean, and every invalid
+/// access it reported was in that kernel. candle serves a single row with the
+/// matvec and two rows or more with its tiled GEMM, which has no such defect,
+/// so only the single row is taken over.
+struct GgufQ2kMatvec {
+    weight: StagedWeight,
+}
+
+impl CustomOp1 for GgufQ2kMatvec {
+    fn name(&self) -> &'static str {
+        "gguf-q2k-matvec"
+    }
+
+    fn cpu_fwd(&self, _s: &CpuStorage, _l: &Layout) -> Result<(CpuStorage, Shape)> {
+        candle_core::bail!("GgufQ2kMatvec: Metal-only")
+    }
+
+    fn metal_fwd(&self, x: &MetalStorage, x_l: &Layout) -> Result<(MetalStorage, Shape)> {
+        if x.dtype() != DType::BF16 {
+            candle_core::bail!("GgufQ2kMatvec: x must be BF16, got {:?}", x.dtype());
+        }
+        if !x_l.is_contiguous() {
+            candle_core::bail!("GgufQ2kMatvec: x must be contiguous");
+        }
+        let (n, k) = (self.weight.n, self.weight.k);
+        if x_l.dims() != [1, k] {
+            candle_core::bail!("GgufQ2kMatvec: x shape {:?} is not [1, {k}]", x_l.dims());
+        }
+
+        let device = x.device();
+        let output = device.new_buffer(n, DType::BF16, "gguf_q2k_matvec")?;
+        let params = GgufParams {
+            in_features: k as u32,
+            out_features: n as u32,
+        };
+        let pipeline = get_or_compile_quant_pipeline(device.device(), "gguf_q2k_gemv_bf16")?;
+        let encoder = device.command_encoder()?;
+        let encoder = encoder.as_ref();
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_input_buffer(0, Some(x.buffer()), x_l.start_offset() * 2);
+        encoder.set_input_buffer(1, Some(&*self.weight.buffer), 0);
+        encoder.set_output_buffer(2, Some(&*output), 0);
+        encoder.set_bytes(3, &params);
+        encoder.dispatch_thread_groups(
+            MTLSize {
+                width: n.div_ceil(GGUF_GEMV_ROWS_PER_TG),
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: 64,
+                height: 1,
+                depth: 1,
+            },
+        );
+
+        Ok((
+            MetalStorage::new(output, device.clone(), n, DType::BF16),
+            Shape::from_dims(&[1, n]),
         ))
     }
 }
@@ -3316,7 +3419,7 @@ impl CustomOp1 for MppOwnedGather {
         let encoder = encoder.as_ref();
         encoder.set_compute_pipeline_state(&pipeline);
         encoder.set_input_buffer(0, Some(t.buffer()), t_l.start_offset() * 4);
-        encoder.set_input_buffer(1, Some(&self.table.buffer), 0);
+        encoder.set_input_buffer(1, Some(&*self.table.buffer), 0);
         encoder.set_output_buffer(2, Some(&*output), 0);
         encoder.set_bytes(3, &params);
         encoder.dispatch_thread_groups(
@@ -7854,7 +7957,7 @@ pub(crate) mod owned_weights {
         let cpu = Device::Cpu;
         let w = Tensor::from_vec(dense(kind, bytes, n, k), (n, k), &cpu).unwrap();
         let buffer = md.new_buffer_with_data(bytes).unwrap();
-        let staged = StagedWeight::of_kind((*buffer).clone(), kind, &[n, k]).unwrap();
+        let staged = StagedWeight::of_kind(buffer, kind, &[n, k]).unwrap();
         for m in [1usize, 3, MPP_MATVEC_MAX_M, MPP_MATVEC_MAX_M + 1, 64, 200] {
             let x: Vec<f32> = (0..m * k).map(|i| ((i % 13) as f32 - 6.0) * 0.05).collect();
             let x_bf = Tensor::from_vec(x, (m, k), &cpu)
@@ -7927,6 +8030,113 @@ pub(crate) mod owned_weights {
         }
     }
 
+    /// Contract: every owned kernel is deterministic: the same weight and
+    /// activations give bitwise the same output on every run, through the
+    /// matvec, the staged GEMM and the embedding gather alike.
+    #[test]
+    fn the_owned_kernels_are_deterministic() {
+        let Ok(dev) = Device::new_metal(0) else {
+            return;
+        };
+        let Device::Metal(md) = &dev else {
+            return;
+        };
+        if !mpp_owned_kernels_available(md.device()) {
+            return;
+        }
+        let (n, k) = (1024usize, 3072usize);
+        for kind in [WeightKind::Iq4Xs, WeightKind::Iq4Nl, WeightKind::Iq3S] {
+            let bytes = synthetic(kind, n, k, 23);
+            let staged =
+                StagedWeight::of_kind(md.new_buffer_with_data(&bytes).unwrap(), kind, &[n, k])
+                    .unwrap();
+            for m in [1usize, 3, MPP_MATVEC_MAX_M, 64, 200] {
+                let x: Vec<f32> = (0..m * k).map(|i| ((i % 17) as f32 - 8.0) * 0.07).collect();
+                let x_bf = Tensor::from_vec(x, (m, k), &dev)
+                    .unwrap()
+                    .to_dtype(DType::BF16)
+                    .unwrap();
+                let first = mpp_owned_matmul(&x_bf, &staged)
+                    .unwrap()
+                    .to_dtype(DType::F32)
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap();
+                for run in 1..24 {
+                    let again = mpp_owned_matmul(&x_bf, &staged)
+                        .unwrap()
+                        .to_dtype(DType::F32)
+                        .unwrap()
+                        .flatten_all()
+                        .unwrap()
+                        .to_vec1::<f32>()
+                        .unwrap();
+                    let differing = first.iter().zip(&again).filter(|(a, b)| a != b).count();
+                    assert_eq!(
+                        differing,
+                        0,
+                        "{kind:?} m={m}: run {run} differs from run 0 in {differing} of {} outputs",
+                        first.len()
+                    );
+                }
+            }
+            let ids = Tensor::from_vec(vec![3u32, 0, 511, 3, 17, 1000], (6,), &dev).unwrap();
+            let first = mpp_owned_gather(&ids, &staged)
+                .unwrap()
+                .to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            for run in 1..8 {
+                let again = mpp_owned_gather(&ids, &staged)
+                    .unwrap()
+                    .to_dtype(DType::F32)
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap();
+                assert_eq!(first, again, "{kind:?} gather: run {run} differs");
+            }
+        }
+    }
+
+    /// Contract: while an owned weight lives, candle's pool never hands its
+    /// buffer out again.
+    ///
+    /// The pool reuses any buffer whose `Arc` count is one; a handle that
+    /// kept a bare `Buffer` and dropped the `Arc` left its weight to be
+    /// overwritten by the next allocation of a compatible size until the
+    /// next drain. Every pool buffer of this size is taken and held here, so
+    /// a reusable weight buffer would have to come back.
+    #[test]
+    fn an_owned_weight_keeps_its_buffer_out_of_the_pool() {
+        let Ok(dev) = Device::new_metal(0) else {
+            return;
+        };
+        let Device::Metal(md) = &dev else {
+            return;
+        };
+        let kind = WeightKind::Iq4Xs;
+        let (n, k) = (64usize, 512usize);
+        let bytes = synthetic(kind, n, k, 5);
+        let staged =
+            StagedWeight::of_kind(md.new_buffer_with_data(&bytes).unwrap(), kind, &[n, k]).unwrap();
+        let weight = staged.buffer.contents() as usize;
+        let handed_out: Vec<_> = (0..16)
+            .map(|_| md.allocate_buffer(bytes.len()).unwrap())
+            .collect();
+        assert!(
+            handed_out.iter().all(|b| b.contents() as usize != weight),
+            "the pool handed the weight's buffer out again"
+        );
+        assert_eq!(staged.bytes(), bytes, "the weight reads back intact");
+    }
+
     /// Contract: the token embedding over a table candle cannot serve hands
     /// back, for a batch of token ids in any shape, exactly the rows the CPU
     /// reference decodes, in the model's dtype, and reads the last row for an
@@ -7948,7 +8158,7 @@ pub(crate) mod owned_weights {
             let bytes = synthetic(kind, vocab, k, 19);
             let table = dense(kind, &bytes, vocab, k);
             let buffer = md.new_buffer_with_data(&bytes).unwrap();
-            let staged = StagedWeight::of_kind((*buffer).clone(), kind, &[vocab, k]).unwrap();
+            let staged = StagedWeight::of_kind(buffer, kind, &[vocab, k]).unwrap();
             let embedding = Embedding::Owned {
                 table: staged,
                 dtype: DType::F32,
@@ -8003,7 +8213,7 @@ pub(crate) mod owned_weights {
             for kind in [WeightKind::Iq4Xs, WeightKind::Iq4Nl, WeightKind::Iq3S] {
                 let bytes = synthetic(kind, n, k, 11);
                 let buffer = md.new_buffer_with_data(&bytes).unwrap();
-                let staged = StagedWeight::of_kind((*buffer).clone(), kind, &[n, k]).unwrap();
+                let staged = StagedWeight::of_kind(buffer, kind, &[n, k]).unwrap();
                 let x: Vec<f32> = (0..k).map(|i| ((i % 13) as f32 - 6.0) * 0.05).collect();
                 let x_bf = Tensor::from_vec(x.clone(), (1, k), &dev)
                     .unwrap()
@@ -8032,5 +8242,113 @@ pub(crate) mod owned_weights {
                 peso as f64 / t_candle / 1e9
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod q2k_matvec_tests {
+    use super::*;
+    use candle_core::Device;
+    use candle_core::quantized::{GgmlDType, QTensor};
+
+    /// A Q2_K weight `[n, k]` as its block bytes and as the dense matrix
+    /// those bytes decode to.
+    fn q2k_weight(n: usize, k: usize, seed: u64) -> (Vec<u8>, Tensor) {
+        let cpu = Device::Cpu;
+        let w: Vec<f32> = (0..n * k)
+            .map(|i| {
+                let h = (i as u64).wrapping_mul(2654435761).wrapping_add(seed) % 97;
+                (h as f32 - 48.0) * 0.02
+            })
+            .collect();
+        let qt =
+            QTensor::quantize(&Tensor::from_vec(w, (n, k), &cpu).unwrap(), GgmlDType::Q2K).unwrap();
+        let bytes = qt.data().unwrap().into_owned();
+        (bytes, qt.dequantize(&cpu).unwrap())
+    }
+
+    fn row(t: &Tensor) -> Vec<f32> {
+        t.to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap()
+    }
+
+    /// Contract: a single row through a Q2_K weight agrees with the
+    /// dequantized weight on every output, for row counts that are and are
+    /// not multiples of a threadgroup's eight, and gives the same bits on
+    /// every run.
+    ///
+    /// candle's own matvec for this type is launched for twice the rows it
+    /// has, which left a Q2_K model answering NaN to every prompt.
+    #[test]
+    fn a_single_row_through_a_q2k_weight_matches_the_dequantized_weight() {
+        let Ok(dev) = Device::new_metal(0) else {
+            return;
+        };
+        let Device::Metal(md) = &dev else {
+            return;
+        };
+        for (n, k) in [(37usize, 512usize), (256, 1536), (8960, 1536)] {
+            let (bytes, dequant) = q2k_weight(n, k, 7);
+            let staged = StagedWeight::of_kind(
+                md.new_buffer_with_data(&bytes).unwrap(),
+                WeightKind::Q2K,
+                &[n, k],
+            )
+            .unwrap();
+            let x: Vec<f32> = (0..k).map(|i| ((i % 23) as f32 - 11.0) * 0.05).collect();
+            let x_bf = Tensor::from_vec(x, (1, k), &Device::Cpu)
+                .unwrap()
+                .to_dtype(DType::BF16)
+                .unwrap();
+            let expected = row(&x_bf
+                .to_dtype(DType::F32)
+                .unwrap()
+                .matmul(&dequant.t().unwrap())
+                .unwrap());
+            let x_dev = x_bf.to_device(&dev).unwrap();
+            let got = row(&maybe_staged_quant_matmul(&x_dev, &staged)
+                .unwrap()
+                .expect("a single Q2_K row is served by the crate's matvec"));
+            let peak = expected.iter().fold(0f32, |a, v| a.max(v.abs()));
+            let worst = expected
+                .iter()
+                .zip(&got)
+                .fold(0f32, |a, (e, g)| a.max((e - g).abs()))
+                / peak;
+            assert!(worst < 0.02, "[{n}x{k}] relative error {worst}");
+            let again = row(&maybe_staged_quant_matmul(&x_dev, &staged).unwrap().unwrap());
+            assert_eq!(got, again, "[{n}x{k}] the matvec must be deterministic");
+        }
+    }
+
+    /// Contract: the takeover is for Q2_K alone; a single row of a kind
+    /// candle serves correctly still goes to candle.
+    #[test]
+    fn a_single_row_of_another_kind_still_goes_to_candle() {
+        let Ok(dev) = Device::new_metal(0) else {
+            return;
+        };
+        let Device::Metal(md) = &dev else {
+            return;
+        };
+        let (n, k) = (64usize, 512usize);
+        let w = Tensor::zeros((n, k), DType::F32, &Device::Cpu).unwrap();
+        let bytes = QTensor::quantize(&w, GgmlDType::Q4K)
+            .unwrap()
+            .data()
+            .unwrap()
+            .into_owned();
+        let staged = StagedWeight::of_kind(
+            md.new_buffer_with_data(&bytes).unwrap(),
+            WeightKind::Q4K,
+            &[n, k],
+        )
+        .unwrap();
+        let x = Tensor::zeros((1, k), DType::BF16, &dev).unwrap();
+        assert!(maybe_staged_quant_matmul(&x, &staged).unwrap().is_none());
     }
 }

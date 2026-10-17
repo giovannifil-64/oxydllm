@@ -4,8 +4,8 @@ set -eu
 echo "[pre-commit] cargo fmt --check"
 cargo fmt --check
 
-echo "[pre-commit] cargo clippy -- -D warnings"
-cargo clippy -- -D warnings
+echo "[pre-commit] cargo clippy --all-targets -- -D warnings"
+cargo clippy --all-targets -- -D warnings
 
 echo "[pre-commit] cargo audit"
 cargo audit

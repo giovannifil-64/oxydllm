@@ -110,6 +110,44 @@ impl PrefixCache {
         (n, matched)
     }
 
+    /// Marks the cached leading blocks of `tokens` as most recently used, so
+    /// that eviction under pressure takes other prompts' blocks before the
+    /// ones this prompt is about to reuse. No-op when disabled.
+    pub fn touch(&mut self, tokens: &[u32], block_size: usize) {
+        if self.disabled {
+            return;
+        }
+        let mut prev_hash: u64 = 0;
+        for block_tokens in tokens.chunks_exact(block_size) {
+            let h = chain_hash(block_tokens, prev_hash);
+            match self.entries.get(&h) {
+                Some(entry) if entry.block_tokens == block_tokens => prev_hash = h,
+                _ => break,
+            }
+        }
+    }
+
+    /// Drops the least recently used entry and frees its blocks, returning
+    /// whether there was one to drop.
+    ///
+    /// Blocks are freed through the per-layer `allocators`, so a block a
+    /// running sequence still shares merely loses the cache's reference and
+    /// stays allocated. Returns `false` when disabled or empty.
+    pub fn evict_lru(&mut self, allocators: &[SharedBlockAllocator]) -> bool {
+        if self.disabled {
+            return false;
+        }
+        let Some((_, evicted)) = self.entries.pop_lru() else {
+            return false;
+        };
+        for (layer_idx, bid) in evicted.block_ids.iter().enumerate() {
+            if layer_idx < allocators.len() {
+                allocators[layer_idx].lock().unwrap().free(*bid);
+            }
+        }
+        true
+    }
+
     /// Records the KV blocks of freshly computed prefix blocks so later requests
     /// can reuse them.
     ///

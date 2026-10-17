@@ -64,6 +64,7 @@ pub mod ffn;
 pub mod gdn;
 pub mod gguf_header;
 pub mod gguf_weights;
+pub mod incremental_decode;
 #[cfg(test)]
 pub mod iq_quant;
 pub mod kv_quant;

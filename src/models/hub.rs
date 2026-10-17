@@ -535,6 +535,9 @@ pub fn pull(config: &PullConfig) -> anyhow::Result<()> {
             "{}/{}/resolve/main/{}",
             HF_ENDPOINT, config.repo_id, filename
         );
+        if let Some(parent) = dest.join(filename).parent() {
+            std::fs::create_dir_all(parent)?;
+        }
         match download_file(
             &runtime,
             &fetcher,
@@ -629,10 +632,13 @@ fn list_repo_files(
 }
 
 fn is_relevant_file(f: &str) -> bool {
-    if f.contains('/') || f.starts_with('.') {
+    if f.starts_with('.') {
         return false;
     }
     let l = f.to_lowercase();
+    if f.contains('/') {
+        return l.ends_with(".json");
+    }
     if l == "consolidated.safetensors"
         || l.ends_with(".pth")
         || l.ends_with(".pt")
@@ -946,7 +952,9 @@ mod tests {
         assert!(!is_relevant_file("model.bin"));
         assert!(!is_relevant_file("model.pt"));
         assert!(!is_relevant_file("model.pth"));
-        assert!(!is_relevant_file("sub/config.json")); // nested
+        assert!(is_relevant_file("1_Pooling/config.json"));
+        assert!(!is_relevant_file("onnx/model.onnx"));
+        assert!(!is_relevant_file("sub/model.safetensors"));
         assert!(!is_relevant_file(".hidden.json")); // dotfile
         assert!(!is_relevant_file("consolidated.safetensors")); // excluded by name
     }

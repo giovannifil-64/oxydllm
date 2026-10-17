@@ -100,6 +100,14 @@ fn spawn_stuck_engine() -> tokio_mpsc::Sender<IncomingRequest> {
 }
 
 fn build_test_app(replies: Vec<ScriptedReply>) -> anyhow::Result<(Router, TempDir)> {
+    build_test_app_with_capacity(replies, 4096)
+}
+
+/// A test app whose model's KV pool holds `kv_capacity_tokens` tokens.
+fn build_test_app_with_capacity(
+    replies: Vec<ScriptedReply>,
+    kv_capacity_tokens: usize,
+) -> anyhow::Result<(Router, TempDir)> {
     let tmp = tempfile::tempdir()?;
     let model_id = "test-model";
     create_test_model_dir(tmp.path(), model_id)?;
@@ -129,6 +137,7 @@ fn build_test_app(replies: Vec<ScriptedReply>) -> anyhow::Result<(Router, TempDi
             request_tx,
             tokenizer,
             max_seq_len: 4096,
+            kv_capacity_tokens,
         },
     );
 
@@ -173,6 +182,7 @@ fn build_test_app_with_api_key(
             request_tx,
             tokenizer,
             max_seq_len: 4096,
+            kv_capacity_tokens: 4096,
         },
     );
 
@@ -216,6 +226,7 @@ fn build_test_app_with_timeout(
             request_tx,
             tokenizer,
             max_seq_len: 4096,
+            kv_capacity_tokens: 4096,
         },
     );
 
@@ -448,6 +459,53 @@ async fn get_model_not_found_returns_404() {
             .unwrap_or("")
             .contains("nonexistent")
     );
+}
+
+/// Contract: a prompt that leaves no room in the model's context is refused
+/// with 400 `context_length_exceeded` before it reaches the engine.
+///
+/// Enqueued with `max_tokens` clamped to zero, such a prompt blocked the
+/// scheduler's queue and kept the engine thread spinning until the request
+/// timeout, or indefinitely with the timeout disabled.
+#[tokio::test]
+async fn prompt_filling_the_context_is_refused_with_400() {
+    let (app, _tmp) = build_test_app(vec![]).expect("test app");
+    let content = "a ".repeat(4096);
+    let response = post_chat(
+        &app,
+        json!({"model": "test-model", "messages": [{"role": "user", "content": content}]}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: Value = serde_json::from_slice(
+        &to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body"),
+    )
+    .expect("json");
+    assert_eq!(body["error"]["code"], "context_length_exceeded");
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+}
+
+/// Contract: the KV pool bounds a request below the declared context when
+/// it came out smaller, so a prompt the pool cannot hold gets the same 400.
+#[tokio::test]
+async fn prompt_exceeding_the_kv_pool_is_refused_with_400() {
+    let (app, _tmp) = build_test_app_with_capacity(vec![], 64).expect("test app");
+    let content = "a ".repeat(64);
+    let response = post_chat(
+        &app,
+        json!({"model": "test-model", "messages": [{"role": "user", "content": content}]}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: Value = serde_json::from_slice(
+        &to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body"),
+    )
+    .expect("json");
+    assert_eq!(body["error"]["code"], "context_length_exceeded");
 }
 
 #[tokio::test]
@@ -1300,6 +1358,7 @@ async fn tools_streaming_error_emits_done_sentinel() {
             request_tx,
             tokenizer,
             max_seq_len: 4096,
+            kv_capacity_tokens: 4096,
         },
     );
     let state = Arc::new(AppState {
@@ -1501,6 +1560,7 @@ async fn stream_error_mid_stream_emits_done_after_error_chunk() {
             request_tx,
             tokenizer,
             max_seq_len: 4096,
+            kv_capacity_tokens: 4096,
         },
     );
     let state = Arc::new(AppState {

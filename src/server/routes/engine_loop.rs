@@ -8,9 +8,9 @@
 //! Two decoding concerns live here:
 //!
 //! - Prefix decode: tokenizers with a `Strip` decoder (LLaMA/Phi BPE) lose
-//!   inter-word spaces when tokens are decoded one at a time, so
-//!   [`prefix_decode_incremental`] re-decodes the accumulated sequence and
-//!   emits only the new text suffix.
+//!   inter-word spaces when tokens are decoded one at a time, so an
+//!   [`IncrementalDecoder`] per channel re-decodes the accumulated sequence
+//!   and emits only the new text suffix.
 //! - Channel routing: `<think>` blocks and the GPT-OSS harmony protocol
 //!   ([`HarmonyState`]) split tokens between reasoning and content streams.
 //!
@@ -29,6 +29,7 @@ use tokio::sync::mpsc as tokio_mpsc;
 
 use super::metrics;
 use super::types::{EngineEvent, EngineLogprobEntry, IncomingRequest};
+use crate::common::incremental_decode::{IncrementalDecoder, NeutralPrefix};
 use crate::engine::Engine;
 use crate::scheduler::sequence::SequenceId;
 use crate::tokenizer::Tokenizer;
@@ -122,7 +123,7 @@ enum HarmonyState {
     Markers,
     Role,
     Header,
-    Body { final_channel: bool },
+    Body { final_channel: bool, tool: bool },
 }
 
 /// Special-token ids for the harmony protocol markers. `channel` and
@@ -135,8 +136,20 @@ struct HarmonyIds {
     start: Option<u32>,
 }
 
-/// Returns `None` when the token is protocol framing (skip it), otherwise
-/// whether the token belongs to reasoning (`true`) or content (`false`).
+/// What one token means in the harmony protocol.
+#[derive(Debug, PartialEq)]
+enum HarmonyRoute {
+    /// Markers, role names and channel headers: nothing the client sees.
+    Framing,
+    Reasoning,
+    Content,
+    /// A commentary header addressed to a function just closed; the body that
+    /// follows is the call's arguments and this is the function's name.
+    ToolCall(String),
+    /// The body of a function call ended.
+    ToolCallEnd,
+}
+
 /// Unknown structure fails open to content.
 fn harmony_route(
     state: &mut HarmonyState,
@@ -144,32 +157,31 @@ fn harmony_route(
     ids: &HarmonyIds,
     tokenizer: &Tokenizer,
     tok: u32,
-) -> Option<bool> {
+) -> HarmonyRoute {
     let is_end = ids.end == Some(tok) || ids.start == Some(tok);
     match *state {
         HarmonyState::Markers => {
             if tok == ids.channel {
                 header_ids.clear();
                 *state = HarmonyState::Header;
-                return None;
+                return HarmonyRoute::Framing;
             }
             if ids.start == Some(tok) {
                 *state = HarmonyState::Role;
-                return None;
+                return HarmonyRoute::Framing;
             }
             if ids.end == Some(tok) {
-                return None;
-            }
-            if tok == ids.message {
-                *state = HarmonyState::Body {
-                    final_channel: true,
-                };
-                return None;
+                return HarmonyRoute::Framing;
             }
             *state = HarmonyState::Body {
                 final_channel: true,
+                tool: false,
             };
-            Some(false)
+            if tok == ids.message {
+                HarmonyRoute::Framing
+            } else {
+                HarmonyRoute::Content
+            }
         }
         HarmonyState::Role => {
             if tok == ids.channel {
@@ -178,49 +190,89 @@ fn harmony_route(
             } else if tok == ids.message {
                 *state = HarmonyState::Body {
                     final_channel: true,
+                    tool: false,
                 };
             } else if ids.end == Some(tok) {
                 *state = HarmonyState::Markers;
             }
-            None
+            HarmonyRoute::Framing
         }
         HarmonyState::Header => {
             if tok == ids.message {
                 let name = tokenizer.decode(header_ids).unwrap_or_default();
+                let recipient = name
+                    .split("to=")
+                    .nth(1)
+                    .and_then(|r| r.split_whitespace().next())
+                    .map(|r| r.trim_start_matches("functions.").to_string());
                 *state = HarmonyState::Body {
                     final_channel: name.contains("final"),
+                    tool: recipient.is_some(),
+                };
+                return match recipient {
+                    Some(function) => HarmonyRoute::ToolCall(function),
+                    None => HarmonyRoute::Framing,
                 };
             } else if is_end {
                 *state = HarmonyState::Markers;
             } else {
                 header_ids.push(tok);
             }
-            None
+            HarmonyRoute::Framing
         }
-        HarmonyState::Body { final_channel } => {
-            if is_end {
-                *state = HarmonyState::Markers;
-                return None;
+        HarmonyState::Body {
+            final_channel,
+            tool,
+        } => {
+            if is_end || tok == ids.channel {
+                if tok == ids.channel {
+                    header_ids.clear();
+                    *state = HarmonyState::Header;
+                } else {
+                    *state = HarmonyState::Markers;
+                }
+                return if tool {
+                    HarmonyRoute::ToolCallEnd
+                } else {
+                    HarmonyRoute::Framing
+                };
             }
-            if tok == ids.channel {
-                header_ids.clear();
-                *state = HarmonyState::Header;
-                return None;
+            if tool || final_channel {
+                HarmonyRoute::Content
+            } else {
+                HarmonyRoute::Reasoning
             }
-            Some(!final_channel)
         }
     }
+}
+
+/// Closes the `<tool_call>` block a harmony function call was written into:
+/// the body text still held by the decoder, then the brace and tag that
+/// complete the JSON the opener began.
+fn close_harmony_tool_call(tracker: &mut SeqTracker, tokenizer: &Tokenizer) {
+    if !tracker.harmony_tool_open {
+        return;
+    }
+    tracker.harmony_tool_open = false;
+    let mut text = tracker
+        .output
+        .finish(tokenizer, &tracker.output_ids)
+        .unwrap_or_default();
+    text.push_str("}\n</tool_call>");
+    let _ = tracker.tx.send(EngineEvent::Token {
+        text,
+        logprob_entries: vec![],
+    });
 }
 
 /// Per-sequence streaming state, mapping engine tokens to one request's
 /// response channel.
 ///
 /// Output and reasoning token ids are accumulated (`output_ids`,
-/// `thinking_ids`) and re-decoded incrementally via
-/// [`prefix_decode_incremental`], because decoding tokens one at a time loses
-/// inter-word spaces on tokenizers with a `Strip` decoder; `decoded_len`, the
-/// `*_stable_end` offsets, and the `*_stable_text` buffers carry that decoder
-/// state per channel. Raw logprobs wait in `pending_raw_lps` until text is
+/// `thinking_ids`) and re-decoded incrementally through one
+/// [`IncrementalDecoder`] per channel (`output`, `thinking`), because
+/// decoding tokens one at a time loses inter-word spaces on tokenizers with a
+/// `Strip` decoder. Raw logprobs wait in `pending_raw_lps` until text is
 /// emitted so entries stay aligned with chunks. `span` is the per-request
 /// OpenTelemetry span covering the whole lifecycle and `decode_span` its
 /// child covering first token to completion (its start offset from the
@@ -241,15 +293,17 @@ struct SeqTracker {
     thinking_header: bool,
     output_ids: Vec<u32>,
     thinking_ids: Vec<u32>,
-    decoded_len: usize,
-    thinking_decoded_len: usize,
+    output: IncrementalDecoder,
+    thinking: IncrementalDecoder,
     pending_raw_lps: Vec<PendingRawLogprob>,
-    out_stable_end: usize,
-    out_stable_text: String,
-    think_stable_end: usize,
-    think_stable_text: String,
     harmony_state: HarmonyState,
     harmony_header_ids: Vec<u32>,
+    /// A harmony function call is being written into the content as a
+    /// `<tool_call>` block whose closing is still owed.
+    harmony_tool_open: bool,
+    /// Whether the request asked for reasoning; a harmony model reasons
+    /// regardless, and what it reasoned is dropped when it was not asked for.
+    wants_reasoning: bool,
     span: tracing::Span,
     decode_span: Option<tracing::Span>,
 }
@@ -286,6 +340,11 @@ fn abort_sequences(
 
 /// Registers `req` with the engine and inserts its [`SeqTracker`].
 ///
+/// A request whose prompt plus completion exceeds what the KV pool holds is
+/// answered at once with an error event instead: scheduled, it could never
+/// be admitted, and it would block the queue behind it for as long as its
+/// timeout allowed.
+///
 /// The sequence is JSON-constrained when the request asks for it, a token
 /// byte table is available, and neither thinking nor harmony is active
 /// (those channels would break the byte-level automaton). Also opens the
@@ -298,13 +357,31 @@ fn enqueue_request(
     trackers: &mut HashMap<SequenceId, SeqTracker>,
     byte_table: Option<&std::sync::Arc<crate::constrain::TokenByteTable>>,
     harmony: bool,
-    named_thought_channel: bool,
 ) {
     let request_id = req.request_id.clone();
     let model_id = req.model_id.clone();
     let enqueued_at = req.enqueued_at;
     let prompt_len = req.prompt_tokens.len();
     let max_tokens = req.max_tokens;
+    let capacity = engine.kv_capacity_tokens();
+    if prompt_len.saturating_add(max_tokens) > capacity {
+        let err = format!(
+            "prompt of {prompt_len} tokens plus {max_tokens} completion tokens exceeds the \
+             {capacity} tokens the KV cache holds"
+        );
+        tracing::warn!(
+            request_id = %request_id,
+            model_id = %model_id,
+            error = %err,
+            "request refused before scheduling"
+        );
+        metrics::REQUESTS_TOTAL
+            .with_label_values(&[model_id.as_str(), "error"])
+            .inc();
+        let _ = req.response_tx.send(EngineEvent::Error(err));
+        let _ = req.response_tx.send(EngineEvent::StreamEnd);
+        return;
+    }
     let constraint = match (req.json_mode, byte_table) {
         (Some(spec), Some(table)) if !req.enable_thinking && !harmony => {
             Some(crate::constrain::JsonConstraint::new(
@@ -359,213 +436,21 @@ fn enqueue_request(
             enqueued_at,
             first_token_at: None,
             token_count: 0,
-            in_thinking: req.enable_thinking,
-            thinking_header: req.enable_thinking && named_thought_channel,
+            in_thinking: req.thinking_open,
+            thinking_header: false,
             output_ids: Vec::new(),
             thinking_ids: Vec::new(),
-            decoded_len: 0,
-            thinking_decoded_len: 0,
+            output: IncrementalDecoder::new(),
+            thinking: IncrementalDecoder::new(),
             pending_raw_lps: Vec::new(),
-            out_stable_end: 0,
-            out_stable_text: String::new(),
-            think_stable_end: 0,
-            think_stable_text: String::new(),
             harmony_state: HarmonyState::Markers,
             harmony_header_ids: Vec::new(),
+            harmony_tool_open: false,
+            wants_reasoning: req.enable_thinking,
             span,
             decode_span: None,
         },
     );
-}
-
-/// Clamps `idx` down to the nearest UTF-8 character boundary in `s`.
-fn clamp_to_char_boundary(s: &str, idx: usize) -> usize {
-    let mut i = idx.min(s.len());
-    while i > 0 && !s.is_char_boundary(i) {
-        i -= 1;
-    }
-    i
-}
-
-/// Emits the not-yet-sent suffix of `full`, advancing `decoded_len`.
-///
-/// A trailing `U+FFFD` is held back so multi-byte UTF-8 split across tokens
-/// is buffered until the continuation token arrives.
-fn emit_suffix(full: &str, decoded_len: &mut usize) -> Option<String> {
-    let start = clamp_to_char_boundary(full, *decoded_len);
-    let new_text = &full[start..];
-    let emit = new_text.trim_end_matches('\u{FFFD}');
-    if !emit.is_empty() {
-        *decoded_len = start + emit.len();
-        Some(emit.to_string())
-    } else {
-        *decoded_len = start;
-        None
-    }
-}
-
-/// Number of trailing tokens re-decoded every step; anything older is frozen
-/// into the stable prefix because the decoder can no longer change its text.
-const DECODE_STABLE_LOOKBACK: usize = 4;
-
-/// Decodes `ids` as a mid-sequence fragment by prefixing a neutral token and
-/// stripping its text, preserving the leading space that a `Strip`/BPE
-/// decoder would otherwise drop from a standalone decode.
-fn decode_with_neutral_prefix(
-    tokenizer: &Tokenizer,
-    ids: &[u32],
-    neutral_id: u32,
-    neutral_text: &str,
-) -> String {
-    if ids.is_empty() {
-        return String::new();
-    }
-    let mut prefixed = Vec::with_capacity(ids.len() + 1);
-    prefixed.push(neutral_id);
-    prefixed.extend_from_slice(ids);
-    let with_prefix = tokenizer.decode(&prefixed).unwrap_or_default();
-    with_prefix
-        .strip_prefix(neutral_text)
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| tokenizer.decode(ids).unwrap_or_default())
-}
-
-/// Freezes tokens older than [`DECODE_STABLE_LOOKBACK`] into `stable_text`,
-/// appending their decoded delta so each step re-decodes only the tail.
-fn advance_stable_window(
-    tokenizer: &Tokenizer,
-    all_ids: &[u32],
-    stable_end: &mut usize,
-    stable_text: &mut String,
-    neutral_id: u32,
-    neutral_text: &str,
-) {
-    let new_stable_end = all_ids.len().saturating_sub(DECODE_STABLE_LOOKBACK);
-    if new_stable_end <= *stable_end {
-        return;
-    }
-    if *stable_end == 0 {
-        *stable_text = tokenizer
-            .decode(&all_ids[..new_stable_end])
-            .unwrap_or_default();
-    } else {
-        let delta_ids = &all_ids[*stable_end..new_stable_end];
-        let delta = decode_with_neutral_prefix(tokenizer, delta_ids, neutral_id, neutral_text);
-        stable_text.push_str(&delta);
-    }
-    *stable_end = new_stable_end;
-}
-
-/// Incrementally decodes the accumulated `all_ids` and returns the new text
-/// suffix to emit, if any.
-///
-/// Decoding one token at a time is wrong for tokenizers with a `Strip`
-/// decoder (each token loses its leading space), and re-decoding the full
-/// sequence every step is quadratic. Instead the stable prefix (everything
-/// older than the lookback window) is decoded once and cached; each step
-/// re-decodes only the tail window and emits `full[decoded_len..]` via
-/// [`emit_suffix`].
-fn prefix_decode_incremental(
-    tokenizer: &Tokenizer,
-    all_ids: &[u32],
-    decoded_len: &mut usize,
-    stable_end: &mut usize,
-    stable_text: &mut String,
-    neutral_id: u32,
-    neutral_text: &str,
-) -> Option<String> {
-    advance_stable_window(
-        tokenizer,
-        all_ids,
-        stable_end,
-        stable_text,
-        neutral_id,
-        neutral_text,
-    );
-    let window_ids = &all_ids[*stable_end..];
-    let window_text = if *stable_end == 0 {
-        tokenizer.decode(window_ids).unwrap_or_default()
-    } else {
-        decode_with_neutral_prefix(tokenizer, window_ids, neutral_id, neutral_text)
-    };
-    let full = format!("{}{}", stable_text, window_text);
-    emit_suffix(&full, decoded_len)
-}
-
-#[cfg(test)]
-mod streaming_decode_tests {
-    use super::*;
-
-    fn run_stream(steps: &[&str]) -> String {
-        let mut decoded_len = 0;
-        let mut out = String::new();
-        for full in steps {
-            if let Some(s) = emit_suffix(full, &mut decoded_len) {
-                out.push_str(&s);
-            }
-        }
-        out
-    }
-
-    #[test]
-    fn cumulative_emission_matches_final_canonical_text() {
-        let steps = [
-            "Sono",
-            "Sono un",
-            "Sono un assistente",
-            "Sono un assistente virtuale",
-        ];
-        assert_eq!(run_stream(&steps), *steps.last().unwrap());
-    }
-
-    #[test]
-    fn space_only_token_followed_by_g_prefixed_token_does_not_double_space() {
-        // Regression: Ġ-only space token followed by a Ġ-prefixed token must
-        // not emit a double space.
-        let steps = [
-            "Sono un assistente",
-            "Sono un assistente ",
-            "Sono un assistente virtuale",
-        ];
-        assert_eq!(run_stream(&steps), "Sono un assistente virtuale");
-    }
-
-    #[test]
-    fn no_character_loss_across_partial_utf8_token_boundary() {
-        let steps = ["caf\u{FFFD}", "café", "café 🎉"];
-        assert_eq!(run_stream(&steps), "café 🎉");
-    }
-
-    #[test]
-    fn empty_step_emits_nothing() {
-        let steps = ["hello", "hello", "hello world"];
-        assert_eq!(run_stream(&steps), "hello world");
-    }
-
-    #[test]
-    fn idempotent_when_decoded_len_matches_full_len() {
-        let mut decoded_len = 5;
-        let out = emit_suffix("hello", &mut decoded_len);
-        assert!(out.is_none());
-        assert_eq!(decoded_len, 5);
-    }
-
-    #[test]
-    fn clamps_decoded_len_past_end_of_full() {
-        let mut decoded_len = 100;
-        let out = emit_suffix("short", &mut decoded_len);
-        assert!(out.is_none());
-        assert_eq!(decoded_len, 5);
-    }
-
-    #[test]
-    fn clamps_decoded_len_to_char_boundary_inside_multibyte() {
-        // decoded_len starts inside é (2-byte UTF-8); must back off to boundary.
-        let mut decoded_len = 4;
-        let out = emit_suffix("café!", &mut decoded_len);
-        assert_eq!(out.as_deref(), Some("é!"));
-        assert_eq!(decoded_len, 6);
-    }
 }
 
 /// Runs a model's blocking request-to-token loop until shutdown, owning the
@@ -606,7 +491,6 @@ pub fn engine_loop(
     let think_end_id = tokenizer
         .special_token_id("</think>")
         .or_else(|| tokenizer.special_token_id("<channel|>"));
-    let named_thought_channel = tokenizer.special_token_id("<|channel>").is_some();
     let harmony_ids = match (
         tokenizer.special_token_id("<|channel|>"),
         tokenizer.special_token_id("<|message|>"),
@@ -629,12 +513,7 @@ pub fn engine_loop(
         );
     }
 
-    let neutral_id = tokenizer
-        .encode("a")
-        .ok()
-        .and_then(|ids| ids.into_iter().next())
-        .unwrap_or(1);
-    let neutral_text = tokenizer.decode(&[neutral_id]).unwrap_or_default();
+    let neutral = NeutralPrefix::new(&tokenizer);
 
     loop {
         if shutdown.load(std::sync::atomic::Ordering::Acquire) {
@@ -649,7 +528,6 @@ pub fn engine_loop(
                     &mut trackers,
                     byte_table.as_ref(),
                     harmony_ids.is_some(),
-                    named_thought_channel,
                 );
             }
         } else {
@@ -660,7 +538,6 @@ pub fn engine_loop(
                     &mut trackers,
                     byte_table.as_ref(),
                     harmony_ids.is_some(),
-                    named_thought_channel,
                 ),
                 None => break,
             }
@@ -722,22 +599,47 @@ pub fn engine_loop(
                                     &tokenizer,
                                     tok.token,
                                 ) {
-                                    None => continue,
-                                    Some(r) => r,
-                                }
-                            } else {
-                                if tracker.in_thinking {
-                                    let raw = tokenizer
-                                        .decode_with_special(&[tok.token])
-                                        .unwrap_or_default();
-
-                                    let is_think_start = think_start_id == Some(tok.token)
-                                        || raw.contains("<think>")
-                                        || raw.contains("<|channel>");
-                                    if is_think_start {
+                                    HarmonyRoute::Framing => continue,
+                                    HarmonyRoute::Reasoning if !tracker.wants_reasoning => continue,
+                                    HarmonyRoute::Reasoning => true,
+                                    HarmonyRoute::Content => false,
+                                    HarmonyRoute::ToolCall(function) => {
+                                        tracker.harmony_tool_open = true;
+                                        let opener = format!(
+                                            "<tool_call>\n{{\"name\": \"{function}\", \"arguments\": "
+                                        );
+                                        if tracker
+                                            .tx
+                                            .send(EngineEvent::Token {
+                                                text: opener,
+                                                logprob_entries: vec![],
+                                            })
+                                            .is_err()
+                                        {
+                                            disconnected_ids.push(tok.seq_id);
+                                        }
                                         continue;
                                     }
+                                    HarmonyRoute::ToolCallEnd => {
+                                        close_harmony_tool_call(tracker, &tokenizer);
+                                        continue;
+                                    }
+                                }
+                            } else {
+                                let raw = tokenizer
+                                    .decode_with_special(&[tok.token])
+                                    .unwrap_or_default();
 
+                                let is_think_start = think_start_id == Some(tok.token)
+                                    || raw.contains("<think>")
+                                    || raw.contains("<|channel>");
+                                if is_think_start {
+                                    tracker.thinking_header =
+                                        !tracker.in_thinking && raw.contains("<|channel>");
+                                    tracker.in_thinking = true;
+                                    continue;
+                                }
+                                if tracker.in_thinking {
                                     let is_think_end = think_end_id == Some(tok.token)
                                         || raw.contains("</think>")
                                         || raw.contains("<channel|>");
@@ -758,14 +660,10 @@ pub fn engine_loop(
 
                             if route_reasoning {
                                 tracker.thinking_ids.push(tok.token);
-                                if let Some(text) = prefix_decode_incremental(
+                                if let Some(text) = tracker.thinking.push(
                                     &tokenizer,
                                     &tracker.thinking_ids,
-                                    &mut tracker.thinking_decoded_len,
-                                    &mut tracker.think_stable_end,
-                                    &mut tracker.think_stable_text,
-                                    neutral_id,
-                                    &neutral_text,
+                                    &neutral,
                                 ) && tracker.tx.send(EngineEvent::ReasoningToken(text)).is_err()
                                 {
                                     disconnected = true;
@@ -779,15 +677,11 @@ pub fn engine_loop(
                                     ));
                                 }
                                 tracker.output_ids.push(tok.token);
-                                if let Some(text) = prefix_decode_incremental(
-                                    &tokenizer,
-                                    &tracker.output_ids,
-                                    &mut tracker.decoded_len,
-                                    &mut tracker.out_stable_end,
-                                    &mut tracker.out_stable_text,
-                                    neutral_id,
-                                    &neutral_text,
-                                ) {
+                                if let Some(text) =
+                                    tracker
+                                        .output
+                                        .push(&tokenizer, &tracker.output_ids, &neutral)
+                                {
                                     let drained = std::mem::take(&mut tracker.pending_raw_lps);
                                     let mut logprob_entries: Vec<EngineLogprobEntry> =
                                         Vec::with_capacity(drained.len());
@@ -829,24 +723,10 @@ pub fn engine_loop(
 
                     for completed in &step.completed {
                         if let Some(mut tracker) = trackers.remove(&completed.id) {
-                            let remaining_text = if !tracker.output_ids.is_empty() {
-                                let full =
-                                    tokenizer.decode(&tracker.output_ids).unwrap_or_default();
-                                if tracker.decoded_len < full.len() {
-                                    let start = clamp_to_char_boundary(&full, tracker.decoded_len);
-                                    if start < full.len() {
-                                        let rest = full[start..].to_string();
-                                        tracker.decoded_len = full.len();
-                                        rest
-                                    } else {
-                                        String::new()
-                                    }
-                                } else {
-                                    String::new()
-                                }
-                            } else {
-                                String::new()
-                            };
+                            let remaining_text = tracker
+                                .output
+                                .finish(&tokenizer, &tracker.output_ids)
+                                .unwrap_or_default();
 
                             let drained = std::mem::take(&mut tracker.pending_raw_lps);
                             let mut remaining_lp_entries: Vec<EngineLogprobEntry> =
@@ -867,20 +747,12 @@ pub fn engine_loop(
                                     logprob_entries: remaining_lp_entries,
                                 });
                             }
+                            close_harmony_tool_call(&mut tracker, &tokenizer);
 
-                            if !tracker.thinking_ids.is_empty() {
-                                let full =
-                                    tokenizer.decode(&tracker.thinking_ids).unwrap_or_default();
-                                if tracker.thinking_decoded_len < full.len() {
-                                    let start =
-                                        clamp_to_char_boundary(&full, tracker.thinking_decoded_len);
-                                    let rest = &full[start..];
-                                    if !rest.is_empty() {
-                                        let _ = tracker
-                                            .tx
-                                            .send(EngineEvent::ReasoningToken(rest.to_string()));
-                                    }
-                                }
+                            if let Some(rest) =
+                                tracker.thinking.finish(&tokenizer, &tracker.thinking_ids)
+                            {
+                                let _ = tracker.tx.send(EngineEvent::ReasoningToken(rest));
                             }
 
                             let total_ms = tracker.enqueued_at.elapsed().as_secs_f64() * 1000.0;
@@ -998,34 +870,31 @@ pub fn engine_loop(
     }
 }
 
+/// Test doubles shared by the engine-loop and manager tests.
 #[cfg(test)]
-mod metrics_loop_tests {
-    use super::*;
+pub(crate) mod test_support {
     use crate::common::paged::{
         BlockAllocator, DEFAULT_BLOCK_SIZE, PagedKvCache, SharedBlockAllocator,
     };
     use crate::models::traits::BatchModel;
-    use crate::sampling::SamplingParams;
-    use crate::scheduler::SchedulerConfig;
     use candle_core::{DType, Device, Tensor};
-    use std::sync::Mutex;
-    use std::sync::atomic::AtomicBool;
-    use tempfile::TempDir;
-    use tokenizers::models::wordlevel::WordLevel;
-    use tokenizers::pre_tokenizers::whitespace::Whitespace;
+    use std::sync::{Arc, Mutex};
 
-    // Minimal model that drives the real `engine_loop`: either fails on forward
-    // (to exercise the error path) or forces `forced` as the argmax token so a
-    // request completes (to exercise the success + prefix-cache path).
-    struct StubModel {
+    /// Minimal model that drives the real [`engine_loop`](super::engine_loop):
+    /// either fails on forward (to exercise the error path) or forces `forced`
+    /// as the argmax token so a request completes (to exercise the success and
+    /// prefix-cache paths).
+    pub(crate) struct StubModel {
         device: Device,
         allocators: Vec<SharedBlockAllocator>,
-        forced: u32,
+        /// The argmax token of each forward call in turn; the last one repeats.
+        forced: Vec<u32>,
+        calls: std::sync::atomic::AtomicUsize,
         fail: bool,
     }
 
     impl StubModel {
-        fn new(forced: u32, fail: bool) -> Self {
+        pub(crate) fn new(forced: u32, fail: bool) -> Self {
             let alloc = BlockAllocator::growing(
                 64,
                 64,
@@ -1040,15 +909,22 @@ mod metrics_loop_tests {
             Self {
                 device: Device::Cpu,
                 allocators: vec![Arc::new(Mutex::new(alloc))],
-                forced,
+                forced: vec![forced],
+                calls: std::sync::atomic::AtomicUsize::new(0),
                 fail,
             }
         }
-        fn failing() -> Self {
+        pub(crate) fn failing() -> Self {
             Self::new(0, true)
         }
-        fn completing(forced: u32) -> Self {
+        pub(crate) fn completing(forced: u32) -> Self {
             Self::new(forced, false)
+        }
+        /// Emits `tokens` one per forward call, the prefill included.
+        pub(crate) fn scripted(tokens: Vec<u32>) -> Self {
+            let mut stub = Self::new(0, false);
+            stub.forced = tokens;
+            stub
         }
     }
 
@@ -1067,7 +943,11 @@ mod metrics_loop_tests {
             }
             let (_, total_tokens) = token_ids.dims2()?;
             let vocab = self.vocab_size();
-            let forced = (self.forced as usize).min(vocab - 1);
+            let call = self
+                .calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                .min(self.forced.len() - 1);
+            let forced = (self.forced[call] as usize).min(vocab - 1);
             let mut logits = vec![0f32; total_tokens * vocab];
             for i in 0..total_tokens {
                 logits[i * vocab + forced] = 1.0;
@@ -1090,14 +970,34 @@ mod metrics_loop_tests {
             &self.allocators
         }
     }
+}
+
+#[cfg(test)]
+mod metrics_loop_tests {
+    use super::test_support::StubModel;
+    use super::*;
+    use crate::common::paged::DEFAULT_BLOCK_SIZE;
+    use crate::models::traits::BatchModel;
+    use crate::sampling::SamplingParams;
+    use crate::scheduler::SchedulerConfig;
+    use std::sync::atomic::AtomicBool;
+    use tempfile::TempDir;
+    use tokenizers::models::wordlevel::WordLevel;
+    use tokenizers::pre_tokenizers::whitespace::Whitespace;
 
     fn make_tokenizer() -> (Arc<Tokenizer>, TempDir) {
         let tmp = tempfile::tempdir().expect("tempdir");
         let model = WordLevel::builder()
             .vocab(
-                [("[UNK]".to_string(), 0u32), ("a".to_string(), 1u32)]
-                    .into_iter()
-                    .collect(),
+                [
+                    ("[UNK]".to_string(), 0u32),
+                    ("a".to_string(), 1u32),
+                    ("<think>".to_string(), 2u32),
+                    ("</think>".to_string(), 3u32),
+                    ("b".to_string(), 4u32),
+                ]
+                .into_iter()
+                .collect(),
             )
             .unk_token("[UNK]".to_string())
             .build()
@@ -1112,14 +1012,45 @@ mod metrics_loop_tests {
         (Arc::new(tok), tmp)
     }
 
-    // Run a single request through the real engine_loop to completion (or failure)
-    // and join the loop thread, so metrics are fully recorded before assertions.
+    /// Runs one request through the real `engine_loop` to completion, failure
+    /// or refusal, and returns every event the request's channel received;
+    /// the loop runs on this thread, so metrics are recorded before the
+    /// caller asserts.
     fn drive_one_request(
         stub: StubModel,
         engine_model_id: &str,
         request_model_id: &str,
+        prompt_tokens: Vec<u32>,
         max_tokens: usize,
-    ) {
+    ) -> Vec<EngineEvent> {
+        let (tok, _tmp) = make_tokenizer();
+        drive_one_request_with_ids(
+            stub,
+            tok,
+            engine_model_id,
+            request_model_id,
+            prompt_tokens,
+            max_tokens,
+        )
+    }
+
+    fn drive_one_request_with(
+        stub: StubModel,
+        tok: Arc<Tokenizer>,
+        prompt_tokens: Vec<u32>,
+        max_tokens: usize,
+    ) -> Vec<EngineEvent> {
+        drive_one_request_with_ids(stub, tok, "m", "m", prompt_tokens, max_tokens)
+    }
+
+    fn drive_one_request_with_ids(
+        stub: StubModel,
+        tok: Arc<Tokenizer>,
+        engine_model_id: &str,
+        request_model_id: &str,
+        prompt_tokens: Vec<u32>,
+        max_tokens: usize,
+    ) -> Vec<EngineEvent> {
         let engine = Engine::new_with_stop_controls(
             Box::new(stub),
             SchedulerConfig {
@@ -1129,20 +1060,20 @@ mod metrics_loop_tests {
             &[],
             &[],
         );
-        let (tok, _tmp) = make_tokenizer();
         let (req_tx, req_rx) = tokio_mpsc::channel::<IncomingRequest>(8);
-        let (resp_tx, resp_rx) = tokio_mpsc::unbounded_channel::<EngineEvent>();
+        let (resp_tx, mut resp_rx) = tokio_mpsc::unbounded_channel::<EngineEvent>();
         let shutdown = Arc::new(AtomicBool::new(false));
 
         let req = IncomingRequest {
             request_id: "req-test".to_string(),
-            prompt_tokens: vec![1, 1, 1],
+            prompt_tokens,
             sampling_params: SamplingParams::default(),
             max_tokens,
             response_tx: resp_tx,
             model_id: request_model_id.to_string(),
             enqueued_at: std::time::Instant::now(),
             enable_thinking: false,
+            thinking_open: false,
             extra_stop_token_ids: vec![],
             json_mode: None,
             parent_span: tracing::Span::none(),
@@ -1156,7 +1087,151 @@ mod metrics_loop_tests {
         // closed channel.
         drop(req_tx);
         engine_loop(engine, tok, req_rx, shutdown, engine_model_id.to_string());
-        drop(resp_rx);
+        let mut events = Vec::new();
+        while let Ok(event) = resp_rx.try_recv() {
+            events.push(event);
+        }
+        events
+    }
+
+    fn harmony_tokenizer() -> (Tokenizer, TempDir) {
+        use tokenizers::models::wordlevel::WordLevel;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let vocab = [
+            "[UNK]",
+            "analysis",
+            "final",
+            "Paris",
+            "<|channel|>",
+            "<|message|>",
+            "<|end|>",
+            "<|start|>",
+            "assistant",
+            "commentary",
+            "to=functions.get_weather",
+            "{\"city\":\"Rome\"}",
+            "<|call|>",
+            "<|return|>",
+        ];
+        let model = WordLevel::builder()
+            .vocab(
+                vocab
+                    .iter()
+                    .enumerate()
+                    .map(|(i, t)| (t.to_string(), i as u32))
+                    .collect(),
+            )
+            .unk_token("[UNK]".to_string())
+            .build()
+            .expect("wordlevel");
+        tokenizers::Tokenizer::new(model)
+            .save(tmp.path().join("tokenizer.json"), false)
+            .expect("save");
+        let specials: serde_json::Map<String, serde_json::Value> = [4, 5, 6, 7, 12, 13]
+            .iter()
+            .map(|&id| {
+                (
+                    id.to_string(),
+                    serde_json::json!({"content": vocab[id], "special": true}),
+                )
+            })
+            .collect();
+        std::fs::write(
+            tmp.path().join("tokenizer_config.json"),
+            serde_json::json!({"eos_token": "<|return|>", "added_tokens_decoder": specials})
+                .to_string(),
+        )
+        .expect("write config");
+        let tok = Tokenizer::from_dir(tmp.path().to_str().expect("utf-8")).expect("load");
+        (tok, tmp)
+    }
+
+    /// Contract: in the harmony protocol the analysis body is reasoning, the
+    /// final body is content, every marker, role name and channel name is
+    /// framing, and a commentary header addressed to a function opens a call
+    /// whose body is the arguments, on the token sequences gpt-oss emits.
+    #[test]
+    fn harmony_routes_analysis_to_reasoning_and_final_to_content() {
+        let (tok, _tmp) = harmony_tokenizer();
+        let ids = HarmonyIds {
+            channel: 4,
+            message: 5,
+            end: Some(6),
+            start: Some(7),
+        };
+        let mut state = HarmonyState::Markers;
+        let mut header = Vec::new();
+        let mut route = |t: u32| harmony_route(&mut state, &mut header, &ids, &tok, t);
+        let routed: Vec<HarmonyRoute> = [4u32, 1, 5, 3, 6, 7, 8, 4, 2, 5, 3]
+            .iter()
+            .map(|&t| route(t))
+            .collect();
+        use HarmonyRoute::*;
+        assert_eq!(
+            routed,
+            vec![
+                Framing, Framing, Framing, Reasoning, Framing, Framing, Framing, Framing, Framing,
+                Framing, Content
+            ]
+        );
+        let call: Vec<HarmonyRoute> = [4u32, 9, 10, 5, 11, 6].iter().map(|&t| route(t)).collect();
+        assert_eq!(
+            call,
+            vec![
+                Framing,
+                Framing,
+                Framing,
+                ToolCall("get_weather".to_string()),
+                Content,
+                ToolCallEnd
+            ]
+        );
+    }
+
+    /// Contract: a harmony function call reaches the client as the
+    /// `<tool_call>` block the route already parses, name and arguments, and
+    /// the analysis that preceded it is dropped when reasoning was not asked
+    /// for.
+    #[test]
+    fn a_harmony_function_call_becomes_a_tool_call_block() {
+        let (tok, _tmp) = harmony_tokenizer();
+        let events = drive_one_request_with(
+            StubModel::scripted(vec![4, 1, 5, 3, 6, 4, 9, 10, 5, 11, 6]),
+            Arc::new(tok),
+            vec![3],
+            11,
+        );
+        let (mut content, mut reasoning) = (String::new(), String::new());
+        for event in events {
+            match event {
+                EngineEvent::Token { text, .. } => content.push_str(&text),
+                EngineEvent::ReasoningToken(text) => reasoning.push_str(&text),
+                _ => {}
+            }
+        }
+        assert_eq!(
+            content,
+            "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\":\"Rome\"}}\n</tool_call>"
+        );
+        assert!(reasoning.is_empty(), "{reasoning:?}");
+    }
+
+    /// Contract: a thinking block the model opens although thinking is off
+    /// goes to `reasoning_content`, markers stripped, instead of leaking into
+    /// the content, as gemma-4 did after a tool result.
+    #[test]
+    fn a_thinking_block_with_thinking_off_is_routed_to_reasoning() {
+        let events = drive_one_request(StubModel::scripted(vec![2, 1, 3, 4]), "m", "m", vec![1], 4);
+        let (mut content, mut reasoning) = (String::new(), String::new());
+        for event in events {
+            match event {
+                EngineEvent::Token { text, .. } => content.push_str(&text),
+                EngineEvent::ReasoningToken(text) => reasoning.push_str(&text),
+                _ => {}
+            }
+        }
+        assert_eq!(reasoning.trim(), "a");
+        assert_eq!(content.trim(), "b");
     }
 
     fn counter_value(name: &str, labels: &[(&str, &str)]) -> Option<f64> {
@@ -1178,7 +1253,7 @@ mod metrics_loop_tests {
     #[test]
     fn failed_request_is_counted_as_error_status() {
         let model = "metricstest-error-status-model";
-        drive_one_request(StubModel::failing(), model, model, 4);
+        drive_one_request(StubModel::failing(), model, model, vec![1, 1, 1], 4);
         assert_eq!(
             counter_value(
                 "oxydllm_requests_total",
@@ -1196,7 +1271,13 @@ mod metrics_loop_tests {
     fn prefix_cache_uses_engine_model_label_not_empty() {
         let engine_label = "metricstest-engine-label";
         let request_label = "metricstest-request-label";
-        drive_one_request(StubModel::completing(5), engine_label, request_label, 1);
+        drive_one_request(
+            StubModel::completing(5),
+            engine_label,
+            request_label,
+            vec![1, 1, 1],
+            1,
+        );
 
         let misses = counter_value(
             "oxydllm_prefix_cache_requests_total",
@@ -1221,6 +1302,46 @@ mod metrics_loop_tests {
             ),
             Some(1.0),
             "the successful completion is still counted under the request's model id"
+        );
+    }
+
+    /// Contract: a request whose prompt and completion cannot fit the KV
+    /// pool is refused on arrival with an error event, never scheduled.
+    ///
+    /// Enqueued, such a prompt is never admitted (or outgrows the pool after
+    /// a preemption and is never re-admitted), so it sat at the head of the
+    /// queue blocking every later request while the loop spun until the
+    /// request timeout.
+    #[test]
+    fn a_request_the_kv_pool_cannot_hold_is_refused_at_enqueue() {
+        let model = "metricstest-refused-model";
+        let stub = StubModel::completing(5);
+        let capacity = stub.allocators()[0].lock().unwrap().num_total() * DEFAULT_BLOCK_SIZE;
+        let events = drive_one_request(stub, model, model, vec![1; capacity - 2], 4);
+        assert_eq!(events.len(), 2, "exactly an error and the end of stream");
+        assert!(
+            matches!(&events[0], EngineEvent::Error(msg) if msg.contains("KV cache")),
+            "the refusal names the KV cache"
+        );
+        assert!(matches!(events[1], EngineEvent::StreamEnd));
+        assert_eq!(
+            counter_value(
+                "oxydllm_requests_total",
+                &[("model", model), ("status", "error")]
+            ),
+            Some(1.0)
+        );
+
+        let fits = drive_one_request(
+            StubModel::completing(5),
+            model,
+            model,
+            vec![1; capacity - 4],
+            4,
+        );
+        assert!(
+            fits.iter().any(|e| matches!(e, EngineEvent::Finish { .. })),
+            "a request that exactly fits is served"
         );
     }
 }

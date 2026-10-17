@@ -236,6 +236,14 @@ impl Scheduler {
     /// while the running-set, token-budget, and free-block limits allow;
     /// admission stops at the first prompt that does not fit.
     ///
+    /// Every block a scheduled decode will take is reserved as it is
+    /// scheduled, and admission counts only what is left: the forward takes
+    /// the blocks the scheduler promised, so a step never promises one block
+    /// twice. Before a sequence is preempted or a prompt turned away for want
+    /// of blocks, the prefix cache gives up its least recently used entries,
+    /// whose blocks it alone holds; the entries the prompt itself reuses are
+    /// refreshed first so they go last.
+    ///
     /// The token budget bundles work into a step, it does not cap what a
     /// sequence may be: a prompt longer than a whole step's budget is admitted
     /// as the only prefill of its step rather than deferred, because admission
@@ -243,7 +251,7 @@ impl Scheduler {
     /// every request queued behind it. Running decodes still ride along, one
     /// token each. Callers therefore see steps that exceed
     /// [`SchedulerConfig::max_tokens_per_step`] when a single prompt does.
-    pub fn schedule(&mut self, prefix_cache: Option<&PrefixCache>) -> SchedulerOutput {
+    pub fn schedule(&mut self, mut prefix_cache: Option<&mut PrefixCache>) -> SchedulerOutput {
         let mut scheduled = Vec::new();
         let mut budget = self.config.max_tokens_per_step;
 
@@ -260,14 +268,19 @@ impl Scheduler {
             }
         }
 
+        let mut reserved = 0usize;
         for &seq_id in &seqs_needing_block {
-            if self.num_free_blocks() > 0 {
+            if let Some(pc) = prefix_cache.as_deref_mut() {
+                while self.num_free_blocks() <= reserved && pc.evict_lru(&self.allocators) {}
+            }
+            if self.num_free_blocks() > reserved {
                 if budget > 0 {
                     scheduled.push(ScheduledSequence {
                         id: seq_id,
                         phase: SequencePhase::Decode,
                     });
                     budget -= 1;
+                    reserved += 1;
                 }
             } else {
                 let idx = *self.running_index.get(&seq_id).unwrap();
@@ -284,7 +297,7 @@ impl Scheduler {
             }
         }
 
-        let mut free_blocks = self.num_free_blocks();
+        let mut free_blocks = self.num_free_blocks().saturating_sub(reserved);
         let mut prefill_scheduled = false;
 
         while self.running.len() < self.config.max_num_sequences && budget > 0 {
@@ -293,7 +306,16 @@ impl Scheduler {
                 None => break,
             };
 
-            let blocks_needed = self.blocks_needed_for_prefill(seq, prefix_cache);
+            let mut blocks_needed = self.blocks_needed_for_prefill(seq, prefix_cache.as_deref());
+            if blocks_needed > free_blocks
+                && let Some(pc) = prefix_cache.as_deref_mut()
+            {
+                pc.touch(&seq.all_tokens, self.block_size);
+                while blocks_needed > free_blocks && pc.evict_lru(&self.allocators) {
+                    free_blocks = self.num_free_blocks().saturating_sub(reserved);
+                    blocks_needed = self.blocks_needed_for_prefill(seq, Some(pc));
+                }
+            }
             if blocks_needed > free_blocks {
                 break;
             }
@@ -898,5 +920,205 @@ mod tests {
         assert!(sched.abort_sequence(waiting_id));
         assert!(!sched.abort_sequence(999_999));
         assert!(!sched.has_pending_work());
+    }
+
+    /// Stands in for the engine after a prefill: the cache takes the blocks
+    /// the prompt fills and the sequence moves on to decoding.
+    fn simulate_prefill(sched: &mut Scheduler, id: SequenceId) {
+        let seq = sched.get_running_mut(id).unwrap();
+        let tokens = seq.all_tokens.len();
+        let kv = candle_core::Tensor::zeros(
+            (1, 2, tokens, 4),
+            candle_core::DType::F32,
+            &candle_core::Device::Cpu,
+        )
+        .unwrap();
+        seq.caches[0].append(&kv, &kv).unwrap();
+        seq.num_processed_tokens = tokens;
+        seq.phase = SequencePhase::Decode;
+        seq.append_token(7);
+    }
+
+    /// Contract: a free block is promised to at most one sequence per step.
+    ///
+    /// Scheduling re-read the free count for every decode at a block boundary
+    /// without reserving anything, so two sequences crossing a boundary in the
+    /// same step were both scheduled against one free block. The second
+    /// allocation then failed inside the forward, and the engine aborted every
+    /// running request instead of preempting one sequence.
+    #[test]
+    fn the_last_free_block_is_promised_to_one_decode_only() {
+        let allocators = make_allocators(1, 3);
+        let config = SchedulerConfig {
+            max_num_sequences: 4,
+            max_tokens_per_step: 1024,
+        };
+        let mut sched = Scheduler::new(config, allocators.clone(), 1);
+        let a = sched.add_request(vec![1; DEFAULT_BLOCK_SIZE], SamplingParams::default(), 10);
+        let b = sched.add_request(vec![2; DEFAULT_BLOCK_SIZE], SamplingParams::default(), 10);
+        assert_eq!(sched.schedule(None).scheduled.len(), 2);
+        simulate_prefill(&mut sched, a);
+        simulate_prefill(&mut sched, b);
+        assert_eq!(allocators[0].lock().unwrap().num_free(), 1);
+
+        let out = sched.schedule(None);
+        assert_eq!(
+            out.scheduled.len(),
+            1,
+            "one free block lets exactly one decode cross its boundary"
+        );
+        assert_eq!(out.scheduled[0].phase, SequencePhase::Decode);
+        assert_eq!(
+            sched.num_waiting(),
+            1,
+            "the other sequence is preempted instead of being promised the same block"
+        );
+    }
+
+    /// Contract: a block promised to a decode this step is not counted as
+    /// free when the step admits prompts.
+    #[test]
+    fn a_block_promised_to_a_decode_is_not_handed_to_a_prefill() {
+        let allocators = make_allocators(1, 2);
+        let config = SchedulerConfig {
+            max_num_sequences: 4,
+            max_tokens_per_step: 1024,
+        };
+        let mut sched = Scheduler::new(config, allocators.clone(), 1);
+        let a = sched.add_request(vec![1; DEFAULT_BLOCK_SIZE], SamplingParams::default(), 10);
+        assert_eq!(sched.schedule(None).scheduled.len(), 1);
+        simulate_prefill(&mut sched, a);
+        assert_eq!(allocators[0].lock().unwrap().num_free(), 1);
+        let b = sched.add_request(vec![2; DEFAULT_BLOCK_SIZE], SamplingParams::default(), 10);
+
+        let out = sched.schedule(None);
+        assert!(
+            out.scheduled
+                .iter()
+                .any(|s| s.id == a && s.phase == SequencePhase::Decode),
+            "the running decode keeps its block"
+        );
+        assert!(
+            !out.scheduled.iter().any(|s| s.id == b),
+            "the prompt must wait: the only free block is already promised"
+        );
+        assert_eq!(sched.num_waiting(), 1);
+    }
+
+    /// Pins `blocks` blocks of a finished prompt in the prefix cache, the way
+    /// a completed request leaves them: held by the cache alone.
+    fn pin_in_prefix_cache(
+        cache: &mut PrefixCache,
+        allocators: &[SharedBlockAllocator],
+        tokens: &[u32],
+    ) {
+        let blocks = tokens.len() / DEFAULT_BLOCK_SIZE;
+        let ids: Vec<Vec<usize>> = (0..blocks)
+            .map(|_| vec![allocators[0].lock().unwrap().allocate().unwrap()])
+            .collect();
+        cache.register(tokens, 0, &ids, allocators, DEFAULT_BLOCK_SIZE);
+        for id in &ids {
+            allocators[0].lock().unwrap().free(id[0]);
+        }
+    }
+
+    /// Contract: blocks held only by the prefix cache never keep a prompt
+    /// out; under pressure the cache yields them, oldest first.
+    ///
+    /// The cache had no eviction other than overflowing its own capacity, so
+    /// on a pool it could cover it pinned every block a finished prompt had
+    /// filled, the next prompt with a different prefix was never admitted,
+    /// and the engine loop spun on a queue it could not advance.
+    #[test]
+    fn a_prompt_kept_out_only_by_the_prefix_cache_is_admitted() {
+        let allocators = make_allocators(1, 4);
+        let mut cache = PrefixCache::new(512);
+        pin_in_prefix_cache(&mut cache, &allocators, &[1u32; 3 * DEFAULT_BLOCK_SIZE]);
+        assert_eq!(allocators[0].lock().unwrap().num_free(), 1);
+
+        let config = SchedulerConfig {
+            max_num_sequences: 4,
+            max_tokens_per_step: 1024,
+        };
+        let mut sched = Scheduler::new(config, allocators.clone(), 1);
+        let id = sched.add_request(
+            vec![2; 2 * DEFAULT_BLOCK_SIZE],
+            SamplingParams::default(),
+            10,
+        );
+
+        let out = sched.schedule(Some(&mut cache));
+        assert_eq!(
+            out.scheduled.len(),
+            1,
+            "the cache yields what the prompt needs"
+        );
+        assert_eq!(out.scheduled[0].id, id);
+        assert_eq!(out.scheduled[0].phase, SequencePhase::Prefill);
+        assert!(
+            allocators[0].lock().unwrap().num_free() >= 2,
+            "the yielded blocks are free for the prefill to take"
+        );
+    }
+
+    /// Contract: the cache yields a block to a decode at a block boundary
+    /// before the scheduler preempts that sequence.
+    #[test]
+    fn a_decode_takes_a_block_from_the_prefix_cache_before_being_preempted() {
+        let allocators = make_allocators(1, 2);
+        let mut cache = PrefixCache::new(512);
+        pin_in_prefix_cache(&mut cache, &allocators, &[1u32; DEFAULT_BLOCK_SIZE]);
+
+        let config = SchedulerConfig {
+            max_num_sequences: 4,
+            max_tokens_per_step: 1024,
+        };
+        let mut sched = Scheduler::new(config, allocators.clone(), 1);
+        let a = sched.add_request(vec![2; DEFAULT_BLOCK_SIZE], SamplingParams::default(), 10);
+        assert_eq!(sched.schedule(Some(&mut cache)).scheduled.len(), 1);
+        simulate_prefill(&mut sched, a);
+        assert_eq!(allocators[0].lock().unwrap().num_free(), 0);
+
+        let out = sched.schedule(Some(&mut cache));
+        assert_eq!(
+            out.scheduled.len(),
+            1,
+            "the decode continues on the yielded block"
+        );
+        assert_eq!(out.scheduled[0].phase, SequencePhase::Decode);
+        assert_eq!(sched.num_waiting(), 0, "nothing was preempted");
+    }
+
+    /// Contract: under pressure the cache keeps the blocks the waiting prompt
+    /// itself reuses and yields the others, so admission does not cost the
+    /// prompt its own prefix hit.
+    #[test]
+    fn pressure_eviction_spares_the_prompt_s_own_cached_prefix() {
+        let allocators = make_allocators(1, 4);
+        let mut cache = PrefixCache::new(512);
+        let shared = [1u32; 2 * DEFAULT_BLOCK_SIZE];
+        pin_in_prefix_cache(&mut cache, &allocators, &shared);
+        pin_in_prefix_cache(&mut cache, &allocators, &[2u32; 2 * DEFAULT_BLOCK_SIZE]);
+        assert_eq!(allocators[0].lock().unwrap().num_free(), 0);
+
+        let config = SchedulerConfig {
+            max_num_sequences: 4,
+            max_tokens_per_step: 1024,
+        };
+        let mut sched = Scheduler::new(config, allocators.clone(), 1);
+        let prompt: Vec<u32> = shared
+            .iter()
+            .copied()
+            .chain([3u32; DEFAULT_BLOCK_SIZE])
+            .collect();
+        sched.add_request(prompt.clone(), SamplingParams::default(), 10);
+
+        let out = sched.schedule(Some(&mut cache));
+        assert_eq!(out.scheduled.len(), 1);
+        assert_eq!(
+            cache.count_cached_blocks(&prompt, DEFAULT_BLOCK_SIZE),
+            2,
+            "the prompt's own prefix stays cached; the other prompt's blocks were yielded"
+        );
     }
 }

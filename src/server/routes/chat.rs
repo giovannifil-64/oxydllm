@@ -640,25 +640,33 @@ fn validate_against_schema_inner(
     true
 }
 
+/// The obligation to call in `required` and forced modes, which is all a
+/// template that renders the definitions itself still needs to hear; `auto`
+/// needs nothing.
+fn tool_choice_instruction(config: &ToolConfig) -> Option<String> {
+    match &config.choice_mode {
+        ToolChoiceMode::Required => {
+            Some("You must call one or more tools. Do not respond with plain text.".to_string())
+        }
+        ToolChoiceMode::ForcedFunction { name } => Some(format!(
+            "You must call exactly one tool named \"{name}\". Do not respond with plain text."
+        )),
+        ToolChoiceMode::None | ToolChoiceMode::Auto => None,
+    }
+}
+
 /// Builds the system-prompt block that teaches a model without native tool
 /// support the JSON calling convention, including the choice-mode and
 /// parallel-call instructions.
 fn tools_system_instruction(tools: &[ToolDefinition], config: &ToolConfig) -> String {
     let tools_json = serde_json::to_string_pretty(tools).unwrap_or_default();
-    let choice_instruction = match &config.choice_mode {
-        ToolChoiceMode::None => "Do not call any tool. Respond normally.".to_string(),
-        ToolChoiceMode::Auto => {
-            "If no tool is needed, respond normally. Otherwise, emit tool calls only.".to_string()
+    let choice_instruction = tool_choice_instruction(config).unwrap_or_else(|| {
+        match config.choice_mode {
+            ToolChoiceMode::None => "Do not call any tool. Respond normally.",
+            _ => "If no tool is needed, respond normally. Otherwise, emit tool calls only.",
         }
-        ToolChoiceMode::Required => {
-            "You must call one or more tools. Do not respond with plain text.".to_string()
-        }
-        ToolChoiceMode::ForcedFunction { name } => {
-            format!(
-                "You must call exactly one tool named \"{name}\". Do not respond with plain text."
-            )
-        }
-    };
+        .to_string()
+    });
     let parallel_instruction = if config.parallel_tool_calls {
         "You may call multiple tools by adding more objects to the array."
     } else {
@@ -677,19 +685,25 @@ fn tools_system_instruction(tools: &[ToolDefinition], config: &ToolConfig) -> St
 
 /// Parses one tool-call object in either the OpenAI nested shape
 /// (`function.name`/`function.arguments`) or the flat `name`/`arguments`
-/// shape, generating an id when absent.
+/// shape, generating an id when absent. Llama 3's `parameters` stands for
+/// `arguments`, and a `function` that is the bare name, as Llama 3.2 1B
+/// writes it, is the name.
 fn parse_tool_call_entry(call: &serde_json::Value) -> Option<ToolCall> {
     let call_obj = call.as_object()?;
     let name = call_obj
         .get("function")
-        .and_then(|f| f.get("name"))
-        .and_then(|v| v.as_str())
+        .and_then(|f| {
+            f.get("name")
+                .and_then(|v| v.as_str())
+                .or_else(|| f.as_str())
+        })
         .or_else(|| call_obj.get("name").and_then(|v| v.as_str()))?
         .to_string();
     let args = call_obj
         .get("function")
-        .and_then(|f| f.get("arguments"))
-        .or_else(|| call_obj.get("arguments"))?;
+        .and_then(|f| f.get("arguments").or_else(|| f.get("parameters")))
+        .or_else(|| call_obj.get("arguments"))
+        .or_else(|| call_obj.get("parameters"))?;
     let arguments = match args {
         serde_json::Value::String(s) => s.clone(),
         other => serde_json::to_string(other).ok()?,
@@ -713,9 +727,182 @@ fn tool_exists(tools: &[ToolDefinition], name: &str) -> bool {
     tools.iter().any(|tool| tool.function.name == name)
 }
 
+/// The JSON inside one `<tool_call>` block. Qwen2.5's GGUF template shows
+/// the example call with doubled braces, `{{"name": ...}}`, and the models
+/// copy them, closing with two braces or three, so an object wrapped in an
+/// extra opening brace is read from its own brace to its own end.
+fn parse_json_block(block: &str) -> Option<serde_json::Value> {
+    let text = strip_json_fences(block.trim());
+    serde_json::from_str(text).ok().or_else(|| {
+        let inner = text.strip_prefix('{')?.trim_start();
+        if !inner.starts_with('{') {
+            return None;
+        }
+        serde_json::Deserializer::from_str(inner)
+            .into_iter::<serde_json::Value>()
+            .next()?
+            .ok()
+    })
+}
+
+/// Parses gemma-4's call, `<|tool_call>call:NAME{key:value,...}<tool_call|>`,
+/// whose string values and nested keys sit between `<|"|>` quote tokens. The
+/// GGUF files keep the three markers in the text; the safetensors tokenizer
+/// drops them as special, leaving `call:NAME{city:Rome}` with the quotes
+/// gone, so a value that is not a JSON literal is read as a string and a
+/// comma splits arguments only where a declared parameter name follows.
+fn parse_gemma_calls(raw: &str, tools: &[ToolDefinition]) -> Option<Vec<ToolCall>> {
+    let text = raw
+        .replace("<|\"|>", "\"")
+        .replace("<|tool_call>", "")
+        .replace("<tool_call|>", "");
+    let mut calls = Vec::new();
+    let mut rest = text.as_str();
+    while let Some(start) = rest.find("call:") {
+        let after = &rest[start + "call:".len()..];
+        let Some(open) = after.find('{') else { break };
+        let name = after[..open].trim();
+        let Some(close) = matching_brace(&after[open..]).map(|i| open + i) else {
+            break;
+        };
+        if let Some(tool) = tools.iter().find(|t| t.function.name == name) {
+            let names: Vec<&str> = tool
+                .function
+                .parameters
+                .as_ref()
+                .and_then(|p| p.get("properties"))
+                .and_then(|p| p.as_object())
+                .map(|p| p.keys().map(String::as_str).collect())
+                .unwrap_or_default();
+            calls.push(ToolCall {
+                id: make_tool_call_id(),
+                call_type: "function".to_string(),
+                function: ToolCallFunction {
+                    name: name.to_string(),
+                    arguments: gemma_arguments(&after[open + 1..close], &names).to_string(),
+                },
+            });
+        }
+        rest = &after[close + 1..];
+    }
+    if calls.is_empty() { None } else { Some(calls) }
+}
+
+/// The index of the brace closing the one at `text[0]`, skipping quoted
+/// strings.
+fn matching_brace(text: &str) -> Option<usize> {
+    let (mut depth, mut quoted, mut escaped) = (0usize, false, false);
+    for (i, b) in text.bytes().enumerate() {
+        match b {
+            _ if escaped => escaped = false,
+            b'\\' if quoted => escaped = true,
+            b'"' => quoted = !quoted,
+            b'{' | b'[' if !quoted => depth += 1,
+            b'}' | b']' if !quoted => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Reads gemma-4's `key:value,key:value` argument list into a JSON object.
+fn gemma_arguments(text: &str, names: &[&str]) -> serde_json::Value {
+    let mut args = serde_json::Map::new();
+    let mut rest = text.trim();
+    while let Some(colon) = rest.find(':') {
+        let key = rest[..colon].trim().trim_matches('"').to_string();
+        let value_text = rest[colon + 1..].trim_start();
+        let end = gemma_value_end(value_text, names);
+        let value = &value_text[..end];
+        let parsed = serde_json::from_str(value.trim())
+            .unwrap_or_else(|_| serde_json::Value::String(value.trim().to_string()));
+        args.insert(key, parsed);
+        rest = value_text[end..].trim_start().trim_start_matches(',');
+    }
+    serde_json::Value::Object(args)
+}
+
+/// Where the value starting at `text[0]` ends: a quoted string at its closing
+/// quote, a container at its closing bracket, anything else at the comma
+/// that a declared parameter name and a colon follow, or at the end.
+fn gemma_value_end(text: &str, names: &[&str]) -> usize {
+    let bytes = text.as_bytes();
+    match bytes.first() {
+        Some(b'"') => {
+            let mut escaped = false;
+            for (i, &b) in bytes.iter().enumerate().skip(1) {
+                match b {
+                    _ if escaped => escaped = false,
+                    b'\\' => escaped = true,
+                    b'"' => return i + 1,
+                    _ => {}
+                }
+            }
+            text.len()
+        }
+        Some(b'{' | b'[') => matching_brace(text).map(|i| i + 1).unwrap_or(text.len()),
+        _ => {
+            let mut from = 0;
+            while let Some(comma) = text[from..].find(',').map(|i| from + i) {
+                let next = text[comma + 1..].trim_start();
+                let starts_argument = names.iter().any(|n| {
+                    next.strip_prefix(n)
+                        .is_some_and(|after| after.trim_start().starts_with(':'))
+                });
+                if starts_argument {
+                    return comma;
+                }
+                from = comma + 1;
+            }
+            text.len()
+        }
+    }
+}
+
+/// Parses the Mistral call `[TOOL_CALLS]name[ARGS]{...}` as it reaches the
+/// text once its two special tokens are dropped: a known tool name followed
+/// by a JSON object, repeated for parallel calls.
+fn parse_name_brace_calls(raw: &str, tools: &[ToolDefinition]) -> Option<Vec<ToolCall>> {
+    let mut calls = Vec::new();
+    let mut rest = raw.trim();
+    while !rest.is_empty() {
+        let name = &tools
+            .iter()
+            .find(|t| {
+                rest.strip_prefix(t.function.name.as_str())
+                    .is_some_and(|after| after.trim_start().starts_with('{'))
+            })?
+            .function
+            .name;
+        let after = rest[name.len()..].trim_start();
+        let mut stream = serde_json::Deserializer::from_str(after).into_iter::<serde_json::Value>();
+        let args = stream.next()?.ok()?;
+        if !args.is_object() {
+            return None;
+        }
+        calls.push(ToolCall {
+            id: make_tool_call_id(),
+            call_type: "function".to_string(),
+            function: ToolCallFunction {
+                name: name.clone(),
+                arguments: args.to_string(),
+            },
+        });
+        rest = after[stream.byte_offset()..].trim_start();
+    }
+    if calls.is_empty() { None } else { Some(calls) }
+}
+
 /// Parse the tool calls wrapped in `<tool_call>…</tool_call>` blocks,
 /// possibly preceded by free-form reasoning text and possibly repeated for
-/// parallel calls. Two block payloads exist in the wild:
+/// parallel calls. A last block the model left open, stopping right after
+/// its payload instead of closing the tag, runs to the end of the text, as
+/// the reference parsers read it. Two block payloads exist in the wild:
 ///
 /// - Qwen3.5-class XML: `<function=NAME>\n<parameter=KEY>\nVALUE\n
 ///   </parameter>…</function>`. Parameter values are typed best-effort:
@@ -729,16 +916,14 @@ fn parse_tool_call_tag_blocks(raw: &str) -> Option<Vec<ToolCall>> {
     let mut rest = raw;
     while let Some(start) = rest.find("<tool_call>") {
         let after = &rest[start + "<tool_call>".len()..];
-        let Some(end) = after.find("</tool_call>") else {
-            break;
+        let (block, next) = match after.find("</tool_call>") {
+            Some(end) => (&after[..end], &after[end + "</tool_call>".len()..]),
+            None => (after, ""),
         };
-        let block = &after[..end];
-        rest = &after[end + "</tool_call>".len()..];
+        rest = next;
 
         let Some(fstart) = block.find("<function=") else {
-            if let Ok(value) =
-                serde_json::from_str::<serde_json::Value>(strip_json_fences(block.trim()))
-            {
+            if let Some(value) = parse_json_block(block) {
                 if let Some(nested) = value.get("tool_calls").and_then(|v| v.as_array()) {
                     calls.extend(nested.iter().filter_map(parse_tool_call_entry));
                 } else if let Some(single) = parse_tool_call_entry(&value) {
@@ -798,7 +983,10 @@ fn parse_tool_call_tag_blocks(raw: &str) -> Option<Vec<ToolCall>> {
 /// Calls naming unknown tools are dropped, serial mode truncates to one
 /// call, and a forced function keeps only matching calls.
 fn try_parse_tool_calls(raw: &str, config: &ToolConfig) -> Option<Vec<ToolCall>> {
-    if let Some(mut result) = parse_tool_call_tag_blocks(raw) {
+    if let Some(mut result) = parse_tool_call_tag_blocks(raw)
+        .or_else(|| parse_name_brace_calls(raw, &config.tools))
+        .or_else(|| parse_gemma_calls(raw, &config.tools))
+    {
         result.retain(|call| tool_exists(&config.tools, &call.function.name));
         if !result.is_empty() {
             if !config.parallel_tool_calls && result.len() > 1 {
@@ -816,8 +1004,10 @@ fn try_parse_tool_calls(raw: &str, config: &ToolConfig) -> Option<Vec<ToolCall>>
 
     let stripped = strip_json_fences(raw.trim());
     let value: serde_json::Value = serde_json::from_str(stripped).ok()?;
-    let mut result: Vec<ToolCall> = if let Some(calls) =
-        value.get("tool_calls").and_then(|v| v.as_array())
+    let mut result: Vec<ToolCall> = if let Some(calls) = value
+        .get("tool_calls")
+        .and_then(|v| v.as_array())
+        .or_else(|| value.as_array())
     {
         let mut parsed = Vec::with_capacity(calls.len());
         for call in calls {
@@ -1318,6 +1508,33 @@ pub fn apply_chat_template(
     }
 }
 
+/// Whether the rendered prompt ends with an opened thinking block, which
+/// the templates that end in `<think>` and gemma-4's after a tool result do,
+/// so the reply starts with reasoning before any marker.
+fn prompt_opens_thinking(prompt: &str) -> bool {
+    let prompt = prompt.trim_end();
+    prompt.ends_with("<think>") || prompt.ends_with("<|channel>thought")
+}
+
+/// Whether this model's chat template renders the tool definitions itself,
+/// read off the render: a template that knows `tools` produces a different
+/// prompt with them than without. Such a model gets the definitions once,
+/// in the format it was trained on, instead of a second copy with the JSON
+/// convention meant for templates that ignore them.
+fn template_renders_tools(
+    tokenizer: &Tokenizer,
+    messages: &[ChatMessage],
+    enable_thinking: bool,
+    reasoning_effort: Option<&str>,
+    tools: &serde_json::Value,
+) -> bool {
+    let render = |t| apply_chat_template(tokenizer, messages, enable_thinking, reasoning_effort, t);
+    matches!(
+        (render(Some(tools.clone())), render(None)),
+        (Ok(with), Ok(without)) if with != without
+    )
+}
+
 /// Converts engine logprob entries into the response `logprobs` object,
 /// truncating alternatives to the requested `top_logprobs` count.
 fn build_logprobs_content(entries: &[EngineLogprobEntry], req_top_n: usize) -> Logprobs {
@@ -1465,6 +1682,43 @@ async fn collect_one_completion_inner(
         }
     }
     Ok(data)
+}
+
+/// Collects every completion of one request concurrently, in request order.
+///
+/// The collectors are tasks of a `JoinSet` this future owns: dropping the
+/// future, which is what happens to a handler when its client goes away and
+/// to the streaming task when its SSE receiver does, aborts them and drops
+/// their receivers, and a closed response channel is what makes the engine
+/// loop abort the sequence. Detached collector tasks kept every sequence
+/// generating to `max_tokens` after a disconnect, holding its slot and KV
+/// blocks for thousands of tokens nobody would read.
+///
+/// ## Errors
+///
+/// The first completion to fail decides the error and the rest are aborted;
+/// a collector that panics reports a 500.
+async fn collect_all_completions(
+    rxs: Vec<tokio_mpsc::UnboundedReceiver<EngineEvent>>,
+    timeout: Option<Duration>,
+) -> Result<Vec<CompletionData>, (StatusCode, Json<serde_json::Value>)> {
+    let mut collectors = tokio::task::JoinSet::new();
+    for (i, rx) in rxs.into_iter().enumerate() {
+        collectors.spawn(async move { (i, collect_one_completion(rx, timeout).await) });
+    }
+    let mut results = Vec::with_capacity(collectors.len());
+    while let Some(joined) = collectors.join_next().await {
+        let (i, data) = joined.map_err(|_| {
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Task panic",
+                "server_error",
+            )
+        })?;
+        results.push((i, data?));
+    }
+    results.sort_by_key(|(i, _)| *i);
+    Ok(results.into_iter().map(|(_, data)| data).collect())
 }
 
 /// `POST /v1/chat/completions`: the OpenAI-compatible chat completion
@@ -1641,49 +1895,53 @@ pub(super) async fn chat_completions(
     let tools_value: Option<serde_json::Value> = (!tool_config.tools.is_empty())
         .then(|| serde_json::to_value(&tool_config.tools).ok())
         .flatten();
+    let native_tools = tools_value.as_ref().is_some_and(|tools| {
+        template_renders_tools(
+            &handle.tokenizer,
+            &body.messages,
+            enable_thinking,
+            reasoning_effort.as_deref(),
+            tools,
+        )
+    });
 
     let messages_for_prompt: std::borrow::Cow<[ChatMessage]> = {
-        let needs_json_instr = json_mode;
-        let needs_tool_instr = has_tools;
+        let mut extra_parts: Vec<String> = Vec::new();
+        if has_tools && native_tools {
+            extra_parts.extend(tool_choice_instruction(&tool_config));
+        } else if has_tools {
+            extra_parts.push(tools_system_instruction(&tool_config.tools, &tool_config));
+        }
+        if json_mode && let Some(rf) = &body.response_format {
+            extra_parts.push(json_system_instruction(rf));
+        }
 
-        if needs_json_instr || needs_tool_instr {
-            let mut msgs = body.messages.clone();
-
-            let mut extra_parts: Vec<String> = Vec::new();
-            if needs_tool_instr {
-                extra_parts.push(tools_system_instruction(&tool_config.tools, &tool_config));
-            }
-            if needs_json_instr && let Some(rf) = &body.response_format {
-                extra_parts.push(json_system_instruction(rf));
-            }
-
-            if !extra_parts.is_empty() {
-                let combined = extra_parts.join("\n\n");
-                if let Some(sys) = msgs.iter_mut().find(|m| m.role == "system") {
-                    let existing = sys.content.take().unwrap_or_default();
-                    sys.content = Some(if existing.is_empty() {
-                        combined
-                    } else {
-                        format!("{existing}\n\n{combined}")
-                    });
-                } else {
-                    msgs.insert(
-                        0,
-                        ChatMessage {
-                            role: "system".to_string(),
-                            content: Some(combined),
-                            reasoning_content: None,
-                            tool_calls: None,
-                            tool_call_id: None,
-                            name: None,
-                        },
-                    );
-                }
-            }
-
-            std::borrow::Cow::Owned(msgs)
-        } else {
+        if extra_parts.is_empty() {
             std::borrow::Cow::Borrowed(&body.messages)
+        } else {
+            let mut msgs = body.messages.clone();
+            let combined = extra_parts.join("\n\n");
+            if let Some(sys) = msgs.iter_mut().find(|m| m.role == "system") {
+                let existing = sys.content.take().unwrap_or_default();
+                sys.content = Some(if existing.is_empty() {
+                    combined
+                } else {
+                    format!("{existing}\n\n{combined}")
+                });
+            } else {
+                msgs.insert(
+                    0,
+                    ChatMessage {
+                        role: "system".to_string(),
+                        content: Some(combined),
+                        reasoning_content: None,
+                        tool_calls: None,
+                        tool_call_id: None,
+                        name: None,
+                    },
+                );
+            }
+            std::borrow::Cow::Owned(msgs)
         }
     };
 
@@ -1774,7 +2032,25 @@ pub(super) async fn chat_completions(
         top_logprobs_k,
     };
 
-    let remaining = handle.max_seq_len.saturating_sub(prompt_len);
+    let capacity = handle.max_seq_len.min(handle.kv_capacity_tokens);
+    if prompt_len >= capacity {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": {
+                    "message": format!(
+                        "This model's maximum context length is {capacity} tokens. However, \
+                         your messages resulted in {prompt_len} tokens. Please reduce the \
+                         length of the messages."
+                    ),
+                    "type": "invalid_request_error",
+                    "param": "messages",
+                    "code": "context_length_exceeded",
+                }
+            })),
+        ));
+    }
+    let remaining = capacity - prompt_len;
     let max_tokens = body
         .max_completion_tokens
         .or(body.max_tokens)
@@ -1834,6 +2110,7 @@ pub(super) async fn chat_completions(
                 model_id: model_id.clone(),
                 enqueued_at: std::time::Instant::now(),
                 enable_thinking,
+                thinking_open: enable_thinking && prompt_opens_thinking(&prompt),
                 extra_stop_token_ids: extra_stop_token_ids.clone(),
                 json_mode,
                 parent_span: http_span.clone(),
@@ -1874,40 +2151,25 @@ pub(super) async fn chat_completions(
             let req_timeout = state.request_timeout;
 
             tokio::spawn(async move {
-                let mut handles: Vec<_> = buffered_rxs
-                    .into_iter()
-                    .map(|rx| Some(tokio::spawn(collect_one_completion(rx, req_timeout))))
-                    .collect();
-
-                let mut completions = Vec::with_capacity(handles.len());
-                let mut total_completion_tokens = 0usize;
-                for idx in 0..handles.len() {
-                    let handle = handles[idx].take().expect("handle consumed once");
-                    let data = match handle.await {
-                        Ok(Ok(data)) => data,
-                        Ok(Err((_, err_json))) => {
-                            for h in handles[idx + 1..].iter_mut().filter_map(|h| h.take()) {
-                                h.abort();
-                            }
-                            let _ = sse_tx
+                let completions = tokio::select! {
+                    collected = collect_all_completions(buffered_rxs, req_timeout) => collected,
+                    _ = sse_tx.closed() => return,
+                };
+                let completions = match completions {
+                    Ok(completions) => completions,
+                    Err((_, err_json)) => {
+                        let _ =
+                            sse_tx
                                 .send(Ok(Event::default()
                                     .data(serde_json::to_string(&err_json.0).unwrap())));
-                            let _ = sse_tx.send(Ok(Event::default().data("[DONE]")));
-                            return;
-                        }
-                        Err(_) => {
-                            for h in handles[idx + 1..].iter_mut().filter_map(|h| h.take()) {
-                                h.abort();
-                            }
-                            let _ = sse_tx.send(Ok(Event::default().data("[DONE]")));
-                            return;
-                        }
-                    };
-                    total_completion_tokens += data.completion_tokens;
-                    completions.push((idx, data));
-                }
+                        let _ = sse_tx.send(Ok(Event::default().data("[DONE]")));
+                        return;
+                    }
+                };
+                let total_completion_tokens: usize =
+                    completions.iter().map(|data| data.completion_tokens).sum();
 
-                for (choice_idx, data) in completions {
+                for (choice_idx, data) in completions.into_iter().enumerate() {
                     let role_chunk = ChatCompletionChunk {
                         id: chat_id.clone(),
                         object: "chat.completion.chunk".to_string(),
@@ -2045,7 +2307,7 @@ pub(super) async fn chat_completions(
                             return;
                         }
                     } else {
-                        let final_content = data.content.trim().to_string();
+                        let final_content = data.content.clone();
                         if !final_content.is_empty() {
                             let chunk = ChatCompletionChunk {
                                 id: chat_id.clone(),
@@ -2536,32 +2798,20 @@ pub(super) async fn chat_completions(
         let sse_stream = UnboundedReceiverStream::new(sse_rx);
         Ok(Sse::new(sse_stream).into_response())
     } else {
-        let req_timeout = state.request_timeout;
-        let mut handles = Vec::with_capacity(n);
-        for rx in completion_rxs {
-            handles.push(tokio::spawn(collect_one_completion(rx, req_timeout)));
-        }
+        let completions = collect_all_completions(completion_rxs, state.request_timeout).await?;
 
         let mut all_choices: Vec<Choice> = Vec::with_capacity(n);
         let mut total_completion_tokens: usize = 0;
         let mut total_reasoning_tokens: usize = 0;
 
-        for (i, handle) in handles.into_iter().enumerate() {
-            let data = handle.await.map_err(|_| {
-                error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "Task panic",
-                    "server_error",
-                )
-            })??;
-
+        for (i, data) in completions.into_iter().enumerate() {
             total_completion_tokens += data.completion_tokens;
             total_reasoning_tokens += data.reasoning_tokens;
 
             let reasoning_opt = if data.reasoning_content.is_empty() {
                 None
             } else {
-                Some(data.reasoning_content.trim().to_string())
+                Some(data.reasoning_content.clone())
             };
 
             let logprobs = if wants_logprobs {
@@ -2586,7 +2836,7 @@ pub(super) async fn chat_completions(
                     (
                         ResponseMessage {
                             role: "assistant".to_string(),
-                            content: Some(data.content.trim().to_string()),
+                            content: Some(data.content.clone()),
                             reasoning_content: reasoning_opt,
                             tool_calls: None,
                         },
@@ -2637,7 +2887,7 @@ pub(super) async fn chat_completions(
                 (
                     ResponseMessage {
                         role: "assistant".to_string(),
-                        content: Some(data.content.trim().to_string()),
+                        content: Some(data.content.clone()),
                         reasoning_content: reasoning_opt,
                         tool_calls: None,
                     },
@@ -2684,6 +2934,33 @@ pub(super) async fn chat_completions(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// Contract: dropping the collection future closes every completion
+    /// channel, which is the only way a client disconnect reaches the engine
+    /// loop; detached collectors left them open until generation ended.
+    #[tokio::test]
+    async fn dropping_the_collection_closes_every_completion_channel() {
+        let (tx_a, rx_a) = tokio_mpsc::unbounded_channel::<EngineEvent>();
+        let (tx_b, rx_b) = tokio_mpsc::unbounded_channel::<EngineEvent>();
+        let handler = tokio::spawn(collect_all_completions(vec![rx_a, rx_b], None));
+        tokio::task::yield_now().await;
+        assert!(
+            !tx_a.is_closed() && !tx_b.is_closed(),
+            "collectors are waiting"
+        );
+
+        handler.abort();
+        for _ in 0..100 {
+            if tx_a.is_closed() && tx_b.is_closed() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            tx_a.is_closed() && tx_b.is_closed(),
+            "every completion channel must close with the handler"
+        );
+    }
 
     fn sample_tools() -> Vec<ToolDefinition> {
         vec![
@@ -2819,6 +3096,207 @@ mod tests {
     }
 
     /// Contract: the JSON payloads that Qwen2.5/Qwen3-class templates wrap in
+    /// Contract: a call whose arguments sit under `parameters`, which is how
+    /// Llama 3 renders its tool calls, parses like one that says `arguments`.
+    /// Contract: a bare JSON array of calls, which is what Granite's
+    /// `<|tool_call|>[...]` leaves once the special token is dropped, parses
+    /// like the `tool_calls` wrapper.
+    #[test]
+    fn a_bare_array_of_calls_parses() {
+        let config = build_tool_config(Some(&sample_tools()), None, None).expect("config");
+        let raw = r#"[{"name": "get_weather", "arguments": {"location": "Rome"}}]"#;
+        let calls = try_parse_tool_calls(raw, &config).expect("parsed");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "get_weather");
+        assert_eq!(calls[0].function.arguments, r#"{"location":"Rome"}"#);
+    }
+
+    fn tokenizer_with_template(template: &str) -> (Tokenizer, tempfile::TempDir) {
+        use tokenizers::models::wordlevel::WordLevel;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let model = WordLevel::builder()
+            .vocab([("[UNK]".to_string(), 0u32)].into_iter().collect())
+            .unk_token("[UNK]".to_string())
+            .build()
+            .expect("wordlevel");
+        tokenizers::Tokenizer::new(model)
+            .save(tmp.path().join("tokenizer.json"), false)
+            .expect("save tokenizer");
+        std::fs::write(
+            tmp.path().join("tokenizer_config.json"),
+            serde_json::to_string(&json!({"chat_template": template})).expect("json"),
+        )
+        .expect("write config");
+        let tokenizer =
+            Tokenizer::from_dir(tmp.path().to_str().expect("utf-8 path")).expect("load");
+        (tokenizer, tmp)
+    }
+
+    /// Contract: a template that renders `tools` itself is recognised from
+    /// its output, and one that ignores them is not, so the definitions
+    /// reach the model exactly once either way.
+    #[test]
+    fn a_template_is_known_to_render_tools_by_its_output() {
+        let messages = vec![ChatMessage {
+            role: "user".to_string(),
+            content: Some("weather".to_string()),
+            reasoning_content: None,
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        }];
+        let tools = serde_json::to_value(sample_tools()).expect("tools");
+        let native = "{% if tools %}<tools>{{ tools | tojson }}</tools>{% endif %}\
+                      {% for m in messages %}{{ m.role }}: {{ m.content }}\n{% endfor %}";
+        let (tokenizer, _tmp) = tokenizer_with_template(native);
+        assert!(template_renders_tools(
+            &tokenizer, &messages, false, None, &tools
+        ));
+
+        let blind = "{% for m in messages %}{{ m.role }}: {{ m.content }}\n{% endfor %}";
+        let (tokenizer, _tmp) = tokenizer_with_template(blind);
+        assert!(!template_renders_tools(
+            &tokenizer, &messages, false, None, &tools
+        ));
+    }
+
+    /// Contract: the doubled braces that Qwen2.5's GGUF template teaches by
+    /// example do not hide the call.
+    #[test]
+    fn doubled_braces_around_a_tool_call_are_unwrapped() {
+        let config = build_tool_config(Some(&sample_tools()), None, None).expect("config");
+        for closing in ["}}}", "}}"] {
+            let raw = format!(
+                "<tool_call>\n{{{{\"name\": \"get_weather\", \"arguments\": {{\"location\": \"Rome\"{closing}\n</tool_call>"
+            );
+            let calls = try_parse_tool_calls(&raw, &config).expect("parsed");
+            assert_eq!(calls.len(), 1, "{raw}");
+            assert_eq!(calls[0].function.name, "get_weather");
+            assert_eq!(calls[0].function.arguments, r#"{"location":"Rome"}"#);
+        }
+        assert!(parse_json_block("{{\"name\": 1").is_none(), "unfinished");
+    }
+
+    /// Contract: a Mistral call reaches the parser as `name{json}` once its
+    /// `[TOOL_CALLS]` and `[ARGS]` tokens are dropped, also when parallel,
+    /// while prose that merely starts with a tool name is not a call.
+    #[test]
+    fn a_mistral_call_without_its_special_tokens_parses() {
+        let config = build_tool_config(Some(&sample_tools()), None, None).expect("config");
+        let calls =
+            try_parse_tool_calls(r#"get_weather{"location": "Rome"}"#, &config).expect("parsed");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "get_weather");
+        assert_eq!(calls[0].function.arguments, r#"{"location":"Rome"}"#);
+
+        let two = r#"get_weather{"location": "Rome"} search_docs{"query": "rain"}"#;
+        let calls = try_parse_tool_calls(two, &config).expect("parsed");
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[1].function.name, "search_docs");
+        assert_eq!(calls[1].function.arguments, r#"{"query":"rain"}"#);
+
+        assert!(try_parse_tool_calls("get_weather is a tool I could use.", &config).is_none());
+        assert!(
+            try_parse_tool_calls(r#"get_weather{"location": "Rome"} and more"#, &config).is_none()
+        );
+    }
+
+    /// Contract: gemma-4's call parses from the GGUF text, markers and quote
+    /// tokens included, and from the safetensors text that dropped them as
+    /// special, where a comma inside a string value does not split it.
+    #[test]
+    fn a_gemma_call_parses_with_and_without_its_markers() {
+        let config = build_tool_config(Some(&sample_tools()), None, None).expect("config");
+        let gguf = "<|tool_call>call:get_weather{location:<|\"|>Rome<|\"|>}<tool_call|>";
+        let calls = try_parse_tool_calls(gguf, &config).expect("parsed");
+        assert_eq!(calls[0].function.name, "get_weather");
+        assert_eq!(calls[0].function.arguments, r#"{"location":"Rome"}"#);
+
+        let mut tools = sample_tools();
+        tools.push(ToolDefinition {
+            tool_type: "function".to_string(),
+            function: super::super::types::FunctionDefinition {
+                name: "get_forecast".to_string(),
+                description: None,
+                parameters: Some(json!({
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}, "days": {"type": "integer"}}
+                })),
+                strict: None,
+            },
+        });
+        let config = build_tool_config(Some(&tools), None, None).expect("config");
+        let bare = "call:get_forecast{days:3,city:Rome, Italy}";
+        let calls = try_parse_tool_calls(bare, &config).expect("parsed");
+        assert_eq!(
+            calls[0].function.arguments,
+            r#"{"days":3,"city":"Rome, Italy"}"#
+        );
+
+        let two = "call:get_weather{location:Rome}call:search_docs{query:x}";
+        assert_eq!(try_parse_tool_calls(two, &config).expect("parsed").len(), 2);
+        assert!(try_parse_tool_calls("call: me later", &config).is_none());
+    }
+
+    /// Contract: a tool definition renders into the prompt with only the
+    /// fields the request gave, as transformers and llama.cpp render it; a
+    /// `"strict": null` the model never saw in training cost four tokens and
+    /// turned Qwen3-1.7B's "2+2" into "6".
+    #[test]
+    fn absent_tool_fields_are_not_rendered_as_null() {
+        let value = serde_json::to_value(sample_tools()).expect("tools");
+        let text = value.to_string();
+        assert!(!text.contains("null"), "{text}");
+        assert!(text.contains(r#""strict":true"#), "a given field stays");
+    }
+
+    #[test]
+    fn a_llama_style_call_with_parameters_parses() {
+        let config = ToolConfig {
+            tools: sample_tools(),
+            choice_mode: ToolChoiceMode::Auto,
+            parallel_tool_calls: true,
+        };
+        let raw =
+            r#"{"tool_calls": [{"name": "get_weather", "parameters": {"location": "Rome"}}]}"#;
+        let calls = try_parse_tool_calls(raw, &config).expect("one call");
+        assert_eq!(calls[0].function.name, "get_weather");
+        assert_eq!(calls[0].function.arguments, r#"{"location":"Rome"}"#);
+        let raw = r#"{"name": "get_weather", "parameters": {"location": "Rome"}}"#;
+        assert_eq!(
+            try_parse_tool_calls(raw, &config).expect("one call").len(),
+            1
+        );
+        let bare =
+            r#"{"type": "function", "function": "get_weather", "parameters": {"city": "Rome"}}"#;
+        let calls = try_parse_tool_calls(bare, &config).expect("a bare function name");
+        assert_eq!(calls[0].function.name, "get_weather");
+        assert_eq!(calls[0].function.arguments, r#"{"city":"Rome"}"#);
+    }
+
+    /// Contract: a final `<tool_call>` block the model never closed still
+    /// parses, in both payload shapes, as the reference parsers read it.
+    ///
+    /// Qwen2.5 stops right after the JSON payload often enough; while the
+    /// tags were stripped from GGUF output the bare JSON happened to parse,
+    /// and with the tags kept a closing tag must not be required.
+    #[test]
+    fn an_unclosed_final_tool_call_block_still_parses() {
+        let raw = "<tool_call>\n{\n  \"tool_calls\": [\n    {\"name\": \"get_weather\", \"arguments\": {\"city\": \"Rome\"}}\n  ]\n}";
+        let calls = parse_tool_call_tag_blocks(raw).expect("one call");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "get_weather");
+        assert_eq!(calls[0].function.arguments, "{\"city\":\"Rome\"}");
+
+        let raw = "<tool_call>\n{\"name\": \"a\", \"arguments\": {}}\n</tool_call>\n<tool_call>\n<function=b>\n<parameter=x>\n1\n</parameter>\n</function>";
+        let calls = parse_tool_call_tag_blocks(raw).expect("two calls");
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[1].function.name, "b");
+        assert_eq!(calls[1].function.arguments, "{\"x\":1}");
+
+        assert!(parse_tool_call_tag_blocks("<tool_call>\n").is_none());
+    }
+
     /// `<tool_call>` tags parse into proper tool calls: both the canonical
     /// single `{"name": …, "arguments": …}` object and the
     /// `{"tool_calls": […]}` shape models produce when echoing the injected

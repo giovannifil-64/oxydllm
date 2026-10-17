@@ -23,11 +23,11 @@ candle-metal-kernels ={ version = "0.11.0", optional = true }
 objc2-metal = { version = "0.3.2", optional = true }
 objc2-foundation = { version = "0.3.2", optional = true }
 serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.149"
+serde_json = { version = "1.0.149", features = ["preserve_order"] }
 tokio = { version = "1.52.2", features = ["rt-multi-thread", "macros", "sync", "net", "signal", "time"] }
 tokio-stream = { version = "0.1.18", features = ["sync"] }
 tokenizers = { version = "0.23.1", default-features = false, features = ["onig"] }
-minijinja = { version = "2.19.0", features = ["builtins"] }
+minijinja = { version = "2.19.0", features = ["builtins", "preserve_order"] }
 minijinja-contrib = { version = "2.19.0", features = ["pycompat"] }
 chrono = "0.4.44"
 rustc-hash = "2.1.2"

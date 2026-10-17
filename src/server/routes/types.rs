@@ -31,11 +31,11 @@ pub struct ResponseFormat {
 #[derive(Deserialize, Serialize, Clone, Debug)]
 pub struct FunctionDefinition {
     pub name: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parameters: Option<serde_json::Value>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub strict: Option<bool>,
 }
 
@@ -163,6 +163,10 @@ pub struct IncomingRequest {
     pub model_id: String,
     pub enqueued_at: std::time::Instant,
     pub enable_thinking: bool,
+    /// Whether the rendered prompt ends inside an open thinking block, as
+    /// gemma-4 after a tool result and the templates that end with `<think>`
+    /// do, so the first generated tokens are reasoning before any marker.
+    pub thinking_open: bool,
     pub extra_stop_token_ids: Vec<u32>,
     /// Constrain generation to valid JSON of this shape, with optional
     /// schema guidance. Applied only when the model emits content directly

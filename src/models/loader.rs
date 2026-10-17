@@ -1175,6 +1175,7 @@ fn load_standard_safetensors(
             qjl_quantization: opts.qjl_quantization,
             weights_bytes: weights_size,
             retry_cap,
+            memory_budget_bytes: opts.memory_budget_bytes,
         },
         opts.kv_budget,
     )?;
@@ -1524,6 +1525,7 @@ fn load_batch_model_gguf(
             qjl_quantization: opts.qjl_quantization,
             weights_bytes: weights_size,
             retry_cap,
+            memory_budget_bytes: opts.memory_budget_bytes,
         },
         opts.kv_budget,
     )?;
@@ -1618,6 +1620,10 @@ struct KvBlockParams {
     /// Upper bound on pool bytes imposed by a previous attempt whose weights
     /// did not survive; `None` on the first try.
     retry_cap: Option<usize>,
+    /// The operator's `--memory-budget`, which the weights and the pool must
+    /// fit together, so the pool is capped at what the budget leaves after
+    /// the weights.
+    memory_budget_bytes: Option<usize>,
 }
 
 /// Sizes the model's KV pool against the global budget, returning
@@ -1708,7 +1714,11 @@ fn compute_kv_blocks(p: &KvBlockParams, kv_budget: &GlobalKvBudget) -> anyhow::R
     let min_blocks: usize = 256;
 
     let ceiling = crate::common::paged::safe_model_kv_ceiling(p.weights_bytes)
-        .min(p.retry_cap.unwrap_or(usize::MAX));
+        .min(p.retry_cap.unwrap_or(usize::MAX))
+        .min(
+            p.memory_budget_bytes
+                .map_or(usize::MAX, |budget| budget.saturating_sub(p.weights_bytes)),
+        );
     let mode = resolve_kv_quant(p);
     let per_block_bytes = kv_bytes_per_block(p, mode);
 
@@ -1997,7 +2007,29 @@ mod kv_quant_decision_tests {
             qjl_quantization: false,
             weights_bytes,
             retry_cap: None,
+            memory_budget_bytes: None,
         }
+    }
+
+    /// Contract: with `--memory-budget`, the weights and the pool fit the
+    /// budget together, so weights that leave one gigabyte get a pool of at
+    /// most that; OLMoE at 13.8 GB under a 15.6 GB budget was granted 3 GB
+    /// from the KV budget alone and unloaded right after loading.
+    #[test]
+    fn the_pool_fits_under_the_memory_budget_with_the_weights() {
+        let mut p = params(KvQuantMode::Off, 36, 1 << 30);
+        p.memory_budget_bytes = Some(2 << 30);
+        let budget = crate::common::paged::GlobalKvBudget::new(8 << 30);
+        let plan = compute_kv_blocks(&p, &budget).expect("a pool");
+        assert!(
+            plan.acquired_bytes <= 1 << 30,
+            "{} bytes",
+            plan.acquired_bytes
+        );
+        assert!(plan.num_blocks >= 256);
+        p.memory_budget_bytes = None;
+        let unbounded = compute_kv_blocks(&p, &budget).expect("a pool");
+        assert!(unbounded.acquired_bytes > plan.acquired_bytes);
     }
 
     /// Contract: an explicit mode is never second-guessed, including `off`,

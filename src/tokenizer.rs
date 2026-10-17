@@ -363,15 +363,27 @@ impl Tokenizer {
             .or_else(|| self.inner.token_to_id(content))
     }
 
+    /// Whether the model can be asked to reason: its template takes
+    /// `enable_thinking`, or it speaks harmony, where the analysis channel is
+    /// the reasoning and `enable_thinking` decides whether the reply carries it.
     pub fn has_thinking_support(&self) -> bool {
         self.chat_template
             .as_deref()
-            .map(|t| t.contains("enable_thinking"))
-            .unwrap_or(false)
+            .is_some_and(|t| t.contains("enable_thinking"))
+            || self.speaks_harmony()
     }
 
     pub fn eos_token_id(&self) -> Option<u32> {
         self.eos_token().and_then(|tok| self.special_token_id(tok))
+    }
+
+    /// Whether the vocabulary speaks the harmony protocol, whose `<|end|>`
+    /// closes one message of the turn and not the turn, which `<|return|>`
+    /// and `<|call|>` do; gpt-oss stopped after its analysis message and
+    /// answered nothing once `<|end|>` was a stop for Phi-3's sake.
+    fn speaks_harmony(&self) -> bool {
+        self.special_token_id("<|channel|>").is_some()
+            && self.special_token_id("<|message|>").is_some()
     }
 
     pub fn stop_token_ids(&self) -> Vec<u32> {
@@ -395,14 +407,24 @@ impl Tokenizer {
             "<|end_of_text|>",
             "<|im_end|>",
             "<|endoftext|>",
+            "<|end|>",
             "<turn|>",
             "<end_of_turn>",
         ] {
+            if *content == "<|end|>" && self.speaks_harmony() {
+                continue;
+            }
             if let Some(id) = self.special_token_id(content)
                 && !ids.contains(&id)
             {
                 ids.push(id);
             }
+        }
+        if self.speaks_harmony()
+            && let Some(id) = self.special_token_id("<|call|>")
+            && !ids.contains(&id)
+        {
+            ids.push(id);
         }
         ids
     }
@@ -425,9 +447,13 @@ impl Tokenizer {
             "<|im_end|>",
             "<|im_start|>",
             "<|endoftext|>",
+            "<|end|>",
             "<turn|>",
             "<end_of_turn>",
         ] {
+            if *content == "<|end|>" && self.speaks_harmony() {
+                continue;
+            }
             if !markers.iter().any(|m| m == content) {
                 markers.push((*content).to_string());
             }
@@ -487,13 +513,13 @@ mod gguf {
         AddedToken, Tokenizer,
         decoders::{
             DecoderWrapper, byte_fallback::ByteFallback, byte_level::ByteLevel as ByteLevelDecoder,
-            fuse::Fuse, sequence::Sequence as DecoderSequence,
+            fuse::Fuse, sequence::Sequence as DecoderSequence, strip::Strip,
         },
-        models::{
-            bpe::{BPE, Vocab},
-            unigram::Unigram,
+        models::bpe::{BPE, Vocab},
+        normalizers::{
+            NormalizerWrapper, Sequence as NormalizerSequence, prepend::Prepend, replace::Replace,
+            unicode::NFC,
         },
-        normalizers::{NormalizerWrapper, replace::Replace, unicode::NFC},
         pre_tokenizers::PreTokenizerWrapper,
         processors::sequence::Sequence as ProcessorSequence,
         processors::{PostProcessorWrapper, byte_level::ByteLevel as ByteLevelProcessor},
@@ -545,6 +571,39 @@ mod gguf {
             .collect()
     }
 
+    /// The merge list a SentencePiece BPE vocabulary implies: every piece
+    /// that splits into two pieces of the vocabulary is a merge, ordered by
+    /// the merged piece's score from the highest down, which is the order the
+    /// reference conversion (`SentencePieceExtractor`) writes into a
+    /// `tokenizer.json`, so the ids come out as SentencePiece's own. Picking
+    /// the pieces by maximum score sum instead, as a unigram model does,
+    /// split the official Phi-3 file's `Hello` into six pieces.
+    fn merges_from_scores(tokens: &[String], scores: &[f32]) -> Vec<(String, String)> {
+        let ids: std::collections::HashMap<&str, usize> = tokens
+            .iter()
+            .enumerate()
+            .map(|(i, t)| (t.as_str(), i))
+            .collect();
+        let mut merges: Vec<((String, String), f32)> = Vec::new();
+        for (piece, &score) in tokens.iter().zip(scores) {
+            let mut local: Vec<(usize, usize, usize)> = piece
+                .char_indices()
+                .skip(1)
+                .filter_map(|(at, _)| {
+                    let (l, r) = piece.split_at(at);
+                    Some((*ids.get(l)?, *ids.get(r)?, at))
+                })
+                .collect();
+            local.sort_unstable();
+            merges.extend(local.into_iter().map(|(_, _, at)| {
+                let (l, r) = piece.split_at(at);
+                ((l.to_string(), r.to_string()), score)
+            }));
+        }
+        merges.sort_by(|a, b| b.1.total_cmp(&a.1));
+        merges.into_iter().map(|(pair, _)| pair).collect()
+    }
+
     fn merges_from_value(v: &gguf_file::Value) -> Result<Vec<(String, String)>> {
         value_to_string_array(v, "tokenizer.ggml.merges")?
             .into_iter()
@@ -584,13 +643,34 @@ mod gguf {
     /// rather than from memory, including the pre-tokenizer that splits on a
     /// space the normalizer has already replaced: it does nothing, and leaving
     /// it out is a difference nobody would notice until it mattered.
-    fn sentencepiece_pipeline() -> Result<Pipeline> {
-        let normalizer = Replace::new(" ", "\u{2581}")
+    /// The SentencePiece pipeline: a space is spelled U+2581, and with
+    /// `add_space_prefix` one is put in front of the text, as SentencePiece's
+    /// dummy prefix does, so the first word is the same piece it would be in
+    /// the middle of a sentence; the decoder takes that one space back.
+    fn sentencepiece_pipeline(add_space_prefix: bool) -> Result<Pipeline> {
+        let replace = Replace::new(" ", "\u{2581}")
             .map_err(|e| anyhow::anyhow!("sentencepiece normalizer: {e}"))?;
+        let normalizer: NormalizerWrapper = if add_space_prefix {
+            NormalizerSequence::new(vec![
+                Prepend::new("\u{2581}".to_string()).into(),
+                replace.into(),
+            ])
+            .into()
+        } else {
+            replace.into()
+        };
         let replace_back = tokenizers::normalizers::replace::Replace::new("\u{2581}", " ")
             .map_err(|e| anyhow::anyhow!("sentencepiece decoder: {e}"))?;
+        let mut decoders = vec![
+            DecoderWrapper::Replace(replace_back),
+            DecoderWrapper::ByteFallback(ByteFallback::default()),
+            DecoderWrapper::Fuse(Fuse::default()),
+        ];
+        if add_space_prefix {
+            decoders.push(DecoderWrapper::Strip(Strip::new(' ', 1, 0)));
+        }
         Ok(Pipeline {
-            normalizer: Some(normalizer.into()),
+            normalizer: Some(normalizer),
             pretokenizer: Some(
                 Split::new(
                     SplitPattern::String(" ".to_string()),
@@ -600,11 +680,7 @@ mod gguf {
                 .map_err(|e| anyhow::anyhow!("sentencepiece pre-tokenizer: {e}"))?
                 .into(),
             ),
-            decoder: Some(DecoderWrapper::Sequence(DecoderSequence::new(vec![
-                DecoderWrapper::Replace(replace_back),
-                DecoderWrapper::ByteFallback(ByteFallback::default()),
-                DecoderWrapper::Fuse(Fuse::default()),
-            ]))),
+            decoder: Some(DecoderWrapper::Sequence(DecoderSequence::new(decoders))),
             post_processor: None,
         })
     }
@@ -713,6 +789,15 @@ mod gguf {
         Some(PostProcessorWrapper::Template(proc))
     }
 
+    /// Builds the tokenizer a GGUF file describes.
+    ///
+    /// Token types follow `llama_token_type` the way llama.cpp renders them:
+    /// unknown (2), control (3) and unused (5) tokens are special, added
+    /// atomically and dropped from decoded text; user-defined tokens (4) are
+    /// added atomically but survive decoding, since they are the chat and
+    /// tool markup (`<tool_call>`, `<think>` on the Qwen files) that the
+    /// server parses out of the generated text, exactly as the checkpoint's
+    /// own `tokenizer.json` lists them as non-special added tokens.
     pub(super) fn build_tokenizer(ct: &gguf_file::Content) -> Result<Tokenizer> {
         let model_kind = metadata_value(ct, "tokenizer.ggml.model")?
             .to_string()
@@ -748,62 +833,74 @@ mod gguf {
             Err(_) => tokens.iter().any(|t| t == "<0x0A>"),
         };
 
-        let mut tokenizer = match merges_from_value(metadata_value(ct, "tokenizer.ggml.merges")?) {
-            Ok(merges) => {
-                let vocab: Vocab = tokens
-                    .iter()
-                    .enumerate()
-                    .map(|(i, t)| (t.clone(), i as u32))
-                    .collect();
-                let mut builder = BPE::builder()
-                    .vocab_and_merges(vocab, merges)
-                    .byte_fallback(byte_fallback);
-                if let Some(token) = unk_token.clone() {
-                    builder = builder.unk_token(token);
+        let mut tokenizer =
+            match metadata_value(ct, "tokenizer.ggml.merges").and_then(merges_from_value) {
+                Ok(merges) => {
+                    let vocab: Vocab = tokens
+                        .iter()
+                        .enumerate()
+                        .map(|(i, t)| (t.clone(), i as u32))
+                        .collect();
+                    let mut builder = BPE::builder()
+                        .vocab_and_merges(vocab, merges)
+                        .byte_fallback(byte_fallback);
+                    if let Some(token) = unk_token.clone() {
+                        builder = builder.unk_token(token);
+                    }
+                    if let Ok(val) = metadata_value(ct, "tokenizer.ggml.ignore_merges") {
+                        builder = builder
+                            .ignore_merges(val.to_bool().map_err(|e| anyhow::anyhow!("{e}"))?);
+                    }
+                    Tokenizer::new(
+                        builder
+                            .build()
+                            .map_err(|e| anyhow::anyhow!("BPE build: {e}"))?,
+                    )
                 }
-                if let Ok(val) = metadata_value(ct, "tokenizer.ggml.ignore_merges") {
-                    builder =
-                        builder.ignore_merges(val.to_bool().map_err(|e| anyhow::anyhow!("{e}"))?);
+                // No merge list: a SentencePiece file states the scores instead,
+                // and a piece's score is its rank in the merge order, so the
+                // merges are rebuilt from the pieces the way the reference
+                // conversion rebuilds them.
+                Err(e) if sentencepiece => {
+                    let scores = value_to_f32_array(
+                        metadata_value(ct, "tokenizer.ggml.scores")
+                            .map_err(|_| anyhow::anyhow!("neither merges nor scores: {e}"))?,
+                        "tokenizer.ggml.scores",
+                    )?;
+                    if scores.len() != tokens.len() {
+                        anyhow::bail!(
+                            "tokenizer.ggml.scores has {} entries for {} tokens",
+                            scores.len(),
+                            tokens.len()
+                        );
+                    }
+                    let vocab: Vocab = tokens
+                        .iter()
+                        .enumerate()
+                        .map(|(i, t)| (t.clone(), i as u32))
+                        .collect();
+                    let mut builder = BPE::builder()
+                        .vocab_and_merges(vocab, merges_from_scores(&tokens, &scores))
+                        .byte_fallback(byte_fallback)
+                        .fuse_unk(true);
+                    if let Some(token) = unk_token.clone() {
+                        builder = builder.unk_token(token);
+                    }
+                    Tokenizer::new(
+                        builder
+                            .build()
+                            .map_err(|e| anyhow::anyhow!("BPE build: {e}"))?,
+                    )
                 }
-                Tokenizer::new(
-                    builder
-                        .build()
-                        .map_err(|e| anyhow::anyhow!("BPE build: {e}"))?,
-                )
-            }
-            // No merge list: a SentencePiece file states the scores instead,
-            // and the pieces are picked to maximise their sum rather than
-            // merged pairwise.
-            Err(e) if sentencepiece => {
-                let scores = value_to_f32_array(
-                    metadata_value(ct, "tokenizer.ggml.scores")
-                        .map_err(|_| anyhow::anyhow!("neither merges nor scores: {e}"))?,
-                    "tokenizer.ggml.scores",
-                )?;
-                if scores.len() != tokens.len() {
-                    anyhow::bail!(
-                        "tokenizer.ggml.scores has {} entries for {} tokens",
-                        scores.len(),
-                        tokens.len()
-                    );
-                }
-                let vocab: Vec<(String, f64)> = tokens
-                    .iter()
-                    .cloned()
-                    .zip(scores.iter().map(|s| *s as f64))
-                    .collect();
-                let unk_id = unk_token
-                    .as_ref()
-                    .and_then(|t| tokens.iter().position(|x| x == t));
-                let unigram = Unigram::from(vocab, unk_id, byte_fallback)
-                    .map_err(|e| anyhow::anyhow!("Unigram build: {e}"))?;
-                Tokenizer::new(unigram)
-            }
-            Err(e) => return Err(e),
-        };
+                Err(e) => return Err(e),
+            };
 
         let pipeline = if sentencepiece {
-            sentencepiece_pipeline()?
+            let add_space_prefix = match metadata_value(ct, "tokenizer.ggml.add_space_prefix") {
+                Ok(val) => val.to_bool().map_err(|e| anyhow::anyhow!("{e}"))?,
+                Err(_) => model_kind == "llama",
+            };
+            sentencepiece_pipeline(add_space_prefix)?
         } else {
             let pre = metadata_value(ct, "tokenizer.ggml.pre")
                 .and_then(|v| v.to_string().map_err(|e| anyhow::anyhow!("{e}")))
@@ -854,19 +951,24 @@ mod gguf {
             let _ = tokenizer.with_post_processor(Some(pp));
         }
 
-        // Mark special tokens so decode(skip_special_tokens = true) works.
         if let Ok(gguf_file::Value::Array(arr)) = metadata_value(ct, "tokenizer.ggml.token_type") {
             let mut specials = Vec::new();
+            let mut user_defined = Vec::new();
             for (idx, v) in arr.iter().enumerate() {
-                // Aligns with llama_token_type: non-normal/non-byte = special.
-                if matches!(value_to_u32(v)?, 2..=5)
-                    && let Some(tok) = tokens.get(idx)
-                {
-                    specials.push(AddedToken::from(tok.clone(), true));
+                let Some(tok) = tokens.get(idx) else {
+                    continue;
+                };
+                match value_to_u32(v)? {
+                    4 => user_defined.push(AddedToken::from(tok.clone(), false).normalized(false)),
+                    2 | 3 | 5 => specials.push(AddedToken::from(tok.clone(), true)),
+                    _ => {}
                 }
             }
             if !specials.is_empty() {
                 let _ = tokenizer.add_special_tokens(specials);
+            }
+            if !user_defined.is_empty() {
+                let _ = tokenizer.add_tokens(user_defined);
             }
         }
 
@@ -937,6 +1039,46 @@ mod gemma4_tokenizer_tests {
         }
     }
 
+    /// Contract: the `llama` kind gives the ids llama.cpp gives, on a file that
+    /// carries merges (TinyLlama) and on one that carries scores alone (the
+    /// official Phi-3), both of which spell the first word with the dummy
+    /// prefix. Reference ids from `llama-server /tokenize` with
+    /// `add_special: false`.
+    ///
+    /// Needs the checkpoints; run with
+    /// `cargo test a_llama_gguf_tokenizer_matches_llama_cpp -- --ignored`.
+    #[test]
+    #[ignore]
+    fn a_llama_gguf_tokenizer_matches_llama_cpp() {
+        let home = std::env::var("HOME").unwrap();
+        let files = [
+            format!(
+                "{home}/.oxydllm/models/microsoft/Phi-3-mini-4k-instruct-gguf/Phi-3-mini-4k-instruct-q4.gguf"
+            ),
+            format!(
+                "{home}/.oxydllm/models/TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF/tinyllama-1.1b-chat-v1.0.Q4_0.gguf"
+            ),
+        ];
+        for gguf in files {
+            if !std::path::Path::new(&gguf).exists() {
+                eprintln!("checkpoint assente, salto: {gguf}");
+                continue;
+            }
+            let tok = Tokenizer::from_gguf_file(&gguf).expect("tokenizer from a llama GGUF");
+            assert_eq!(
+                tok.encode("Hello world, how are you?").unwrap(),
+                vec![15043, 3186, 29892, 920, 526, 366, 29973],
+                "{gguf}"
+            );
+            assert_eq!(
+                tok.decode(&[15043, 3186, 29892, 920, 526, 366, 29973])
+                    .unwrap(),
+                "Hello world, how are you?",
+                "{gguf}"
+            );
+        }
+    }
+
     /// Contract: the tokenizer built from a GGUF gives the same token ids as the
     /// checkpoint's own `tokenizer.json`.
     ///
@@ -999,6 +1141,74 @@ mod tests {
     use super::*;
     use tokenizers::models::wordlevel::WordLevel;
     use tokenizers::pre_tokenizers::whitespace::Whitespace;
+
+    /// Contract: `<|end|>` ends the turn for Phi-3, where it is the end of
+    /// turn, and not for a harmony vocabulary, where it ends one message and
+    /// `<|return|>` ends the turn; with it as a stop, gpt-oss stopped after
+    /// its analysis and answered nothing.
+    #[test]
+    fn the_harmony_message_end_is_not_a_stop() {
+        fn tokenizer_with(specials: &[&str]) -> Tokenizer {
+            let tmp = tempfile::tempdir().unwrap();
+            let vocab: Vec<(String, u32)> = ["[UNK]", "hi"]
+                .iter()
+                .chain(specials.iter())
+                .enumerate()
+                .map(|(i, t)| (t.to_string(), i as u32))
+                .collect();
+            let model = WordLevel::builder()
+                .vocab(vocab.iter().cloned().collect())
+                .unk_token("[UNK]".to_string())
+                .build()
+                .unwrap();
+            tokenizers::Tokenizer::new(model)
+                .save(tmp.path().join("tokenizer.json"), false)
+                .unwrap();
+            let decoder: serde_json::Map<String, serde_json::Value> = vocab
+                .iter()
+                .filter(|(t, _)| specials.contains(&t.as_str()))
+                .map(|(t, id)| {
+                    (
+                        id.to_string(),
+                        serde_json::json!({"content": t, "special": true}),
+                    )
+                })
+                .collect();
+            let cfg = serde_json::json!({
+                "eos_token": specials[0],
+                "added_tokens_decoder": decoder,
+            });
+            std::fs::write(tmp.path().join("tokenizer_config.json"), cfg.to_string()).unwrap();
+            Tokenizer::from_dir(tmp.path().to_str().unwrap()).unwrap()
+        }
+
+        let harmony = tokenizer_with(&[
+            "<|return|>",
+            "<|end|>",
+            "<|channel|>",
+            "<|message|>",
+            "<|call|>",
+        ]);
+        assert_eq!(
+            harmony.stop_token_ids(),
+            vec![
+                harmony.special_token_id("<|return|>").unwrap(),
+                harmony.special_token_id("<|call|>").unwrap()
+            ],
+            "the turn ends at <|return|> or at a function call"
+        );
+        assert!(!harmony.stop_text_markers().iter().any(|m| m == "<|end|>"));
+        assert!(
+            harmony.has_thinking_support(),
+            "the analysis channel is reasoning on request"
+        );
+
+        let phi = tokenizer_with(&["<|endoftext|>", "<|end|>"]);
+        assert!(
+            phi.stop_token_ids()
+                .contains(&phi.special_token_id("<|end|>").unwrap())
+        );
+    }
 
     fn build_test_tokenizer(chat_template: Option<&str>, eos_token: Option<&str>) -> Tokenizer {
         let tmp = tempfile::tempdir().unwrap();
@@ -1081,6 +1291,129 @@ mod tests {
         for pre in ["refact", "starcoder", "gpt-2", "llama-bpe"] {
             run_gguf_pre_tokenizer_case(pre);
         }
+    }
+
+    /// Contract: a SentencePiece GGUF that carries scores and no merge list,
+    /// as the official Phi-3 files do, builds its tokenizer from the scores.
+    ///
+    /// The scores branch existed but sat behind a `?` on the merge-list key,
+    /// so a file without that key failed to load before reaching it; only a
+    /// file that had merges as well, like TinyLlama's, ever loaded.
+    #[test]
+    fn a_sentencepiece_gguf_without_merges_builds_from_scores() {
+        use candle_core::quantized::gguf_file::{Content, Value, VersionedMagic};
+        use std::collections::HashMap;
+
+        let tokens = [
+            "<unk>",
+            "<s>",
+            "</s>",
+            "\u{2581}hi",
+            "\u{2581}h",
+            "h",
+            "i",
+            "\u{2581}yo",
+            "\u{2581}y",
+            "y",
+            "o",
+            "\u{2581}",
+        ];
+        let scores = [
+            0.0f32, 0.0, 0.0, -1.0, -2.0, -3.0, -3.0, -1.5, -2.5, -3.0, -3.0, -3.0,
+        ];
+        let token_types = [2u32, 3, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1];
+        let mut metadata: HashMap<String, Value> = HashMap::new();
+        metadata.insert("tokenizer.ggml.model".into(), Value::String("llama".into()));
+        metadata.insert(
+            "tokenizer.ggml.tokens".into(),
+            Value::Array(tokens.iter().map(|t| Value::String((*t).into())).collect()),
+        );
+        metadata.insert(
+            "tokenizer.ggml.scores".into(),
+            Value::Array(scores.iter().map(|&s| Value::F32(s)).collect()),
+        );
+        metadata.insert(
+            "tokenizer.ggml.token_type".into(),
+            Value::Array(token_types.iter().map(|&t| Value::U32(t)).collect()),
+        );
+        metadata.insert("tokenizer.ggml.unknown_token_id".into(), Value::U32(0));
+        let content = Content {
+            magic: VersionedMagic::GgufV3,
+            metadata,
+            tensor_infos: HashMap::new(),
+            tensor_data_offset: 0,
+        };
+        let tok =
+            Tokenizer::from_gguf_content(&content).expect("a scores-only SentencePiece file loads");
+        let ids = tok.encode("hi yo").unwrap();
+        assert_eq!(ids, vec![3, 7], "the pieces are merged in score order");
+        assert_eq!(tok.decode(&ids).unwrap(), "hi yo");
+    }
+
+    /// Contract: a GGUF token of type user-defined (4) is one token in the
+    /// input and survives decoding, while a control token (3) is dropped.
+    ///
+    /// Every non-normal type was marked special, so `<tool_call>` and
+    /// `<think>`, which the Qwen converters type as user-defined, vanished
+    /// from the generated text on GGUF models: the tool-call parser never
+    /// saw the tags that the same model's `tokenizer.json` keeps.
+    #[test]
+    fn gguf_user_defined_tokens_survive_decoding() {
+        use candle_core::quantized::gguf_file::{Content, Value, VersionedMagic};
+        use std::collections::HashMap;
+
+        let tokens = [
+            "<|x|>",
+            "Ġ",
+            "u",
+            "s",
+            "e",
+            "r",
+            "us",
+            "er",
+            "user",
+            "Ġuser",
+            "<tool_call>",
+            "<|end|>",
+        ];
+        let token_types = [3u32, 1, 1, 1, 1, 1, 1, 1, 1, 1, 4, 4];
+        let merges = ["u s", "e r", "us er", "Ġ user"];
+
+        let mut metadata: HashMap<String, Value> = HashMap::new();
+        metadata.insert("tokenizer.ggml.model".into(), Value::String("gpt2".into()));
+        metadata.insert("tokenizer.ggml.pre".into(), Value::String("gpt-2".into()));
+        metadata.insert(
+            "tokenizer.ggml.tokens".into(),
+            Value::Array(tokens.iter().map(|t| Value::String((*t).into())).collect()),
+        );
+        metadata.insert(
+            "tokenizer.ggml.token_type".into(),
+            Value::Array(token_types.iter().map(|&t| Value::U32(t)).collect()),
+        );
+        metadata.insert(
+            "tokenizer.ggml.merges".into(),
+            Value::Array(merges.iter().map(|m| Value::String((*m).into())).collect()),
+        );
+        let content = Content {
+            magic: VersionedMagic::GgufV3,
+            metadata,
+            tensor_infos: HashMap::new(),
+            tensor_data_offset: 0,
+        };
+        let tok = Tokenizer::from_gguf_content(&content).unwrap();
+
+        assert_eq!(tok.encode("<tool_call>user").unwrap(), vec![10, 8]);
+        assert_eq!(tok.decode(&[10, 8]).unwrap(), "<tool_call>user");
+        assert_eq!(
+            tok.decode(&[0, 8]).unwrap(),
+            "user",
+            "control tokens stay hidden"
+        );
+        assert_eq!(tok.special_token_id("<tool_call>"), Some(10));
+        assert!(
+            tok.stop_token_ids().contains(&11),
+            "Phi-3 ends its turn with the user-defined <|end|>, which llama.cpp knows by name"
+        );
     }
 
     fn run_gguf_pre_tokenizer_case(pre: &str) {

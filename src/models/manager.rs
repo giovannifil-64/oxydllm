@@ -45,6 +45,10 @@ pub struct ReadyHandle {
     pub request_tx: tokio_mpsc::Sender<IncomingRequest>,
     pub tokenizer: Arc<Tokenizer>,
     pub max_seq_len: usize,
+    /// Tokens the model's KV pool can hold in all, which bounds a single
+    /// request below `max_seq_len` when the pool came out smaller than the
+    /// pinned context.
+    pub kv_capacity_tokens: usize,
 }
 
 /// Lifecycle state of one model slot.
@@ -63,6 +67,7 @@ enum SlotState {
         request_tx: tokio_mpsc::Sender<IncomingRequest>,
         tokenizer: Arc<Tokenizer>,
         max_seq_len: usize,
+        kv_capacity_tokens: usize,
         architecture: String,
         vocab_size: usize,
         num_layers: usize,
@@ -613,6 +618,7 @@ impl ModelManager {
                     request_tx,
                     tokenizer,
                     max_seq_len,
+                    kv_capacity_tokens,
                     last_used,
                     effective_keep_alive,
                     ..
@@ -625,6 +631,7 @@ impl ModelManager {
                         request_tx: request_tx.clone(),
                         tokenizer: Arc::clone(tokenizer),
                         max_seq_len: *max_seq_len,
+                        kv_capacity_tokens: *kv_capacity_tokens,
                     });
                 }
                 SlotState::Loading { waiters } => {
@@ -721,6 +728,7 @@ impl ModelManager {
                 request_tx: handle.request_tx,
                 tokenizer: handle.tokenizer,
                 max_seq_len: handle.max_seq_len,
+                kv_capacity_tokens: handle.kv_capacity_tokens,
                 architecture: "TestArchitecture".to_string(),
                 vocab_size: 0,
                 num_layers: 0,
@@ -739,6 +747,7 @@ impl ModelManager {
         model_id: &str,
         handle: ReadyHandle,
         age: Duration,
+        shutdown: Arc<AtomicBool>,
     ) {
         self.slots.insert(
             model_id.to_string(),
@@ -746,6 +755,7 @@ impl ModelManager {
                 request_tx: handle.request_tx,
                 tokenizer: handle.tokenizer,
                 max_seq_len: handle.max_seq_len,
+                kv_capacity_tokens: handle.kv_capacity_tokens,
                 architecture: "TestArchitecture".to_string(),
                 vocab_size: 0,
                 num_layers: 0,
@@ -753,19 +763,27 @@ impl ModelManager {
                 effective_keep_alive: self.keep_alive,
                 weights_size_bytes: 0,
                 kv_cache_bytes: 0,
-                shutdown: Arc::new(AtomicBool::new(false)),
+                shutdown,
             },
         );
     }
 
+    /// Installs a `Ready` slot and returns the shutdown flag it was given,
+    /// which is what identifies the slot to its [`EngineSlotGuard`].
     #[cfg(test)]
-    pub fn insert_ready_for_tests(&mut self, model_id: &str, handle: ReadyHandle) {
+    pub fn insert_ready_for_tests(
+        &mut self,
+        model_id: &str,
+        handle: ReadyHandle,
+    ) -> Arc<AtomicBool> {
+        let shutdown = Arc::new(AtomicBool::new(false));
         self.slots.insert(
             model_id.to_string(),
             SlotState::Ready {
                 request_tx: handle.request_tx,
                 tokenizer: handle.tokenizer,
                 max_seq_len: handle.max_seq_len,
+                kv_capacity_tokens: handle.kv_capacity_tokens,
                 architecture: "TestArchitecture".to_string(),
                 vocab_size: 0,
                 num_layers: 0,
@@ -773,9 +791,10 @@ impl ModelManager {
                 effective_keep_alive: self.keep_alive,
                 weights_size_bytes: 0,
                 kv_cache_bytes: 0,
-                shutdown: Arc::new(AtomicBool::new(false)),
+                shutdown: Arc::clone(&shutdown),
             },
         );
+        shutdown
     }
 
     /// Upserts a model's registry entry with its measured sizes and persists
@@ -806,6 +825,7 @@ struct LoadResult {
     request_tx: tokio_mpsc::Sender<IncomingRequest>,
     tokenizer: Arc<Tokenizer>,
     max_seq_len: usize,
+    kv_capacity_tokens: usize,
     architecture: String,
     vocab_size: usize,
     num_layers: usize,
@@ -840,7 +860,7 @@ struct SpawnLoadParams {
 /// first real request pays multi-second compilation latency. Phase 3 (full
 /// prefill) MUST be last: a Metal candle bug emits NaN logits on the first
 /// `call_sdpa_full` after a `call_sdpa_vector` call without an intervening full.
-fn warm_up_model(model: &dyn BatchModel) {
+pub(crate) fn warm_up_model(model: &dyn BatchModel) {
     let device = model.device();
     let allocators = model.allocators();
 
@@ -952,15 +972,24 @@ fn warm_up_model(model: &dyn BatchModel) {
 /// Lives on the engine thread for the whole life of [`engine_loop`] and runs
 /// on drop, unwinding included. Normal teardown paths (keep-alive expiry,
 /// LRU eviction, over-budget unload) remove the slot before the loop exits,
-/// so the drop-time check, "is this exact engine's channel still
-/// registered", fails and the guard does nothing; `same_channel` also keeps
-/// it from touching a reloaded successor slot. When the check passes the
-/// slot is stale: it is removed and its KV budget released, so the next
-/// request reloads the model instead of getting 503 forever.
+/// so the drop-time check, "is this exact engine's slot still registered",
+/// fails and the guard does nothing; the slot is recognised by its shutdown
+/// flag, which every spawn allocates afresh, so the guard never touches a
+/// reloaded successor slot. When the check passes the slot is stale: it is
+/// removed and its KV budget released, so the next request reloads the model
+/// instead of getting 503 forever.
+///
+/// The guard deliberately holds no `Sender` of the request channel. An idle
+/// engine loop parks in `blocking_recv`, which returns only when a request
+/// arrives or every `Sender` is gone, and eviction sends nothing: removing
+/// the slot drops the slot's `Sender`, and once the last in-flight
+/// [`ReadyHandle`] is dropped the channel closes and the loop exits. A
+/// `Sender` kept here would hold the channel open and leave the evicted
+/// engine, its weights and its KV pool resident for good.
 struct EngineSlotGuard {
     manager: SharedModelManager,
     model_id: String,
-    request_tx: tokio_mpsc::Sender<IncomingRequest>,
+    shutdown: Arc<AtomicBool>,
 }
 
 impl Drop for EngineSlotGuard {
@@ -969,7 +998,7 @@ impl Drop for EngineSlotGuard {
         let mut mgr = self.manager.blocking_lock();
         let stale = matches!(
             mgr.slots.get(&self.model_id),
-            Some(SlotState::Ready { request_tx, .. }) if request_tx.same_channel(&self.request_tx)
+            Some(SlotState::Ready { shutdown, .. }) if Arc::ptr_eq(shutdown, &self.shutdown)
         );
         if !stale {
             return;
@@ -1181,13 +1210,13 @@ fn spawn_load(params: SpawnLoadParams) {
         };
 
         let (request_tx, request_rx) = tokio_mpsc::channel(max_queued_requests);
-        let engine_tx = request_tx.clone();
         let shutdown = Arc::new(AtomicBool::new(false));
 
         let result = LoadResult {
             request_tx,
             tokenizer: Arc::clone(&tokenizer),
             max_seq_len,
+            kv_capacity_tokens: total_blocks * block_size,
             architecture,
             vocab_size,
             num_layers,
@@ -1256,7 +1285,7 @@ fn spawn_load(params: SpawnLoadParams) {
         let _slot_guard = EngineSlotGuard {
             manager: manager_thread,
             model_id: model_id_thread.clone(),
-            request_tx: engine_tx,
+            shutdown: Arc::clone(&shutdown),
         };
         engine_loop(engine, tokenizer, request_rx, shutdown, model_id_thread);
     });
@@ -1291,6 +1320,7 @@ fn spawn_load(params: SpawnLoadParams) {
                     request_tx: result.request_tx.clone(),
                     tokenizer: Arc::clone(&result.tokenizer),
                     max_seq_len: result.max_seq_len,
+                    kv_capacity_tokens: result.kv_capacity_tokens,
                 };
 
                 mgr.update_registry(
@@ -1308,6 +1338,7 @@ fn spawn_load(params: SpawnLoadParams) {
                         request_tx: result.request_tx,
                         tokenizer: result.tokenizer,
                         max_seq_len: result.max_seq_len,
+                        kv_capacity_tokens: result.kv_capacity_tokens,
                         architecture: result.architecture,
                         vocab_size: result.vocab_size,
                         num_layers: result.num_layers,
@@ -1460,6 +1491,7 @@ mod tests {
             request_tx: tx,
             tokenizer: tok,
             max_seq_len: 1024,
+            kv_capacity_tokens: 1024,
         }
     }
 
@@ -1586,15 +1618,14 @@ mod tests {
         let shared: SharedModelManager = Arc::new(tokio::sync::Mutex::new(mgr));
 
         let handle = build_dummy_handle();
-        let engine_tx = handle.request_tx.clone();
-        shared
+        let shutdown = shared
             .blocking_lock()
             .insert_ready_for_tests("crashy", handle);
 
         let guard = EngineSlotGuard {
             manager: Arc::clone(&shared),
             model_id: "crashy".to_string(),
-            request_tx: engine_tx,
+            shutdown,
         };
         let t = std::thread::spawn(move || {
             let _guard = guard;
@@ -1613,7 +1644,6 @@ mod tests {
         let mgr = build_test_manager(&tmp, Duration::from_secs(60), None);
         let shared: SharedModelManager = Arc::new(tokio::sync::Mutex::new(mgr));
 
-        let (dead_tx, _dead_rx) = tokio_mpsc::channel::<IncomingRequest>(1);
         let replacement = build_dummy_handle();
         shared
             .blocking_lock()
@@ -1622,7 +1652,7 @@ mod tests {
         drop(EngineSlotGuard {
             manager: Arc::clone(&shared),
             model_id: "reloaded".to_string(),
-            request_tx: dead_tx,
+            shutdown: Arc::new(AtomicBool::new(false)),
         });
         assert_eq!(
             shared.blocking_lock().list_running().len(),
@@ -1684,7 +1714,12 @@ mod tests {
         let mut mgr = build_test_manager(&tmp, keep_alive, None);
 
         let h = build_dummy_handle();
-        mgr.insert_aged_slot_for_tests("old-model", h, Duration::from_secs(60));
+        mgr.insert_aged_slot_for_tests(
+            "old-model",
+            h,
+            Duration::from_secs(60),
+            Arc::new(AtomicBool::new(false)),
+        );
 
         assert_eq!(mgr.list_running().len(), 1);
         mgr.evict_expired();
@@ -1692,6 +1727,82 @@ mod tests {
             mgr.list_running().len(),
             0,
             "slot past keep-alive must be evicted"
+        );
+    }
+
+    /// Contract: evicting an idle model ends its engine loop, so the weights
+    /// and KV pool the loop owns go away with the slot.
+    ///
+    /// An idle loop is parked in `blocking_recv` and never reads the shutdown
+    /// flag; only the request channel closing wakes it. While the guard on the
+    /// engine thread held a `Sender` of that channel, every keep-alive or LRU
+    /// eviction left the loop parked for good, with the model resident on the
+    /// GPU after its KV budget had already been handed back. The slot here
+    /// carries a flag of its own rather than the loop's, so the test proves
+    /// that dropping the slot closes the channel and that alone ends the loop:
+    /// a loop that happened to read the flag before parking would pass for the
+    /// wrong reason.
+    #[test]
+    fn evicting_an_idle_model_ends_its_engine_loop() {
+        use crate::engine::Engine;
+        use crate::scheduler::SchedulerConfig;
+        use crate::server::routes::engine_loop;
+        use crate::server::routes::test_support::StubModel;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mgr = build_test_manager(&tmp, Duration::from_secs(10), None);
+        let shared: SharedModelManager = Arc::new(tokio::sync::Mutex::new(mgr));
+
+        let (request_tx, request_rx) = tokio_mpsc::channel::<IncomingRequest>(8);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let handle = build_dummy_handle();
+        let tokenizer = Arc::clone(&handle.tokenizer);
+
+        let (exited_tx, exited_rx) = std::sync::mpsc::channel::<()>();
+        let loop_manager = Arc::clone(&shared);
+        let loop_shutdown = Arc::clone(&shutdown);
+        std::thread::spawn(move || {
+            let engine = Engine::new_with_stop_controls(
+                Box::new(StubModel::completing(5)),
+                SchedulerConfig {
+                    max_num_sequences: 4,
+                    max_tokens_per_step: 1024,
+                },
+                &[],
+                &[],
+            );
+            let _slot_guard = EngineSlotGuard {
+                manager: loop_manager,
+                model_id: "idle".to_string(),
+                shutdown: Arc::clone(&loop_shutdown),
+            };
+            engine_loop(
+                engine,
+                tokenizer,
+                request_rx,
+                loop_shutdown,
+                "idle".to_string(),
+            );
+            let _ = exited_tx.send(());
+        });
+
+        shared.blocking_lock().insert_aged_slot_for_tests(
+            "idle",
+            ReadyHandle {
+                request_tx,
+                tokenizer: handle.tokenizer,
+                max_seq_len: handle.max_seq_len,
+                kv_capacity_tokens: handle.kv_capacity_tokens,
+            },
+            Duration::from_secs(60),
+            Arc::new(AtomicBool::new(false)),
+        );
+        shared.blocking_lock().evict_expired();
+        assert!(shared.blocking_lock().list_running().is_empty());
+
+        assert!(
+            exited_rx.recv_timeout(Duration::from_secs(10)).is_ok(),
+            "the evicted engine loop must exit instead of staying parked on its channel"
         );
     }
 }

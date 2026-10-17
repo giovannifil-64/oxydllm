@@ -630,7 +630,7 @@ mod tests {
         let bias: Vec<f32> = (0..n).map(|i| (i % 7) as f32 * 0.1).collect();
         let bias_t = Tensor::from_vec(bias, n, &Device::Cpu).unwrap();
         let buffer = md.new_buffer_with_data(&bytes).unwrap();
-        let staged = StagedWeight::of_kind((*buffer).clone(), kind, &[n, k]).unwrap();
+        let staged = StagedWeight::of_kind(buffer, kind, &[n, k]).unwrap();
         let layer = QLinear::from_gguf(
             LinearWeight::Owned(staged),
             Some(

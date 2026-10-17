@@ -54,7 +54,8 @@ pub struct StepOutput {
 /// directly. The caches are taken with `mem::take` on construction and
 /// restored either explicitly via [`restore`](Self::restore) or on drop, so a
 /// forward error cannot leave sequences with empty caches (leaking their KV
-/// blocks).
+/// blocks). Taking them is also where each cache learns its phase: prefill
+/// caches write the block pool, decode caches do not.
 struct CacheRestoreGuard<'a> {
     scheduler: &'a mut Scheduler,
     prefill_ids: Vec<SequenceId>,
@@ -74,11 +75,15 @@ impl<'a> CacheRestoreGuard<'a> {
 
         for &seq_id in prefill_ids {
             let seq = scheduler.get_running_mut(seq_id).unwrap();
-            cache_vecs.push(std::mem::take(&mut seq.caches));
+            let mut caches = std::mem::take(&mut seq.caches);
+            caches.iter_mut().for_each(|c| c.set_pool_writes(true));
+            cache_vecs.push(caches);
         }
         for &seq_id in decode_ids {
             let seq = scheduler.get_running_mut(seq_id).unwrap();
-            cache_vecs.push(std::mem::take(&mut seq.caches));
+            let mut caches = std::mem::take(&mut seq.caches);
+            caches.iter_mut().for_each(|c| c.set_pool_writes(false));
+            cache_vecs.push(caches);
         }
 
         Self {
@@ -788,6 +793,9 @@ fn run_speculative_decode(
 ) -> Result<()> {
     for &seq_id in decode_ids {
         let seq = scheduler.get_running_mut(seq_id).unwrap();
+        for c in seq.caches.iter_mut().chain(seq.draft_caches.iter_mut()) {
+            c.set_pool_writes(false);
+        }
         let l = seq.all_tokens.len();
         let target_have = l - 1;
         let draft_have = seq.draft_caches.first().map_or(0, |c| c.num_tokens());
@@ -930,6 +938,15 @@ impl Engine {
         &self.device
     }
 
+    /// Tokens the KV pool holds in all: the most one request's prompt and
+    /// completion can span, since a sequence that outgrows the pool can
+    /// neither continue nor be re-admitted after preemption.
+    pub fn kv_capacity_tokens(&self) -> usize {
+        self.allocators
+            .first()
+            .map_or(0, |a| a.lock().unwrap().num_total() * self.block_size)
+    }
+
     /// Queues a prompt for generation and returns its sequence id.
     pub fn add_request(
         &mut self,
@@ -1009,7 +1026,7 @@ impl Engine {
         let block_size = *block_size;
         let draft = draft_model.as_deref();
 
-        let output = scheduler.schedule(Some(prefix_cache));
+        let output = scheduler.schedule(Some(&mut *prefix_cache));
 
         let mut prefill_ids: Vec<SequenceId> = Vec::new();
         let mut decode_ids: Vec<SequenceId> = Vec::new();
@@ -1480,16 +1497,22 @@ mod tests {
         fn forward_batch(
             &self,
             token_ids: &Tensor,
-            _position_ids: &Tensor,
+            position_ids: &Tensor,
             seq_caches: &mut [&mut [PagedKvCache]],
             token_counts: &[usize],
         ) -> Result<Tensor> {
             let (_, total_tokens) = token_ids.dims2()?;
-            // append expects shape (batch=1, n_kv_heads=1, seq, head_dim=8)
+            let positions: Vec<u32> = position_ids.to_vec1()?;
+            let mut consumed = 0usize;
             for (seq_idx, seq_cache) in seq_caches.iter_mut().enumerate() {
                 let n = token_counts[seq_idx];
-                let k = Tensor::zeros((1usize, 1usize, n, 8usize), DType::F32, &self.device)?;
-                let v = Tensor::zeros((1usize, 1usize, n, 8usize), DType::F32, &self.device)?;
+                let values: Vec<f32> = positions[consumed..consumed + n]
+                    .iter()
+                    .flat_map(|&p| std::iter::repeat_n(p as f32, 8))
+                    .collect();
+                consumed += n;
+                let k = Tensor::from_vec(values, (1usize, 1usize, n, 8usize), &self.device)?;
+                let v = k.clone();
                 for layer_cache in seq_cache.iter_mut() {
                     layer_cache.append(&k, &v)?;
                 }
@@ -1786,6 +1809,57 @@ mod tests {
         assert_eq!(out.completed.len(), 1);
         assert_eq!(out.completed[0].id, seq_id);
         assert_eq!(out.completed[0].finish_reason.as_deref(), Some("stop"));
+    }
+
+    /// Contract: every full prompt block the prefix cache registers holds the
+    /// prompt's K/V in all of its slots, whatever chunking the planner chose.
+    ///
+    /// The cache decided pool writes from the shape of an append, taking any
+    /// one-token append on a started sequence for a decode step. The planner
+    /// can leave a prompt a one-token tail (here 497 + 16 at a 512 cap splits
+    /// the second prompt as 15 + 1), so the block that tail completed was
+    /// registered with one position never written: the next prompt sharing
+    /// the prefix read stale K/V there, without any error.
+    #[test]
+    fn a_one_token_prefill_tail_still_reaches_the_pool() {
+        let allocators = make_allocators(1, 256);
+        let model = KvFakeModel::new(vec![31], 1, allocators.clone());
+        let mut engine = Engine::new_with_stop_controls(
+            Box::new(model),
+            SchedulerConfig {
+                max_num_sequences: 8,
+                max_tokens_per_step: 4096,
+            },
+            &[],
+            &[],
+        );
+        assert_eq!(engine.pacer.cap(), 512);
+
+        let long: Vec<u32> = (0..497).map(|i| (i % 7) as u32).collect();
+        let short: Vec<u32> = (100..100 + DEFAULT_BLOCK_SIZE as u32).collect();
+        engine.add_request(long, SamplingParams::default(), 1);
+        engine.add_request(short.clone(), SamplingParams::default(), 1);
+        engine.step().unwrap();
+
+        let (cached, blocks) = engine.prefix_cache.lookup(&short, DEFAULT_BLOCK_SIZE);
+        assert_eq!(
+            cached, 1,
+            "the one full block of the short prompt is registered"
+        );
+        let block = blocks[0][0] as u32;
+        let slots: Vec<u32> = (0..DEFAULT_BLOCK_SIZE as u32)
+            .map(|i| block * DEFAULT_BLOCK_SIZE as u32 + i)
+            .collect();
+        let idx = Tensor::from_vec(slots, (DEFAULT_BLOCK_SIZE,), &Device::Cpu).unwrap();
+        let (k, _) = allocators[0].lock().unwrap().gather(&idx).unwrap();
+        let k: Vec<f32> = k.flatten_all().unwrap().to_vec1().unwrap();
+        for t in 0..DEFAULT_BLOCK_SIZE {
+            assert_eq!(
+                k[t * 8],
+                t as f32,
+                "slot {t} must hold the K written for position {t}"
+            );
+        }
     }
 
     #[test]

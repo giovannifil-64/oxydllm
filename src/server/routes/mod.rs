@@ -9,6 +9,8 @@ mod types;
 
 pub use chat::apply_chat_template;
 pub use engine_loop::engine_loop;
+#[cfg(test)]
+pub(crate) use engine_loop::test_support;
 pub use types::{ChatMessage, IncomingRequest};
 
 use std::path::PathBuf;

@@ -1104,14 +1104,6 @@ impl ThoughtChannel {
     }
 }
 
-fn clamp_to_char_boundary(s: &str, idx: usize) -> usize {
-    let mut i = idx.min(s.len());
-    while i > 0 && !s.is_char_boundary(i) {
-        i -= 1;
-    }
-    i
-}
-
 fn find_first_stop_marker(text: &str, stop_markers: &[String]) -> Option<usize> {
     stop_markers
         .iter()
@@ -1126,6 +1118,9 @@ fn find_first_stop_marker(text: &str, stop_markers: &[String]) -> Option<usize> 
 }
 
 fn run_interactive(args: &RunArgs) -> anyhow::Result<()> {
+    use crate::common::incremental_decode::{
+        IncrementalDecoder, NeutralPrefix, clamp_to_char_boundary,
+    };
     use std::io::{BufRead, Write};
 
     let cuda_idx = args.cuda_device.unwrap_or(0);
@@ -1160,6 +1155,8 @@ fn run_interactive(args: &RunArgs) -> anyhow::Result<()> {
     } = loaded;
     let kv_cache_bytes = batch_model.kv_cache_bytes();
     let total_bytes = weights_size_bytes + kv_cache_bytes;
+    println!("Warming up...");
+    models::manager::warm_up_model(batch_model.as_ref());
     println!(
         "Model loaded. vocab_size={}, max_seq_len={}, size={:.2} GB (weights) + {:.2} GB (KV cache) = {:.2} GB total",
         batch_model.vocab_size(),
@@ -1231,6 +1228,7 @@ fn run_interactive(args: &RunArgs) -> anyhow::Result<()> {
         .saturating_sub(1);
 
     let thinking = tokenizer.has_thinking_support();
+    let neutral = NeutralPrefix::new(&tokenizer);
     let (dim, undim) = if std::io::IsTerminal::is_terminal(&std::io::stdout()) {
         ("\x1b[2m", "\x1b[0m")
     } else {
@@ -1304,12 +1302,12 @@ fn run_interactive(args: &RunArgs) -> anyhow::Result<()> {
 
         let mut response_text = String::new();
         let mut output_ids: Vec<u32> = Vec::new();
-        let mut decoded_len: usize = 0;
+        let mut answer = IncrementalDecoder::new();
         let mut stream_buffer = String::new();
         let mut hit_text_stop = false;
         let mut channel = ThoughtChannel::new(&tokenizer, thinking);
         let mut thought_ids: Vec<u32> = Vec::new();
-        let mut thought_len: usize = 0;
+        let mut thought = IncrementalDecoder::new();
         while engine.has_pending_work() && !hit_text_stop {
             let step = engine.step().map_err(|e| anyhow::anyhow!("{}", e))?;
             for tok in &step.new_tokens {
@@ -1326,31 +1324,18 @@ fn run_interactive(args: &RunArgs) -> anyhow::Result<()> {
                             println!("{dim}Thinking...");
                         }
                         thought_ids.push(tok.token);
-                        let full = tokenizer.decode(&thought_ids)?;
-                        let start = clamp_to_char_boundary(&full, thought_len);
-                        let fresh = full[start..].trim_end_matches('\u{FFFD}');
-                        if fresh.is_empty() {
-                            thought_len = start;
-                            continue;
+                        if let Some(fresh) = thought.push(&tokenizer, &thought_ids, &neutral) {
+                            print!("{fresh}");
+                            std::io::stdout().flush()?;
                         }
-                        thought_len = start + fresh.len();
-                        print!("{fresh}");
-                        std::io::stdout().flush()?;
                         continue;
                     }
                     TokenRole::Answer => {}
                 }
                 output_ids.push(tok.token);
-                let full = tokenizer.decode(&output_ids)?;
-                let start = clamp_to_char_boundary(&full, decoded_len);
-                let new_text = &full[start..];
-                let trimmed = new_text.trim_end_matches('\u{FFFD}');
-                if trimmed.is_empty() {
-                    decoded_len = start;
+                let Some(emit) = answer.push(&tokenizer, &output_ids, &neutral) else {
                     continue;
-                }
-                decoded_len = start + trimmed.len();
-                let emit = trimmed.to_string();
+                };
 
                 stream_buffer.push_str(&emit);
 
@@ -1393,13 +1378,8 @@ fn run_interactive(args: &RunArgs) -> anyhow::Result<()> {
             let _ = engine.abort_all();
         }
 
-        if !hit_text_stop && !output_ids.is_empty() {
-            let full = tokenizer.decode(&output_ids)?;
-            if decoded_len < full.len() {
-                let start = clamp_to_char_boundary(&full, decoded_len);
-                let rest = &full[start..];
-                stream_buffer.push_str(rest);
-            }
+        if !hit_text_stop && let Some(rest) = answer.finish(&tokenizer, &output_ids) {
+            stream_buffer.push_str(&rest);
         }
 
         if !hit_text_stop && !stream_buffer.is_empty() {

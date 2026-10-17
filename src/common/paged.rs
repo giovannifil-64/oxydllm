@@ -532,14 +532,6 @@ impl BlockAllocator {
         Ok(())
     }
 
-    /// The segment a block lives in and the slot its first token has there.
-    fn locate(&self, block_id: usize) -> (usize, usize) {
-        (
-            block_id / self.segment_blocks,
-            (block_id % self.segment_blocks) * self.block_size,
-        )
-    }
-
     /// Records the sliding window this layer attends over, so the caches built
     /// on this allocator keep only what the layer can still read.
     ///
@@ -721,7 +713,9 @@ impl BlockAllocator {
         self.max_blocks * self.bytes_per_block()
     }
 
-    /// data_k, data_v shape: [n_tokens, n_kv_heads, head_dim]
+    /// Writes `n_tokens` of K/V, shaped `[n_tokens, n_kv_heads, head_dim]`,
+    /// into the pool from `offset` of `block_id` on; a run that continues
+    /// into the next segment is split at the boundary.
     pub fn write(
         &mut self,
         block_id: usize,
@@ -730,14 +724,22 @@ impl BlockAllocator {
         data_v: &Tensor,
     ) -> Result<()> {
         let start = block_id * self.block_size + offset;
-        let (segment, local) = self.locate(block_id);
         match &mut self.pool {
             KvPool::Full {
                 segments_k,
                 segments_v,
             } => {
-                segments_k[segment].slice_set(data_k, 0, local + offset)?;
-                segments_v[segment].slice_set(data_v, 0, local + offset)?;
+                let n_tokens = data_k.dim(0)?;
+                let segment_slots = self.segment_blocks * self.block_size;
+                let mut done = 0;
+                while done < n_tokens {
+                    let slot = start + done;
+                    let (segment, local) = (slot / segment_slots, slot % segment_slots);
+                    let n = (n_tokens - done).min(segment_slots - local);
+                    segments_k[segment].slice_set(&data_k.narrow(0, done, n)?, 0, local)?;
+                    segments_v[segment].slice_set(&data_v.narrow(0, done, n)?, 0, local)?;
+                    done += n;
+                }
             }
             KvPool::Quantized {
                 packed_k,
@@ -997,6 +999,7 @@ pub struct PagedKvCache {
     window: Option<usize>,
     pending_writes: Vec<PendingBatch>,
     recurrent: Option<RecurrentState>,
+    pool_writes: bool,
 }
 
 impl PagedKvCache {
@@ -1025,7 +1028,21 @@ impl PagedKvCache {
             window,
             pending_writes: Vec::new(),
             recurrent: None,
+            pool_writes: true,
         }
+    }
+
+    /// Sets whether appended tokens are also written to the block pool.
+    ///
+    /// Only the pool is shared through the prefix cache, and only whole
+    /// prompt blocks are ever registered there, so the engine turns writes on
+    /// for a sequence's prefill and off for its decode steps. The decision
+    /// belongs to the engine, which knows the phase: deciding it from the
+    /// shape of an append mistook a one-token prefill tail for a decode step
+    /// and left the block it completed, already registered, with one stale
+    /// position.
+    pub fn set_pool_writes(&mut self, on: bool) {
+        self.pool_writes = on;
     }
 
     /// Mutable access to the recurrent-state slot (linear-attention layers).
@@ -1057,9 +1074,10 @@ impl PagedKvCache {
     /// values the next forward should read.
     ///
     /// Two structures are kept. The block pool holds whole blocks for the prefix
-    /// cache to share; decode skips writing to it, since only full blocks filled
-    /// during prefill are ever reused. The contiguous per-sequence buffer is
-    /// what the attention kernels read, and what this returns a view of.
+    /// cache to share, written only while [`set_pool_writes`](Self::set_pool_writes)
+    /// is on, since only full blocks filled during prefill are ever reused. The
+    /// contiguous per-sequence buffer is what the attention kernels read, and
+    /// what this returns a view of.
     ///
     /// For a layer with a sliding window that buffer holds the window rather
     /// than the sequence, which is what bounds the memory a long context costs.
@@ -1081,9 +1099,7 @@ impl PagedKvCache {
         let v_flat = new_v.squeeze(0)?.transpose(0, 1)?;
         let block_size = self.block_size;
 
-        // Decode-only: pool writes are only needed for prefix-cache reuse, which
-        // only uses full blocks filled during prefill.
-        let skip_pool_write = self.contig_len > 0 && new_seq == 1;
+        let skip_pool_write = !self.pool_writes;
 
         let prev_tokens = self.table.num_tokens;
         debug_assert!(
@@ -2096,6 +2112,48 @@ mod tests {
 
         assert!(dk < 1e-4, "prefix K corrupted after append: {dk}");
         assert!(dv < 1e-4, "prefix V corrupted after append: {dv}");
+    }
+
+    /// Contract: a prompt whose blocks run across a segment boundary is
+    /// written whole and reads back whole.
+    ///
+    /// Consecutive blocks are written as one run, and the pool is held in
+    /// segments; a run that crossed from the last block of one segment into
+    /// the first of the next was written into the first segment alone and
+    /// failed there, which aborted every request in the batch. The free list
+    /// hands out consecutive ascending ids after a sequence retires, so every
+    /// model hit this once a few prompts had come and gone.
+    #[test]
+    fn a_run_across_a_segment_boundary_is_written_whole() {
+        let alloc = Arc::new(Mutex::new(
+            BlockAllocator::growing(8, 4, 4, 1, 4, DType::F32, &Device::Cpu, None).unwrap(),
+        ));
+        {
+            let mut a = alloc.lock().unwrap();
+            for _ in 0..8 {
+                a.allocate().unwrap();
+            }
+            for id in [0usize, 1, 6, 7, 5, 4, 3, 2] {
+                a.free(id);
+            }
+        }
+        let mut cache = PagedKvCache::new(Arc::clone(&alloc));
+        let values: Vec<f32> = (0..16 * 4).map(|i| (i / 4) as f32).collect();
+        let k = Tensor::from_vec(values.clone(), (1, 1, 16, 4), &Device::Cpu).unwrap();
+        cache.append(&k, &k).unwrap();
+        assert_eq!(
+            (0..4)
+                .map(|i| cache.block_id_at(i).unwrap())
+                .collect::<Vec<_>>(),
+            vec![2, 3, 4, 5],
+            "the blocks straddle the two segments of four blocks"
+        );
+        cache.flush_pending().unwrap();
+
+        let slots = Tensor::from_vec((8u32..24).collect::<Vec<_>>(), (16,), &Device::Cpu).unwrap();
+        let (back, _) = alloc.lock().unwrap().gather(&slots).unwrap();
+        let back: Vec<f32> = back.flatten_all().unwrap().to_vec1().unwrap();
+        assert_eq!(back, values, "every token of the run is in the pool");
     }
 
     #[test]

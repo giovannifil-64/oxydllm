@@ -42,6 +42,7 @@ All notable changes to this project will be documented in this file.
 - A panicking engine loop no longer leaves a model permanently unusable: a drop guard on the engine thread removes the stale slot and releases its KV budget, so the next request reloads the model instead of receiving 503 forever.
 
 ### Build and Tooling
+- quinn-proto 0.11.19 and rustls 0.23.46 for RUSTSEC-2026-0338 to 0342 and 0346 to 0349, which the audit in the pre-commit hook and in CI flags; both serve the downloads and the hub listing only, checked with a pull of a file already on disk, which asks upstream for its length over HTTPS. The three zip advisories, RUSTSEC-2026-0367 to 0369, are allowed in `.cargo/audit.toml`: zip reaches the build only through candle-core 0.11.0, which pins zip 8 and uses it for npz archives the server never reads or writes.
 - Rust 1.94 is declared as the minimum supported version, so older toolchains fail immediately with a clear message instead of a misleading error from a transitive dependency. The full test suite was executed green on every stable release from 1.94.1 through 1.97.1.
 - CI gained a blocking MSRV job and a non-blocking latest-stable job, plus a weekly workflow that runs the suite across every supported toolchain.
 - The regression sweep runs every verified checkpoint by default, with no opt-in flags, and persists results after each model so an interrupted run keeps its measurements.

@@ -1,0 +1,11 @@
+# Advisories the pre-commit and CI audit may pass over, each with the reason.
+[advisories]
+ignore = [
+    # zip 8.6 is reached only through candle-core 0.11.0, which pins zip ^8.6
+    # and uses it for its npz reader and writer; oxydllm never reads or
+    # writes an npz archive, so the three extraction advisories have no path
+    # here. Drop these once candle depends on zip 9.
+    "RUSTSEC-2026-0367",
+    "RUSTSEC-2026-0368",
+    "RUSTSEC-2026-0369",
+]

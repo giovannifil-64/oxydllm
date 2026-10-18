@@ -5,6 +5,7 @@ mod handlers;
 #[cfg(test)]
 mod http_compat_tests;
 mod metrics;
+mod stop_scan;
 mod types;
 
 pub use chat::apply_chat_template;

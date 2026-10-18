@@ -167,7 +167,9 @@ pub struct IncomingRequest {
     /// gemma-4 after a tool result and the templates that end with `<think>`
     /// do, so the first generated tokens are reasoning before any marker.
     pub thinking_open: bool,
-    pub extra_stop_token_ids: Vec<u32>,
+    /// Stop strings matched on the decoded content; the reply ends before
+    /// the first one found.
+    pub stop_strings: Vec<String>,
     /// Constrain generation to valid JSON of this shape, with optional
     /// schema guidance. Applied only when the model emits content directly
     /// (no thinking preamble, no harmony channels); post-hoc validation runs

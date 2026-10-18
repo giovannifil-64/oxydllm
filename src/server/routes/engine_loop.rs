@@ -28,6 +28,7 @@ use lru::LruCache;
 use tokio::sync::mpsc as tokio_mpsc;
 
 use super::metrics;
+use super::stop_scan::{Scan, StopScanner};
 use super::types::{EngineEvent, EngineLogprobEntry, IncomingRequest};
 use crate::common::incremental_decode::{IncrementalDecoder, NeutralPrefix};
 use crate::engine::Engine;
@@ -295,6 +296,8 @@ struct SeqTracker {
     thinking_ids: Vec<u32>,
     output: IncrementalDecoder,
     thinking: IncrementalDecoder,
+    /// The request's stop strings, matched on the content as it decodes.
+    stops: StopScanner,
     pending_raw_lps: Vec<PendingRawLogprob>,
     harmony_state: HarmonyState,
     harmony_header_ids: Vec<u32>,
@@ -306,6 +309,62 @@ struct SeqTracker {
     wants_reasoning: bool,
     span: tracing::Span,
     decode_span: Option<tracing::Span>,
+}
+
+/// Builds the logprob entries of the tokens decoded since text was last
+/// handed out.
+fn drain_logprobs(
+    tokenizer: &Tokenizer,
+    decode_cache: &mut TokenDecodeCache,
+    pending: &mut Vec<PendingRawLogprob>,
+) -> Vec<EngineLogprobEntry> {
+    std::mem::take(pending)
+        .into_iter()
+        .map(|(tid, lp, top)| build_logprob_entry(tokenizer, decode_cache, tid, lp, top))
+        .collect()
+}
+
+/// Records a sequence's completion in its span and the metrics and closes
+/// its stream with the finish reason.
+fn finish_tracker(mut tracker: SeqTracker, seq_id: SequenceId, finish_reason: &str) {
+    let total_ms = tracker.enqueued_at.elapsed().as_secs_f64() * 1000.0;
+    let decode_s = tracker
+        .first_token_at
+        .map(|t| t.elapsed().as_secs_f64())
+        .unwrap_or(0.001);
+    let tps = tracker.token_count as f64 / decode_s.max(0.001);
+    let total_ms = (total_ms * 10.0).round() / 10.0;
+    let decode_ms = ((decode_s * 1000.0) * 10.0).round() / 10.0;
+    let tps = (tps * 100.0).round() / 100.0;
+    tracker.decode_span = None;
+    tracker
+        .span
+        .record("completion_tokens", tracker.token_count);
+    tracker.span.record("tokens_per_second", tps);
+    tracker.span.record("finish_reason", finish_reason);
+    tracker.span.record("outcome", "ok");
+    tracing::info!(
+        parent: &tracker.span,
+        request_id = %tracker.request_id,
+        model_id = %tracker.model_id,
+        seq_id,
+        completion_tokens = tracker.token_count,
+        total_ms,
+        decode_ms,
+        tokens_per_second = tps,
+        "request completed"
+    );
+    metrics::TPS_HISTOGRAM
+        .with_label_values(&[&tracker.model_id])
+        .observe(tps);
+    metrics::REQUESTS_TOTAL
+        .with_label_values(&[tracker.model_id.as_str(), "ok"])
+        .inc();
+    let _ = tracker.tx.send(EngineEvent::Finish {
+        finish_reason: finish_reason.to_string(),
+        completion_tokens: tracker.token_count,
+    });
+    let _ = tracker.tx.send(EngineEvent::StreamEnd);
 }
 
 /// Aborts the given sequences in the engine and drops their trackers,
@@ -397,15 +456,9 @@ fn enqueue_request(
             req.prompt_tokens,
             req.sampling_params,
             req.max_tokens,
-            req.extra_stop_token_ids,
             c,
         ),
-        None => engine.add_request_with_stop(
-            req.prompt_tokens,
-            req.sampling_params,
-            req.max_tokens,
-            req.extra_stop_token_ids,
-        ),
+        None => engine.add_request(req.prompt_tokens, req.sampling_params, req.max_tokens),
     };
     tracing::debug!(
         request_id = %request_id,
@@ -442,6 +495,7 @@ fn enqueue_request(
             thinking_ids: Vec::new(),
             output: IncrementalDecoder::new(),
             thinking: IncrementalDecoder::new(),
+            stops: StopScanner::new(req.stop_strings),
             pending_raw_lps: Vec::new(),
             harmony_state: HarmonyState::Markers,
             harmony_header_ids: Vec::new(),
@@ -567,7 +621,11 @@ pub fn engine_loop(
                 Ok(step) => {
                     consecutive_errors = 0;
                     let mut disconnected_ids: Vec<SequenceId> = Vec::new();
+                    let mut stopped_ids: Vec<SequenceId> = Vec::new();
                     for tok in &step.new_tokens {
+                        if stopped_ids.contains(&tok.seq_id) {
+                            continue;
+                        }
                         let mut disconnected = false;
                         if let Some(tracker) = trackers.get_mut(&tok.seq_id) {
                             if tracker.first_token_at.is_none() {
@@ -685,27 +743,28 @@ pub fn engine_loop(
                                         .output
                                         .push(&tokenizer, &tracker.output_ids, &neutral)
                                 {
-                                    let drained = std::mem::take(&mut tracker.pending_raw_lps);
-                                    let mut logprob_entries: Vec<EngineLogprobEntry> =
-                                        Vec::with_capacity(drained.len());
-                                    for (tid, lp, top) in drained {
-                                        logprob_entries.push(build_logprob_entry(
-                                            &tokenizer,
-                                            &mut decode_cache,
-                                            tid,
-                                            lp,
-                                            top,
-                                        ));
-                                    }
-                                    if tracker
-                                        .tx
-                                        .send(EngineEvent::Token {
-                                            text,
-                                            logprob_entries,
-                                        })
-                                        .is_err()
+                                    let (text, stopped) = match tracker.stops.push(&text) {
+                                        Scan::Text(text) => (text, false),
+                                        Scan::Stopped(text) => (text, true),
+                                    };
+                                    let logprob_entries = drain_logprobs(
+                                        &tokenizer,
+                                        &mut decode_cache,
+                                        &mut tracker.pending_raw_lps,
+                                    );
+                                    if (!text.is_empty() || !logprob_entries.is_empty())
+                                        && tracker
+                                            .tx
+                                            .send(EngineEvent::Token {
+                                                text,
+                                                logprob_entries,
+                                            })
+                                            .is_err()
                                     {
                                         disconnected = true;
+                                    }
+                                    if stopped {
+                                        stopped_ids.push(tok.seq_id);
                                     }
                                 }
                             }
@@ -724,26 +783,33 @@ pub fn engine_loop(
                         );
                     }
 
+                    for seq_id in stopped_ids {
+                        if let Some(mut tracker) = trackers.remove(&seq_id) {
+                            engine.abort_sequence(seq_id);
+                            if let Some(rest) =
+                                tracker.thinking.finish(&tokenizer, &tracker.thinking_ids)
+                            {
+                                let _ = tracker.tx.send(EngineEvent::ReasoningToken(rest));
+                            }
+                            finish_tracker(tracker, seq_id, "stop");
+                        }
+                    }
+
                     for completed in &step.completed {
                         if let Some(mut tracker) = trackers.remove(&completed.id) {
-                            let remaining_text = tracker
+                            let remaining = tracker
                                 .output
                                 .finish(&tokenizer, &tracker.output_ids)
                                 .unwrap_or_default();
-
-                            let drained = std::mem::take(&mut tracker.pending_raw_lps);
-                            let mut remaining_lp_entries: Vec<EngineLogprobEntry> =
-                                Vec::with_capacity(drained.len());
-                            for (tid, lp, top) in drained {
-                                remaining_lp_entries.push(build_logprob_entry(
-                                    &tokenizer,
-                                    &mut decode_cache,
-                                    tid,
-                                    lp,
-                                    top,
-                                ));
-                            }
-
+                            let (remaining_text, stopped) = match tracker.stops.finish(&remaining) {
+                                Scan::Text(text) => (text, false),
+                                Scan::Stopped(text) => (text, true),
+                            };
+                            let remaining_lp_entries = drain_logprobs(
+                                &tokenizer,
+                                &mut decode_cache,
+                                &mut tracker.pending_raw_lps,
+                            );
                             if !remaining_text.is_empty() || !remaining_lp_entries.is_empty() {
                                 let _ = tracker.tx.send(EngineEvent::Token {
                                     text: remaining_text,
@@ -758,50 +824,12 @@ pub fn engine_loop(
                                 let _ = tracker.tx.send(EngineEvent::ReasoningToken(rest));
                             }
 
-                            let total_ms = tracker.enqueued_at.elapsed().as_secs_f64() * 1000.0;
-                            let decode_s = tracker
-                                .first_token_at
-                                .map(|t| t.elapsed().as_secs_f64())
-                                .unwrap_or(0.001);
-                            let tps = tracker.token_count as f64 / decode_s.max(0.001);
-                            let total_ms = (total_ms * 10.0).round() / 10.0;
-                            let decode_ms = ((decode_s * 1000.0) * 10.0).round() / 10.0;
-                            let tps = (tps * 100.0).round() / 100.0;
-                            let finish_reason =
-                                completed.finish_reason.as_deref().unwrap_or("stop");
-                            tracker.decode_span = None;
-                            tracker
-                                .span
-                                .record("completion_tokens", tracker.token_count);
-                            tracker.span.record("tokens_per_second", tps);
-                            tracker.span.record("finish_reason", finish_reason);
-                            tracker.span.record("outcome", "ok");
-                            tracing::info!(
-                                parent: &tracker.span,
-                                request_id = %tracker.request_id,
-                                model_id = %tracker.model_id,
-                                seq_id = completed.id,
-                                completion_tokens = tracker.token_count,
-                                total_ms,
-                                decode_ms,
-                                tokens_per_second = tps,
-                                "request completed"
-                            );
-                            metrics::TPS_HISTOGRAM
-                                .with_label_values(&[&tracker.model_id])
-                                .observe(tps);
-                            metrics::REQUESTS_TOTAL
-                                .with_label_values(&[tracker.model_id.as_str(), "ok"])
-                                .inc();
-                            let _ = tracker.tx.send(EngineEvent::Finish {
-                                finish_reason: completed
-                                    .finish_reason
-                                    .as_deref()
-                                    .unwrap_or("stop")
-                                    .to_string(),
-                                completion_tokens: tracker.token_count,
-                            });
-                            let _ = tracker.tx.send(EngineEvent::StreamEnd);
+                            let finish_reason = if stopped {
+                                "stop"
+                            } else {
+                                completed.finish_reason.as_deref().unwrap_or("stop")
+                            };
+                            finish_tracker(tracker, completed.id, finish_reason);
                         }
                     }
 
@@ -1035,6 +1063,7 @@ mod metrics_loop_tests {
             prompt_tokens,
             max_tokens,
             false,
+            vec![],
         )
     }
 
@@ -1044,9 +1073,19 @@ mod metrics_loop_tests {
         prompt_tokens: Vec<u32>,
         max_tokens: usize,
     ) -> Vec<EngineEvent> {
-        drive_one_request_with_ids(stub, tok, "m", "m", prompt_tokens, max_tokens, false)
+        drive_one_request_with_ids(
+            stub,
+            tok,
+            "m",
+            "m",
+            prompt_tokens,
+            max_tokens,
+            false,
+            vec![],
+        )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn drive_one_request_with_ids(
         stub: StubModel,
         tok: Arc<Tokenizer>,
@@ -1055,6 +1094,7 @@ mod metrics_loop_tests {
         prompt_tokens: Vec<u32>,
         max_tokens: usize,
         enable_thinking: bool,
+        stop_strings: Vec<String>,
     ) -> Vec<EngineEvent> {
         let engine = Engine::new_with_stop_controls(
             Box::new(stub),
@@ -1079,7 +1119,7 @@ mod metrics_loop_tests {
             enqueued_at: std::time::Instant::now(),
             enable_thinking,
             thinking_open: false,
-            extra_stop_token_ids: vec![],
+            stop_strings,
             json_mode: None,
             parent_span: tracing::Span::none(),
         };
@@ -1237,6 +1277,7 @@ mod metrics_loop_tests {
                 vec![1],
                 4,
                 wants,
+                vec![],
             );
             let (mut content, mut reasoning) = (String::new(), String::new());
             for event in events {
@@ -1253,6 +1294,52 @@ mod metrics_loop_tests {
             );
             assert_eq!(content.trim(), "b", "thinking requested: {wants}");
         }
+    }
+
+    /// Contract: a stop string is matched on the decoded content, across
+    /// token boundaries, and the reply ends before it with `finish_reason`
+    /// "stop" and no token generated past the one that completed it; a stop
+    /// string completed by the last token of the budget still reads "stop".
+    #[test]
+    fn a_stop_string_ends_the_reply_before_it_however_it_is_tokenized() {
+        let (tok, _tmp) = make_tokenizer();
+        let run = |tokens: Vec<u32>, max_tokens: usize, stops: Vec<&str>| {
+            let events = drive_one_request_with_ids(
+                StubModel::scripted(tokens),
+                Arc::clone(&tok),
+                "m",
+                "m",
+                vec![1],
+                max_tokens,
+                false,
+                stops.into_iter().map(str::to_string).collect(),
+            );
+            let mut content = String::new();
+            let mut finish = None;
+            for event in events {
+                match event {
+                    EngineEvent::Token { text, .. } => content.push_str(&text),
+                    EngineEvent::Finish {
+                        finish_reason,
+                        completion_tokens,
+                    } => finish = Some((finish_reason, completion_tokens)),
+                    _ => {}
+                }
+            }
+            (content, finish.expect("a finish event"))
+        };
+
+        let (content, finish) = run(vec![1, 4, 1, 4, 1], 5, vec![]);
+        assert_eq!(content.trim(), "a b a b a");
+        assert_eq!(finish, ("length".to_string(), 5));
+
+        let (content, finish) = run(vec![1, 4, 1, 4, 1], 5, vec!["b a"]);
+        assert_eq!(content, "a ");
+        assert_eq!(finish, ("stop".to_string(), 3));
+
+        let (content, finish) = run(vec![1, 4], 2, vec!["b"]);
+        assert_eq!(content, "a ");
+        assert_eq!(finish, ("stop".to_string(), 2));
     }
 
     fn counter_value(name: &str, labels: &[(&str, &str)]) -> Option<f64> {

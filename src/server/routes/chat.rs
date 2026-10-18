@@ -2102,21 +2102,14 @@ pub(super) async fn chat_completions(
         "prompt preparation timings"
     );
 
-    // Single-token stops only.
-    let extra_stop_token_ids: Vec<u32> = match &body.stop {
-        Some(StopParam::Single(s)) => {
-            let ids = handle.tokenizer.encode(s).unwrap_or_default();
-            if ids.len() == 1 { ids } else { Vec::new() }
-        }
-        Some(StopParam::Multiple(strings)) => strings
-            .iter()
-            .filter_map(|s| {
-                let ids = handle.tokenizer.encode(s).unwrap_or_default();
-                if ids.len() == 1 { Some(ids[0]) } else { None }
-            })
-            .collect(),
+    let stop_strings: Vec<String> = match &body.stop {
+        Some(StopParam::Single(s)) => vec![s.clone()],
+        Some(StopParam::Multiple(strings)) => strings.clone(),
         None => Vec::new(),
-    };
+    }
+    .into_iter()
+    .filter(|s| !s.is_empty())
+    .collect();
 
     let logit_bias: Option<Vec<(u32, f32)>> = match &body.logit_bias {
         Some(serde_json::Value::Object(map)) if !map.is_empty() => {
@@ -2231,7 +2224,7 @@ pub(super) async fn chat_completions(
                 enqueued_at: std::time::Instant::now(),
                 enable_thinking,
                 thinking_open: prompt_opens_thinking(&prompt),
-                extra_stop_token_ids: extra_stop_token_ids.clone(),
+                stop_strings: stop_strings.clone(),
                 json_mode,
                 parent_span: http_span.clone(),
             })

@@ -114,37 +114,18 @@ impl Scheduler {
         seq
     }
 
-    /// Queues a prompt with default stop behavior; returns the new sequence
-    /// id.
+    /// Queues a prompt; returns the new sequence id.
     pub fn add_request(
         &mut self,
         prompt_tokens: Vec<u32>,
         sampling_params: SamplingParams,
         max_tokens: usize,
     ) -> SequenceId {
-        self.add_request_with_stop(prompt_tokens, sampling_params, max_tokens, Vec::new())
-    }
-
-    /// [`add_request`](Self::add_request) with request-specific extra stop
-    /// token ids.
-    pub fn add_request_with_stop(
-        &mut self,
-        prompt_tokens: Vec<u32>,
-        sampling_params: SamplingParams,
-        max_tokens: usize,
-        extra_stop_token_ids: Vec<u32>,
-    ) -> SequenceId {
-        self.add_request_full(
-            prompt_tokens,
-            sampling_params,
-            max_tokens,
-            extra_stop_token_ids,
-            None,
-        )
+        self.add_request_full(prompt_tokens, sampling_params, max_tokens, None)
     }
 
     /// Queues a prompt with every per-request control: sampling parameters,
-    /// generation cap, extra stop ids, and an optional grammar constraint.
+    /// generation cap, and an optional grammar constraint.
     ///
     /// The sequence starts `Waiting` in `Prefill` phase with fresh per-layer
     /// caches (target, plus draft when speculative decoding is enabled) and
@@ -154,7 +135,6 @@ impl Scheduler {
         prompt_tokens: Vec<u32>,
         sampling_params: SamplingParams,
         max_tokens: usize,
-        extra_stop_token_ids: Vec<u32>,
         constraint: Option<crate::constrain::JsonConstraint>,
     ) -> SequenceId {
         let id = self.next_id;
@@ -186,7 +166,6 @@ impl Scheduler {
             num_processed_tokens: 0,
             max_tokens,
             finish_reason: None,
-            extra_stop_token_ids,
             constraint,
         };
 

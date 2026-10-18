@@ -392,12 +392,10 @@ struct StopRules<'a> {
 }
 
 impl StopRules<'_> {
-    /// True when `token` is a stop token (engine-wide or in the sequence's
-    /// extras) or the tail of `all_tokens` matches a stop sequence.
-    fn matches(&self, token: u32, seq_extra_ids: &[u32], all_tokens: &[u32]) -> bool {
-        self.token_ids.contains(&token)
-            || seq_extra_ids.contains(&token)
-            || has_matching_stop_sequence(all_tokens, self.sequences)
+    /// True when `token` is a stop token or the tail of `all_tokens` matches
+    /// a stop sequence.
+    fn matches(&self, token: u32, all_tokens: &[u32]) -> bool {
+        self.token_ids.contains(&token) || has_matching_stop_sequence(all_tokens, self.sequences)
     }
 }
 
@@ -654,7 +652,7 @@ fn sample_prefill_outputs(
             seq.append_token(next_token);
             seq.num_processed_tokens = seq.all_tokens.len() - 1;
             seq.phase = SequencePhase::Decode;
-            let is_stop = stop.matches(next_token, &seq.extra_stop_token_ids, &seq.all_tokens);
+            let is_stop = stop.matches(next_token, &seq.all_tokens);
             seq.apply_token(next_token, is_stop)
         };
 
@@ -721,7 +719,7 @@ fn sample_decode_outputs(
         }
         seq.append_token(next_token);
         seq.num_processed_tokens = seq.all_tokens.len() - 1;
-        let is_stop = stop.matches(next_token, &seq.extra_stop_token_ids, &seq.all_tokens);
+        let is_stop = stop.matches(next_token, &seq.all_tokens);
 
         if seq.apply_token(next_token, is_stop) {
             new_tokens.push(NewToken {
@@ -830,7 +828,7 @@ fn run_speculative_decode(
         for tok in accepted {
             seq.append_token(tok);
             seq.num_processed_tokens = seq.all_tokens.len() - 1;
-            let is_stop = stop.matches(tok, &seq.extra_stop_token_ids, &seq.all_tokens);
+            let is_stop = stop.matches(tok, &seq.all_tokens);
             if seq.apply_token(tok, is_stop) {
                 new_tokens.push(NewToken {
                     seq_id: seq.id,
@@ -958,39 +956,20 @@ impl Engine {
             .add_request(prompt_tokens, sampling_params, max_tokens)
     }
 
-    /// [`add_request`](Self::add_request) with request-specific extra stop
-    /// token ids.
-    pub fn add_request_with_stop(
-        &mut self,
-        prompt_tokens: Vec<u32>,
-        sampling_params: SamplingParams,
-        max_tokens: usize,
-        extra_stop_token_ids: Vec<u32>,
-    ) -> SequenceId {
-        self.scheduler.add_request_with_stop(
-            prompt_tokens,
-            sampling_params,
-            max_tokens,
-            extra_stop_token_ids,
-        )
-    }
-
-    /// [`add_request_with_stop`](Self::add_request_with_stop) with a grammar
-    /// constraint attached; constrained sequences never join the speculative
-    /// cycle (the mask changes the sampled distribution).
+    /// [`add_request`](Self::add_request) with a grammar constraint
+    /// attached; constrained sequences never join the speculative cycle (the
+    /// mask changes the sampled distribution).
     pub fn add_request_constrained(
         &mut self,
         prompt_tokens: Vec<u32>,
         sampling_params: SamplingParams,
         max_tokens: usize,
-        extra_stop_token_ids: Vec<u32>,
         constraint: crate::constrain::JsonConstraint,
     ) -> SequenceId {
         self.scheduler.add_request_full(
             prompt_tokens,
             sampling_params,
             max_tokens,
-            extra_stop_token_ids,
             Some(constraint),
         )
     }
@@ -1640,8 +1619,7 @@ mod tests {
             Engine::new_with_stop_controls(Box::new(model), test_scheduler_config(), &[], &[]);
 
         let id0 = engine.add_request(vec![10, 11], SamplingParams::default(), 4);
-        let id1 =
-            engine.add_request_with_stop(vec![12, 13], SamplingParams::default(), 4, vec![99]);
+        let id1 = engine.add_request(vec![12, 13], SamplingParams::default(), 4);
 
         assert!(engine.has_pending_work());
         let mut ids = engine.abort_all();
@@ -1700,19 +1678,18 @@ mod tests {
     }
 
     #[test]
-    fn step_respects_request_specific_stop_tokens() {
+    fn step_respects_engine_level_stop_tokens() {
         let allocators = make_allocators(1, 8);
         let forced_token = 11;
         let (model, _) = FakeModel::new(Vec::new(), forced_token, allocators);
-        let mut engine =
-            Engine::new_with_stop_controls(Box::new(model), test_scheduler_config(), &[], &[]);
-
-        let seq_id = engine.add_request_with_stop(
-            vec![21, 22],
-            SamplingParams::default(),
-            4,
-            vec![forced_token],
+        let mut engine = Engine::new_with_stop_controls(
+            Box::new(model),
+            test_scheduler_config(),
+            &[forced_token],
+            &[],
         );
+
+        let seq_id = engine.add_request(vec![21, 22], SamplingParams::default(), 4);
         let out = engine.step().unwrap();
 
         assert!(out.new_tokens.is_empty());

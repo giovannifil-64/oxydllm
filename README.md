@@ -84,22 +84,24 @@ Support is per architecture (the `architectures` field in a checkpoint's `config
 
 | Architecture | Example models | Verified checkpoint |
 |---|---|---|
-| `LlamaForCausalLM` | Llama 3.x, TinyLlama | meta-llama/Llama-3.2-1B-Instruct (BF16 + GGUF) |
-| `MistralForCausalLM` | Mistral 7B v0.x | same code path as Ministral, unverified |
+| `LlamaForCausalLM` | Llama 3.x, TinyLlama, DeepSeek-R1 Llama distills | meta-llama/Llama-3.2-1B and 3B-Instruct (BF16 + GGUF), Meta-Llama-3.1-8B-Instruct (GGUF Q4_K_M), DeepSeek-R1-Distill-Llama-8B (GGUF), TinyLlama-1.1B (GGUF) |
+| `MistralForCausalLM` | Mistral 7B v0.3, Mistral Nemo, Mistral Small 3.x | Mistral-7B-Instruct-v0.3, Mistral-Nemo-Instruct-2407 and Mistral-Small-3.2-24B-Instruct-2506 (GGUF Q4_K_M; the 7B in BF16 does not fit 24 GB) |
 | `Mistral3ForConditionalGeneration` | Ministral 3 | mistralai/Ministral-3-3B-Instruct-2512 |
-| `Qwen2ForCausalLM` | Qwen2, Qwen2.5 | Qwen/Qwen2.5-1.5B and 3B-Instruct (BF16 + GGUF) |
-| `Qwen3ForCausalLM` | Qwen3 dense | Qwen/Qwen3-0.6B, 1.7B, 4B (BF16, GGUF, AWQ, GPTQ, FP8) |
-| `Qwen3MoeForCausalLM` | Qwen3-30B-A3B | same MoE runtime as OLMoE/Qwen3.6, unverified |
-| `Qwen3_5ForConditionalGeneration` | Qwen3.5 (hybrid GDN + gated attention, text-only) | Qwen/Qwen3.5-4B (BF16, INT4, GGUF) |
+| `Qwen2ForCausalLM` | Qwen2, Qwen2.5, DeepSeek-R1 Qwen distills | Qwen/Qwen2.5-1.5B and 3B-Instruct (BF16 + GGUF + GPTQ-Int4), Qwen2.5-7B and 14B-Instruct (GGUF Q4_K_M), Qwen2-1.5B (GGUF), DeepSeek-R1-Distill-Qwen-7B (GGUF) |
+| `Qwen3ForCausalLM` | Qwen3 dense | Qwen/Qwen3-0.6B, 1.7B, 4B (BF16, GGUF incl. IQ3_M, IQ4_NL, IQ4_XS, AWQ, GPTQ, FP8), Qwen3-8B and 14B (GGUF Q4_K_M) |
+| `Qwen3MoeForCausalLM` | Qwen3-30B-A3B | safetensors runtime unverified; GGUF files of this architecture are refused at `pull`, since the GGUF runtime serves dense models only |
+| `Qwen3_5ForConditionalGeneration` | Qwen3.5, Qwen3.8 (hybrid GDN + gated attention, text-only) | Qwen/Qwen3.5-0.8B (GGUF), Qwen3.5-4B (BF16, INT4, GGUF), Qwen3.8-27B (GGUF Q2_K; the Q4_K_M needs more than 24 GB) |
 | `Qwen3_5MoeForConditionalGeneration` | Qwen3.6 MoE hybrid | Qwen/Qwen3.6-35B-A3B-FP8 (24 GB via automatic SSD expert streaming) |
 | `GemmaForCausalLM` | Gemma 1 | google/gemma-2b-it |
-| `Gemma2ForCausalLM` | Gemma 2 | google/gemma-2-2b-it |
-| `Gemma3ForCausalLM` | Gemma 3 | google/gemma-3-1b-it |
-| `Gemma4ForConditionalGeneration` | Gemma 4 (text) | google/gemma-4-E2B-it |
-| `Phi3ForCausalLM` | Phi-3, Phi-3.5 | microsoft/Phi-3.5-mini-instruct + Phi-3-mini GGUF |
-| `GraniteForCausalLM` | Granite 3.x dense | ibm-granite/granite-3.3-2b-instruct (BF16 + GGUF) |
+| `Gemma2ForCausalLM` | Gemma 2 | google/gemma-2-2b-it (BF16 + GGUF), gemma-2-9b-it (GGUF Q4_K_M) |
+| `Gemma3ForCausalLM` | Gemma 3 | google/gemma-3-1b-it (BF16 + GGUF), gemma-3-4b-it and 12b-it (GGUF Q4_K_M) |
+| `Gemma4ForConditionalGeneration` | Gemma 4 (text) | google/gemma-4-E2B-it (BF16), gemma-4-12b-it (GGUF Q4_K_M) |
+| `Phi3ForCausalLM` | Phi-3, Phi-3.5, Phi-4 | microsoft/Phi-3.5-mini-instruct (BF16 + GGUF), Phi-3-mini (GGUF), Phi-4-mini-instruct (BF16), phi-4 (GGUF Q4_K_M) |
+| `GraniteForCausalLM` | Granite 3.x dense | ibm-granite/granite-3.3-2b-instruct (BF16 + GGUF), granite-3.3-8b-instruct (GGUF Q4_K_M) |
 | `OlmoeForCausalLM` | OLMoE | allenai/OLMoE-1B-7B-0924-Instruct |
-| `GptOssForCausalLM` | gpt-oss | openai/gpt-oss-20b (MXFP4, harmony channels) |
+| `GptOssForCausalLM` | gpt-oss | openai/gpt-oss-20b (MXFP4, harmony channels, function calls through the commentary channel) |
+
+On a 24 GB Apple Silicon machine, checkpoints up to about 13 GB of weights serve 4096-token requests with room for several concurrent sequences; the loader refuses what cannot hold a 256-block KV pool beside its weights (Qwen3.8-27B Q4_K_M at 15.3 GB, Mistral 7B in BF16 at 14.5 GB) rather than fail on the first long prompt.
 
 ### Embeddings (`/v1/embeddings`)
 
@@ -119,13 +121,13 @@ Not supported yet. A cross-encoder scoring endpoint reusing the embeddings runti
 Formats span BF16 safetensors, GGUF, AWQ/GPTQ, compressed-tensors INT4, FP8, and MXFP4, auto-detected per checkpoint.
 
 > [!NOTE]
-> All Qwen3 and Qwen3.5 models have been tested with and without thinking enabled, with reasoning separated into `reasoning_content` in both streaming and non-streaming responses.
+> Qwen3, Qwen3.5, Qwen3.8, Gemma 4, the DeepSeek-R1 distills and gpt-oss have been tested with and without thinking enabled, with reasoning separated into `reasoning_content` in both streaming and non-streaming responses; a model that reasons whether or not it was asked (the R1 distills, gpt-oss) has its reasoning dropped from the reply when it was not asked for.
 
 ## Unsupported Model Families
 The following model families are not currently supported:
 - Mixtral (`MixtralForCausalLM`): uses `block_sparse_moe.experts.{e}.{w1,w2,w3}` tensor naming, not yet routed in the loader (the MoE infrastructure itself is in place via `Qwen3MoeForCausalLM` and `OlmoeForCausalLM`).
 - DeepSeek-V2/V3: Mixture-of-Experts plus Multi-head Latent Attention (MLA); MLA is not implemented yet.
-- GGUF MoE checkpoints: quant-per-expert tensor layout not yet wired; safetensors MoE works.
+- GGUF MoE checkpoints: quant-per-expert tensor layout not yet wired, so `pull` refuses them from the header before downloading; safetensors MoE works.
 - Multimodal inference (vision+language) is not supported yet; text-only paths from some multimodal checkpoints may work.
 - Encoder-only models beyond the BERT/RoBERTa embedding family (e.g. ModernBERT-based granite-embedding r2)
 

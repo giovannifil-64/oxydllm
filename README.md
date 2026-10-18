@@ -536,40 +536,71 @@ CUDA is currently a functional compatibility path, not a performance-tuned backe
 
 ## Benchmarks
 
-All numbers were measured on the Apple Silicon reference machine (M5, 24 GB unified memory). Every model below passes the deterministic coherence check in the regression suite; decode `tok/s` is the steady-state median over five 150-token runs after one warm-up. Run-to-run variance is ~10%; treat the figures as indicative of relative cost, not as guarantees.
+All numbers come from the regression sweep of 17 and 18 October 2026 on the Apple Silicon reference machine (M5, 24 GB unified memory), one model resident at a time and nothing else on the GPU. Decode tok/s is the median of three single-stream requests for a 100-word essay with `max_tokens` 150 at temperature 0, completion tokens over the wall-clock time of the whole request, prefill included, with a 4096-token context. Weights GB is what the loader reports resident for the checkpoint; the KV pool comes on top of it (see the memory note under Supported Models). Run-to-run variance is about 10%; read the figures as relative cost, not as guarantees. The table is written by the sweep's reporting script from its results, not by hand, so it moves when the sweep next runs.
 
-> The GGUF rows below understate current throughput. They were measured before quantized matmuls moved to candle's kernels, which raised decode by roughly 1.2× and prompt processing by 3.5 to 4× on every GGUF checkpoint tested (Qwen3-4B-Q4_K_M, for one, decodes at 35.5 tok/s against the 27.0 listed here). The table is refreshed by the regression sweep, not by hand, so it will move when the sweep next runs. Rows in safetensors, AWQ, GPTQ and FP8 formats are unaffected: those paths did not change.
-
-| Model | Architecture | Format | Decode tok/s |
-|---|---|---|---|
-| `meta-llama/Llama-3.2-1B-Instruct` | LlamaForCausalLM | BF16 safetensors | 33.1 |
-| `Qwen/Qwen2.5-1.5B-Instruct` | Qwen2ForCausalLM | BF16 safetensors | 25.4 |
-| `Qwen/Qwen2.5-3B-Instruct` | Qwen2ForCausalLM | BF16 safetensors | 13.6 |
-| `Qwen/qwen2-1_5b-instruct-q4_0` | Qwen2 (GGUF) | Q4_0 | 67.3 |
-| `Qwen/Qwen2.5-1.5B-Instruct-Q2_K` | Qwen2 (GGUF) | Q2_K | 105.2 |
-| `Qwen/Qwen2.5-1.5B-Instruct-Q3_K_M` | Qwen2 (GGUF) | Q3_K_M | 85.1 |
-| `Qwen/Qwen2.5-1.5B-Instruct-Q4_0` | Qwen2 (GGUF) | Q4_0 | 85.4 |
-| `bartowski/Qwen2.5-1.5B-Instruct-Q4_0` | Qwen2 (GGUF) | Q4_0 | 64.6 |
-| `Qwen/Qwen2.5-1.5B-Instruct-Q4_K_M` | Qwen2 (GGUF) | Q4_K_M | 80.4 |
-| `Qwen/Qwen3-0.6B` | Qwen3ForCausalLM | BF16 safetensors | 52.7 |
-| `Qwen/Qwen3-0.6B-GPTQ-Int8` | Qwen3ForCausalLM | GPTQ Int8 (W8A16 resident) | 86.8 |
-| `Qwen/Qwen3-1.7B-Q8_0` | Qwen3 (GGUF) | Q8_0 | 38.0 |
-| `Qwen/Qwen3-1.7B-GPTQ-Int8` | Qwen3ForCausalLM | GPTQ Int8 (W8A16 resident) | 41.5 |
-| `Qwen/Qwen3-4B-Q4_K_M` | Qwen3 (GGUF) | Q4_K_M | 27.0 |
-| `Qwen/Qwen3-4B-Q5_0` | Qwen3 (GGUF) | Q5_0 | 26.4 |
-| `Qwen/Qwen3-4B-Q5_K_M` | Qwen3 (GGUF) | Q5_K_M | 25.5 |
-| `Qwen/Qwen3-4B-Q6_K` | Qwen3 (GGUF) | Q6_K | 22.8 |
-| `Qwen/Qwen3-4B-AWQ` | Qwen3ForCausalLM | AWQ 4-bit (W4A16 resident) | 38.5 |
-| `Qwen/Qwen3-4B-Instruct-2507-FP8` | Qwen3ForCausalLM | FP8 (E4M3, block-wise) | 10.0 |
-| `google/gemma-2b-it` | GemmaForCausalLM | BF16 safetensors | 16.6 |
-| `google/gemma-2-2b-it` | Gemma2ForCausalLM | BF16 safetensors | 15.5 |
-| `google/gemma-3-1b-it` | Gemma3ForCausalLM | BF16 safetensors | 36.1 |
-| `google/gemma-4-E2B-it` | Gemma4ForConditionalGeneration | BF16 safetensors | 15.4 |
-| `mistralai/Ministral-3-3B-Instruct-2512` | Mistral3ForConditionalGeneration | BF16 safetensors | 12.1 |
-| `microsoft/Phi-3-mini-4k-instruct-Q4` | Phi3 (GGUF) | Q4 | 17.9 |
-| `ibm-granite/granite-3.3-2b-instruct-Q4_K_M` | GraniteForCausalLM (GGUF) | Q4_K_M | 44.3 |
-| `allenai/OLMoE-1B-7B-0924-Instruct` | OlmoeForCausalLM (MoE) | BF16 safetensors, 64 experts × top-k 8 | 13.6 |
-| `openai/gpt-oss-20b` | GptOssForCausalLM (MoE) | MXFP4 experts + BF16, 32 experts × top-k 4 | 14.3 |
+| Model | Architecture | Format | Weights GB | Decode tok/s |
+|---|---|---|---|---|
+| `TheBloke/TinyLlama-1.1B-Chat-v1.0.Q4_0` | llama (GGUF) | Q4_0 | 0.6 | 144.4 |
+| `TheBloke/TinyLlama-1.1B-Chat-v1.0.Q4_K_M` | llama (GGUF) | Q4_K_M | 0.6 | 136.6 |
+| `bartowski/Llama-3.2-1B-Instruct-Q4_K_M` | llama (GGUF) | Q4_K_M | 0.7 | 112.7 |
+| `bartowski/Llama-3.2-3B-Instruct-Q4_K_M` | llama (GGUF) | Q4_K_M | 1.9 | 49.2 |
+| `meta-llama/Llama-3.2-1B-Instruct` | LlamaForCausalLM | BF16 safetensors | 2.3 | 43.8 |
+| `bartowski/Mistral-7B-Instruct-v0.3-Q4_K_M` | llama (GGUF) | Q4_K_M | 4.1 | 24.6 |
+| `bartowski/DeepSeek-R1-Distill-Llama-8B-Q4_K_M` | llama (GGUF) | Q4_K_M | 4.6 | 24.0 |
+| `bartowski/Meta-Llama-3.1-8B-Instruct-Q4_K_M` | llama (GGUF) | Q4_K_M | 4.6 | 22.3 |
+| `meta-llama/Llama-3.2-3B-Instruct` | LlamaForCausalLM | BF16 safetensors | 6.0 | 17.3 |
+| `bartowski/Mistral-Nemo-Instruct-2407-Q4_K_M` | llama (GGUF) | Q4_K_M | 7.0 | 15.0 |
+| `bartowski/mistralai_Mistral-Small-3.2-24B-Instruct-2506-Q4_K_M` | llama (GGUF) | Q4_K_M | 13.3 | 8.1 |
+| `mistralai/Ministral-3-3B-Instruct-2512` | Mistral3ForConditionalGeneration | BF16 safetensors | 7.2 | 14.5 |
+| `Qwen/Qwen2.5-1.5B-Instruct-Q2_K` | qwen2 (GGUF) | Q2_K | 0.7 | 119.0 |
+| `Qwen/Qwen2.5-1.5B-Instruct-Q3_K_M` | qwen2 (GGUF) | Q3_K_M | 0.9 | 95.8 |
+| `Qwen/qwen2-1_5b-instruct-q4_0` | qwen2 (GGUF) | Q4_0 | 0.9 | 95.5 |
+| `bartowski/Qwen2.5-1.5B-Instruct-Q4_0` | qwen2 (GGUF) | Q4_0 | 0.9 | 94.6 |
+| `Qwen/Qwen2.5-1.5B-Instruct-Q4_0` | qwen2 (GGUF) | Q4_0 | 1.0 | 97.5 |
+| `Qwen/Qwen2.5-1.5B-Instruct-Q4_K_M` | qwen2 (GGUF) | Q4_K_M | 1.0 | 92.2 |
+| `Qwen/Qwen2.5-1.5B-Instruct` | Qwen2ForCausalLM | BF16 safetensors | 2.9 | 36.7 |
+| `Qwen/Qwen2.5-7B-Instruct-Q4_K_M` | qwen2 (GGUF) | Q4_K_M | 4.4 | 25.1 |
+| `bartowski/DeepSeek-R1-Distill-Qwen-7B-Q4_K_M` | qwen2 (GGUF) | Q4_K_M | 4.4 | 24.3 |
+| `Qwen/Qwen2.5-3B-Instruct` | Qwen2ForCausalLM | BF16 safetensors | 5.8 | 18.4 |
+| `bartowski/Qwen2.5-14B-Instruct-Q4_K_M` | qwen2 (GGUF) | Q4_K_M | 8.4 | 12.9 |
+| `bartowski/Qwen_Qwen3-0.6B-IQ3_M` | qwen3 (GGUF) | IQ3_M | 0.4 | 201.6 |
+| `bartowski/Qwen_Qwen3-0.6B-IQ4_XS` | qwen3 (GGUF) | IQ4_XS | 0.4 | 202.3 |
+| `bartowski/Qwen_Qwen3-0.6B-IQ4_NL` | qwen3 (GGUF) | IQ4_NL | 0.4 | 199.1 |
+| `Qwen/Qwen3-0.6B-GPTQ-Int8` | Qwen3ForCausalLM | GPTQ Int8 (W8A16 resident) | 0.7 | 107.4 |
+| `Qwen/Qwen3-0.6B` | Qwen3ForCausalLM | BF16 safetensors | 1.4 | 81.2 |
+| `Qwen/Qwen3-1.7B-Q8_0` | qwen3 (GGUF) | Q8_0 | 1.7 | 52.2 |
+| `Qwen/Qwen3-1.7B-GPTQ-Int8` | Qwen3ForCausalLM | GPTQ Int8 (W8A16 resident) | 1.9 | 47.1 |
+| `Qwen/Qwen3-4B-Q4_K_M` | qwen3 (GGUF) | Q4_K_M | 2.3 | 40.3 |
+| `Qwen/Qwen3-4B-Q5_0` | qwen3 (GGUF) | Q5_0 | 2.6 | 35.1 |
+| `Qwen/Qwen3-4B-AWQ` | Qwen3ForCausalLM | AWQ 4-bit (W4A16 resident) | 2.7 | 41.4 |
+| `Qwen/Qwen3-4B-Q5_K_M` | qwen3 (GGUF) | Q5_K_M | 2.7 | 35.7 |
+| `Qwen/Qwen3-4B-Q6_K` | qwen3 (GGUF) | Q6_K | 3.1 | 34.2 |
+| `Qwen/Qwen3-8B-Q4_K_M` | qwen3 (GGUF) | Q4_K_M | 4.7 | 23.9 |
+| `Qwen/Qwen3-4B-Instruct-2507-FP8` | Qwen3ForCausalLM | FP8 (E4M3, block-wise) | 8.2 | 14.0 |
+| `Qwen/Qwen3-14B-Q4_K_M` | qwen3 (GGUF) | Q4_K_M | 8.4 | 12.3 |
+| `Qwen/Qwen3.5-4B` | Qwen3_5ForConditionalGeneration | BF16 safetensors | 7.8 | 11.4 |
+| `unsloth/Qwen3.5-0.8B-Q4_K_M` | qwen35 (GGUF) | Q4_K_M | 0.5 | 95.2 |
+| `Qwen3.8-27B-Q2_K` | qwen35 (GGUF) | Q2_K | 11.0 | 7.6 |
+| `google/gemma-2b-it` | GemmaForCausalLM | BF16 safetensors | 4.7 | 22.5 |
+| `bartowski/gemma-2-2b-it-Q4_K_M` | gemma2 (GGUF) | Q4_K_M | 1.6 | 60.3 |
+| `google/gemma-2-2b-it` | Gemma2ForCausalLM | BF16 safetensors | 4.9 | 21.2 |
+| `bartowski/gemma-2-9b-it-Q4_K_M` | gemma2 (GGUF) | Q4_K_M | 5.4 | 18.8 |
+| `google/gemma-3-1b-it` | Gemma3ForCausalLM | BF16 safetensors | 1.9 | 51.3 |
+| `bartowski/google_gemma-3-4b-it-Q4_K_M` | gemma3 (GGUF) | Q4_K_M | 2.3 | 39.8 |
+| `bartowski/google_gemma-3-12b-it-Q4_K_M` | gemma3 (GGUF) | Q4_K_M | 6.8 | 14.3 |
+| `unsloth/gemma-4-12b-it-Q4_K_M` | gemma4 (GGUF) | Q4_K_M | 6.6 | 14.0 |
+| `google/gemma-4-E2B-it` | Gemma4ForConditionalGeneration | BF16 safetensors | 9.5 | 22.9 |
+| `microsoft/Phi-3-mini-4k-instruct-Q4` | phi3 (GGUF) | Q4 | 2.2 | 42.4 |
+| `bartowski/Phi-3.5-mini-instruct-Q4_K_M` | phi3 (GGUF) | Q4_K_M | 2.2 | 46.0 |
+| `microsoft/Phi-3.5-mini-instruct` | Phi3ForCausalLM | BF16 safetensors | 7.1 | 15.1 |
+| `microsoft/Phi-4-mini-instruct` | Phi3ForCausalLM | BF16 safetensors | 7.2 | 14.6 |
+| `bartowski/phi-4-Q4_K_M` | phi3 (GGUF) | Q4_K_M | 8.4 | 12.6 |
+| `ibm-granite/granite-3.3-2b-instruct-Q4_K_M` | granite (GGUF) | Q4_K_M | 1.4 | 60.1 |
+| `ibm-granite/granite-3.3-8b-instruct-Q4_K_M` | granite (GGUF) | Q4_K_M | 4.6 | 20.7 |
+| `ibm-granite/granite-3.3-2b-instruct` | GraniteForCausalLM | BF16 safetensors | 4.7 | 20.8 |
+| `ibm-granite/granite-3.3-2b-instruct-F16` | granite (GGUF) | F16 | 4.7 | 11.4 |
+| `allenai/OLMoE-1B-7B-0924-Instruct` | OlmoeForCausalLM | BF16 safetensors, 64 experts × top-k 8 | 12.9 | 24.9 |
+| `openai/gpt-oss-20b` | GptOssForCausalLM | MXFP4 experts + BF16, 32 experts × top-k 4 | 12.8 | 10.9 |
 
 ### Embeddings
 
@@ -600,7 +631,7 @@ The Qwen3.5 family additionally went through a 13-test adversarial battery per f
 | `cyankiwi/Qwen3.5-4B-AWQ-BF16-INT4` | mixed BF16 DeltaNet + INT4 attn/MLP | 4.4 GB | 15.9 | 30.3 (1.9×) | 13/13 |
 | `unsloth/Qwen3.5-4B-GGUF` (Q4_K_M) | GGUF (`qwen35` arch) | 2.5 GB | 24.1 | n/a | 12/13** |
 
-\* Median of three 150-token completions, prefill included.
+\* Median of three 150-token completions, prefill included, as measured by the battery; the table above carries the sweep's current figures.
 
 \*\* Quality loss of the Q4_K_M quantization on one marginal reasoning prompt, not a runtime defect: the same weights answer correctly when prompted step-by-step, and batched-vs-single decode stays byte-identical.
 

@@ -796,8 +796,11 @@ impl Attention {
             )
             && matches!(q.dtype(), DType::F16 | DType::BF16 | DType::F32);
 
+        let prefill = super::phase::current() == Some(super::phase::Phase::Prefill);
+
         for (i, seg) in segments.iter().enumerate() {
             let q_seg = q.narrow(2, q_offset, seg.num_tokens)?;
+            let prefill_tail = prefill && seg.num_tokens == 1;
             let (k_seg, v_seg, kv_len) = truncate_kv_window(
                 k_parts[i].clone(),
                 v_parts[i].clone(),
@@ -809,7 +812,7 @@ impl Attention {
             #[cfg(feature = "metal")]
             let use_metal_fa = metal_fa_base_ok
                 && self.sinks.is_none()
-                && if seg.num_tokens > 1 {
+                && if seg.num_tokens > 1 || prefill_tail {
                     super::metal_ops::flash_attention_uses_hardware_path(
                         self.head_dim,
                         q.dtype(),
@@ -822,6 +825,7 @@ impl Attention {
                 && kv_len >= seg.num_tokens
                 && (kv_len >= METAL_FA_MIN_KV
                     || seg.num_tokens > 1
+                    || prefill_tail
                     || (seg.num_tokens == 1 && !sdpa_base_ok));
             #[cfg(not(feature = "metal"))]
             let use_metal_fa = false;

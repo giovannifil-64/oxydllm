@@ -47,6 +47,23 @@ pub struct FeedForward {
 }
 
 impl FeedForward {
+    /// The forward of a fused SiLU layer stage by stage, for the tests that
+    /// look inside a layer.
+    #[cfg(all(test, feature = "metal"))]
+    pub(crate) fn forward_stages(&self, x: &Tensor) -> Result<Vec<(String, Tensor)>> {
+        let GateUpProjection::Fused(gu) = &self.gate_up else {
+            candle_core::bail!("forward_stages: only the fused gate/up layout");
+        };
+        let projected = gu.forward(x)?;
+        let activated = super::metal_ops::gated_silu_fused(&projected, self.intermediate_size)?;
+        let down = self.down_proj.forward(&activated)?;
+        Ok(vec![
+            ("gate_up".to_string(), projected),
+            ("activation".to_string(), activated),
+            ("down".to_string(), down),
+        ])
+    }
+
     /// Loads the MLP for `layer_idx` from safetensors weights
     /// (`model.layers.{i}.mlp.*`).
     ///

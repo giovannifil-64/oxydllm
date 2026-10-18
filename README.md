@@ -58,10 +58,11 @@ A rust-based inference engine for Large Language Models.
 - Thinking/reasoning models with a separated `reasoning_content` field: `<think>`-style (Qwen3/Qwen3.5, toggled with `enable_thinking`) and harmony channels (gpt-oss, scaled with `reasoning_effort`)
 - Metal acceleration on Apple Silicon with fused attention, RMSNorm, RoPE, and Softmax kernels; on macOS 26+ prefill matmuls use Metal 4 TensorOps (M5 neural accelerator) automatically
 - Continuous batching: all active sequences share each GPU forward pass; `max_num_seqs` is auto-computed at load and can be overridden with `--max-num-seqs`
+- Batch-invariant decoding: a request gets the same logits bit for bit whether its prompt is prefilled alone, beside other prompts or behind a cached prefix, and, on GGUF, importance-quantized and AWQ checkpoints, whether its tokens decode alone or in a batch of up to eight sequences (Metal; see Known Limitations for the edges)
 - Paged KV cache with prefix caching, plus optional KV cache quantization (Lossless/Balanced/Aggressive, 2-4× smaller)
 - Multi-model server with LRU eviction and configurable memory budgets
 - Quantized checkpoint support, auto-detected per checkpoint with no flags:
-  - **GGUF**: every ggml quant type candle decodes, through its quantized matmul, plus a zero-copy mmap loader and sharded files
+  - **GGUF**: every ggml quant type candle decodes, with the engine's own gemv kernels for decode and the TensorOps GEMM for prefill, plus a zero-copy mmap loader and sharded files
   - **AWQ** 4/8-bit and **GPTQ** 4/8-bit (`desc_act=false`): packed weights stay resident on Metal with fused GEMV kernels (batched across concurrent sequences for AWQ-layout checkpoints)
   - **compressed-tensors** pack-quantized INT4 (llm-compressor): converted to the AWQ layout at load, fully-quantized or mixed-precision
   - **FP8** (E4M3) block-wise and **MXFP4** (GPT-OSS experts, packed-resident)
@@ -487,6 +488,7 @@ The following options are shared between `start` and `run`:
 `--models-dir`, `--devices`, `--max-context-len`, `--kv-quant`, `--allow-cpu`.
 
 ## Known Limitations and Work in Progress
+- Batch invariance holds for GGUF, importance-quantized and AWQ checkpoints for decode batches of up to eight sequences; from the ninth concurrent sequence on, candle's tiled GEMM serves the GGUF decode with its own reduction order. Dense BF16 checkpoints are prefill-invariant (cold, cached and packed prefills agree) but a token decoded beside others can differ from the same token decoded alone in the last bits, since candle serves one row with a gemv and more with its GEMM; the GPTQ, W8A16 and FP8 kernels are not yet verified either way. On a Mac without Metal 4 TensorOps a prompt whose uncached tail is one token is prefilled by candle's matvec rather than its GEMM, and can differ from the cold prefill in the last bits.
 - GGUF compatibility: MoE GGUF checkpoints are not yet wired. The importance-quantized types IQ4_XS, IQ4_NL and IQ3_S load through the engine's own kernels, which covers unsloth's UD-Q*_K_M and UD-Q*_K_XL builds; a GGUF holding any other IQ or ternary type is refused before the download rather than after it.
 - Thinking mode is template-dependent: `enable_thinking` is applied only when the tokenizer chat template supports it.
 - Byte-level tokenizers: Streaming decode uses incremental buffering; occasional model-specific Unicode artifacts can still appear.

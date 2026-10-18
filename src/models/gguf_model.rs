@@ -757,6 +757,11 @@ impl StandardTransformer {
 }
 
 impl BatchModel for StandardTransformer {
+    #[cfg(test)]
+    fn as_standard(&self) -> Option<&StandardTransformer> {
+        Some(self)
+    }
+
     fn weight_fingerprint(&self) -> Option<f64> {
         self.norm.fingerprint()
     }

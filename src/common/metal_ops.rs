@@ -1609,7 +1609,7 @@ fn get_or_compile_quant_pipeline(
     }
 
     let lib = device
-        .new_library_with_source(QUANT_METAL_SOURCE, None)
+        .new_library_with_source(QUANT_METAL_SOURCE, Some(&exact_math()))
         .map_err(|e| candle_core::Error::Msg(format!("quant Metal compile: {e}")))?;
     let func = lib
         .get_function(kernel_name, None)
@@ -1620,6 +1620,21 @@ fn get_or_compile_quant_pipeline(
 
     guard.insert(key, pipeline.clone());
     Ok(pipeline)
+}
+
+/// Compile options for the libraries whose kernels come in a single-row and
+/// a batch instantiation of one source. Fast math stays on for speed, and
+/// the sources forbid reassociation with `#pragma clang fp reassociate(off)`:
+/// with it allowed, the same source compiled twice differed in a few outputs
+/// of every ten thousand, enough to move a layer of a real model by a unit in
+/// the last place, and without it the two instantiations give a row the same
+/// bits, so a token decoded in a batch gets the logits it gets alone. Turning
+/// fast math off altogether did the same at eight percent of decode speed.
+fn exact_math() -> impl std::ops::Deref<Target = objc2_metal::MTLCompileOptions> {
+    let opts = objc2_metal::MTLCompileOptions::new();
+    #[allow(deprecated)]
+    opts.setFastMathEnabled(true);
+    opts
 }
 
 /// Kernel argument block for the AWQ-layout GEMV/dequant kernels; field
@@ -2586,8 +2601,8 @@ fn mpp_library(device: &candle_metal_kernels::metal::Device) -> Option<Library> 
                 return None;
             }
             use objc2_foundation::NSString;
-            use objc2_metal::{MTLCompileOptions, MTLLanguageVersion};
-            let opts = MTLCompileOptions::new();
+            use objc2_metal::MTLLanguageVersion;
+            let opts = exact_math();
             opts.setLanguageVersion(MTLLanguageVersion::Version4_0);
             match device.as_ref().newLibraryWithSource_options_error(
                 &NSString::from_str(MPP_GEMM_SOURCE),
@@ -2814,9 +2829,13 @@ pub fn mpp_matmul(x: &Tensor, b: &Tensor) -> Result<Tensor> {
 /// Routes `x @ b` onto the TensorOps GEMM when profitable, else `Ok(None)`.
 ///
 /// Declines for non-BF16 dtypes, off-Metal tensors, `m` below
-/// [`MPP_GEMM_MIN_M`], unsupported layouts, or an unavailable library, and
-/// also when the runtime turns out broken mid-call; the caller then falls
-/// back to the candle GEMM.
+/// [`MPP_GEMM_MIN_M`] outside a prefill, unsupported layouts, or an
+/// unavailable library, and also when the runtime turns out broken mid-call;
+/// the caller then falls back to the candle GEMM. A prefill takes the
+/// TensorOps GEMM whatever its row count, so a prompt gets the same bits
+/// prefilled alone, beside others or behind a cached prefix (see
+/// [`crate::common::phase`]); candle's GEMM, which serves decode, gives a
+/// row the same bits in any batch of its own.
 ///
 /// ## Errors
 /// Propagates kernel failures other than a broken TensorOps runtime.
@@ -2828,7 +2847,8 @@ pub fn maybe_mpp_matmul(x: &Tensor, b: &Tensor) -> Result<Option<Tensor>> {
         return Ok(None);
     };
     let dims = x.dims();
-    if dims.len() != 2 || dims[0] < MPP_GEMM_MIN_M || !x.is_contiguous() {
+    let prefill = crate::common::phase::current() == Some(crate::common::phase::Phase::Prefill);
+    if dims.len() != 2 || (dims[0] < MPP_GEMM_MIN_M && !prefill) || !x.is_contiguous() {
         return Ok(None);
     }
     let k = dims[1];
@@ -2974,8 +2994,9 @@ impl WeightKind {
     }
 
     /// The kernel that multiplies one activation row, or a batch of up to
-    /// [`MPP_MATVEC_MAX_M`], by a weight of a kind candle cannot serve; the
-    /// kinds candle serves have candle's matvec.
+    /// [`MPP_MATVEC_MAX_M`], by a weight of a kind candle cannot serve, two
+    /// instantiations of one source (see [`exact_math`]); the kinds candle
+    /// serves have the GGUF gemv.
     fn matvec_kernel(self, batch: bool) -> Option<&'static str> {
         match (self, batch) {
             (Self::Iq4Nl, false) => Some("mpp_mv_iq4_nl"),
@@ -2986,6 +3007,30 @@ impl WeightKind {
             (Self::Iq3S, true) => Some("mpp_mv_iq3_s_batch"),
             _ => None,
         }
+    }
+
+    /// The crate's decode gemv for the kind, the single-row or the batch
+    /// instantiation of the same source (see [`exact_math`]), with its launch
+    /// geometry; `None` for the kinds the owned matvec serves.
+    fn gguf_gemv(self, batch: bool) -> Option<GgufGemv> {
+        let (single, batched, rows_per_tg, threads) = match self {
+            Self::Q4_0 => ("gguf_q4_0_gemv_bf16", "gguf_q4_0_gemv_batch_bf16", 8, 64),
+            Self::Q4_1 => ("gguf_q4_1_gemv_bf16", "gguf_q4_1_gemv_batch_bf16", 8, 64),
+            Self::Q5_0 => ("gguf_q5_0_gemv_bf16", "gguf_q5_0_gemv_batch_bf16", 8, 64),
+            Self::Q5_1 => ("gguf_q5_1_gemv_bf16", "gguf_q5_1_gemv_batch_bf16", 8, 64),
+            Self::Q8_0 => ("gguf_q8_0_gemv_bf16", "gguf_q8_0_gemv_batch_bf16", 8, 64),
+            Self::Q2K => ("gguf_q2k_gemv_bf16", "gguf_q2k_gemv_batch_bf16", 8, 64),
+            Self::Q3K => ("gguf_q3k_gemv_bf16", "gguf_q3k_gemv_batch_bf16", 4, 64),
+            Self::Q4K => ("gguf_q4k_gemv_bf16", "gguf_q4k_gemv_batch_bf16", 4, 32),
+            Self::Q5K => ("gguf_q5k_gemv_bf16", "gguf_q5k_gemv_batch_bf16", 4, 64),
+            Self::Q6K => ("gguf_q6k_gemv_bf16", "gguf_q6k_gemv_batch_bf16", 2, 64),
+            Self::Iq4Nl | Self::Iq4Xs | Self::Iq3S => return None,
+        };
+        Some(GgufGemv {
+            kernel: if batch { batched } else { single },
+            rows_per_tg,
+            threads,
+        })
     }
 
     /// The kernel that gathers rows of a table of a kind candle cannot serve.
@@ -3180,15 +3225,25 @@ pub fn mpp_staged_matmul(x: &Tensor, weight: &StagedWeight) -> Result<Tensor> {
     })
 }
 
-/// `x @ weight^T` through the staged kernel where it is the better path, else
-/// `None` so the caller falls back to candle's quantized matmul.
+/// `x @ weight^T` through the crate's kernels where they are the better
+/// path, else `None` so the caller falls back to candle's quantized matmul.
 ///
-/// The batch size that decides is [`StagedWeight::min_m`], measured per block
-/// type. Below it candle serves, which covers decode, where its matvec is
-/// memory bound and within reach of llama.cpp. The one exception is a single
-/// row of a Q2_K weight, which goes to the crate's own matvec because candle's
-/// is launched for twice the rows it has (see [`GgufQ2kMatvec`]).
-pub fn maybe_staged_quant_matmul(x: &Tensor, weight: &StagedWeight) -> Result<Option<Tensor>> {
+/// The kernel family follows the phase of the forward (see
+/// [`crate::common::phase`]) so that a row gets the same bits whatever rows
+/// share the forward: a decode step of up to [`GGUF_BATCH_MAX`] rows goes to
+/// the crate's gemv kernels, the same reduction alone or in a batch, in
+/// `out_dtype` (see [`GgufMatvec`]); a prefill goes to the staged GEMM
+/// whatever its row count, so a prompt prefilled beside others or behind a
+/// cached prefix gets the logits it gets alone, except the vocabulary
+/// projection of up to eight rows, which takes the gemv for its F32 logits.
+/// Outside the engine the row count alone decides: the gemv up to
+/// [`GGUF_BATCH_MAX`], the staged GEMM from [`StagedWeight::min_m`] rows,
+/// measured per block type, and candle's tiled GEMM between the two.
+pub fn maybe_staged_quant_matmul(
+    x: &Tensor,
+    weight: &StagedWeight,
+    out_dtype: DType,
+) -> Result<Option<Tensor>> {
     if x.dtype() != DType::BF16 {
         return Ok(None);
     }
@@ -3199,14 +3254,19 @@ pub fn maybe_staged_quant_matmul(x: &Tensor, weight: &StagedWeight) -> Result<Op
     if dims.len() != 2 || dims[1] != weight.k || !x.is_contiguous() {
         return Ok(None);
     }
-    if dims[0] == 1 && weight.kind == WeightKind::Q2K {
+    let prefill = crate::common::phase::current() == Some(crate::common::phase::Phase::Prefill);
+    if dims[0] <= GGUF_BATCH_MAX
+        && weight.kind.gguf_gemv(false).is_some()
+        && (!prefill || out_dtype == DType::F32)
+    {
         return x
-            .apply_op1_no_bwd(&GgufQ2kMatvec {
+            .apply_op1_no_bwd(&GgufMatvec {
                 weight: weight.clone(),
+                out_dtype,
             })
             .map(Some);
     }
-    if dims[0] < weight.min_m() {
+    if dims[0] < weight.min_m() && !prefill {
         return Ok(None);
     }
     if !mpp_gemm_available(md.device()) {
@@ -3295,85 +3355,100 @@ impl CustomOp1 for MppOwnedMatvec {
     }
 }
 
-/// Rows one threadgroup of the crate's single-row GGUF gemv kernels covers,
-/// two simdgroups of four rows; must match `GGUF_N_SIMDGROUP * GGUF_N_DST`
-/// in the kernel source.
-const GGUF_GEMV_ROWS_PER_TG: usize = 8;
-
-/// Kernel argument block for the single-row GGUF gemv kernels; must match
-/// `GgufParams` in `quant_kernels.metal`.
-#[repr(C)]
-struct GgufParams {
-    in_features: u32,
-    out_features: u32,
+/// One of the crate's GGUF decode gemv kernels with its launch geometry: the
+/// output rows one threadgroup covers and the threads it runs.
+struct GgufGemv {
+    kernel: &'static str,
+    rows_per_tg: usize,
+    threads: usize,
 }
 
-/// `x [1, k] @ weight^T` for a Q2_K weight through the crate's own
-/// `gguf_q2k_gemv_bf16`, in place of candle's `kernel_mul_mv_q2_K_f32`.
+/// `x [m, k] @ weight^T` for up to [`GGUF_BATCH_MAX`] rows of `x` through the
+/// crate's own GGUF gemv kernels, in the dtype the layer wants out.
 ///
-/// candle launches that kernel with one threadgroup per four rows while the
-/// kernel takes eight rows per threadgroup and guards neither its loads nor
-/// its stores, so the second half of every launch reads past the weight and
-/// writes past the output. A Q2_K model answered NaN to every prompt; under
-/// Metal shader validation the same forward was clean, and every invalid
-/// access it reported was in that kernel. candle serves a single row with the
-/// matvec and two rows or more with its tiled GEMM, which has no such defect,
-/// so only the single row is taken over.
-struct GgufQ2kMatvec {
+/// candle serves one row with its matvec and more with its tiled GEMM, two
+/// reductions in different orders, so a token decoded beside others came out
+/// with other logits than the same token decoded alone. The batch kernels
+/// here accumulate every row in the order of the single-row kernel, so a row
+/// gives the same bits whatever it is batched with, and the vocabulary
+/// projection takes its logits in F32 without a pass over BF16. candle's
+/// Q2_K matvec is besides launched for twice the rows it has and guards
+/// neither its loads nor its stores, which left a Q2_K model answering NaN
+/// to every prompt.
+struct GgufMatvec {
     weight: StagedWeight,
+    out_dtype: DType,
 }
 
-impl CustomOp1 for GgufQ2kMatvec {
+impl CustomOp1 for GgufMatvec {
     fn name(&self) -> &'static str {
-        "gguf-q2k-matvec"
+        "gguf-matvec"
     }
 
     fn cpu_fwd(&self, _s: &CpuStorage, _l: &Layout) -> Result<(CpuStorage, Shape)> {
-        candle_core::bail!("GgufQ2kMatvec: Metal-only")
+        candle_core::bail!("GgufMatvec: Metal-only")
     }
 
     fn metal_fwd(&self, x: &MetalStorage, x_l: &Layout) -> Result<(MetalStorage, Shape)> {
         if x.dtype() != DType::BF16 {
-            candle_core::bail!("GgufQ2kMatvec: x must be BF16, got {:?}", x.dtype());
+            candle_core::bail!("GgufMatvec: x must be BF16, got {:?}", x.dtype());
         }
         if !x_l.is_contiguous() {
-            candle_core::bail!("GgufQ2kMatvec: x must be contiguous");
+            candle_core::bail!("GgufMatvec: x must be contiguous");
         }
         let (n, k) = (self.weight.n, self.weight.k);
-        if x_l.dims() != [1, k] {
-            candle_core::bail!("GgufQ2kMatvec: x shape {:?} is not [1, {k}]", x_l.dims());
+        let m = match x_l.dims() {
+            [m, xk] if *xk == k && (1..=GGUF_BATCH_MAX).contains(m) => *m,
+            dims => candle_core::bail!(
+                "GgufMatvec: x shape {dims:?} is not [1..={GGUF_BATCH_MAX}, {k}]"
+            ),
+        };
+        if !matches!(self.out_dtype, DType::BF16 | DType::F32) {
+            candle_core::bail!(
+                "GgufMatvec: out dtype must be BF16 or F32, got {:?}",
+                self.out_dtype
+            );
         }
+        let Some(gemv) = self.weight.kind.gguf_gemv(m > 1) else {
+            candle_core::bail!("GgufMatvec: {:?} has no gemv kernel", self.weight.kind);
+        };
 
         let device = x.device();
-        let output = device.new_buffer(n, DType::BF16, "gguf_q2k_matvec")?;
-        let params = GgufParams {
-            in_features: k as u32,
-            out_features: n as u32,
-        };
-        let pipeline = get_or_compile_quant_pipeline(device.device(), "gguf_q2k_gemv_bf16")?;
+        let out_elems = m * n;
+        let output = device.new_buffer(out_elems, self.out_dtype, "gguf_matvec")?;
+        let out_f32 = u32::from(self.out_dtype == DType::F32);
+        let pipeline = get_or_compile_quant_pipeline(device.device(), gemv.kernel)?;
         let encoder = device.command_encoder()?;
         let encoder = encoder.as_ref();
         encoder.set_compute_pipeline_state(&pipeline);
         encoder.set_input_buffer(0, Some(x.buffer()), x_l.start_offset() * 2);
         encoder.set_input_buffer(1, Some(&*self.weight.buffer), 0);
         encoder.set_output_buffer(2, Some(&*output), 0);
-        encoder.set_bytes(3, &params);
+        encoder.set_bytes(
+            3,
+            &GgufBatchParams {
+                in_features: k as u32,
+                out_features: n as u32,
+                m_batch: m as u32,
+                out_f32,
+            },
+        );
         encoder.dispatch_thread_groups(
             MTLSize {
-                width: n.div_ceil(GGUF_GEMV_ROWS_PER_TG),
+                width: n.div_ceil(gemv.rows_per_tg),
                 height: 1,
                 depth: 1,
             },
             MTLSize {
-                width: 64,
+                width: gemv.threads,
                 height: 1,
                 depth: 1,
             },
         );
 
         Ok((
-            MetalStorage::new(output, device.clone(), n, DType::BF16),
-            Shape::from_dims(&[1, n]),
+            MetalStorage::new(output, device.clone(), out_elems, self.out_dtype),
+            Shape::from_dims(&[m, n]),
         ))
     }
 }
@@ -3454,7 +3529,8 @@ pub fn mpp_owned_gather(tokens: &Tensor, table: &StagedWeight) -> Result<Tensor>
 }
 
 /// `x @ weight^T` for a weight only this crate's kernels decode: the matvec
-/// up to [`MPP_MATVEC_MAX_M`] rows, the staged GEMM above. Takes `x` in any
+/// up to [`MPP_MATVEC_MAX_M`] rows, the staged GEMM above and in a prefill
+/// whatever the row count (see [`crate::common::phase`]). Takes `x` in any
 /// dtype and answers in BF16.
 ///
 /// ## Errors
@@ -3471,7 +3547,8 @@ pub fn mpp_owned_matmul(x: &Tensor, weight: &StagedWeight) -> Result<Tensor> {
     } else {
         x.contiguous()?
     };
-    if x.dim(0)? < weight.min_m() {
+    let prefill = crate::common::phase::current() == Some(crate::common::phase::Phase::Prefill);
+    if x.dim(0)? < weight.min_m() && !prefill {
         x.apply_op1_no_bwd(&MppOwnedMatvec {
             weight: weight.clone(),
         })
@@ -5062,7 +5139,7 @@ mod fused_kernel_parity_tests {
         words.into_iter().map(|w| w as i32).collect()
     }
 
-    fn build_awq_triplet(
+    pub(super) fn build_awq_triplet(
         dev: &Device,
         dtype: DType,
         in_features: usize,
@@ -6496,6 +6573,7 @@ struct GgufBatchParams {
     in_features: u32,
     out_features: u32,
     m_batch: u32,
+    out_f32: u32,
 }
 
 /// Elementwise F8E4M3 to F32 widening kernel behind
@@ -6902,6 +6980,7 @@ impl InplaceOp1 for Mxfp4Matmul {
             in_features: self.k as u32,
             out_features: self.n as u32,
             m_batch: self.m as u32,
+            out_f32: 0,
         };
 
         let device = out.device();
@@ -8246,28 +8325,59 @@ pub(crate) mod owned_weights {
 }
 
 #[cfg(test)]
-mod q2k_matvec_tests {
+mod gguf_matvec_tests {
     use super::*;
     use candle_core::Device;
     use candle_core::quantized::{GgmlDType, QTensor};
 
-    /// A Q2_K weight `[n, k]` as its block bytes and as the dense matrix
-    /// those bytes decode to.
-    fn q2k_weight(n: usize, k: usize, seed: u64) -> (Vec<u8>, Tensor) {
+    const KINDS: [(GgmlDType, WeightKind); 10] = [
+        (GgmlDType::Q4_0, WeightKind::Q4_0),
+        (GgmlDType::Q4_1, WeightKind::Q4_1),
+        (GgmlDType::Q5_0, WeightKind::Q5_0),
+        (GgmlDType::Q5_1, WeightKind::Q5_1),
+        (GgmlDType::Q8_0, WeightKind::Q8_0),
+        (GgmlDType::Q2K, WeightKind::Q2K),
+        (GgmlDType::Q3K, WeightKind::Q3K),
+        (GgmlDType::Q4K, WeightKind::Q4K),
+        (GgmlDType::Q5K, WeightKind::Q5K),
+        (GgmlDType::Q6K, WeightKind::Q6K),
+    ];
+
+    /// A weight `[n, k]` of `dtype` as the staged handle the kernels read and
+    /// as the dense matrix its blocks decode to.
+    fn weight(
+        md: &candle_core::MetalDevice,
+        dtype: GgmlDType,
+        kind: WeightKind,
+        n: usize,
+        k: usize,
+    ) -> (StagedWeight, Tensor) {
         let cpu = Device::Cpu;
         let w: Vec<f32> = (0..n * k)
             .map(|i| {
-                let h = (i as u64).wrapping_mul(2654435761).wrapping_add(seed) % 97;
+                let h = (i as u64).wrapping_mul(2654435761).wrapping_add(7) % 97;
                 (h as f32 - 48.0) * 0.02
             })
             .collect();
-        let qt =
-            QTensor::quantize(&Tensor::from_vec(w, (n, k), &cpu).unwrap(), GgmlDType::Q2K).unwrap();
+        let qt = QTensor::quantize(&Tensor::from_vec(w, (n, k), &cpu).unwrap(), dtype).unwrap();
         let bytes = qt.data().unwrap().into_owned();
-        (bytes, qt.dequantize(&cpu).unwrap())
+        let staged =
+            StagedWeight::of_kind(md.new_buffer_with_data(&bytes).unwrap(), kind, &[n, k]).unwrap();
+        (staged, qt.dequantize(&cpu).unwrap())
     }
 
-    fn row(t: &Tensor) -> Vec<f32> {
+    /// `m` rows of `k` activations, every row different.
+    fn activations(m: usize, k: usize) -> Tensor {
+        let x: Vec<f32> = (0..m * k)
+            .map(|i| (((i * 7 + (i / k) * 13) % 23) as f32 - 11.0) * 0.05)
+            .collect();
+        Tensor::from_vec(x, (m, k), &Device::Cpu)
+            .unwrap()
+            .to_dtype(DType::BF16)
+            .unwrap()
+    }
+
+    fn values(t: &Tensor) -> Vec<f32> {
         t.to_dtype(DType::F32)
             .unwrap()
             .flatten_all()
@@ -8276,79 +8386,710 @@ mod q2k_matvec_tests {
             .unwrap()
     }
 
-    /// Contract: a single row through a Q2_K weight agrees with the
-    /// dequantized weight on every output, for row counts that are and are
-    /// not multiples of a threadgroup's eight, and gives the same bits on
-    /// every run.
-    ///
-    /// candle's own matvec for this type is launched for twice the rows it
-    /// has, which left a Q2_K model answering NaN to every prompt.
+    fn bits(t: &Tensor) -> Vec<u32> {
+        values(t).iter().map(|v| v.to_bits()).collect()
+    }
+
+    fn worst_relative(expected: &[f32], got: &[f32]) -> f32 {
+        let peak = expected.iter().fold(0f32, |a, v| a.max(v.abs()));
+        expected
+            .iter()
+            .zip(got)
+            .fold(0f32, |a, (e, g)| a.max((e - g).abs()))
+            / peak
+    }
+
+    /// Contract: one row through a weight of every kind agrees with the
+    /// dequantized weight on every output, in BF16 and in F32, for row counts
+    /// that are and are not multiples of a threadgroup's, and gives the same
+    /// bits on every run.
     #[test]
-    fn a_single_row_through_a_q2k_weight_matches_the_dequantized_weight() {
+    fn a_single_row_through_a_weight_of_every_kind_matches_the_dequantized_weight() {
         let Ok(dev) = Device::new_metal(0) else {
             return;
         };
         let Device::Metal(md) = &dev else {
             return;
         };
-        for (n, k) in [(37usize, 512usize), (256, 1536), (8960, 1536)] {
-            let (bytes, dequant) = q2k_weight(n, k, 7);
-            let staged = StagedWeight::of_kind(
-                md.new_buffer_with_data(&bytes).unwrap(),
-                WeightKind::Q2K,
-                &[n, k],
-            )
-            .unwrap();
-            let x: Vec<f32> = (0..k).map(|i| ((i % 23) as f32 - 11.0) * 0.05).collect();
-            let x_bf = Tensor::from_vec(x, (1, k), &Device::Cpu)
-                .unwrap()
-                .to_dtype(DType::BF16)
-                .unwrap();
-            let expected = row(&x_bf
-                .to_dtype(DType::F32)
-                .unwrap()
-                .matmul(&dequant.t().unwrap())
-                .unwrap());
-            let x_dev = x_bf.to_device(&dev).unwrap();
-            let got = row(&maybe_staged_quant_matmul(&x_dev, &staged)
-                .unwrap()
-                .expect("a single Q2_K row is served by the crate's matvec"));
-            let peak = expected.iter().fold(0f32, |a, v| a.max(v.abs()));
-            let worst = expected
-                .iter()
-                .zip(&got)
-                .fold(0f32, |a, (e, g)| a.max((e - g).abs()))
-                / peak;
-            assert!(worst < 0.02, "[{n}x{k}] relative error {worst}");
-            let again = row(&maybe_staged_quant_matmul(&x_dev, &staged).unwrap().unwrap());
-            assert_eq!(got, again, "[{n}x{k}] the matvec must be deterministic");
+        for (dtype, kind) in KINDS {
+            for (n, k) in [(37usize, 512usize), (256, 1536)] {
+                let (staged, dequant) = weight(md, dtype, kind, n, k);
+                let x = activations(1, k);
+                let expected = values(
+                    &x.to_dtype(DType::F32)
+                        .unwrap()
+                        .matmul(&dequant.t().unwrap())
+                        .unwrap(),
+                );
+                let x = x.to_device(&dev).unwrap();
+                for (out_dtype, tolerance) in [(DType::F32, 2e-3), (DType::BF16, 1e-2)] {
+                    let out = maybe_staged_quant_matmul(&x, &staged, out_dtype)
+                        .unwrap()
+                        .expect("a single row is served by the crate's gemv");
+                    assert_eq!(out.dtype(), out_dtype, "{kind:?}");
+                    let got = values(&out);
+                    let worst = worst_relative(&expected, &got);
+                    assert!(
+                        worst < tolerance,
+                        "{kind:?} [{n}x{k}] {out_dtype:?}: relative error {worst}"
+                    );
+                    let again = values(
+                        &maybe_staged_quant_matmul(&x, &staged, out_dtype)
+                            .unwrap()
+                            .unwrap(),
+                    );
+                    assert_eq!(
+                        got, again,
+                        "{kind:?} [{n}x{k}]: the gemv must be deterministic"
+                    );
+                }
+            }
         }
     }
 
-    /// Contract: the takeover is for Q2_K alone; a single row of a kind
-    /// candle serves correctly still goes to candle.
+    /// Contract: a batch of rows gives, row by row, the bits the single-row
+    /// kernel gives, for every kind and every batch size up to the kernels'
+    /// eight, so a token decoded beside others gets the logits it gets alone.
     #[test]
-    fn a_single_row_of_another_kind_still_goes_to_candle() {
+    fn a_batch_of_rows_gives_the_bits_of_the_rows_one_at_a_time() {
         let Ok(dev) = Device::new_metal(0) else {
             return;
         };
         let Device::Metal(md) = &dev else {
             return;
         };
-        let (n, k) = (64usize, 512usize);
-        let w = Tensor::zeros((n, k), DType::F32, &Device::Cpu).unwrap();
-        let bytes = QTensor::quantize(&w, GgmlDType::Q4K)
+        let (n, k) = (70usize, 768usize);
+        let mut differing = Vec::new();
+        for (dtype, kind) in KINDS {
+            let (staged, _) = weight(md, dtype, kind, n, k);
+            for m in [2usize, 5, GGUF_BATCH_MAX] {
+                let x = activations(m, k).to_device(&dev).unwrap();
+                let batched = maybe_staged_quant_matmul(&x, &staged, DType::F32)
+                    .unwrap()
+                    .expect("up to eight rows are served by the crate's gemv");
+                for i in 0..m {
+                    let single =
+                        maybe_staged_quant_matmul(&x.narrow(0, i, 1).unwrap(), &staged, DType::F32)
+                            .unwrap()
+                            .unwrap();
+                    if bits(&batched.narrow(0, i, 1).unwrap()) != bits(&single) {
+                        differing.push(format!("{kind:?} row {i} of {m}"));
+                    }
+                }
+            }
+        }
+        assert!(
+            differing.is_empty(),
+            "rows that differ from the row alone: {differing:?}"
+        );
+    }
+
+    /// Contract: more rows than the batch kernels take go to candle's tiled
+    /// GEMM below the staged GEMM's floor.
+    #[test]
+    fn more_rows_than_the_batch_kernels_take_still_go_to_candle() {
+        let Ok(dev) = Device::new_metal(0) else {
+            return;
+        };
+        let Device::Metal(md) = &dev else {
+            return;
+        };
+        let (staged, _) = weight(md, GgmlDType::Q4K, WeightKind::Q4K, 64, 512);
+        let x = Tensor::zeros((GGUF_BATCH_MAX + 1, 512), DType::BF16, &dev).unwrap();
+        assert!(
+            maybe_staged_quant_matmul(&x, &staged, DType::BF16)
+                .unwrap()
+                .is_none()
+        );
+    }
+}
+
+#[cfg(test)]
+mod row_invariance_tests {
+    use super::*;
+    use candle_core::quantized::{GgmlDType, QMatMul, QTensor};
+    use candle_core::{Device, Module};
+
+    fn activations(m: usize, k: usize, dev: &Device) -> Tensor {
+        let x: Vec<f32> = (0..m * k)
+            .map(|i| (((i * 7 + (i / k) * 13) % 23) as f32 - 11.0) * 0.05)
+            .collect();
+        Tensor::from_vec(x, (m, k), &Device::Cpu)
             .unwrap()
-            .data()
+            .to_dtype(DType::BF16)
             .unwrap()
-            .into_owned();
-        let staged = StagedWeight::of_kind(
-            md.new_buffer_with_data(&bytes).unwrap(),
-            WeightKind::Q4K,
-            &[n, k],
+            .to_device(dev)
+            .unwrap()
+    }
+
+    fn bits(t: &Tensor) -> Vec<u32> {
+        t.to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+            .iter()
+            .map(|v| v.to_bits())
+            .collect()
+    }
+
+    /// Rows of `batched` that differ from the same row computed alone by `one`.
+    fn differing_rows(batched: &Tensor, x: &Tensor, one: impl Fn(&Tensor) -> Tensor) -> Vec<usize> {
+        (0..x.dim(0).unwrap())
+            .filter(|&i| {
+                bits(&batched.narrow(0, i, 1).unwrap()) != bits(&one(&x.narrow(0, i, 1).unwrap()))
+            })
+            .collect()
+    }
+
+    /// Contract: the TensorOps GEMM over a staged quantized weight gives a
+    /// row the same bits whatever rows share the forward, from one row to a
+    /// prefill's worth, which is what lets a prompt prefilled beside others,
+    /// or behind a cached prefix, get the logits it gets alone.
+    #[test]
+    fn the_staged_gemm_gives_a_row_the_same_bits_in_any_batch() {
+        let Ok(dev) = Device::new_metal(0) else {
+            return;
+        };
+        let Device::Metal(md) = &dev else {
+            return;
+        };
+        if !mpp_gemm_available(md.device()) {
+            return;
+        }
+        for (n, k) in [(256usize, 1536usize), (1536, 8960), (8960, 1536)] {
+            let w: Vec<f32> = (0..n * k)
+                .map(|i| (((i as u64).wrapping_mul(2654435761) % 97) as f32 - 48.0) * 0.02)
+                .collect();
+            for dtype in [
+                GgmlDType::Q4_0,
+                GgmlDType::Q8_0,
+                GgmlDType::Q2K,
+                GgmlDType::Q3K,
+                GgmlDType::Q4K,
+                GgmlDType::Q5K,
+                GgmlDType::Q6K,
+            ] {
+                let qt = QTensor::quantize(
+                    &Tensor::from_vec(w.clone(), (n, k), &Device::Cpu).unwrap(),
+                    dtype,
+                )
+                .unwrap();
+                let staged = StagedWeight::new(
+                    md.new_buffer_with_data(&qt.data().unwrap()).unwrap(),
+                    dtype,
+                    &[n, k],
+                )
+                .unwrap();
+                for m in [1usize, 4, 60, 100] {
+                    let x = activations(m, k, &dev);
+                    let batched = mpp_staged_matmul(&x, &staged).unwrap();
+                    let bad = differing_rows(&batched, &x, |row| {
+                        mpp_staged_matmul(row, &staged).unwrap()
+                    });
+                    assert!(
+                        bad.is_empty(),
+                        "{dtype:?} [{n}x{k}] m={m}: rows {bad:?} differ from the row alone"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Contract: the dense TensorOps GEMM gives a row the same bits whatever
+    /// rows share the forward.
+    #[test]
+    fn the_dense_gemm_gives_a_row_the_same_bits_in_any_batch() {
+        let Ok(dev) = Device::new_metal(0) else {
+            return;
+        };
+        let Device::Metal(md) = &dev else {
+            return;
+        };
+        if !mpp_gemm_available(md.device()) {
+            return;
+        }
+        let (n, k) = (256usize, 1536usize);
+        let w = activations(n, k, &dev).t().unwrap().contiguous().unwrap();
+        for m in [1usize, 7, 64, 100] {
+            let x = activations(m, k, &dev);
+            let batched = mpp_matmul(&x, &w).unwrap();
+            let bad = differing_rows(&batched, &x, |row| mpp_matmul(row, &w).unwrap());
+            assert!(
+                bad.is_empty(),
+                "m={m}: rows {bad:?} differ from the row alone"
+            );
+        }
+    }
+
+    /// Contract: candle's BF16 GEMM, which serves dense decode, gives a row
+    /// the same bits whatever rows share the forward, up to the eight rows a
+    /// decode batch holds and beyond, on the shapes of a dense model's
+    /// projections, the vocabulary included.
+    #[test]
+    fn candles_dense_gemm_gives_a_row_the_same_bits_in_any_batch() {
+        let Ok(dev) = Device::new_metal(0) else {
+            return;
+        };
+        for (n, k) in [
+            (256usize, 1536usize),
+            (3072, 1024),
+            (1024, 1024),
+            (6144, 1024),
+            (1024, 3072),
+            (151936, 1024),
+        ] {
+            let w = activations(n, k, &dev).t().unwrap();
+            for m in [2usize, 4, 8, 9, 33] {
+                let x = activations(m, k, &dev);
+                let batched = x.matmul(&w).unwrap();
+                let bad = differing_rows(&batched, &x, |row| row.matmul(&w).unwrap());
+                assert!(
+                    bad.is_empty(),
+                    "[{n}x{k}] m={m}: rows {bad:?} differ from the row alone"
+                );
+            }
+        }
+    }
+
+    /// Contract: candle's quantized tiled GEMM, which serves prefill where
+    /// the TensorOps path is unavailable, gives a row the same bits whatever
+    /// rows share the forward, from two rows up.
+    #[test]
+    fn candles_quantized_gemm_gives_a_row_the_same_bits_in_any_batch() {
+        let Ok(dev) = Device::new_metal(0) else {
+            return;
+        };
+        let (n, k) = (256usize, 1536usize);
+        let w: Vec<f32> = (0..n * k)
+            .map(|i| (((i as u64).wrapping_mul(2654435761) % 97) as f32 - 48.0) * 0.02)
+            .collect();
+        let qt =
+            QTensor::quantize(&Tensor::from_vec(w, (n, k), &dev).unwrap(), GgmlDType::Q4K).unwrap();
+        let qm = QMatMul::from_qtensor(qt).unwrap();
+        let two = activations(2, k, &dev).to_dtype(DType::F32).unwrap();
+        let reference = qm.forward(&two).unwrap();
+        for m in [7usize, 64, 100] {
+            let x = activations(m, k, &dev).to_dtype(DType::F32).unwrap();
+            let batched = qm.forward(&x).unwrap();
+            let bad: Vec<usize> = (0..2)
+                .filter(|&i| {
+                    bits(&batched.narrow(0, i, 1).unwrap())
+                        != bits(&reference.narrow(0, i, 1).unwrap())
+                })
+                .collect();
+            assert!(
+                bad.is_empty(),
+                "m={m}: rows {bad:?} differ from the same rows in a batch of two"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod kernel_inventory_tests {
+    /// Contract: every kernel the quant library compiles is dispatched from
+    /// this module by name, so a kernel that loses its caller is noticed
+    /// rather than compiled for nothing. Twenty-six GGUF kernels once sat
+    /// unreferenced while the path they were written for cast through candle.
+    #[test]
+    fn every_quant_kernel_is_dispatched_from_rust() {
+        let rust = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/common/metal_ops.rs"
+        ))
+        .expect("read this module's source");
+        let mut orphans = Vec::new();
+        for line in super::QUANT_METAL_SOURCE.lines() {
+            let name = if let Some(rest) = line.strip_prefix("kernel void ") {
+                rest.split(|c: char| !c.is_alphanumeric() && c != '_')
+                    .next()
+            } else if line.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+                && line.contains("_KERNEL(")
+                || line.starts_with("GGUF_LEGACY_GEMV_BATCH(")
+            {
+                line.split('(')
+                    .nth(1)
+                    .and_then(|args| args.split(',').next())
+            } else {
+                None
+            };
+            if let Some(name) = name
+                .map(str::trim)
+                .filter(|n| !n.is_empty() && *n != "NAME")
+                && !rust.contains(&format!("\"{name}\""))
+            {
+                orphans.push(name.to_string());
+            }
+        }
+        assert!(
+            orphans.is_empty(),
+            "kernels no Rust code dispatches: {orphans:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod decode_op_invariance_tests {
+    use super::*;
+    use candle_core::Device;
+
+    fn rows(m: usize, k: usize, dev: &Device) -> Tensor {
+        let x: Vec<f32> = (0..m * k)
+            .map(|i| (((i * 7 + (i / k) * 13) % 23) as f32 - 11.0) * 0.05)
+            .collect();
+        Tensor::from_vec(x, (m, k), &Device::Cpu)
+            .unwrap()
+            .to_dtype(DType::BF16)
+            .unwrap()
+            .to_device(dev)
+            .unwrap()
+    }
+
+    fn bits(t: &Tensor) -> Vec<u32> {
+        t.to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+            .iter()
+            .map(|v| v.to_bits())
+            .collect()
+    }
+
+    /// Contract: the fused rotary embedding, the fused gated activation and
+    /// the decode attention kernel give a token the same bits whatever tokens
+    /// share the tensor.
+    #[test]
+    fn the_fused_rope_activation_and_decode_attention_are_the_same_in_any_batch() {
+        let Ok(dev) = Device::new_metal(0) else {
+            return;
+        };
+        let (heads, d, inter) = (12usize, 128usize, 1536usize);
+        let cos = rows(64, d / 2, &dev);
+        let sin = rows(64, d / 2, &dev).affine(0.5, 0.1).unwrap();
+        for m in [2usize, 4, 8] {
+            let x = rows(m, heads * d, &dev)
+                .reshape((1, m, heads, d))
+                .unwrap()
+                .transpose(1, 2)
+                .unwrap()
+                .contiguous()
+                .unwrap();
+            let positions =
+                Tensor::from_vec((10..10 + m as u32).collect::<Vec<_>>(), m, &dev).unwrap();
+            let batched = rope_fused(
+                &x,
+                &cos.index_select(&positions, 0)
+                    .unwrap()
+                    .contiguous()
+                    .unwrap(),
+                &sin.index_select(&positions, 0)
+                    .unwrap()
+                    .contiguous()
+                    .unwrap(),
+            )
+            .unwrap();
+            for i in 0..m {
+                let one = rope_fused(
+                    &x.narrow(2, i, 1).unwrap().contiguous().unwrap(),
+                    &cos.index_select(&positions.narrow(0, i, 1).unwrap(), 0)
+                        .unwrap()
+                        .contiguous()
+                        .unwrap(),
+                    &sin.index_select(&positions.narrow(0, i, 1).unwrap(), 0)
+                        .unwrap()
+                        .contiguous()
+                        .unwrap(),
+                )
+                .unwrap();
+                assert_eq!(
+                    bits(&batched.narrow(2, i, 1).unwrap()),
+                    bits(&one),
+                    "rope token {i} of {m}"
+                );
+            }
+
+            let packed = rows(m, 2 * inter, &dev);
+            let batched = gated_silu_fused(&packed, inter).unwrap();
+            for i in 0..m {
+                let one = gated_silu_fused(
+                    &packed.narrow(0, i, 1).unwrap().contiguous().unwrap(),
+                    inter,
+                )
+                .unwrap();
+                assert_eq!(
+                    bits(&batched.narrow(0, i, 1).unwrap()),
+                    bits(&one),
+                    "silu row {i} of {m}"
+                );
+            }
+            let (gate, up) = (
+                rows(m, inter, &dev),
+                rows(m, inter, &dev).affine(0.7, 0.2).unwrap(),
+            );
+            let batched = silu_mul_fused(&gate, &up).unwrap();
+            for i in 0..m {
+                let one = silu_mul_fused(
+                    &gate.narrow(0, i, 1).unwrap().contiguous().unwrap(),
+                    &up.narrow(0, i, 1).unwrap().contiguous().unwrap(),
+                )
+                .unwrap();
+                assert_eq!(
+                    bits(&batched.narrow(0, i, 1).unwrap()),
+                    bits(&one),
+                    "silu_mul row {i} of {m}"
+                );
+            }
+        }
+
+        let kv_len = 300;
+        let q_all = rows(4, heads * d, &dev)
+            .reshape((1, 4, heads, d))
+            .unwrap()
+            .transpose(1, 2)
+            .unwrap()
+            .contiguous()
+            .unwrap();
+        let k = rows(kv_len, 2 * d, &dev)
+            .reshape((1, kv_len, 2, d))
+            .unwrap()
+            .transpose(1, 2)
+            .unwrap()
+            .contiguous()
+            .unwrap();
+        let v = rows(kv_len, 2 * d, &dev)
+            .affine(0.9, 0.05)
+            .unwrap()
+            .reshape((1, kv_len, 2, d))
+            .unwrap()
+            .transpose(1, 2)
+            .unwrap()
+            .contiguous()
+            .unwrap();
+        if !sdpa_available(&q_all, d) {
+            return;
+        }
+        let reference = sdpa(
+            &q_all.narrow(2, 0, 1).unwrap().contiguous().unwrap(),
+            &k,
+            &v,
+            None,
+            false,
+            0.088,
+            1.0,
         )
         .unwrap();
-        let x = Tensor::zeros((1, k), DType::BF16, &dev).unwrap();
-        assert!(maybe_staged_quant_matmul(&x, &staged).unwrap().is_none());
+        for i in 1..4 {
+            let again = sdpa(
+                &q_all.narrow(2, 0, 1).unwrap().contiguous().unwrap(),
+                &k,
+                &v,
+                None,
+                false,
+                0.088,
+                1.0,
+            )
+            .unwrap();
+            assert_eq!(
+                bits(&reference),
+                bits(&again),
+                "decode attention run {i} is not deterministic"
+            );
+        }
+    }
+
+    /// Contract: the fused RMSNorm gives a row the same bits whatever rows
+    /// share the tensor, in the two and the four-dimensional layouts the
+    /// models hand it.
+    #[test]
+    fn the_fused_rms_norm_gives_a_row_the_same_bits_in_any_batch() {
+        let Ok(dev) = Device::new_metal(0) else {
+            return;
+        };
+        let k = 1536;
+        let w = rows(1, k, &dev).squeeze(0).unwrap();
+        for m in [2usize, 4, 8] {
+            let x = rows(m, k, &dev);
+            let batched = rms_norm_fused(&x, &w, 1e-6).unwrap();
+            for i in 0..m {
+                let one =
+                    rms_norm_fused(&x.narrow(0, i, 1).unwrap().contiguous().unwrap(), &w, 1e-6)
+                        .unwrap();
+                assert_eq!(
+                    bits(&batched.narrow(0, i, 1).unwrap()),
+                    bits(&one),
+                    "row {i} of {m}"
+                );
+            }
+            let x4 = x.reshape((1, m, 12, k / 12)).unwrap().contiguous().unwrap();
+            let w4 = rows(1, k / 12, &dev).squeeze(0).unwrap();
+            let batched4 = rms_norm_fused(&x4, &w4, 1e-6).unwrap();
+            for i in 0..m {
+                let one = rms_norm_fused(
+                    &x4.narrow(1, i, 1).unwrap().contiguous().unwrap(),
+                    &w4,
+                    1e-6,
+                )
+                .unwrap();
+                assert_eq!(
+                    bits(&batched4.narrow(1, i, 1).unwrap()),
+                    bits(&one),
+                    "head row {i} of {m}"
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod owned_matvec_instantiation_tests {
+    use super::*;
+    use candle_core::Device;
+
+    /// Contract: the single-row and the batch instantiation of the owned
+    /// matvec give a row the same bits, on weights the size of a model's,
+    /// which holds only while the library compiles without fast math.
+    #[test]
+    fn the_single_row_and_batch_instantiations_agree_bit_for_bit() {
+        let Ok(dev) = Device::new_metal(0) else {
+            return;
+        };
+        let Device::Metal(md) = &dev else {
+            return;
+        };
+        let mut report = Vec::new();
+        for (n, k) in [(8960usize, 1536usize), (1536, 8960)] {
+            for kind in [WeightKind::Iq4Xs, WeightKind::Iq4Nl, WeightKind::Iq3S] {
+                let bytes = super::owned_weights::synthetic(kind, n, k, 11);
+                let staged =
+                    StagedWeight::of_kind(md.new_buffer_with_data(&bytes).unwrap(), kind, &[n, k])
+                        .unwrap();
+                for seed in 0..3u64 {
+                    let x: Vec<f32> = (0..4 * k)
+                        .map(|i| {
+                            ((((i as u64) * 2654435761 + seed * 97) % 211) as f32 - 105.0) * 0.011
+                        })
+                        .collect();
+                    let x = Tensor::from_vec(x, (4, k), &dev)
+                        .unwrap()
+                        .to_dtype(DType::BF16)
+                        .unwrap();
+                    let batched = mpp_owned_matmul(&x, &staged).unwrap();
+                    for i in 0..4 {
+                        let single = mpp_owned_matmul(
+                            &x.narrow(0, i, 1).unwrap().contiguous().unwrap(),
+                            &staged,
+                        )
+                        .unwrap();
+                        let a: Vec<f32> = batched
+                            .narrow(0, i, 1)
+                            .unwrap()
+                            .to_dtype(DType::F32)
+                            .unwrap()
+                            .flatten_all()
+                            .unwrap()
+                            .to_vec1()
+                            .unwrap();
+                        let b: Vec<f32> = single
+                            .to_dtype(DType::F32)
+                            .unwrap()
+                            .flatten_all()
+                            .unwrap()
+                            .to_vec1()
+                            .unwrap();
+                        let diff = a
+                            .iter()
+                            .zip(&b)
+                            .filter(|(x, y)| x.to_bits() != y.to_bits())
+                            .count();
+                        if diff > 0 {
+                            report.push(format!(
+                                "{kind:?} [{n}x{k}] seed {seed} row {i}: {diff} of {n} differ"
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(report.is_empty(), "{report:?}");
+    }
+}
+
+#[cfg(test)]
+mod packed_quant_instantiation_tests {
+    use super::*;
+    use candle_core::Device;
+
+    /// Contract: the single-row and the batch W4A16 kernels give a row the
+    /// same bits, on the shapes of a model's projections, so an AWQ token
+    /// decoded in a batch gets the logits it gets alone; holds while the
+    /// library compiles without fast math.
+    #[test]
+    fn awq_single_row_and_batch_kernels_agree_bit_for_bit() {
+        let Ok(dev) = Device::new_metal(0) else {
+            return;
+        };
+        let mut report = Vec::new();
+        for (in_features, out_features, group) in [
+            (256usize, 128usize, 64usize),
+            (2048, 1024, 128),
+            (1536, 8960, 128),
+        ] {
+            let raw = super::fused_kernel_parity_tests::build_awq_triplet(
+                &dev,
+                DType::BF16,
+                in_features,
+                out_features,
+                group,
+            );
+            for seed in 0..3u64 {
+                let x: Vec<f32> = (0..4 * in_features)
+                    .map(|i| ((((i as u64) * 2654435761 + seed * 97) % 211) as f32 - 105.0) * 0.011)
+                    .collect();
+                let x = Tensor::from_vec(x, (4, in_features), &dev)
+                    .unwrap()
+                    .to_dtype(DType::BF16)
+                    .unwrap();
+                let qz = raw.qzeros.as_ref().unwrap();
+                let batched = w4a16_matmul(&x, &raw.qweight, qz, &raw.scales).unwrap();
+                for i in 0..4 {
+                    let single = w4a16_matmul(
+                        &x.narrow(0, i, 1).unwrap().contiguous().unwrap(),
+                        &raw.qweight,
+                        qz,
+                        &raw.scales,
+                    )
+                    .unwrap();
+                    let a: Vec<f32> = batched
+                        .narrow(0, i, 1)
+                        .unwrap()
+                        .to_dtype(DType::F32)
+                        .unwrap()
+                        .flatten_all()
+                        .unwrap()
+                        .to_vec1()
+                        .unwrap();
+                    let b: Vec<f32> = single
+                        .to_dtype(DType::F32)
+                        .unwrap()
+                        .flatten_all()
+                        .unwrap()
+                        .to_vec1()
+                        .unwrap();
+                    let diff = a
+                        .iter()
+                        .zip(&b)
+                        .filter(|(x, y)| x.to_bits() != y.to_bits())
+                        .count();
+                    if diff > 0 {
+                        report.push(format!("[{in_features}->{out_features}] seed {seed} row {i}: {diff} of {out_features} differ"));
+                    }
+                }
+            }
+        }
+        assert!(report.is_empty(), "{report:?}");
     }
 }

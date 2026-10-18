@@ -76,6 +76,7 @@ pub mod moe;
 pub mod mxfp4;
 pub mod norm;
 pub mod paged;
+pub mod phase;
 pub mod prefix_cache;
 pub mod profile;
 pub mod rope;

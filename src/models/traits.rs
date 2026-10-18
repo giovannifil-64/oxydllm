@@ -2,6 +2,13 @@ use crate::common::paged::{PagedKvCache, SharedBlockAllocator};
 use candle_core::{Device, Result, Tensor};
 
 pub trait BatchModel {
+    /// The model as the shared transformer, for the tests that look inside
+    /// a forward layer by layer.
+    #[cfg(test)]
+    fn as_standard(&self) -> Option<&crate::models::gguf_model::StandardTransformer> {
+        None
+    }
+
     fn forward_batch(
         &self,
         token_ids: &Tensor,

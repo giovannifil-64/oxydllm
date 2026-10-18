@@ -14,6 +14,12 @@
 //
 // NB: no `const` on a/b, the TensorOps dispatch matches value types without
 // stripping cv-qualifiers, so `const bfloat` falls through to a static_assert.
+// Reassociation is off so that two instantiations of one source, one row and
+// a batch, reduce in the same order and give a row the same bits; the rest of
+// fast math, contraction into fused multiply-adds included, stays for speed.
+#pragma METAL fp contract(fast)
+#pragma clang fp reassociate(off)
+
 
 #include <metal_stdlib>
 #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>

@@ -339,7 +339,9 @@ impl QLinear {
         #[cfg(feature = "metal")]
         if let Some(staged) = &self.staged {
             let x_2d = x.reshape((batch_flat, in_features))?;
-            if let Some(out) = super::metal_ops::maybe_staged_quant_matmul(&x_2d, staged)? {
+            if let Some(out) =
+                super::metal_ops::maybe_staged_quant_matmul(&x_2d, staged, self.out_dtype)?
+            {
                 return self.finish(out, &original_dims);
             }
         }

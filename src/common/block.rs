@@ -700,3 +700,174 @@ pub fn flush_caches(seq_caches: &mut [&mut [PagedKvCache]]) -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod decode_batch_bisection {
+    use super::*;
+    use crate::common::phase::{Phase, with_phase};
+    use candle_core::{DType, Device};
+    use std::sync::Arc;
+
+    /// Contract: a sequence decoded in a batch gets, after every layer, the
+    /// bits it gets decoded alone. Reads a local file and needs Metal, hence
+    /// ignored by default; on a failure it names the first layer that
+    /// differs.
+    #[test]
+    #[ignore]
+    fn a_decode_batch_gives_each_sequence_the_bits_it_gets_alone() {
+        let home = std::env::var("HOME").unwrap();
+        let path = std::env::var("OXYDLLM_BISECT_GGUF").unwrap_or(format!(
+            "{home}/.oxydllm/models/Qwen/Qwen2.5-1.5B-Instruct-GGUF/qwen2.5-1.5b-instruct-q4_k_m.gguf"
+        ));
+        if !std::path::Path::new(&path).exists() {
+            eprintln!("skipped: {path} is not on disk");
+            return;
+        }
+        let device = Device::new_metal(0).expect("a Metal device");
+        let loaded;
+        let gguf;
+        let model = if std::path::Path::new(&path).is_dir() {
+            let budget = Arc::new(crate::common::paged::GlobalKvBudget::new(8 << 30));
+            loaded = crate::models::loader::load_batch_model(
+                &path,
+                "bisect",
+                &device,
+                crate::models::loader::LoadBatchOptions {
+                    max_context_len: Some(512),
+                    max_num_sequences: 8,
+                    kv_budget: &budget,
+                    kv_quant: crate::common::kv_quant::KvQuantMode::Off,
+                    qjl_quantization: false,
+                    expert_stream_mb: None,
+                    memory_budget_bytes: None,
+                },
+            )
+            .expect("model");
+            loaded.model.as_standard().expect("a shared transformer")
+        } else {
+            gguf = crate::common::gguf_weights::GgufWeights::load(&path, &device).expect("gguf");
+            &*Box::leak(Box::new(
+                crate::models::gguf_model::StandardTransformer::load_gguf(
+                    &gguf,
+                    &device,
+                    DType::BF16,
+                    64,
+                    None,
+                    512,
+                )
+                .expect("model"),
+            ))
+        };
+        let layers = model.blocks.len();
+        let prompt: Vec<u32> = (0..20u32).map(|i| 1000 + i * 37).collect();
+        let mut seqs: Vec<Vec<PagedKvCache>> = (0..5)
+            .map(|_| {
+                (0..layers)
+                    .map(|l| PagedKvCache::new(Arc::clone(&model.allocators[l])))
+                    .collect()
+            })
+            .collect();
+        let ids = Tensor::from_vec(prompt.clone(), (1, prompt.len()), &device).unwrap();
+        let pos = Tensor::from_vec((0..20u32).collect::<Vec<_>>(), 20, &device).unwrap();
+        for caches in seqs.iter_mut() {
+            caches.iter_mut().for_each(|c| c.set_pool_writes(true));
+            with_phase(Phase::Prefill, || {
+                crate::models::traits::BatchModel::forward_batch_last(
+                    model,
+                    &ids,
+                    &pos,
+                    &mut [caches.as_mut_slice()],
+                    &[20],
+                )
+            })
+            .unwrap();
+            flush_caches(&mut [caches.as_mut_slice()]).unwrap();
+            caches.iter_mut().for_each(|c| c.set_pool_writes(false));
+        }
+
+        let stages =
+            |caches: &mut [&mut [PagedKvCache]], counts: &[usize]| -> Vec<(String, Tensor)> {
+                let n: usize = counts.iter().sum();
+                let ids = Tensor::from_vec(vec![2000u32; n], (1, n), &device).unwrap();
+                let positions = Tensor::from_vec(vec![20u32; n], n, &device).unwrap();
+                let mut out = Vec::new();
+                let mut x = model.embed_tokens.forward(&ids).unwrap();
+                out.push(("embed".to_string(), x.clone()));
+                for (l, block) in model.blocks.iter().enumerate() {
+                    let normed = block.input_norm.forward(&x).unwrap();
+                    out.push((format!("layer {l} input_norm"), normed.clone()));
+                    let mut segments: Vec<SegmentInfo> = caches
+                        .iter_mut()
+                        .enumerate()
+                        .map(|(s, c)| SegmentInfo {
+                            num_tokens: counts[s],
+                            cache: &mut c[l],
+                            reuse_cache: false,
+                        })
+                        .collect();
+                    let attn = block
+                        .attention
+                        .forward_batch(&normed, &model.ropes[l], &positions, None, &mut segments)
+                        .unwrap();
+                    out.push((format!("layer {l} attention"), attn.clone()));
+                    x = (x + attn).unwrap();
+                    let normed = block.ffn_norm.forward(&x).unwrap();
+                    out.push((format!("layer {l} ffn_norm"), normed.clone()));
+                    let staged = match &block.ffn {
+                        FeedForwardLayer::Dense(ffn) => ffn.forward_stages(&normed),
+                        FeedForwardLayer::Moe(_) => Err(candle_core::Error::Msg("moe".into())),
+                    };
+                    let ffn = match staged {
+                        Ok(stages) => {
+                            let last = stages.last().unwrap().1.clone();
+                            for (name, t) in stages {
+                                out.push((format!("layer {l} ffn {name}"), t));
+                            }
+                            last
+                        }
+                        Err(_) => block.ffn.forward(&normed).unwrap(),
+                    };
+                    out.push((format!("layer {l} ffn"), ffn.clone()));
+                    x = (x + ffn).unwrap();
+                    out.push((format!("layer {l} out"), x.clone()));
+                }
+                let x = model.norm.forward(&x).unwrap();
+                out.push(("logits".to_string(), model.lm_head.forward(&x).unwrap()));
+                out
+            };
+        let (s0, rest) = seqs.split_at_mut(1);
+        let alone = with_phase(Phase::Decode, || stages(&mut [s0[0].as_mut_slice()], &[1]));
+        let mut batch: Vec<&mut [PagedKvCache]> =
+            rest.iter_mut().map(|c| c.as_mut_slice()).collect();
+        let batched = with_phase(Phase::Decode, || stages(&mut batch, &[1, 1, 1, 1]));
+
+        let values = |t: &Tensor| -> Vec<f32> {
+            t.to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1()
+                .unwrap()
+        };
+        let mut report = Vec::new();
+        for ((name, a), (_, b)) in alone.iter().zip(&batched) {
+            let a = values(a);
+            let width = a.len();
+            let b = values(b);
+            for row in 0..4 {
+                let bb = &b[row * width..(row + 1) * width];
+                let maxd = a
+                    .iter()
+                    .zip(bb)
+                    .fold(0f32, |m, (x, y)| m.max((x - y).abs()));
+                if maxd > 0.0 {
+                    report.push(format!("{name}: row {row} max|d|={maxd:.3e}"));
+                }
+            }
+            if !report.is_empty() {
+                break;
+            }
+        }
+        assert!(report.is_empty(), "first stage that differs: {report:?}");
+    }
+}

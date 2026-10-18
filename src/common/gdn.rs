@@ -260,6 +260,12 @@ fn recurrent_delta_step(
 
 /// Chunked parallel scan. q,k: [h, t, dk]; v: [h, t, dv]; g,beta: [h, t];
 /// all F32, raw (pre-l2norm). Returns ([h, t, dv], final state [h, dk, dv]).
+/// Whether the forward in flight is a prefill, whose single-token pieces
+/// take the prefill arithmetic rather than the decode step's.
+fn prefill_in_flight() -> bool {
+    super::phase::current() == Some(super::phase::Phase::Prefill)
+}
+
 fn chunk_gated_delta_rule(
     q: &Tensor,
     k: &Tensor,
@@ -582,6 +588,7 @@ impl GatedDeltaNet {
 
         if let Some(window) = prev_window
             && t == 1
+            && !prefill_in_flight()
         {
             let window = Tensor::cat(&[window, qkv], 1)?; // [1, k, c]
             let out = window
@@ -698,10 +705,13 @@ impl GatedDeltaNet {
         // cut it into, and the pieces after the first carry the state the ones
         // before them left. The single-token step is the same recurrence with
         // the chunked scan's bookkeeping stripped out, so it stays the decode
-        // path; every other length goes to the scan, which takes that state as
-        // the value it starts from.
+        // path; every other length, and a prefill's last token on its own, goes
+        // to the scan, which takes that state as the value it starts from, so a
+        // prompt gets the same bits behind a cached prefix as cold.
         let (core, new_s) = match state.as_ref() {
-            Some(st) if t == 1 => recurrent_delta_step(&q, &k, &v, g, beta, &st.s)?,
+            Some(st) if t == 1 && !prefill_in_flight() => {
+                recurrent_delta_step(&q, &k, &v, g, beta, &st.s)?
+            }
             carried => {
                 chunk_gated_delta_rule(&q, &k, &v, g, beta, carried.map(|st| &st.s), CHUNK_SIZE)?
             }

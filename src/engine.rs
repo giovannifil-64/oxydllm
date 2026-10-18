@@ -22,6 +22,7 @@ use candle_core::{Device, Result, Tensor};
 
 use crate::common::block::flush_caches;
 use crate::common::paged::{DEFAULT_BLOCK_SIZE, PagedKvCache, SharedBlockAllocator};
+use crate::common::phase::{self, Phase};
 use crate::common::prefix_cache::PrefixCache;
 use crate::models::traits::BatchModel;
 use crate::sampling::{self, SamplingParams};
@@ -281,13 +282,15 @@ impl PrefillPacer {
 }
 
 /// One forward's worth of a batch: which sequences it carries, how many tokens
-/// of each, and which of them end here and so contribute a logits row.
+/// of each, which of them end here and so contribute a logits row, and the
+/// phase the forward runs in.
 #[derive(Debug, PartialEq, Eq)]
 struct ForwardChunk {
     start: usize,
     counts: Vec<usize>,
     seq_base: usize,
     finished: Vec<usize>,
+    phase: Phase,
 }
 
 impl ForwardChunk {
@@ -303,18 +306,23 @@ impl ForwardChunk {
 /// only the next request's. Sequences keep their order and may span chunks: a
 /// prompt longer than the cap is carried across several forwards, which is
 /// what bounds the work in any one of them, and a sequence contributes its
-/// logits row in the chunk where its last token lands.
+/// logits row in the chunk where its last token lands. The prefill sequences
+/// come first and the decode sequences from `split_at` on, and no chunk holds
+/// both: a forward is either a prefill or a decode step, since the kernels
+/// are chosen by that phase (see [`crate::common::phase`]).
 struct ChunkPlanner<'a> {
     counts: &'a [usize],
+    split_at: usize,
     seq: usize,
     done_in_seq: usize,
     start: usize,
 }
 
 impl<'a> ChunkPlanner<'a> {
-    fn new(counts: &'a [usize]) -> Self {
+    fn new(counts: &'a [usize], split_at: usize) -> Self {
         Self {
             counts,
+            split_at,
             seq: 0,
             done_in_seq: 0,
             start: 0,
@@ -327,11 +335,19 @@ impl<'a> ChunkPlanner<'a> {
         }
         let seq_base = self.seq;
         let start = self.start;
+        let phase = if seq_base < self.split_at {
+            Phase::Prefill
+        } else {
+            Phase::Decode
+        };
         let mut counts: Vec<usize> = Vec::new();
         let mut finished: Vec<usize> = Vec::new();
         let mut room = cap.max(1);
 
         while self.seq < self.counts.len() && room > 0 {
+            if self.seq == self.split_at && !counts.is_empty() {
+                break;
+            }
             let take = (self.counts[self.seq] - self.done_in_seq).min(room);
             counts.push(take);
             room -= take;
@@ -349,16 +365,17 @@ impl<'a> ChunkPlanner<'a> {
             counts,
             seq_base,
             finished,
+            phase,
         })
     }
 }
 
-/// Every chunk a batch is split into at a fixed cap. The engine drives the
-/// planner directly, asking for a fresh cap per chunk; this is how the tests
-/// look at a whole plan at once.
+/// Every chunk a batch of prefills is split into at a fixed cap. The engine
+/// drives the planner directly, asking for a fresh cap per chunk; this is
+/// how the tests look at a whole plan at once.
 #[cfg(test)]
 fn plan_forward_chunks(token_counts: &[usize], cap: usize) -> Vec<ForwardChunk> {
-    let mut planner = ChunkPlanner::new(token_counts);
+    let mut planner = ChunkPlanner::new(token_counts, token_counts.len());
     std::iter::from_fn(|| planner.next(cap)).collect()
 }
 
@@ -554,7 +571,7 @@ fn run_forward_pass(
     let combined_result: Result<Tensor> = (|| {
         let mut rows: Vec<Tensor> = Vec::with_capacity(token_counts.len());
 
-        let mut planner = ChunkPlanner::new(&token_counts);
+        let mut planner = ChunkPlanner::new(&token_counts, prefill_ids.len());
         while let Some(chunk) = planner.next(pacer.cap()) {
             let len = chunk.len();
             let input = Tensor::from_vec(
@@ -570,7 +587,9 @@ fn run_forward_pass(
             let caches = &mut cache_slices[chunk.seq_base..chunk.seq_base + chunk.counts.len()];
 
             let started = Instant::now();
-            let out = match model.forward_batch_last(&input, &positions, caches, &chunk.counts) {
+            let out = match phase::with_phase(chunk.phase, || {
+                model.forward_batch_last(&input, &positions, caches, &chunk.counts)
+            }) {
                 Ok(out) => out,
                 Err(e) => {
                     if pacer.shrink() {
@@ -753,7 +772,9 @@ fn greedy_forward(
     let input = Tensor::from_vec(tokens.to_vec(), (1, t), device)?;
     let pos = Tensor::from_vec(positions.to_vec(), (t,), device)?;
     let mut slices: Vec<&mut [PagedKvCache]> = vec![caches];
-    let logits = model.forward_batch(&input, &pos, &mut slices, &[t])?;
+    let logits = phase::with_phase(Phase::Decode, || {
+        model.forward_batch(&input, &pos, &mut slices, &[t])
+    })?;
     let argmax = logits.squeeze(0)?.argmax(candle_core::D::Minus1)?;
     argmax.to_vec1::<u32>()
 }
@@ -1170,6 +1191,29 @@ mod tests {
             "the sequence ends only once"
         );
         assert_eq!(chunks[3].finished, vec![0]);
+    }
+
+    /// Contract: prefill and decode sequences never share a forward, however
+    /// much room the cap leaves, and each chunk states its phase, so the
+    /// kernels a token reaches do not depend on what else the step carries.
+    #[test]
+    fn prefill_and_decode_never_share_a_forward() {
+        let counts = [100usize, 60, 1, 1, 1];
+        let mut planner = ChunkPlanner::new(&counts, 2);
+        let chunks: Vec<ForwardChunk> = std::iter::from_fn(|| planner.next(256)).collect();
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].counts, vec![100, 60]);
+        assert_eq!(chunks[0].phase, Phase::Prefill);
+        assert_eq!(chunks[1].counts, vec![1, 1, 1]);
+        assert_eq!((chunks[1].start, chunks[1].seq_base), (160, 2));
+        assert_eq!(chunks[1].phase, Phase::Decode);
+        assert_eq!(chunks[1].finished, vec![0, 1, 2]);
+
+        let decode_only = [1usize; 3];
+        let mut planner = ChunkPlanner::new(&decode_only, 0);
+        let chunks: Vec<ForwardChunk> = std::iter::from_fn(|| planner.next(256)).collect();
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].phase, Phase::Decode);
     }
 
     /// Contract: sequences that fit share a forward, so batching survives the
@@ -1721,8 +1765,12 @@ mod tests {
         );
     }
 
+    /// Contract: a step that holds a prefill and a decode serves both, each
+    /// in a forward of its own, since the kernels are chosen by the phase of
+    /// the forward and a token must get the same bits whatever else the step
+    /// carries.
     #[test]
-    fn step_mixes_prefill_and_decode_in_same_step() {
+    fn step_serves_prefill_and_decode_in_one_step_as_two_forwards() {
         let allocators = make_allocators(1, 8);
         let forced_token = 5;
         let (model, forward_calls) = FakeModel::new(vec![1], forced_token, allocators);
@@ -1739,8 +1787,8 @@ mod tests {
         let out = engine.step().unwrap();
         assert_eq!(
             forward_calls.load(Ordering::Relaxed),
-            2,
-            "mixed prefill+decode must be batched into one forward call"
+            3,
+            "a prefill and a decode step share no forward"
         );
         assert_eq!(out.new_tokens.len(), 2);
         let ids: Vec<u64> = out.new_tokens.iter().map(|t| t.seq_id).collect();

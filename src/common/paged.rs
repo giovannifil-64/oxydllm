@@ -239,6 +239,20 @@ fn available_memory_bytes() -> Option<usize> {
 /// while older idle models kept their memory. Making room is what an operator
 /// expects, and it is the same share of physical memory the per-model ceiling
 /// is measured against, so the two agree by construction.
+/// Memory the forward pass needs beside the weights and the KV: activations,
+/// the F32 logits, and the buffers the Metal allocator keeps between the
+/// shapes a prefill runs through. Twelve percent of the device's working set,
+/// a gigabyte at least: Qwen3.8-27B Q4_K_M at 15.3 GB of weights ran out of
+/// device memory on a 2.3k-token prefill with a gigabyte to spare, while
+/// Mistral-Small-24B at 13.3 GB served the whole battery with 2.7.
+pub fn forward_headroom_bytes() -> usize {
+    let floor = 1usize << 30;
+    match device_working_set_bytes() {
+        Some(working_set) => floor.max(working_set / 100 * 12),
+        None => floor,
+    }
+}
+
 pub fn safe_total_commitment_bytes() -> usize {
     if let Some(budget) = device_working_set_bytes() {
         return budget;

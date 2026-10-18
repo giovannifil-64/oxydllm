@@ -1744,9 +1744,9 @@ impl std::fmt::Display for KvBudgetExhausted {
         write!(
             f,
             "KV cache budget exhausted: the pool needs {:.2} GB at least but only {:.2} GB \
-             are available. Unload other models, or start the server with \
-             --memory-budget <MB> to size the global KV pool independently of the free \
-             memory at startup.",
+             are available. Unload other models, use a smaller quantization of this one, or \
+             start the server with --memory-budget <MB> to size the global KV pool \
+             independently of the free memory at startup.",
             self.needed_bytes as f64 / 1_073_741_824.0,
             self.available_bytes as f64 / 1_073_741_824.0,
         )
@@ -1754,6 +1754,19 @@ impl std::fmt::Display for KvBudgetExhausted {
 }
 
 impl std::error::Error for KvBudgetExhausted {}
+
+/// What of the memory left beside the weights the pool may take. A running
+/// sequence holds its KV twice, in the pool's blocks and in the contiguous
+/// copy the kernels read, so the pool may fill at most half of what remains
+/// once the forward pass has its headroom. Sized to the whole remainder,
+/// Qwen3.8-27B Q4_K_M at 15.3 GB and Mistral-Small-24B Q4_K_M at 13.3 GB
+/// loaded, answered short prompts, and died in Metal's "Insufficient Memory"
+/// on a 2.3k-token prefill, every request in flight aborted with them; with
+/// a gigabyte of headroom the 27B still died there, so the headroom follows
+/// the device's working set.
+fn pool_ceiling(beside_weights: usize, headroom: usize) -> usize {
+    beside_weights.saturating_sub(headroom) / 2
+}
 
 /// The pool a model got, and the context that pool can actually serve.
 struct KvPlan {
@@ -1780,12 +1793,15 @@ fn compute_kv_blocks(p: &KvBlockParams, kv_budget: &GlobalKvBudget) -> anyhow::R
     // the memory allows.
     let min_blocks: usize = 256;
 
-    let ceiling = crate::common::paged::safe_model_kv_ceiling(p.weights_bytes)
-        .min(p.retry_cap.unwrap_or(usize::MAX))
-        .min(
-            p.memory_budget_bytes
-                .map_or(usize::MAX, |budget| budget.saturating_sub(p.weights_bytes)),
-        );
+    let ceiling = pool_ceiling(
+        crate::common::paged::safe_model_kv_ceiling(p.weights_bytes),
+        crate::common::paged::forward_headroom_bytes(),
+    )
+    .min(p.retry_cap.unwrap_or(usize::MAX))
+    .min(
+        p.memory_budget_bytes
+            .map_or(usize::MAX, |budget| budget.saturating_sub(p.weights_bytes)),
+    );
     let mode = resolve_kv_quant(p);
     let per_block_bytes = kv_bytes_per_block(p, mode);
 
@@ -2112,6 +2128,19 @@ mod kv_quant_decision_tests {
             .contig_budget_limit_for_tests();
         assert_eq!(limit, reserved / 8);
         assert!(limit > 0);
+    }
+
+    /// Contract: the pool takes at most half of what is left beside the
+    /// weights after the forward pass's headroom, since a running sequence
+    /// holds its KV twice, and nothing when nothing is left.
+    #[test]
+    fn the_pool_takes_half_of_what_remains_after_the_headroom() {
+        let headroom = 1 << 30;
+        assert_eq!(pool_ceiling(5 << 30, headroom), 2 << 30);
+        assert_eq!(pool_ceiling(1 << 30, headroom), 0);
+        assert_eq!(pool_ceiling(0, headroom), 0);
+        assert_eq!(pool_ceiling(headroom + (3 << 30), headroom), (3 << 30) / 2);
+        assert!(crate::common::paged::forward_headroom_bytes() >= headroom);
     }
 
     /// Contract: a budget that cannot hold the floor fails with the typed

@@ -79,11 +79,14 @@ pub enum HeaderVerdict {
     /// Every tensor is in a quantization the engine decodes.
     Loadable {
         architecture: Option<String>,
+        /// The file's `{arch}.expert_count`, where it states one.
+        experts: Option<u32>,
         composition: Composition,
     },
     /// At least one tensor is not, with a count per offending type.
     Unreadable {
         architecture: Option<String>,
+        experts: Option<u32>,
         offenders: BTreeMap<String, usize>,
         composition: Composition,
     },
@@ -102,22 +105,49 @@ impl HeaderVerdict {
         }
     }
 
-    /// A message naming what cannot be decoded and what to do instead, or
-    /// `None` when there is nothing to warn about.
+    /// A message naming why the file cannot be served and what to do instead,
+    /// or `None` when there is nothing to warn about: a quantization the
+    /// engine cannot decode, an architecture it does not know, or experts,
+    /// which the GGUF runtime does not serve. Qwen3-30B-A3B was downloaded
+    /// whole, 13.8 GB, to be refused at load.
     pub fn refusal(&self) -> Option<String> {
-        let Self::Unreadable { offenders, .. } = self else {
-            return None;
+        let (architecture, experts) = match self {
+            Self::Unreadable { offenders, .. } => {
+                let list = offenders
+                    .iter()
+                    .map(|(k, n)| format!("{k} ({n})"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Some(format!(
+                    "this file stores tensors in quantizations the engine cannot decode: {list}. \
+                     The same label from a publisher that quantizes uniformly, or a variant \
+                     without a UD, AD or IQ marker in its name, will usually load"
+                ));
+            }
+            Self::Loadable {
+                architecture,
+                experts,
+                ..
+            } => (architecture, experts),
+            Self::Unknown => return None,
         };
-        let list = offenders
-            .iter()
-            .map(|(k, n)| format!("{k} ({n})"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        Some(format!(
-            "this file stores tensors in quantizations the engine cannot decode: {list}. \
-             The same label from a publisher that quantizes uniformly, or a variant \
-             without a UD, AD or IQ marker in its name, will usually load"
-        ))
+        if let Some(arch) = architecture
+            && crate::models::arch_defaults::arch_defaults(arch).is_none()
+        {
+            return Some(format!(
+                "its architecture, '{arch}', is not one this build serves"
+            ));
+        }
+        if let Some(n) = experts
+            && *n > 0
+        {
+            return Some(format!(
+                "it is a mixture of {n} experts, and the GGUF runtime serves dense models \
+                 only; a safetensors checkpoint of the same model is served, with its \
+                 experts resident or streamed"
+            ));
+        }
+        None
     }
 }
 
@@ -185,6 +215,7 @@ pub fn inspect_header(bytes: &[u8]) -> HeaderVerdict {
     };
 
     let mut architecture = None;
+    let mut experts = None;
     for _ in 0..n_kv {
         let (Some(key), Some(tag)) = (c.string(), c.u32()) else {
             return HeaderVerdict::Unknown;
@@ -192,6 +223,11 @@ pub fn inspect_header(bytes: &[u8]) -> HeaderVerdict {
         if key == "general.architecture" && tag == 8 {
             match c.string() {
                 Some(v) => architecture = Some(v),
+                None => return HeaderVerdict::Unknown,
+            }
+        } else if key.ends_with(".expert_count") && tag == 4 {
+            match c.u32() {
+                Some(v) => experts = Some(v),
                 None => return HeaderVerdict::Unknown,
             }
         } else if c.skip_value(tag).is_none() {
@@ -225,11 +261,13 @@ pub fn inspect_header(bytes: &[u8]) -> HeaderVerdict {
     if offenders.is_empty() {
         HeaderVerdict::Loadable {
             architecture,
+            experts,
             composition,
         }
     } else {
         HeaderVerdict::Unreadable {
             architecture,
+            experts,
             offenders,
             composition,
         }
@@ -278,20 +316,30 @@ mod tests {
     }
 
     fn header_named(tensors: &[(String, u32)]) -> Vec<u8> {
+        header_of("qwen35", None, tensors)
+    }
+
+    fn header_of(arch: &str, experts: Option<u32>, tensors: &[(String, u32)]) -> Vec<u8> {
         let tensor_types: Vec<u32> = tensors.iter().map(|(_, t)| *t).collect();
         let mut b = Vec::new();
         b.extend_from_slice(b"GGUF");
         b.extend_from_slice(&3u32.to_le_bytes());
         b.extend_from_slice(&(tensor_types.len() as u64).to_le_bytes());
-        b.extend_from_slice(&1u64.to_le_bytes());
+        b.extend_from_slice(&(1 + u64::from(experts.is_some())).to_le_bytes());
 
         let key = b"general.architecture";
         b.extend_from_slice(&(key.len() as u64).to_le_bytes());
         b.extend_from_slice(key);
         b.extend_from_slice(&8u32.to_le_bytes());
-        let val = b"qwen35";
-        b.extend_from_slice(&(val.len() as u64).to_le_bytes());
-        b.extend_from_slice(val);
+        b.extend_from_slice(&(arch.len() as u64).to_le_bytes());
+        b.extend_from_slice(arch.as_bytes());
+        if let Some(n) = experts {
+            let key = format!("{arch}.expert_count");
+            b.extend_from_slice(&(key.len() as u64).to_le_bytes());
+            b.extend_from_slice(key.as_bytes());
+            b.extend_from_slice(&4u32.to_le_bytes());
+            b.extend_from_slice(&n.to_le_bytes());
+        }
 
         for (i, t) in tensor_types.iter().enumerate() {
             let name = tensors[i].0.clone();
@@ -454,6 +502,7 @@ mod tests {
         let HeaderVerdict::Loadable {
             architecture,
             composition,
+            ..
         } = &v
         else {
             panic!("plain K-quants must load, got {v:?}");
@@ -490,6 +539,28 @@ mod tests {
             Some("5 tensors: IQ3_S 1, IQ4_NL 1, IQ4_XS 1, Q4_K 1, Q6_K 1")
         );
         assert!(v.refusal().is_none());
+    }
+
+    /// Contract: a file the runtime cannot serve is refused from its header,
+    /// before the download: an architecture this build does not know, and a
+    /// mixture of experts, which the GGUF runtime does not serve; a dense file
+    /// of a known architecture that states zero experts is not.
+    #[test]
+    fn an_unserved_architecture_or_a_mixture_is_refused_from_the_header() {
+        let plain: Vec<(String, u32)> = vec![("blk.0.weight".to_string(), 12)];
+        let moe = inspect_header(&header_of("qwen3moe", Some(128), &plain));
+        assert!(matches!(moe, HeaderVerdict::Loadable { .. }), "{moe:?}");
+        let msg = moe.refusal().expect("refused");
+        assert!(msg.contains("qwen3moe"), "{msg}");
+
+        let unknown = inspect_header(&header_of("mamba2", None, &plain));
+        assert!(unknown.refusal().expect("refused").contains("mamba2"));
+
+        let known_moe = inspect_header(&header_of("llama", Some(8), &plain));
+        assert!(known_moe.refusal().expect("refused").contains("8 experts"));
+
+        let dense = inspect_header(&header_of("llama", Some(0), &plain));
+        assert!(dense.refusal().is_none());
     }
 
     /// Contract: the refusal names every offending quantization with its count,

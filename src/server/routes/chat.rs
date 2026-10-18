@@ -245,12 +245,59 @@ fn strip_json_fences(s: &str) -> &str {
     inner.unwrap_or(s)
 }
 
-/// Generates a unique `call_` id for a synthesized tool call.
+/// Generates a unique id for a synthesized tool call: nine alphanumeric
+/// characters, the one shape every template accepts, since Mistral's refuse
+/// any other length when the call comes back in the next turn.
 fn make_tool_call_id() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("call_{:012x}", seq)
+    format!("call{:05x}", seq % 0x10_0000)
+}
+
+/// The id as a template that insists on nine alphanumeric characters sees
+/// it: kept when it already is one, otherwise a stable nine-character hash,
+/// so a call and its result keep pointing at each other.
+fn nine_char_id(id: &str) -> String {
+    if id.len() == 9 && id.bytes().all(|b| b.is_ascii_alphanumeric()) {
+        return id.to_string();
+    }
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    id.hash(&mut hasher);
+    let mut n = hasher.finish();
+    let digits = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    (0..9)
+        .map(|_| {
+            let d = digits[(n % 36) as usize] as char;
+            n /= 36;
+            d
+        })
+        .collect()
+}
+
+/// Messages whose tool-call ids satisfy a template that checks their length,
+/// as Mistral's do with `tool_call.id|length != 9`; other templates get the
+/// messages as they came.
+fn messages_for_template<'a>(
+    template: &str,
+    messages: &'a [ChatMessage],
+) -> std::borrow::Cow<'a, [ChatMessage]> {
+    if !template.contains("|length != 9") {
+        return std::borrow::Cow::Borrowed(messages);
+    }
+    let mut out = messages.to_vec();
+    for m in &mut out {
+        if let Some(calls) = &mut m.tool_calls {
+            for c in calls {
+                c.id = nine_char_id(&c.id);
+            }
+        }
+        if let Some(id) = &m.tool_call_id {
+            m.tool_call_id = Some(nine_char_id(id));
+        }
+    }
+    std::borrow::Cow::Owned(out)
 }
 
 /// Checks the OpenAI function-name rule: 1 to 64 characters, each ASCII
@@ -1471,6 +1518,8 @@ pub fn apply_chat_template(
         return Ok(chat_template::format_plain_chat(messages));
     };
 
+    let messages = messages_for_template(template, messages);
+    let messages: &[ChatMessage] = &messages;
     let try_render = |msgs: &[ChatMessage], t: Option<serde_json::Value>| {
         chat_template::apply_chat_template(
             template,
@@ -1494,11 +1543,27 @@ pub fn apply_chat_template(
 
             if without_system.len() < messages.len() {
                 let msgs_ref: Vec<ChatMessage> = without_system.into_iter().cloned().collect();
-                if let Ok(prompt) = try_render(&msgs_ref, tools) {
+                if let Ok(prompt) = try_render(&msgs_ref, tools.clone()) {
                     tracing::warn!(
                         "system role not supported by this model template; retrying without system message"
                     );
                     return Ok(prompt);
+                }
+            }
+
+            if let Some(folded) = fold_tool_turns(messages) {
+                let without_system: Vec<ChatMessage> = folded
+                    .iter()
+                    .filter(|m| m.role != "system")
+                    .cloned()
+                    .collect();
+                for candidate in [&folded, &without_system] {
+                    if let Ok(prompt) = try_render(candidate, None) {
+                        tracing::warn!(
+                            "tool turns not supported by this model template; retrying with them folded into user and assistant text"
+                        );
+                        return Ok(prompt);
+                    }
                 }
             }
 
@@ -1508,9 +1573,64 @@ pub fn apply_chat_template(
     }
 }
 
+/// The conversation as a template that knows only user and assistant turns
+/// can take it: an assistant's calls become its text, a tool result becomes
+/// a user turn naming the call, and consecutive turns of one role merge so
+/// the roles still alternate. `None` when there is nothing to fold. The
+/// Mistral 7B v0.3 GGUF ships the plain `[INST]` template and refused the
+/// `tool` role of a round trip outright.
+fn fold_tool_turns(messages: &[ChatMessage]) -> Option<Vec<ChatMessage>> {
+    if !messages
+        .iter()
+        .any(|m| m.role == "tool" || m.tool_calls.is_some())
+    {
+        return None;
+    }
+    let mut out: Vec<ChatMessage> = Vec::with_capacity(messages.len());
+    for m in messages {
+        let (role, text) = match m.role.as_str() {
+            "tool" => (
+                "user",
+                format!(
+                    "Result of tool call {}: {}",
+                    m.tool_call_id.as_deref().unwrap_or("?"),
+                    m.content.as_deref().unwrap_or("")
+                ),
+            ),
+            "assistant" if m.tool_calls.is_some() => {
+                let calls = serde_json::to_string(&m.tool_calls).unwrap_or_default();
+                (
+                    "assistant",
+                    match m.content.as_deref() {
+                        Some(c) if !c.is_empty() => format!("{c}\n{calls}"),
+                        _ => calls,
+                    },
+                )
+            }
+            role => (role, m.content.clone().unwrap_or_default()),
+        };
+        match out.last_mut() {
+            Some(last) if last.role == role => {
+                let joined = format!("{}\n{}", last.content.as_deref().unwrap_or(""), text);
+                last.content = Some(joined);
+            }
+            _ => out.push(ChatMessage {
+                role: role.to_string(),
+                content: Some(text),
+                reasoning_content: None,
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+            }),
+        }
+    }
+    Some(out)
+}
+
 /// Whether the rendered prompt ends with an opened thinking block, which
-/// the templates that end in `<think>` and gemma-4's after a tool result do,
-/// so the reply starts with reasoning before any marker.
+/// the templates that end in `<think>` (DeepSeek-R1 distills, whatever the
+/// request asked) and gemma-4's after a tool result do, so the reply starts
+/// with reasoning before any marker.
 fn prompt_opens_thinking(prompt: &str) -> bool {
     let prompt = prompt.trim_end();
     prompt.ends_with("<think>") || prompt.ends_with("<|channel>thought")
@@ -2110,7 +2230,7 @@ pub(super) async fn chat_completions(
                 model_id: model_id.clone(),
                 enqueued_at: std::time::Instant::now(),
                 enable_thinking,
-                thinking_open: enable_thinking && prompt_opens_thinking(&prompt),
+                thinking_open: prompt_opens_thinking(&prompt),
                 extra_stop_token_ids: extra_stop_token_ids.clone(),
                 json_mode,
                 parent_span: http_span.clone(),
@@ -3248,6 +3368,78 @@ mod tests {
         let text = value.to_string();
         assert!(!text.contains("null"), "{text}");
         assert!(text.contains(r#""strict":true"#), "a given field stays");
+    }
+
+    /// Contract: a template that refuses tool-call ids of any length but nine,
+    /// as Mistral's do, renders a round trip whose ids came from the client in
+    /// another shape, with the call and its result still matching; the ids the
+    /// server makes already have that shape.
+    #[test]
+    fn mistral_s_nine_character_ids_are_satisfied_for_any_client_id() {
+        let template = "{% for m in messages %}{% if m.tool_calls %}{% for c in m.tool_calls %}\
+            {% if not c.id is defined or c.id|length != 9 %}{{ raise_exception(\"Tool call IDs should be alphanumeric strings with length 9!\") }}{% endif %}\
+            call:{{ c.id }} {% endfor %}{% endif %}{% if m.role == 'tool' %}result:{{ m.tool_call_id }} {% endif %}{% endfor %}";
+        let messages: Vec<ChatMessage> = serde_json::from_value(json!([
+            {"role": "assistant", "content": null, "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "f", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "call_1", "content": "ok"}
+        ]))
+        .expect("messages");
+        let (tokenizer, _tmp) = tokenizer_with_template(template);
+        let rendered =
+            apply_chat_template(&tokenizer, &messages, false, None, None).expect("render");
+        let id = rendered
+            .split("call:")
+            .nth(1)
+            .unwrap()
+            .split(' ')
+            .next()
+            .unwrap();
+        assert_eq!(id.len(), 9, "{rendered}");
+        assert!(rendered.contains(&format!("result:{id} ")), "{rendered}");
+        assert_eq!(make_tool_call_id().len(), 9);
+        assert_eq!(
+            nine_char_id("abcdefghi"),
+            "abcdefghi",
+            "a fitting id is kept"
+        );
+    }
+
+    /// Contract: a template that knows only alternating user and assistant
+    /// turns still renders a tool round trip, with the call and its result
+    /// folded into text and the roles alternating.
+    #[test]
+    fn a_tool_round_trip_renders_on_a_template_without_tool_turns() {
+        let template = "{% for m in messages %}{% if (m.role == 'user') != (loop.index0 % 2 == 0) %}\
+            {{ raise_exception('Conversation roles must alternate user/assistant/user/assistant/...') }}{% endif %}\
+            {% if m.role == 'user' %}[INST] {{ m.content }} [/INST]{% else %}{{ m.content }}</s>{% endif %}{% endfor %}";
+        let messages: Vec<ChatMessage> = serde_json::from_value(json!([
+            {"role": "user", "content": "weather in Rome?"},
+            {"role": "assistant", "content": null, "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "get_weather", "arguments": "{\"city\": \"Rome\"}"}}]},
+            {"role": "tool", "tool_call_id": "c1", "content": "{\"temp_c\": 21}"}
+        ]))
+        .expect("messages");
+        let (tokenizer, _tmp) = tokenizer_with_template(template);
+        let rendered =
+            apply_chat_template(&tokenizer, &messages, false, None, None).expect("render");
+        assert!(rendered.contains("get_weather"), "{rendered}");
+        assert!(
+            rendered.contains("[INST] Result of tool call c1: {\"temp_c\": 21} [/INST]"),
+            "{rendered}"
+        );
+        assert!(fold_tool_turns(&messages[..1]).is_none(), "nothing to fold");
+        let mut with_system = vec![ChatMessage {
+            role: "system".to_string(),
+            content: Some("tools follow".to_string()),
+            reasoning_content: None,
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        }];
+        with_system.extend(messages.iter().cloned());
+        assert!(
+            apply_chat_template(&tokenizer, &with_system, false, None, None).is_ok(),
+            "the system turn the tool instruction adds goes too"
+        );
     }
 
     #[test]

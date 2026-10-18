@@ -383,7 +383,7 @@ fn enqueue_request(
         return;
     }
     let constraint = match (req.json_mode, byte_table) {
-        (Some(spec), Some(table)) if !req.enable_thinking && !harmony => {
+        (Some(spec), Some(table)) if !req.enable_thinking && !req.thinking_open && !harmony => {
             Some(crate::constrain::JsonConstraint::new(
                 std::sync::Arc::clone(table),
                 spec.mode,
@@ -654,6 +654,9 @@ pub fn engine_loop(
                                         }
                                         continue;
                                     }
+                                }
+                                if tracker.in_thinking && !tracker.wants_reasoning {
+                                    continue;
                                 }
                                 tracker.in_thinking
                             };
@@ -1031,6 +1034,7 @@ mod metrics_loop_tests {
             request_model_id,
             prompt_tokens,
             max_tokens,
+            false,
         )
     }
 
@@ -1040,7 +1044,7 @@ mod metrics_loop_tests {
         prompt_tokens: Vec<u32>,
         max_tokens: usize,
     ) -> Vec<EngineEvent> {
-        drive_one_request_with_ids(stub, tok, "m", "m", prompt_tokens, max_tokens)
+        drive_one_request_with_ids(stub, tok, "m", "m", prompt_tokens, max_tokens, false)
     }
 
     fn drive_one_request_with_ids(
@@ -1050,6 +1054,7 @@ mod metrics_loop_tests {
         request_model_id: &str,
         prompt_tokens: Vec<u32>,
         max_tokens: usize,
+        enable_thinking: bool,
     ) -> Vec<EngineEvent> {
         let engine = Engine::new_with_stop_controls(
             Box::new(stub),
@@ -1072,7 +1077,7 @@ mod metrics_loop_tests {
             response_tx: resp_tx,
             model_id: request_model_id.to_string(),
             enqueued_at: std::time::Instant::now(),
-            enable_thinking: false,
+            enable_thinking,
             thinking_open: false,
             extra_stop_token_ids: vec![],
             json_mode: None,
@@ -1217,21 +1222,37 @@ mod metrics_loop_tests {
     }
 
     /// Contract: a thinking block the model opens although thinking is off
-    /// goes to `reasoning_content`, markers stripped, instead of leaking into
-    /// the content, as gemma-4 did after a tool result.
+    /// never reaches the content, and is dropped from the reply as the
+    /// harmony analysis is; asked for, it comes back as reasoning, markers
+    /// stripped.
     #[test]
-    fn a_thinking_block_with_thinking_off_is_routed_to_reasoning() {
-        let events = drive_one_request(StubModel::scripted(vec![2, 1, 3, 4]), "m", "m", vec![1], 4);
-        let (mut content, mut reasoning) = (String::new(), String::new());
-        for event in events {
-            match event {
-                EngineEvent::Token { text, .. } => content.push_str(&text),
-                EngineEvent::ReasoningToken(text) => reasoning.push_str(&text),
-                _ => {}
+    fn a_thinking_block_is_dropped_or_returned_as_reasoning_as_asked() {
+        let (tok, _tmp) = make_tokenizer();
+        for (wants, want_reasoning) in [(false, ""), (true, "a")] {
+            let events = drive_one_request_with_ids(
+                StubModel::scripted(vec![2, 1, 3, 4]),
+                Arc::clone(&tok),
+                "m",
+                "m",
+                vec![1],
+                4,
+                wants,
+            );
+            let (mut content, mut reasoning) = (String::new(), String::new());
+            for event in events {
+                match event {
+                    EngineEvent::Token { text, .. } => content.push_str(&text),
+                    EngineEvent::ReasoningToken(text) => reasoning.push_str(&text),
+                    _ => {}
+                }
             }
+            assert_eq!(
+                reasoning.trim(),
+                want_reasoning,
+                "thinking requested: {wants}"
+            );
+            assert_eq!(content.trim(), "b", "thinking requested: {wants}");
         }
-        assert_eq!(reasoning.trim(), "a");
-        assert_eq!(content.trim(), "b");
     }
 
     fn counter_value(name: &str, labels: &[(&str, &str)]) -> Option<f64> {

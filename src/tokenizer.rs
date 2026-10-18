@@ -364,12 +364,16 @@ impl Tokenizer {
     }
 
     /// Whether the model can be asked to reason: its template takes
-    /// `enable_thinking`, or it speaks harmony, where the analysis channel is
-    /// the reasoning and `enable_thinking` decides whether the reply carries it.
+    /// `enable_thinking` or opens a `<think>` block itself, its vocabulary
+    /// has the `<think>` token to open one with, as the DeepSeek-R1 distills
+    /// do on every turn, or it speaks harmony, where the analysis channel is
+    /// the reasoning; `enable_thinking` then decides whether the reply
+    /// carries what the model reasoned.
     pub fn has_thinking_support(&self) -> bool {
         self.chat_template
             .as_deref()
-            .is_some_and(|t| t.contains("enable_thinking"))
+            .is_some_and(|t| t.contains("enable_thinking") || t.contains("<think>"))
+            || self.special_token_id("<think>").is_some()
             || self.speaks_harmony()
     }
 
@@ -1202,12 +1206,21 @@ mod tests {
             harmony.has_thinking_support(),
             "the analysis channel is reasoning on request"
         );
+        assert!(
+            build_test_tokenizer(Some("{{ messages }}<think>\n"), None).has_thinking_support(),
+            "a template that opens the block itself"
+        );
+        assert!(
+            tokenizer_with(&["<|endoftext|>", "<think>"]).has_thinking_support(),
+            "a vocabulary with the token to open one"
+        );
 
         let phi = tokenizer_with(&["<|endoftext|>", "<|end|>"]);
         assert!(
             phi.stop_token_ids()
                 .contains(&phi.special_token_id("<|end|>").unwrap())
         );
+        assert!(!phi.has_thinking_support(), "nothing of the three");
     }
 
     fn build_test_tokenizer(chat_template: Option<&str>, eos_token: Option<&str>) -> Tokenizer {

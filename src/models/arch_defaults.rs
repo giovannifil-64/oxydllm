@@ -50,6 +50,19 @@ pub struct ArchDefaults {
     pub extra_eos_ids: &'static [u32],
     pub default_sliding_window: Option<usize>,
     pub alternating_sliding_window: bool,
+    /// Every `period`-th layer attends to everything and the rest to the
+    /// window, which Gemma 3 states in its config as `sliding_window_pattern`
+    /// and its GGUF files state nowhere.
+    pub sliding_window_period: Option<usize>,
+    /// The RoPE base of the windowed layers when the checkpoint names only
+    /// the full layers' one: Gemma 3 rotates its local layers on 10,000.
+    pub sliding_rope_theta: Option<f64>,
+    /// The GGUF converter stores this family's norm weights with the Gemma
+    /// offset already added, `1 + w` where the safetensors hold `w`, so a GGUF
+    /// file takes [`NormType::Standard`] whatever the family's norm type is;
+    /// adding the one again scaled every norm wrong and gemma-3 answered
+    /// garbage from its GGUF files.
+    pub gguf_norm_offset_baked: bool,
     pub gpt_oss_moe: bool,
     pub attn_output_gate: bool,
     pub gguf_qk_permuted: bool,
@@ -114,6 +127,9 @@ impl Default for ArchDefaults {
             default_sliding_window: None,
             gpt_oss_moe: false,
             alternating_sliding_window: false,
+            sliding_window_period: None,
+            sliding_rope_theta: None,
+            gguf_norm_offset_baked: false,
             attn_output_gate: false,
             gguf_qk_permuted: false,
         }
@@ -138,6 +154,9 @@ pub fn llama_defaults() -> ArchDefaults {
         extra_eos_ids: &[128009, 128008],
         default_sliding_window: None,
         alternating_sliding_window: false,
+        sliding_window_period: None,
+        sliding_rope_theta: None,
+        gguf_norm_offset_baked: false,
         gpt_oss_moe: false,
         attn_output_gate: false,
         gguf_qk_permuted: false,
@@ -282,12 +301,14 @@ pub fn arch_defaults(arch: &str) -> Option<ArchDefaults> {
         }),
 
         "gemma" | "GemmaForCausalLM" => Some(ArchDefaults {
+            gguf_norm_offset_baked: true,
             activation: Activation::GeLUTanh,
             norm_type: NormType::Gemma,
             embed_scale_from_hidden: true,
             ..Default::default()
         }),
         "gemma2" | "gemma-2" | "Gemma2ForCausalLM" => Some(ArchDefaults {
+            gguf_norm_offset_baked: true,
             activation: Activation::GeLUTanh,
             norm_type: NormType::Gemma,
             has_ffn_norms: true,
@@ -299,12 +320,15 @@ pub fn arch_defaults(arch: &str) -> Option<ArchDefaults> {
             ..Default::default()
         }),
         "gemma3" | "gemma-3" | "Gemma3ForCausalLM" => Some(ArchDefaults {
+            gguf_norm_offset_baked: true,
             activation: Activation::GeLUTanh,
             norm_type: NormType::Gemma,
             qk_norm: true,
             has_ffn_norms: true,
             embed_scale_from_hidden: true,
             extra_eos_ids: &[1, 106],
+            sliding_window_period: Some(6),
+            sliding_rope_theta: Some(10_000.0),
             ..Default::default()
         }),
         "gemma4"

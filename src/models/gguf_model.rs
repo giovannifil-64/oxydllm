@@ -193,6 +193,49 @@ pub(crate) fn build_per_layer_geometry(
     Some(g)
 }
 
+/// What a file leaves unsaid and the architecture states: Gemma 3's GGUF
+/// files carry the window and the full layers' base and neither which layers
+/// use the window nor the local base, which llama.cpp keeps in code (every
+/// sixth layer full, 10,000 for the rest); without them every layer attended
+/// through the window on the full base and the model answered garbage.
+pub(crate) fn fill_from_architecture(
+    mut src: PerLayerSource,
+    num_layers: usize,
+    arch: &str,
+) -> PerLayerSource {
+    let Some(def) = crate::models::arch_defaults::arch_defaults(arch) else {
+        return src;
+    };
+    if src.pattern.is_none()
+        && src.window.is_some()
+        && let Some(period) = def.sliding_window_period
+    {
+        src.pattern = Some(
+            (0..num_layers)
+                .map(|i| !(i + 1).is_multiple_of(period))
+                .collect(),
+        );
+    }
+    if src.swa_rope_theta <= 0.0
+        && let Some(theta) = def.sliding_rope_theta
+    {
+        src.swa_rope_theta = theta;
+    }
+    src
+}
+
+/// The norm a GGUF file's weights want: the family's, unless the converter
+/// already folded the Gemma offset into them.
+fn gguf_norm_type(
+    arch_def: &crate::models::arch_defaults::ArchDefaults,
+) -> crate::common::config::NormType {
+    if arch_def.gguf_norm_offset_baked {
+        crate::common::config::NormType::Standard
+    } else {
+        arch_def.norm_type
+    }
+}
+
 /// Reads [`PerLayerSource`] from `{arch}.*` and expands it.
 fn parse_per_layer_geometry(
     gguf: &GgufWeights,
@@ -227,6 +270,7 @@ fn parse_per_layer_geometry(
         swa_rotary_dim: gguf.metadata_u32_or(&format!("{prefix}.rope.dimension_count_swa"), 0)
             as usize,
     };
+    let src = fill_from_architecture(src, num_layers, prefix);
     let g = build_per_layer_geometry(&src, num_layers, head_dim)?;
     tracing::info!(
         layers = num_layers,
@@ -403,7 +447,7 @@ impl StandardTransformer {
             .ok_or_else(|| anyhow::anyhow!("Architecture '{arch}' not supported"))?;
 
         let activation = arch_def.activation;
-        let norm_type = arch_def.norm_type;
+        let norm_type = gguf_norm_type(&arch_def);
         let logit_softcap = arch_def.logit_softcap;
         let attn_softcap = arch_def.attn_softcap;
         let has_ffn_norms = arch_def.has_ffn_norms;
@@ -606,6 +650,15 @@ impl StandardTransformer {
             None => None,
         };
 
+        let stated_scaling = match gguf
+            .metadata_string(&format!("{prefix}.rope.scaling.type"))
+            .as_deref()
+        {
+            Ok("linear") => RopeScaling::Linear {
+                factor: gguf.metadata_f32_or(&format!("{prefix}.rope.scaling.factor"), 1.0) as f64,
+            },
+            _ => RopeScaling::None,
+        };
         let (distinct, per_layer_table) = rope_sharing_plan(&geometries);
         let mut tables = Vec::with_capacity(distinct.len());
         for (idx, &(dim, theta)) in distinct.iter().enumerate() {
@@ -618,7 +671,7 @@ impl StandardTransformer {
                 {
                     RopeScaling::FrequencyFactors(f.clone())
                 }
-                _ => RopeScaling::None,
+                _ => crate::common::rope::scaling_for_theta(theta, rope_theta, &stated_scaling),
             };
             tables.push(
                 RotaryEmbedding::new_with_scaling(
@@ -770,6 +823,76 @@ impl BatchModel for StandardTransformer {
 #[cfg(test)]
 mod per_layer_geometry_tests {
     use super::*;
+
+    /// Contract: a Gemma GGUF takes its norm weights as stored, since the
+    /// converter already added the one the safetensors path adds, while a
+    /// family without that habit keeps its norm type.
+    #[test]
+    fn gemma_gguf_norms_are_taken_as_stored() {
+        use crate::common::config::NormType;
+        use crate::models::arch_defaults::arch_defaults;
+        assert_eq!(
+            gguf_norm_type(&arch_defaults("gemma3").unwrap()),
+            NormType::Standard
+        );
+        assert_eq!(
+            gguf_norm_type(&arch_defaults("gemma2").unwrap()),
+            NormType::Standard
+        );
+        assert_eq!(
+            gguf_norm_type(&arch_defaults("gemma4").unwrap()),
+            NormType::Standard
+        );
+        assert_eq!(arch_defaults("gemma3").unwrap().norm_type, NormType::Gemma);
+        assert_eq!(
+            gguf_norm_type(&arch_defaults("llama").unwrap()),
+            NormType::Standard
+        );
+    }
+
+    /// Contract: a Gemma 3 file that states only the window and the full
+    /// layers' base gets every sixth layer full, the rest on the window with
+    /// the local base, as llama.cpp reads it; a file that states its pattern
+    /// keeps it.
+    #[test]
+    fn gemma_3_s_file_gets_its_pattern_and_local_base_from_the_architecture() {
+        let src = PerLayerSource {
+            pattern: None,
+            kv_heads: None,
+            window: Some(1024),
+            uniform_kv: Some(8),
+            full_key_length: 256,
+            swa_key_length: 0,
+            full_rope_theta: 1_000_000.0,
+            swa_rope_theta: 0.0,
+            full_rotary_dim: 0,
+            swa_rotary_dim: 0,
+        };
+        let g = build_per_layer_geometry(&fill_from_architecture(src, 12, "gemma3"), 12, 256)
+            .expect("a geometry");
+        let full: Vec<usize> = (0..12)
+            .filter(|&i| g.sliding_windows[i].is_none())
+            .collect();
+        assert_eq!(full, vec![5, 11]);
+        assert_eq!(g.rope_thetas[0], 10_000.0);
+        assert_eq!(g.rope_thetas[5], 1_000_000.0);
+        assert_eq!(g.sliding_windows[0], Some(1024));
+
+        let stated = PerLayerSource {
+            pattern: Some(vec![true, false]),
+            kv_heads: None,
+            window: Some(512),
+            uniform_kv: Some(8),
+            full_key_length: 256,
+            swa_key_length: 0,
+            full_rope_theta: 1_000_000.0,
+            swa_rope_theta: 0.0,
+            full_rotary_dim: 0,
+            swa_rotary_dim: 0,
+        };
+        let kept = fill_from_architecture(stated, 2, "gemma3");
+        assert_eq!(kept.pattern, Some(vec![true, false]));
+    }
 
     /// Contract: the projection to the vocabulary yields F32 logits from the
     /// model's BF16 activations, so the sampler never meets BF16 ties.

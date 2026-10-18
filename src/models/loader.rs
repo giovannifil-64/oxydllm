@@ -1367,7 +1367,11 @@ fn load_standard_safetensors(
                     per_layer_rotary_dims[i],
                     ctx,
                     per_layer_rope_thetas[i],
-                    cfg.rope_scaling.clone(),
+                    crate::common::rope::scaling_for_theta(
+                        per_layer_rope_thetas[i],
+                        cfg.rope_theta,
+                        &cfg.rope_scaling,
+                    ),
                     dtype,
                     device,
                 )

@@ -72,6 +72,23 @@ pub struct RotaryEmbedding {
     sin: Tensor,
 }
 
+/// The scaling a layer rotates with: the checkpoint's, when the layer rotates
+/// on the base the scaling was stated for, and none when it has a base of its
+/// own. Gemma 3 scales its full layers' 1M base by eight and leaves its local
+/// layers on an unscaled 10,000; a local layer scaled by eight rotates far too
+/// slowly to tell the positions in its window apart.
+pub fn scaling_for_theta(
+    layer_theta: f64,
+    global_theta: f64,
+    scaling: &RopeScaling,
+) -> RopeScaling {
+    if layer_theta.to_bits() == global_theta.to_bits() {
+        scaling.clone()
+    } else {
+        RopeScaling::None
+    }
+}
+
 impl RotaryEmbedding {
     /// Builds an unscaled rotary embedding: shorthand for
     /// [`new_with_scaling`](Self::new_with_scaling) with [`RopeScaling::None`].
@@ -320,6 +337,21 @@ impl RotaryEmbedding {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Contract: a checkpoint's scaling follows the base it was stated for
+    /// and leaves a layer with a base of its own unscaled.
+    #[test]
+    fn scaling_follows_the_global_base_only() {
+        let linear = RopeScaling::Linear { factor: 8.0 };
+        assert!(matches!(
+            scaling_for_theta(1_000_000.0, 1_000_000.0, &linear),
+            RopeScaling::Linear { factor } if factor == 8.0
+        ));
+        assert!(matches!(
+            scaling_for_theta(10_000.0, 1_000_000.0, &linear),
+            RopeScaling::None
+        ));
+    }
 
     /// Contract: a frequency divisor from the checkpoint freezes the dimensions
     /// it is large for, and leaves the others turning as they were.

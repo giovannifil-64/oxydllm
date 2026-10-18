@@ -581,7 +581,8 @@ fn print_accuracy_line(quant: &str) {
 }
 
 /// The quantization label carried by a GGUF filename, e.g. `Q4_K_M` from
-/// `Qwen3.8-27B-UD-Q4_K_M.gguf`.
+/// `Qwen3.8-27B-UD-Q4_K_M.gguf` and `Q4_K_M-FP16` from
+/// `gemma-2-9b-it-Q4_K_M-fp16.gguf`.
 ///
 /// Reads the label from the name's structure rather than matching a list of
 /// known ones, because publishers keep inventing suffixes: unsloth's dynamic
@@ -589,7 +590,8 @@ fn print_accuracy_line(quant: &str) {
 /// truncates `Q6_K_XL` to `Q6_K`, which then collides with the real `Q6_K` and
 /// with `Q6_K_M` in the same repository. A label is the last dash-separated
 /// segment that opens like a quantization (`Q4`, `IQ2`, `BF16`, `F16`, `F32`),
-/// taken whole, so an unfamiliar suffix survives instead of being cut off.
+/// taken whole, with a precision the publisher appends after it kept as part
+/// of the label, so an unfamiliar suffix survives instead of being cut off.
 pub fn extract_quant_from_filename(filename: &str) -> Option<String> {
     let stem = filename
         .rsplit('/')
@@ -598,9 +600,30 @@ pub fn extract_quant_from_filename(filename: &str) -> Option<String> {
         .strip_suffix(".gguf")
         .unwrap_or(filename);
 
-    stem.split(['-', '.'])
-        .rfind(|seg| is_quant_segment(seg))
+    let segments: Vec<&str> = stem.split(['-', '.']).collect();
+    let start = segments
+        .iter()
+        .rposition(|seg| is_quant_segment(seg) && !is_precision_segment(seg))
+        .or_else(|| segments.iter().rposition(|seg| is_quant_segment(seg)))?;
+    // A precision the publisher appends after the label names a different
+    // file: bartowski ships `Q4_K_M` beside `Q4_K_M-fp16`, whose embedding
+    // and output stay in half precision, and a label that stopped at the
+    // quantization made the two one variant, with the larger file winning
+    // the download. A split suffix is not kept.
+    let label: Vec<String> = segments[start..]
+        .iter()
+        .take_while(|seg| is_quant_segment(seg) || is_precision_segment(seg))
         .map(|seg| seg.to_uppercase())
+        .collect();
+    Some(label.join("-"))
+}
+
+/// Whether a filename segment names a floating-point precision.
+fn is_precision_segment(seg: &str) -> bool {
+    matches!(
+        seg.to_uppercase().as_str(),
+        "FP16" | "FP32" | "F16" | "F32" | "BF16"
+    )
 }
 
 /// Whether a filename segment opens like a quantization label.
@@ -883,6 +906,30 @@ mod tests {
             gguf_file_for(dir.path(), "Qwen/Qwen3-4B-Q8_0").is_err(),
             "a variant the folder does not hold is an error, not the first file"
         );
+    }
+
+    /// Contract: a precision the publisher appends after the quantization
+    /// is part of the label, so `Q4_K_M` and `Q4_K_M-fp16` in one repository
+    /// are two variants; a prefix before it is not, a split suffix is not,
+    /// and a file that is only a precision keeps that as its label.
+    #[test]
+    fn a_precision_appended_to_the_label_names_another_variant() {
+        for (file, label) in [
+            ("gemma-2-9b-it-Q4_K_M-fp16.gguf", "Q4_K_M-FP16"),
+            ("gemma-2-9b-it-Q4_K_M.gguf", "Q4_K_M"),
+            ("Qwen3.8-27B-UD-Q4_K_M.gguf", "Q4_K_M"),
+            ("qwen2.5-14b-instruct-q4_k_m-00001-of-00003.gguf", "Q4_K_M"),
+            ("model-Q4_K_M-f16.gguf", "Q4_K_M-F16"),
+            ("model-bf16.gguf", "BF16"),
+            ("tinyllama-1.1b-chat-v1.0.Q4_0.gguf", "Q4_0"),
+            ("Qwen3-30B-A3B-UD-Q3_K_XL.gguf", "Q3_K_XL"),
+        ] {
+            assert_eq!(
+                extract_quant_from_filename(file).as_deref(),
+                Some(label),
+                "{file}"
+            );
+        }
     }
 
     #[test]

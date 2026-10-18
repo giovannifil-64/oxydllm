@@ -48,6 +48,10 @@ pub struct StandardTransformer {
     pub(crate) embed_tokens: Embedding,
     pub(crate) blocks: Vec<TransformerBlock>,
     pub(crate) norm: RMSNorm,
+    /// The projection to the vocabulary, kept in the F32 its kernel
+    /// accumulates in: rounded to the model's BF16, many tokens landed on
+    /// exactly equal logits and a greedy pick between equals flipped on the
+    /// rounding differences between a cold prefill and a prefix-cache hit.
     pub(crate) lm_head: AnyLinear,
     pub(crate) ropes: Vec<RotaryEmbedding>,
     pub(crate) allocators: Vec<SharedBlockAllocator>,
@@ -514,11 +518,11 @@ impl StandardTransformer {
 
         let lm_head = match gguf.try_linear_weight("output.weight") {
             Some(w) => AnyLinear::Quantized(
-                QLinear::from_gguf(w, None, dtype)
+                QLinear::from_gguf(w, None, DType::F32)
                     .map_err(|e| anyhow::anyhow!("Failed to load output.weight: {e}"))?,
             ),
             None => AnyLinear::Quantized(
-                QLinear::from_gguf(embed_w, None, dtype)
+                QLinear::from_gguf(embed_w, None, DType::F32)
                     .map_err(|e| anyhow::anyhow!("tied lm_head from embedding: {e}"))?,
             ),
         };
@@ -766,6 +770,32 @@ impl BatchModel for StandardTransformer {
 #[cfg(test)]
 mod per_layer_geometry_tests {
     use super::*;
+
+    /// Contract: the projection to the vocabulary yields F32 logits from the
+    /// model's BF16 activations, so the sampler never meets BF16 ties.
+    /// Reads a local file and needs Metal, hence ignored by default.
+    #[test]
+    #[ignore]
+    fn a_local_gguf_projects_to_f32_logits() {
+        let home = std::env::var("HOME").unwrap();
+        let path = format!(
+            "{home}/.oxydllm/models/Qwen/Qwen2.5-1.5B-Instruct-GGUF/qwen2.5-1.5b-instruct-q4_k_m.gguf"
+        );
+        if !std::path::Path::new(&path).exists() {
+            eprintln!("skipped: {path} is not on disk");
+            return;
+        }
+        let device = Device::new_metal(0).expect("a Metal device");
+        let gguf = crate::common::gguf_weights::GgufWeights::load(&path, &device).expect("gguf");
+        let model = StandardTransformer::load_gguf(&gguf, &device, DType::BF16, 64, None, 512)
+            .expect("model");
+        let tokens = Tensor::new(&[[1u32, 2, 3]], &device).expect("ids");
+        let hidden = model.embed_tokens.forward(&tokens).expect("embedding");
+        assert_eq!(hidden.dtype(), DType::BF16, "the model runs in BF16");
+        let logits = model.lm_head.forward(&hidden).expect("projection");
+        assert_eq!(logits.dtype(), DType::F32);
+        assert_eq!(logits.dims()[2], model.vocab_size);
+    }
 
     /// Contract: layers that ask for the same rope share one table.
     ///

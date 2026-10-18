@@ -857,6 +857,7 @@ pub fn load_batch_model(
         // predicted.
         let drained = crate::common::weights::drain_metal(device, "model load");
         if drained.is_ok() && weights_read_consistently(model.as_ref(), device) {
+            bound_contig_pools(model.as_ref(), model_id);
             return Ok(loaded);
         }
         if let Err(e) = &drained {
@@ -885,6 +886,41 @@ pub fn load_batch_model(
         cap = Some(next);
     }
     unreachable!("the loop returns or bails on the last attempt")
+}
+
+/// The allocators of a model, each once: layers may share one.
+fn distinct_allocators(model: &dyn BatchModel) -> Vec<SharedBlockAllocator> {
+    let mut seen: Vec<usize> = Vec::new();
+    let mut out = Vec::new();
+    for a in model.allocators() {
+        let ptr = Arc::as_ptr(a) as usize;
+        if !seen.contains(&ptr) {
+            seen.push(ptr);
+            out.push(Arc::clone(a));
+        }
+    }
+    out
+}
+
+/// Bounds the contiguous buffers the layers keep after a sequence retires to
+/// an eighth of what was reserved for the KV pool, shared across the layers.
+fn bound_contig_pools(model: &dyn BatchModel, model_id: &str) {
+    let allocators = distinct_allocators(model);
+    let reserved: usize = allocators
+        .iter()
+        .map(|a| a.lock().map(|g| g.reserved_bytes()).unwrap_or(0))
+        .sum();
+    let budget = crate::common::paged::ContigBudget::new(reserved / 8);
+    for a in &allocators {
+        if let Ok(mut g) = a.lock() {
+            g.set_contig_budget(Arc::clone(&budget));
+        }
+    }
+    tracing::info!(
+        model_id,
+        limit_mb = budget.limit_bytes() / (1 << 20),
+        "contiguous KV buffers kept after a sequence retires are bounded"
+    );
 }
 
 /// Bytes the model's KV pools currently hold, for halving on a retry.
@@ -1228,11 +1264,11 @@ fn load_standard_safetensors(
             }
 
             // 4-bit tied lm_head (via RTN) applies to the 4-bit packed schemes
-            // (AWQ-4bit and compressed-tensors INT4, which runs on the same
-            // resident W4A16 path); 8-bit AWQ takes the plain-tied path. On a
-            // 4-bit model a BF16 tied lm_head would otherwise dominate decode:
-            // the 248k-vocab Qwen3.5 reads 1.27 GB/token through it (~25% of
-            // the per-token budget measured on the INT4 checkpoint).
+            // (AWQ, GPTQ and compressed-tensors INT4, which all run on the
+            // resident W4A16 path); the 8-bit schemes take the plain-tied path.
+            // On a 4-bit model a BF16 tied lm_head would otherwise dominate
+            // decode: the 248k-vocab Qwen3.5 reads 1.27 GB/token through it
+            // (~25% of the per-token budget measured on the INT4 checkpoint).
             #[cfg(feature = "metal")]
             if has_packed_quantized_weights
                 && device.is_metal()
@@ -1240,6 +1276,7 @@ fn load_standard_safetensors(
                 && matches!(
                     weights.quant_scheme(),
                     Some(crate::common::weights::QuantScheme::Awq { bits: 4 })
+                        | Some(crate::common::weights::QuantScheme::Gptq { bits: 4, .. })
                         | Some(crate::common::weights::QuantScheme::CompressedTensors4)
                 )
             {
@@ -1688,6 +1725,32 @@ fn resolve_kv_quant(p: &KvBlockParams) -> KvQuantMode {
     KvQuantMode::Off
 }
 
+/// What the global KV budget had left could not hold the 256-block floor a
+/// model's pool needs. The manager answers it by evicting an idle model and
+/// loading again, so resident models that hold the whole budget give way as
+/// they do under memory pressure.
+#[derive(Debug)]
+pub struct KvBudgetExhausted {
+    pub needed_bytes: usize,
+    pub available_bytes: usize,
+}
+
+impl std::fmt::Display for KvBudgetExhausted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "KV cache budget exhausted: the pool needs {:.2} GB at least but only {:.2} GB \
+             are available. Unload other models, or start the server with \
+             --memory-budget <MB> to size the global KV pool independently of the free \
+             memory at startup.",
+            self.needed_bytes as f64 / 1_073_741_824.0,
+            self.available_bytes as f64 / 1_073_741_824.0,
+        )
+    }
+}
+
+impl std::error::Error for KvBudgetExhausted {}
+
 /// The pool a model got, and the context that pool can actually serve.
 struct KvPlan {
     num_blocks: usize,
@@ -1746,16 +1809,11 @@ fn compute_kv_blocks(p: &KvBlockParams, kv_budget: &GlobalKvBudget) -> anyhow::R
 
     if granted_blocks < min_blocks {
         kv_budget.release(granted_bytes);
-        anyhow::bail!(
-            "KV cache budget exhausted: requested {} blocks ({:.2} GB minimum) \
-             but only {} blocks ({:.2} GB) available. Unload other models, or \
-             start the server with --memory-budget <MB> to size the global KV \
-             pool independently of the free memory at startup.",
-            min_blocks,
-            min_blocks as f64 * per_block_bytes as f64 / 1_073_741_824.0,
-            granted_blocks,
-            granted_blocks as f64 * per_block_bytes as f64 / 1_073_741_824.0,
-        );
+        return Err(KvBudgetExhausted {
+            needed_bytes: min_blocks * per_block_bytes,
+            available_bytes: granted_blocks * per_block_bytes,
+        }
+        .into());
     }
 
     if granted_blocks < desired_blocks {
@@ -2030,6 +2088,44 @@ mod kv_quant_decision_tests {
         p.memory_budget_bytes = None;
         let unbounded = compute_kv_blocks(&p, &budget).expect("a pool");
         assert!(unbounded.acquired_bytes > plan.acquired_bytes);
+    }
+
+    /// Contract: after a load every layer's retired buffers sit under one
+    /// budget of an eighth of what the pools reserved.
+    #[test]
+    fn the_contig_pools_share_an_eighth_of_the_reservation() {
+        use crate::models::traits::BatchModel;
+        let model = crate::server::routes::test_support::StubModel::completing(1);
+        let reserved: usize = model
+            .allocators()
+            .iter()
+            .map(|a| a.lock().unwrap().reserved_bytes())
+            .sum();
+        bound_contig_pools(&model, "stub");
+        let limit = model.allocators()[0]
+            .lock()
+            .unwrap()
+            .contig_budget_limit_for_tests();
+        assert_eq!(limit, reserved / 8);
+        assert!(limit > 0);
+    }
+
+    /// Contract: a budget that cannot hold the floor fails with the typed
+    /// error the manager evicts on, and gives back what it had taken.
+    #[test]
+    fn an_exhausted_budget_fails_with_the_typed_error() {
+        let p = params(KvQuantMode::Off, 36, 0);
+        let budget = crate::common::paged::GlobalKvBudget::new(1 << 20);
+        let err = match compute_kv_blocks(&p, &budget) {
+            Ok(_) => panic!("no room for the floor"),
+            Err(e) => e,
+        };
+        let typed = err
+            .chain()
+            .find_map(|c| c.downcast_ref::<KvBudgetExhausted>())
+            .expect("a KvBudgetExhausted in the chain");
+        assert!(typed.needed_bytes > typed.available_bytes);
+        assert_eq!(budget.available_bytes(), 1 << 20, "the grant was released");
     }
 
     /// Contract: an explicit mode is never second-guessed, including `off`,

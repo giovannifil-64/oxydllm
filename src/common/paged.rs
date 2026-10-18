@@ -341,38 +341,116 @@ struct ContigBuffer {
     cap: usize,
 }
 
+/// The bytes the contiguous buffers retired by every layer of a model may
+/// hold together, shared by the layers' pools. Unbounded, each layer kept its
+/// four largest buffers for the life of the model, which on Phi-3-mini at
+/// 4096 tokens came to about 8 GB held at rest, more than its KV pool.
+pub struct ContigBudget {
+    limit: usize,
+    held: AtomicUsize,
+}
+
+impl ContigBudget {
+    pub fn new(limit: usize) -> Arc<Self> {
+        Arc::new(Self {
+            limit,
+            held: AtomicUsize::new(0),
+        })
+    }
+
+    /// Reserves `bytes` if they fit under the limit.
+    fn try_add(&self, bytes: usize) -> bool {
+        let mut held = self.held.load(Ordering::Relaxed);
+        loop {
+            if held.saturating_add(bytes) > self.limit {
+                return false;
+            }
+            match self.held.compare_exchange_weak(
+                held,
+                held + bytes,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(now) => held = now,
+            }
+        }
+    }
+
+    fn sub(&self, bytes: usize) {
+        self.held.fetch_sub(bytes, Ordering::Relaxed);
+    }
+
+    pub fn limit_bytes(&self) -> usize {
+        self.limit
+    }
+
+    #[cfg(test)]
+    pub fn held_bytes(&self) -> usize {
+        self.held.load(Ordering::Relaxed)
+    }
+}
+
 /// Invariant: `buffers` is sorted ascending by `cap` (smallest-fit via forward scan,
-/// insertion via `partition_point`). On overflow the smallest is evicted because
-/// large buffers cost more to rebuild.
+/// insertion via `partition_point`). Past the count the smallest is evicted
+/// because large buffers cost more to rebuild; past the byte budget the
+/// largest go, because they free the most, and a buffer that would not fit
+/// an emptied pool is not kept.
 struct ContigBufferPool {
     buffers: Vec<ContigBuffer>,
     max_buffers: usize,
+    bytes_per_token: usize,
+    budget: Arc<ContigBudget>,
 }
 
 const MAX_POOL_BUFFERS: usize = 4;
 
 impl ContigBufferPool {
-    fn new(max_buffers: usize) -> Self {
+    fn new(max_buffers: usize, bytes_per_token: usize) -> Self {
         Self {
             buffers: Vec::with_capacity(max_buffers),
             max_buffers,
+            bytes_per_token,
+            budget: ContigBudget::new(usize::MAX),
         }
     }
 
     fn take(&mut self, needed: usize) -> Option<ContigBuffer> {
         let idx = self.buffers.iter().position(|b| b.cap >= needed)?;
-        Some(self.buffers.remove(idx))
+        let buf = self.buffers.remove(idx);
+        self.budget.sub(buf.cap * self.bytes_per_token);
+        Some(buf)
     }
 
     fn put(&mut self, buf: ContigBuffer) {
         if self.max_buffers == 0 {
             return;
         }
+        let bytes = buf.cap * self.bytes_per_token;
+        while !self.budget.try_add(bytes) {
+            match self.buffers.pop() {
+                Some(largest) => self.budget.sub(largest.cap * self.bytes_per_token),
+                None => return,
+            }
+        }
         let pos = self.buffers.partition_point(|b| b.cap < buf.cap);
         self.buffers.insert(pos, buf);
         if self.buffers.len() > self.max_buffers {
-            self.buffers.remove(0);
+            let smallest = self.buffers.remove(0);
+            self.budget.sub(smallest.cap * self.bytes_per_token);
         }
+    }
+
+    /// Moves the pool, and what it holds, under `budget`.
+    fn set_budget(&mut self, budget: Arc<ContigBudget>) {
+        let held: usize = self
+            .buffers
+            .iter()
+            .map(|b| b.cap * self.bytes_per_token)
+            .sum();
+        self.budget.sub(held);
+        budget.held.fetch_add(held, Ordering::Relaxed);
+        self.budget = budget;
     }
 
     #[cfg(test)]
@@ -468,7 +546,10 @@ impl BlockAllocator {
             head_dim,
             dtype,
             device: device.clone(),
-            contig_pool: ContigBufferPool::new(MAX_POOL_BUFFERS),
+            contig_pool: ContigBufferPool::new(
+                MAX_POOL_BUFFERS,
+                2 * n_kv_heads * head_dim * dtype.size_in_bytes(),
+            ),
             sliding_window: None,
         };
         if max_blocks > 0 {
@@ -630,9 +711,20 @@ impl BlockAllocator {
         self.contig_pool.put(ContigBuffer { k, v, cap });
     }
 
+    /// Puts this layer's retired contiguous buffers under a budget shared with
+    /// the other layers of the model.
+    pub fn set_contig_budget(&mut self, budget: Arc<ContigBudget>) {
+        self.contig_pool.set_budget(budget);
+    }
+
     #[cfg(test)]
     pub fn contig_pool_len(&self) -> usize {
         self.contig_pool.len()
+    }
+
+    #[cfg(test)]
+    pub fn contig_budget_limit_for_tests(&self) -> usize {
+        self.contig_pool.budget.limit_bytes()
     }
 
     #[cfg(test)]
@@ -2213,6 +2305,58 @@ mod tests {
             0,
             "second sequence should have drained the pool"
         );
+    }
+
+    /// Contract: a byte budget shared by the layers bounds what their pools
+    /// keep together; past it a pool drops its largest buffers first and a
+    /// buffer that would not fit even an emptied pool is not kept, while a
+    /// buffer taken back out returns its bytes.
+    #[test]
+    fn a_shared_byte_budget_bounds_the_pools_across_layers() {
+        let per_token = 2 * 2 * 4 * 4;
+        let budget = ContigBudget::new(100 * per_token);
+        let layer_a = make_allocator(64, 2);
+        let layer_b = make_allocator(64, 2);
+        layer_a
+            .lock()
+            .unwrap()
+            .set_contig_budget(Arc::clone(&budget));
+        layer_b
+            .lock()
+            .unwrap()
+            .set_contig_budget(Arc::clone(&budget));
+        let retire = |alloc: &SharedBlockAllocator, cap: usize| {
+            let k = Tensor::zeros((1, 2, cap, 4), DType::F32, &Device::Cpu).unwrap();
+            let v = Tensor::zeros((1, 2, cap, 4), DType::F32, &Device::Cpu).unwrap();
+            alloc.lock().unwrap().release_contig_buffer(k, v, cap);
+        };
+
+        retire(&layer_a, 60);
+        assert_eq!(budget.held_bytes(), 60 * per_token);
+        retire(&layer_b, 60);
+        assert_eq!(
+            budget.held_bytes(),
+            60 * per_token,
+            "no room: dropped, not kept"
+        );
+        assert_eq!(layer_b.lock().unwrap().contig_pool_len(), 0);
+        retire(&layer_b, 30);
+        assert_eq!(budget.held_bytes(), 90 * per_token);
+        retire(&layer_a, 50);
+        assert_eq!(
+            layer_a.lock().unwrap().contig_pool_capacities(),
+            vec![50],
+            "the largest of this layer went to make room"
+        );
+        assert_eq!(budget.held_bytes(), 80 * per_token);
+
+        let taken = layer_b
+            .lock()
+            .unwrap()
+            .take_contig_buffer(10)
+            .expect("the 30");
+        assert_eq!(taken.2, 30);
+        assert_eq!(budget.held_bytes(), 50 * per_token);
     }
 
     #[test]

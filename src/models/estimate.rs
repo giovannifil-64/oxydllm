@@ -167,11 +167,13 @@ fn estimate_local_safetensors(dir: &Path, ctx_len: usize, num_seqs: usize) -> Re
                 sum_safetensors_bytes(dir).unwrap_or((weights_bytes, 0));
             let other_bytes = total_bytes.saturating_sub(qweight_bytes);
             let mut runtime_bytes = other_bytes + (qweight_bytes as f64 * expansion) as usize;
-            let tied_extra = tied_lm_head_extra_bytes_from_file(&config_path);
+            let bits = qi.bits.unwrap_or(4);
+            let tied_extra = (bits == 4)
+                .then(|| tied_lm_head_extra_bytes_from_file(&config_path))
+                .flatten();
             if let Some(extra) = tied_extra {
                 runtime_bytes += extra;
             }
-            let bits = qi.bits.unwrap_or(4);
             let gs = qi.group_size.unwrap_or(128);
             let version = qi
                 .version
@@ -183,8 +185,9 @@ fn estimate_local_safetensors(dir: &Path, ctx_len: usize, num_seqs: usize) -> Re
             } else {
                 "W4A16: 4-bit weights stay resident"
             };
+            let method = packed_method_label(&qi.method);
             let label = format!(
-                "AWQ {bits}-bit ({version}, group_size={gs}) safetensors  ({resident_note})"
+                "{method} {bits}-bit ({version}, group_size={gs}) safetensors  ({resident_note})"
             );
             (
                 runtime_bytes,
@@ -360,7 +363,8 @@ fn estimate_remote(
                 .and_then(|qi| awq_qweight_expansion(qi.bits.unwrap_or(4)))
                 .is_some();
 
-        let tied_extra = if is_awq {
+        let packed_bits = quant_info.as_ref().and_then(|qi| qi.bits).unwrap_or(4);
+        let tied_extra = if is_awq && packed_bits == 4 {
             config_json.as_ref().and_then(tied_lm_head_extra_bytes)
         } else {
             None
@@ -380,11 +384,15 @@ fn estimate_remote(
         let total_str = total.map(fmt_bytes).unwrap_or_else(|| "?".to_string());
         println!("  {}", "─".repeat(72));
         let (label, accuracy) = if is_awq {
-            let bits = quant_info.as_ref().and_then(|qi| qi.bits).unwrap_or(4);
+            let bits = packed_bits;
+            let method = quant_info
+                .as_ref()
+                .map(|qi| packed_method_label(&qi.method))
+                .unwrap_or_else(|| "AWQ".to_string());
             let label = if tied_extra.is_some() {
-                format!("AWQ {bits}-bit safetensors  (+ 4-bit tied lm_head)")
+                format!("{method} {bits}-bit safetensors  (+ 4-bit tied lm_head)")
             } else {
-                format!("AWQ {bits}-bit safetensors")
+                format!("{method} {bits}-bit safetensors")
             };
             (label, "~lossy")
         } else if is_fp8_quant {
@@ -754,6 +762,16 @@ pub fn awq_qweight_expansion(bits: u64) -> Option<f64> {
     match bits {
         4 | 8 => Some(1.0),
         _ => None,
+    }
+}
+
+/// The packed-int method as the label prints it: `AWQ`, `GPTQ`, or the
+/// compressed-tensors name as written.
+fn packed_method_label(method: &str) -> String {
+    if method.eq_ignore_ascii_case("compressed-tensors") {
+        method.to_string()
+    } else {
+        method.to_uppercase()
     }
 }
 

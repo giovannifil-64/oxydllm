@@ -540,30 +540,8 @@ impl ModelManager {
             if used + needed_bytes <= budget {
                 break;
             }
-            let lru_id = self
-                .slots
-                .iter()
-                .filter_map(|(id, s)| match s {
-                    SlotState::Ready { last_used, .. } => Some((id.clone(), *last_used)),
-                    _ => None,
-                })
-                .min_by_key(|(_, lu)| *lu)
-                .map(|(id, _)| id);
-            match lru_id {
-                Some(id) => {
-                    let (freed, kv_bytes, shutdown) = match self.slots.get(&id) {
-                        Some(SlotState::Ready {
-                            weights_size_bytes,
-                            kv_cache_bytes,
-                            shutdown,
-                            ..
-                        }) => (
-                            *weights_size_bytes + *kv_cache_bytes,
-                            *kv_cache_bytes,
-                            Some(Arc::clone(shutdown)),
-                        ),
-                        _ => (0, 0, None),
-                    };
+            match self.evict_lru_one() {
+                Some((id, freed)) => {
                     tracing::warn!(
                         model_id = %id,
                         evicted_gb = round_2(gb(freed)),
@@ -572,17 +550,46 @@ impl ModelManager {
                         used_gb = round_2(gb(used)),
                         "evicting LRU model due to memory pressure"
                     );
-                    self.kv_budget.release(kv_bytes);
-                    self.slots.remove(&id);
-                    if let Some(s) = shutdown {
-                        s.store(true, Ordering::Release);
-                    }
                     evicted += 1;
                 }
                 None => break,
             }
         }
         evicted
+    }
+
+    /// Evicts the least recently used ready model, handing its KV bytes back
+    /// to the budget and ending its engine loop; returns its id and the bytes
+    /// it held, or `None` when no ready model remains.
+    pub fn evict_lru_one(&mut self) -> Option<(String, usize)> {
+        let id = self
+            .slots
+            .iter()
+            .filter_map(|(id, s)| match s {
+                SlotState::Ready { last_used, .. } => Some((id.clone(), *last_used)),
+                _ => None,
+            })
+            .min_by_key(|(_, lu)| *lu)
+            .map(|(id, _)| id)?;
+        let (freed, kv_bytes, shutdown) = match self.slots.get(&id) {
+            Some(SlotState::Ready {
+                weights_size_bytes,
+                kv_cache_bytes,
+                shutdown,
+                ..
+            }) => (
+                *weights_size_bytes + *kv_cache_bytes,
+                *kv_cache_bytes,
+                Some(Arc::clone(shutdown)),
+            ),
+            _ => (0, 0, None),
+        };
+        self.kv_budget.release(kv_bytes);
+        self.slots.remove(&id);
+        if let Some(s) = shutdown {
+            s.store(true, Ordering::Release);
+        }
+        Some((id, freed))
     }
 
     /// Returns a handle to `model_id`, loading the model on demand.
@@ -1098,27 +1105,47 @@ fn spawn_load(params: SpawnLoadParams) {
             .is_some()
             .then(|| kv_budget.acquire(kv_budget.available_bytes() / 2));
 
-        let loaded = match loader::load_batch_model(
-            &model_dir,
-            &model_id_thread,
-            &device,
-            loader::LoadBatchOptions {
-                max_context_len,
-                max_num_sequences: load_max_num_sequences,
-                kv_budget: &kv_budget,
-                kv_quant,
-                qjl_quantization,
-                expert_stream_mb,
-                memory_budget_bytes,
-            },
-        ) {
-            Ok(m) => m,
-            Err(e) => {
-                if let Some(reserved) = draft_kv_reservation {
-                    kv_budget.release(reserved);
+        // Resident idle models may hold the whole KV budget while the memory
+        // budget still has room; the pool then fails its floor, and an idle
+        // model gives way as it would under memory pressure.
+        let manager_for_room = Arc::clone(&manager_thread);
+        let loaded = loop {
+            match loader::load_batch_model(
+                &model_dir,
+                &model_id_thread,
+                &device,
+                loader::LoadBatchOptions {
+                    max_context_len,
+                    max_num_sequences: load_max_num_sequences,
+                    kv_budget: &kv_budget,
+                    kv_quant,
+                    qjl_quantization,
+                    expert_stream_mb,
+                    memory_budget_bytes,
+                },
+            ) {
+                Ok(m) => break m,
+                Err(e) => {
+                    let exhausted = e
+                        .chain()
+                        .any(|c| c.downcast_ref::<loader::KvBudgetExhausted>().is_some());
+                    if exhausted
+                        && let Some((id, freed)) = manager_for_room.blocking_lock().evict_lru_one()
+                    {
+                        tracing::warn!(
+                            model_id = %id,
+                            evicted_gb = round_2(gb(freed)),
+                            loading = %model_id_thread,
+                            "evicting LRU model to free KV budget"
+                        );
+                        continue;
+                    }
+                    if let Some(reserved) = draft_kv_reservation {
+                        kv_budget.release(reserved);
+                    }
+                    let _ = result_tx.send(Err(format!("Failed to load model: {e:#}")));
+                    return;
                 }
-                let _ = result_tx.send(Err(format!("Failed to load model: {e:#}")));
-                return;
             }
         };
 
@@ -1659,6 +1686,32 @@ mod tests {
             1,
             "the guard of a dead engine must not evict the reloaded slot"
         );
+    }
+
+    /// Contract: evicting one model takes the least recently used ready one,
+    /// returns its KV bytes to the budget, and reports nothing once no ready
+    /// model is left, which is what a load that found the KV budget held by
+    /// idle residents relies on.
+    #[test]
+    fn evicting_one_model_frees_the_least_recently_used() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut mgr = build_test_manager(&tmp, Duration::from_secs(60), Some(1_000));
+        mgr.kv_budget = Arc::new(GlobalKvBudget::new(1_000));
+        mgr.insert_ready_with_size_for_tests("older", build_dummy_handle(), 100, 40);
+        mgr.insert_ready_with_size_for_tests("newer", build_dummy_handle(), 100, 60);
+        assert_eq!(mgr.kv_budget.acquire(100), 100);
+        assert_eq!(mgr.kv_budget.available_bytes(), 900);
+
+        assert_eq!(mgr.evict_lru_one(), Some(("older".to_string(), 140)));
+        assert_eq!(
+            mgr.kv_budget.available_bytes(),
+            940,
+            "the older model's KV came back"
+        );
+        assert_eq!(mgr.list_running().len(), 1);
+        assert_eq!(mgr.evict_lru_one(), Some(("newer".to_string(), 160)));
+        assert_eq!(mgr.evict_lru_one(), None);
+        assert_eq!(mgr.kv_budget.available_bytes(), 1_000);
     }
 
     #[test]

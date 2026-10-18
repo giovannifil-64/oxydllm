@@ -796,10 +796,12 @@ impl Attention {
             )
             && matches!(q.dtype(), DType::F16 | DType::BF16 | DType::F32);
 
+        #[cfg(feature = "metal")]
         let prefill = super::phase::current() == Some(super::phase::Phase::Prefill);
 
         for (i, seg) in segments.iter().enumerate() {
             let q_seg = q.narrow(2, q_offset, seg.num_tokens)?;
+            #[cfg(feature = "metal")]
             let prefill_tail = prefill && seg.num_tokens == 1;
             let (k_seg, v_seg, kv_len) = truncate_kv_window(
                 k_parts[i].clone(),

@@ -757,7 +757,7 @@ impl StandardTransformer {
 }
 
 impl BatchModel for StandardTransformer {
-    #[cfg(test)]
+    #[cfg(all(test, feature = "metal"))]
     fn as_standard(&self) -> Option<&StandardTransformer> {
         Some(self)
     }

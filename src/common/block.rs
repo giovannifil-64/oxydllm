@@ -701,7 +701,7 @@ pub fn flush_caches(seq_caches: &mut [&mut [PagedKvCache]]) -> Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "metal"))]
 mod decode_batch_bisection {
     use super::*;
     use crate::common::phase::{Phase, with_phase};

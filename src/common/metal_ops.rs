@@ -8960,6 +8960,9 @@ mod owned_matvec_instantiation_tests {
         let Device::Metal(md) = &dev else {
             return;
         };
+        if !mpp_owned_kernels_available(md.device()) {
+            return;
+        }
         let mut report = Vec::new();
         for (n, k) in [(8960usize, 1536usize), (1536, 8960)] {
             for kind in [WeightKind::Iq4Xs, WeightKind::Iq4Nl, WeightKind::Iq3S] {

@@ -1,5 +1,5 @@
 <p align="center">
-  <img width="350" alt="oxydLLM Dynamic Logo" src=".github/res/oxydLLM.svg">
+  <img width="450" alt="oxydLLM Dynamic Logo" src=".github/res/oxydLLM.svg">
 </p>
 
 <br>

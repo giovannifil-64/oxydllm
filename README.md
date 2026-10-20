@@ -1,6 +1,5 @@
 <p align="center">
-  <img width="350" src=".github/res/oxydLLM_light.png#gh-light-mode-only">
-  <img width="350" src=".github/res/oxydLLM_dark.png#gh-dark-mode-only">
+  <img width="350" alt="oxydLLM Dynamic Logo" src=".github/res/oxydLLM.svg">
 </p>
 
 <br>

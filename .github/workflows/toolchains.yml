@@ -36,7 +36,7 @@ jobs:
           - "1.97.1"
           - "stable"
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
         with:

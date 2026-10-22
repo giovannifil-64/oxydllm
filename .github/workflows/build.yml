@@ -36,7 +36,7 @@ jobs:
     name: Build · macOS arm64 (Metal)
     runs-on: macos-14
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
@@ -77,7 +77,7 @@ jobs:
     name: Build · Linux x86_64 (CPU)
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
@@ -149,7 +149,7 @@ jobs:
       image: nvidia/cuda:13.2.1-devel-ubuntu22.04
       options: --user root
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install build deps
         run: |
@@ -213,7 +213,7 @@ jobs:
     name: Build · Linux arm64 (CPU)
     runs-on: ubuntu-24.04-arm
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
@@ -280,7 +280,7 @@ jobs:
       image: nvidia/cuda:13.2.1-devel-ubuntu22.04
       options: --user root
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install build deps
         run: |
@@ -331,7 +331,7 @@ jobs:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Log in to GHCR
         uses: docker/login-action@v4
@@ -394,7 +394,7 @@ jobs:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Log in to GHCR
         uses: docker/login-action@v4
@@ -571,7 +571,7 @@ jobs:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Free disk space
         run: |
@@ -672,7 +672,7 @@ jobs:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Free disk space
         run: |

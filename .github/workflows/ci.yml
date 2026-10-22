@@ -42,7 +42,7 @@ jobs:
     name: Format
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
@@ -54,7 +54,7 @@ jobs:
     name: Security audit
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-audit
@@ -68,7 +68,7 @@ jobs:
     needs: fmt
     runs-on: ubuntu-24.04-arm
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.94.0
@@ -90,7 +90,7 @@ jobs:
     runs-on: ubuntu-24.04-arm
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -111,7 +111,7 @@ jobs:
     needs: fmt
     runs-on: macos-26
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
@@ -137,7 +137,7 @@ jobs:
     needs: fmt
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
@@ -175,7 +175,7 @@ jobs:
       image: nvidia/cuda:13.2.1-devel-ubuntu22.04
       options: --user root
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install build deps
         run: |
@@ -228,7 +228,7 @@ jobs:
     needs: fmt
     runs-on: ubuntu-24.04-arm
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
@@ -263,7 +263,7 @@ jobs:
       image: nvidia/cuda:13.2.1-devel-ubuntu22.04
       options: --user root
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install build deps
         run: |

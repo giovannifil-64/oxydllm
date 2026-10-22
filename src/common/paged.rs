@@ -206,15 +206,18 @@ fn read_available_memory_bytes() -> Option<usize> {
 }
 
 /// The memory a `vm_stat` report says the system could hand out: the free,
-/// speculative and purgeable pages and the file cache, which is dropped
-/// without touching disk.
+/// speculative and purgeable pages, plus the larger of the inactive pages
+/// and the file cache.
 ///
-/// The cache is read from `File-backed pages` where the report has it. The
-/// older reports have only `Pages inactive`, which counts the idle anonymous
-/// memory of other processes, reclaimable only through the compressor, and
-/// misses the cache pages touched lately: a checkpoint just downloaded sits
+/// The inactive pages are what the system reclaims first, idle memory of
+/// other processes and the older part of the cache alike; the file cache,
+/// read from `File-backed pages` where the report has it, is dropped without
+/// touching disk whether it is old or not. Counting only the inactive pages
+/// missed the cache pages touched lately: a checkpoint just downloaded sits
 /// active in the cache, so it read as memory in use, and Qwen3.6-35B was
-/// refused for a 10.9 GB envelope right after its own 36 GB download.
+/// refused for a 10.9 GB envelope right after its own 36 GB download. The
+/// two overlap in the inactive cache pages, so the larger counts rather than
+/// the sum.
 #[cfg(target_os = "macos")]
 fn available_bytes_in(report: &str) -> Option<usize> {
     let mut page_size = 4096usize;
@@ -240,7 +243,7 @@ fn available_bytes_in(report: &str) -> Option<usize> {
             file_backed = Some(count(rest)?);
         }
     }
-    let pages = free + file_backed.unwrap_or(inactive);
+    let pages = free + inactive.max(file_backed.unwrap_or(0));
     (pages > 0).then(|| pages * page_size)
 }
 
@@ -2706,30 +2709,39 @@ mod tests {
 mod available_memory_tests {
     use super::available_bytes_in;
 
-    /// Contract: the file cache counts as available wherever the report
-    /// names it, so a checkpoint just downloaded does not read as memory in
-    /// use; a report without that line falls back to the inactive pages.
+    /// Contract: the larger of the inactive pages and the file cache counts
+    /// as available, so a checkpoint just downloaded, whose cache pages are
+    /// still active, does not read as memory in use, and a desktop whose idle
+    /// memory outweighs its cache keeps the reading it had; a report without
+    /// the cache line falls back to the inactive pages.
     #[test]
     fn the_file_cache_counts_as_available_memory() {
-        let report = "Mach Virtual Memory Statistics: (page size of 16384 bytes)\n\
+        let report = |file_backed: &str| {
+            format!(
+                "Mach Virtual Memory Statistics: (page size of 16384 bytes)\n\
 Pages free:                                   100.\n\
 Pages active:                                 2000.\n\
 Pages inactive:                               300.\n\
 Pages speculative:                            10.\n\
 Pages wired down:                             500.\n\
 Pages purgeable:                              5.\n\
-File-backed pages:                            1500.\n\
-Anonymous pages:                              800.\n";
+{file_backed}Anonymous pages:                              800.\n"
+            )
+        };
+        let after_a_download = report("File-backed pages:                            1500.\n");
         assert_eq!(
-            available_bytes_in(report),
+            available_bytes_in(&after_a_download),
             Some((100 + 10 + 5 + 1500) * 16384)
         );
-
-        let older = "Mach Virtual Memory Statistics: (page size of 4096 bytes)\n\
-Pages free:                                   100.\n\
-Pages inactive:                               300.\n\
-Pages speculative:                            10.\n\
-Pages purgeable:                              5.\n";
-        assert_eq!(available_bytes_in(older), Some((100 + 10 + 5 + 300) * 4096));
+        let idle_desktop = report("File-backed pages:                            200.\n");
+        assert_eq!(
+            available_bytes_in(&idle_desktop),
+            Some((100 + 10 + 5 + 300) * 16384)
+        );
+        let older = report("");
+        assert_eq!(
+            available_bytes_in(&older),
+            Some((100 + 10 + 5 + 300) * 16384)
+        );
     }
 }

@@ -27,6 +27,9 @@ jobs:
     permissions:
       actions: read
     steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
       - name: Check CI conclusion for this commit
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -35,12 +38,44 @@ jobs:
           echo "Release tag: ${{ github.ref_name }}"
           echo "Commit:      $SHA"
 
-          # Poll for up to 20 minutes in case CI has not yet completed for this
+          # CI runs only when the sources, the manifests or the toolchain
+          # change, so a tag on a docs-only follow-up commit has no run of its
+          # own: take the nearest ancestor CI ran on, provided nothing CI
+          # watches changed since.
+          WATCHED='^(src/|Cargo\.toml$|Cargo\.lock$|rust-toolchain\.toml$|install\.sh$|\.github/workflows/ci\.yml$)'
+          RUN_SHA=""
+          for CANDIDATE in $(git rev-list --max-count=50 "$SHA"); do
+            COUNT=$(gh run list \
+              --repo "${{ github.repository }}" \
+              --commit "$CANDIDATE" \
+              --workflow ci.yml \
+              --limit 1 \
+              --json status --jq 'length' 2>/dev/null || echo 0)
+            if [ "$COUNT" != "0" ]; then
+              RUN_SHA="$CANDIDATE"
+              break
+            fi
+          done
+          if [ -z "$RUN_SHA" ]; then
+            echo "::error::No CI run on $SHA or its last 50 ancestors. Push the commit to main first."
+            exit 1
+          fi
+          if [ "$RUN_SHA" != "$SHA" ]; then
+            CHANGED=$(git diff --name-only "$RUN_SHA" "$SHA" | grep -E "$WATCHED" || true)
+            if [ -n "$CHANGED" ]; then
+              echo "::error::CI never ran on $SHA, and it changes what CI watches since $RUN_SHA:"
+              echo "$CHANGED"
+              exit 1
+            fi
+            echo "CI ran on ancestor $RUN_SHA; only files CI does not watch changed since."
+          fi
+
+          # Poll for up to 20 minutes in case CI has not yet completed for that
           # SHA (e.g. tag pushed immediately after merge).
           for i in $(seq 1 20); do
             PAYLOAD=$(gh run list \
               --repo "${{ github.repository }}" \
-              --commit "$SHA" \
+              --commit "$RUN_SHA" \
               --workflow ci.yml \
               --limit 1 \
               --json status,conclusion,url 2>/dev/null || echo "[]")
@@ -53,10 +88,10 @@ jobs:
 
             if [ "$STATUS" = "completed" ]; then
               if [ "$CONCLUSION" = "success" ]; then
-                echo "CI passed for $SHA ✓ ($RUN_URL)"
+                echo "CI passed for $RUN_SHA ✓ ($RUN_URL)"
                 exit 0
               fi
-              echo "::error::CI conclusion is '$CONCLUSION' for $SHA. Release aborted."
+              echo "::error::CI conclusion is '$CONCLUSION' for $RUN_SHA. Release aborted."
               echo "::error::See: $RUN_URL"
               exit 1
             fi
@@ -64,7 +99,7 @@ jobs:
             sleep 30
           done
 
-          echo "::error::CI did not complete within 20 minutes for $SHA."
+          echo "::error::CI did not complete within 20 minutes for $RUN_SHA."
           echo "::error::Either CI was never triggered (push the commit to main first) or it is stuck."
           exit 1
 

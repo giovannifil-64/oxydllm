@@ -202,26 +202,45 @@ fn available_memory_bytes() -> Option<usize> {
 #[cfg(target_os = "macos")]
 fn read_available_memory_bytes() -> Option<usize> {
     let out = std::process::Command::new("vm_stat").output().ok()?;
-    let text = std::str::from_utf8(&out.stdout).ok()?;
+    available_bytes_in(std::str::from_utf8(&out.stdout).ok()?)
+}
+
+/// The memory a `vm_stat` report says the system could hand out: the free,
+/// speculative and purgeable pages and the file cache, which is dropped
+/// without touching disk.
+///
+/// The cache is read from `File-backed pages` where the report has it. The
+/// older reports have only `Pages inactive`, which counts the idle anonymous
+/// memory of other processes, reclaimable only through the compressor, and
+/// misses the cache pages touched lately: a checkpoint just downloaded sits
+/// active in the cache, so it read as memory in use, and Qwen3.6-35B was
+/// refused for a 10.9 GB envelope right after its own 36 GB download.
+#[cfg(target_os = "macos")]
+fn available_bytes_in(report: &str) -> Option<usize> {
     let mut page_size = 4096usize;
-    let mut pages = 0usize;
-    for line in text.lines() {
+    let mut free = 0usize;
+    let mut inactive = 0usize;
+    let mut file_backed = None;
+    for line in report.lines() {
         if let Some(rest) = line.strip_prefix("Mach Virtual Memory Statistics:")
             && let Some(p) = rest.split("page size of ").nth(1)
         {
             page_size = p.split_whitespace().next()?.parse().ok()?;
         }
-        for label in [
-            "Pages free:",
-            "Pages inactive:",
-            "Pages speculative:",
-            "Pages purgeable:",
-        ] {
-            if let Some(rest) = line.strip_prefix(label) {
-                pages += rest.trim().trim_end_matches('.').parse::<usize>().ok()?;
-            }
+        let count = |rest: &str| rest.trim().trim_end_matches('.').parse::<usize>().ok();
+        if let Some(rest) = line.strip_prefix("Pages free:") {
+            free += count(rest)?;
+        } else if let Some(rest) = line.strip_prefix("Pages speculative:") {
+            free += count(rest)?;
+        } else if let Some(rest) = line.strip_prefix("Pages purgeable:") {
+            free += count(rest)?;
+        } else if let Some(rest) = line.strip_prefix("Pages inactive:") {
+            inactive = count(rest)?;
+        } else if let Some(rest) = line.strip_prefix("File-backed pages:") {
+            file_backed = Some(count(rest)?);
         }
     }
+    let pages = free + file_backed.unwrap_or(inactive);
     (pages > 0).then(|| pages * page_size)
 }
 
@@ -2680,5 +2699,37 @@ mod tests {
             q_bytes < f_bytes / 3,
             "quantized pool not smaller: q={q_bytes} f={f_bytes}"
         );
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod available_memory_tests {
+    use super::available_bytes_in;
+
+    /// Contract: the file cache counts as available wherever the report
+    /// names it, so a checkpoint just downloaded does not read as memory in
+    /// use; a report without that line falls back to the inactive pages.
+    #[test]
+    fn the_file_cache_counts_as_available_memory() {
+        let report = "Mach Virtual Memory Statistics: (page size of 16384 bytes)\n\
+Pages free:                                   100.\n\
+Pages active:                                 2000.\n\
+Pages inactive:                               300.\n\
+Pages speculative:                            10.\n\
+Pages wired down:                             500.\n\
+Pages purgeable:                              5.\n\
+File-backed pages:                            1500.\n\
+Anonymous pages:                              800.\n";
+        assert_eq!(
+            available_bytes_in(report),
+            Some((100 + 10 + 5 + 1500) * 16384)
+        );
+
+        let older = "Mach Virtual Memory Statistics: (page size of 4096 bytes)\n\
+Pages free:                                   100.\n\
+Pages inactive:                               300.\n\
+Pages speculative:                            10.\n\
+Pages purgeable:                              5.\n";
+        assert_eq!(available_bytes_in(older), Some((100 + 10 + 5 + 300) * 4096));
     }
 }

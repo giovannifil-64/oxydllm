@@ -36,7 +36,8 @@
 use candle_core::quantized::GgmlDType;
 use candle_core::{
     CpuStorage, CustomOp1, CustomOp2, CustomOp3, D, DType, InplaceOp1, Layout, MetalStorage,
-    Result, Shape, Tensor, backend::BackendStorage,
+    Result, Shape, Tensor,
+    backend::{BackendDevice, BackendStorage},
 };
 use candle_metal_kernels::{
     SdpaDType,
@@ -1075,15 +1076,19 @@ struct FlashAttnParams {
     prefix_len: u32,
     window: u32,
     kv_head_stride: u32,
+    has_sink: u32,
 }
 
 /// Flash Attention prefill over `[B, H, T, D]` q/k/v with causal masking
 /// shifted by `prefix_len` cached tokens (`prefix_len + T_q == T_kv`).
 ///
-/// GQA is handled in-kernel (`H` must be a multiple of `H_kv`) and softcap
-/// is optional. `br`/`bc` are the tile heights from [`fa_tile_sizes`]; each
-/// 128-thread threadgroup owns one `[br, D]` query block, and Apple family
-/// 8+ devices run the MMA kernel variants.
+/// GQA is handled in-kernel (`H` must be a multiple of `H_kv`), softcap is
+/// optional, and `sinks`, one F32 logit per head, joins every row's softmax
+/// with no value (gpt-oss attention sinks), so a sink model's prefill takes
+/// this kernel rather than a GEMM whose reduction depends on the row count.
+/// `br`/`bc` are the tile heights from [`fa_tile_sizes`]; each 128-thread
+/// threadgroup owns one `[br, D]` query block, and Apple family 8+ devices
+/// run the MMA kernel variants.
 struct FlashAttnPrefill {
     scale: f32,
     softcap: f32,
@@ -1092,6 +1097,7 @@ struct FlashAttnPrefill {
     window: usize,
     br: usize,
     bc: usize,
+    sinks: Option<Tensor>,
 }
 
 impl CustomOp3 for FlashAttnPrefill {
@@ -1190,6 +1196,7 @@ impl CustomOp3 for FlashAttnPrefill {
             prefix_len: self.prefix_len as u32,
             window: self.window as u32,
             kv_head_stride: kv_stride as u32,
+            has_sink: u32::from(self.sinks.is_some()),
         };
 
         let tg_bytes = fa_threadgroup_bytes(self.br, self.bc, d, dtype_bytes, use_mma);
@@ -1209,6 +1216,22 @@ impl CustomOp3 for FlashAttnPrefill {
         encoder.set_input_buffer(2, Some(v.buffer()), v_l.start_offset() * dtype_bytes);
         encoder.set_output_buffer(3, Some(&*output), 0);
         encoder.set_bytes(4, &params);
+        let sinks_sl = self.sinks.as_ref().map(|s| s.storage_and_layout());
+        let (sink_buf, sink_off) = match &sinks_sl {
+            Some(sl) => {
+                if sl.1.dims() != [h] || !sl.1.is_contiguous() {
+                    candle_core::bail!("FlashAttnPrefill: sinks must be a contiguous [{h}] tensor");
+                }
+                match &*sl.0 {
+                    candle_core::Storage::Metal(ms) if ms.dtype() == DType::F32 => {
+                        (ms.buffer(), sl.1.start_offset() * 4)
+                    }
+                    _ => candle_core::bail!("FlashAttnPrefill: sinks must be F32 on Metal"),
+                }
+            }
+            None => (q.buffer(), 0),
+        };
+        encoder.set_input_buffer(5, Some(sink_buf), sink_off);
         encoder.set_threadgroup_memory_length(0, tg_bytes);
 
         encoder.dispatch_thread_groups(
@@ -1458,14 +1481,29 @@ pub fn softcap_fused(x: &Tensor, softcap: f32) -> Result<Tensor> {
     x.apply_op1_no_bwd(&SoftcapOp { softcap })
 }
 
+/// What a prefill attention call needs besides q, k and v.
+#[derive(Clone, Copy)]
+pub struct FlashAttnCall<'a> {
+    pub scale: f32,
+    /// Softcap, or `None`.
+    pub softcap: Option<f32>,
+    /// KV-cache tokens ahead of the queries (`prefix_len + T_q == T_kv`).
+    pub prefix_len: usize,
+    /// Sliding window in tokens, 0 for the whole prefix.
+    pub window: usize,
+    /// One sink logit per head (gpt-oss), or `None`.
+    pub sinks: Option<&'a Tensor>,
+}
+
 /// Flash Attention prefill; prefers the TensorOps kernel when eligible.
 ///
 /// BF16 inputs with no softcap and head dim 64/128/256 first try
 /// [`MppFlashAttn`]; if the TensorOps runtime is unavailable or breaks
 /// mid-flight, the call falls back to [`FlashAttnPrefill`] with tile sizes from
 /// [`fa_tile_sizes`]. `prefix_len` is the number of KV-cache tokens ahead of the
-/// queries (`prefix_len + T_q == T_kv`), and `window` bounds how far back a
-/// query may attend, 0 for the whole prefix.
+/// queries (`prefix_len + T_q == T_kv`), `window` bounds how far back a query
+/// may attend, 0 for the whole prefix, and `sinks`, one logit per head, is the
+/// attention sink of gpt-oss, which only the tiled kernel takes.
 ///
 /// ## Errors
 /// Fails when q/k/v are off-Metal, on shape or dtype mismatches, or when
@@ -1474,16 +1512,21 @@ pub fn flash_attention_metal_prefill(
     q: &Tensor,
     k: &Tensor,
     v: &Tensor,
-    scale: f32,
-    softcap: Option<f32>,
-    prefix_len: usize,
-    window: usize,
+    call: FlashAttnCall<'_>,
 ) -> Result<Tensor> {
+    let FlashAttnCall {
+        scale,
+        softcap,
+        prefix_len,
+        window,
+        sinks,
+    } = call;
     if !q.device().is_metal() || !k.device().is_metal() || !v.device().is_metal() {
         candle_core::bail!("flash_attention_metal_prefill: q, k, v must all be on a Metal device");
     }
     let head_dim = q.dim(D::Minus1)?;
     if q.dtype() == DType::BF16
+        && sinks.is_none()
         && softcap.unwrap_or(0.0) == 0.0
         && matches!(head_dim, 64 | 128 | 256 | 512)
         && let candle_core::Device::Metal(md) = q.device()
@@ -1518,6 +1561,9 @@ pub fn flash_attention_metal_prefill(
             window,
             br,
             bc,
+            sinks: sinks
+                .map(|s| s.flatten_all()?.to_dtype(DType::F32)?.contiguous())
+                .transpose()?,
         },
     )
 }
@@ -1581,7 +1627,6 @@ const QDET_S_BATCH: usize = 16;
 const QDET_A_TGW: usize = 32;
 const QDET_A_S: usize = 32;
 const QDET_AB_TGW: usize = 16;
-const QDET_AB_S: usize = 32;
 
 /// Compiled quant pipelines, keyed by `(device registry id, kernel name)`.
 static QUANT_PIPELINES: OnceLock<Mutex<HashMap<(u64, &'static str), ComputePipeline>>> =
@@ -1649,6 +1694,7 @@ struct W4A16Params {
     k_splits: u32,
     chunk: u32,
     m: u32,
+    out_f32: u32,
 }
 
 /// Validated geometry of an AWQ-layout weight: output-packed `qweight`
@@ -1693,7 +1739,14 @@ impl AwqShape {
     }
 
     /// Fills the kernel argument block for one dispatch.
-    fn params(&self, group_shift: usize, k_splits: usize, chunk: usize, m: usize) -> W4A16Params {
+    fn params(
+        &self,
+        group_shift: usize,
+        k_splits: usize,
+        chunk: usize,
+        m: usize,
+        out_f32: bool,
+    ) -> W4A16Params {
         W4A16Params {
             in_features: self.in_features as u32,
             out_features: self.out_features as u32,
@@ -1703,27 +1756,31 @@ impl AwqShape {
             k_splits: k_splits as u32,
             chunk: chunk as u32,
             m: m as u32,
+            out_f32: u32::from(out_f32),
         }
     }
 }
 
 /// AWQ/W8A16 decode GEMV: `x [m, in]` (m in 1..=8) against the packed
-/// `qweight`/`qzeros`/`scales` triplet, accumulated in F32.
+/// `qweight`/`qzeros`/`scales` triplet, accumulated in F32 and stored once
+/// in `out_dtype`, so nothing zeroes or casts an accumulator around the
+/// kernel.
 ///
-/// Written as an [`InplaceOp1`] on the F32 accumulator because the op needs
-/// four input tensors and `CustomOp3` tops out at three. The default
+/// A [`CustomOp1`] on `x` with the weight triplet in the op, since the op
+/// needs four tensors and `CustomOp3` tops out at three. The default
 /// deterministic kernels reduce their k-splits inside one threadgroup in
 /// fixed order, keeping temp-0 decode bitwise stable; the retired atomic
-/// variants stay selectable via [`QUANT_GEMV_ATOMIC`].
+/// variants, selectable via [`QUANT_GEMV_ATOMIC`], accumulate into a zeroed
+/// F32 buffer that the caller casts.
 struct W4A16Matmul {
-    x: Tensor,
     qweight: Tensor,
     qzeros: Tensor,
     scales: Tensor,
     bits: u32,
+    out_dtype: DType,
 }
 
-impl InplaceOp1 for W4A16Matmul {
+impl CustomOp1 for W4A16Matmul {
     fn name(&self) -> &'static str {
         match self.bits {
             8 => "w8a16-matmul",
@@ -1731,23 +1788,14 @@ impl InplaceOp1 for W4A16Matmul {
         }
     }
 
-    fn cpu_fwd(&self, _s: &mut CpuStorage, _l: &Layout) -> Result<()> {
+    fn cpu_fwd(&self, _s: &CpuStorage, _l: &Layout) -> Result<(CpuStorage, Shape)> {
         candle_core::bail!(
             "W{}A16Matmul: Metal-only; use the CPU dequantize_awq path",
             self.bits
         )
     }
 
-    fn metal_fwd(&self, out: &mut MetalStorage, out_l: &Layout) -> Result<()> {
-        if out.dtype() != DType::F32 {
-            candle_core::bail!(
-                "W4A16Matmul: accumulator must be F32, got {:?}",
-                out.dtype()
-            );
-        }
-
-        let x_sl = self.x.storage_and_layout();
-        let x_l = x_sl.1;
+    fn metal_fwd(&self, x: &MetalStorage, x_l: &Layout) -> Result<(MetalStorage, Shape)> {
         if !x_l.is_contiguous() {
             candle_core::bail!("W4A16Matmul: x must be contiguous");
         }
@@ -1776,20 +1824,12 @@ impl InplaceOp1 for W4A16Matmul {
                 shape.in_features
             );
         }
-        if out_l.dims() != [m, shape.out_features] {
-            candle_core::bail!(
-                "W{}A16Matmul: accumulator shape {:?} != [{m}, {}]",
-                self.bits,
-                out_l.dims(),
-                shape.out_features
-            );
-        }
-        if self.scales.dtype() != self.x.dtype() {
+        if self.scales.dtype() != x.dtype() {
             candle_core::bail!(
                 "W{}A16Matmul: scales dtype {:?} must match x dtype {:?}",
                 self.bits,
                 self.scales.dtype(),
-                self.x.dtype()
+                x.dtype()
             );
         }
         if !shape.group_size.is_power_of_two() {
@@ -1802,7 +1842,7 @@ impl InplaceOp1 for W4A16Matmul {
 
         let atomic = quant_gemv_atomic();
         let kernel_name = if atomic {
-            match (self.bits, self.x.dtype(), m) {
+            match (self.bits, x.dtype(), m) {
                 (4, DType::F16, 1) => "w4a16_gemv_f16_atomic",
                 (4, DType::BF16, 1) => "w4a16_gemv_bf16_atomic",
                 (8, DType::F16, 1) => "w8a16_gemv_f16_atomic",
@@ -1818,17 +1858,21 @@ impl InplaceOp1 for W4A16Matmul {
         } else {
             // M=1 geometry class by output width: narrow outputs need a deep
             // split to keep the GPU busy, mid ones a narrow tile for
-            // threadgroup balance, wide ones are fine at S=16.
+            // threadgroup balance, wide ones are fine at S=16. The batch
+            // kernel of a wide output splits K as the wide M=1 kernel does,
+            // since the split is the order of the sums and a row must get
+            // the same bits in a batch and alone.
+            let wide = shape.packed_out >= 1024;
             let class = if m > 1 {
-                2
+                if wide { 4 } else { 2 }
             } else if shape.packed_out < 512 {
                 0
-            } else if shape.packed_out < 1024 {
+            } else if !wide {
                 1
             } else {
                 3
             };
-            match (self.bits, self.x.dtype(), class) {
+            match (self.bits, x.dtype(), class) {
                 (4, DType::F16, 0) => "w4a16_gemv_f16",
                 (4, DType::BF16, 0) => "w4a16_gemv_bf16",
                 (8, DType::F16, 0) => "w8a16_gemv_f16",
@@ -1841,6 +1885,10 @@ impl InplaceOp1 for W4A16Matmul {
                 (4, DType::BF16, 3) => "w4a16_gemv_s16_bf16",
                 (8, DType::F16, 3) => "w8a16_gemv_s16_f16",
                 (8, DType::BF16, 3) => "w8a16_gemv_s16_bf16",
+                (4, DType::F16, 4) => "w4a16_gemv_batch_s16_f16",
+                (4, DType::BF16, 4) => "w4a16_gemv_batch_s16_bf16",
+                (8, DType::F16, 4) => "w8a16_gemv_batch_s16_f16",
+                (8, DType::BF16, 4) => "w8a16_gemv_batch_s16_bf16",
                 (4, DType::F16, _) => "w4a16_gemv_batch_f16",
                 (4, DType::BF16, _) => "w4a16_gemv_batch_bf16",
                 (8, DType::F16, _) => "w8a16_gemv_batch_f16",
@@ -1855,14 +1903,15 @@ impl InplaceOp1 for W4A16Matmul {
         // so the split count is the kernel's threadgroup height; the atomic
         // kernels size the grid for occupancy instead. Geometry must mirror
         // the kernel-name classes above.
-        let (det_tgw, s_rows) = if m > 1 {
-            (QDET_AB_TGW, QDET_AB_S)
-        } else if shape.packed_out < 512 {
-            (QDET_A_TGW, QDET_A_S)
-        } else if shape.packed_out < 1024 {
-            (QDET_AB_TGW, QDET_A_S)
+        let s_rows = if shape.packed_out >= 1024 {
+            QDET_S
         } else {
-            (QDET_A_TGW, QDET_S)
+            QDET_A_S
+        };
+        let det_tgw = if m > 1 || (512..1024).contains(&shape.packed_out) {
+            QDET_AB_TGW
+        } else {
+            QDET_A_TGW
         };
         let (k_splits, chunk) = if atomic {
             const TARGET_THREADS: usize = 32768;
@@ -1876,15 +1925,23 @@ impl InplaceOp1 for W4A16Matmul {
             (shape.in_features.div_ceil(chunk), chunk)
         };
         let group_shift = shape.group_size.trailing_zeros() as usize;
-        let params = shape.params(group_shift, k_splits, chunk, m);
-
-        let dtype_bytes = self.x.dtype().size_in_bytes();
-        let device = out.device();
-
-        let x_buf = match &*x_sl.0 {
-            candle_core::Storage::Metal(ms) => ms.buffer(),
-            _ => candle_core::bail!("W4A16Matmul: x must be Metal-resident"),
+        let device = x.device();
+        let out_elems = m * shape.out_features;
+        let output = if atomic {
+            device.zeros_impl(&Shape::from_dims(&[m, shape.out_features]), DType::F32)?
+        } else {
+            let buffer = device.new_buffer(out_elems, self.out_dtype, "w4a16_matmul")?;
+            MetalStorage::new(buffer, device.clone(), out_elems, self.out_dtype)
         };
+        let params = shape.params(
+            group_shift,
+            k_splits,
+            chunk,
+            m,
+            output.dtype() == DType::F32,
+        );
+        let dtype_bytes = x.dtype().size_in_bytes();
+
         let qw_sl = self.qweight.storage_and_layout();
         let qz_sl = self.qzeros.storage_and_layout();
         let sc_sl = self.scales.storage_and_layout();
@@ -1905,11 +1962,11 @@ impl InplaceOp1 for W4A16Matmul {
         let encoder = device.command_encoder()?;
         let encoder = encoder.as_ref();
         encoder.set_compute_pipeline_state(&pipeline);
-        encoder.set_input_buffer(0, Some(x_buf), x_l.start_offset() * dtype_bytes);
+        encoder.set_input_buffer(0, Some(x.buffer()), x_l.start_offset() * dtype_bytes);
         encoder.set_input_buffer(1, Some(qweight_buf), qw_sl.1.start_offset() * 4);
         encoder.set_input_buffer(2, Some(qzeros_buf), qz_sl.1.start_offset() * 4);
         encoder.set_input_buffer(3, Some(scales_buf), sc_sl.1.start_offset() * dtype_bytes);
-        encoder.set_output_buffer(4, Some(out.buffer()), out_l.start_offset() * 4);
+        encoder.set_output_buffer(4, Some(output.buffer()), 0);
         encoder.set_bytes(5, &params);
 
         if atomic {
@@ -1941,7 +1998,7 @@ impl InplaceOp1 for W4A16Matmul {
             );
         }
 
-        Ok(())
+        Ok((output, Shape::from_dims(&[m, shape.out_features])))
     }
 }
 
@@ -2004,7 +2061,7 @@ impl CustomOp1 for DequantizeW4 {
         let out_elems = in_features * out_features;
         let device = qweight.device();
         let output = device.new_buffer(out_elems, out_dtype, "dequant_w4")?;
-        let params = shape.params(0, 0, 0, 1);
+        let params = shape.params(0, 0, 0, 1, false);
 
         let qz_sl = self.qzeros.storage_and_layout();
         let sc_sl = self.scales.storage_and_layout();
@@ -2053,13 +2110,14 @@ impl CustomOp1 for DequantizeW4 {
 ///
 /// ## Errors
 /// Fails off-Metal, when `m > 8`, or on packing, shape, or dtype mismatches.
+#[cfg(test)]
 pub fn w4a16_matmul(
     x: &Tensor,
     qweight: &Tensor,
     qzeros: &Tensor,
     scales: &Tensor,
 ) -> Result<Tensor> {
-    wna16_matmul_inner(x, qweight, qzeros, scales, 4)
+    wna16_matmul_to(x, qweight, qzeros, scales, 4, x.dtype())
 }
 
 /// W8A16 decode GEMV over the AWQ-layout 8-bit packing; same contract as
@@ -2067,38 +2125,43 @@ pub fn w4a16_matmul(
 ///
 /// ## Errors
 /// Fails off-Metal, when `m > 8`, or on packing, shape, or dtype mismatches.
+#[cfg(test)]
 pub fn w8a16_matmul(
     x: &Tensor,
     qweight: &Tensor,
     qzeros: &Tensor,
     scales: &Tensor,
 ) -> Result<Tensor> {
-    wna16_matmul_inner(x, qweight, qzeros, scales, 8)
+    wna16_matmul_to(x, qweight, qzeros, scales, 8, x.dtype())
 }
 
-/// Allocates the F32 accumulator, runs [`W4A16Matmul`], and casts back to
-/// `x`'s dtype.
+/// The AWQ-layout decode GEMV of `bits` width with its output in
+/// `out_dtype`, stored by the kernel itself: it accumulates in F32, which
+/// the vocabulary projection keeps so the sampler never meets BF16 ties,
+/// and the other layers round to their dtype.
 ///
 /// ## Errors
 /// Propagates validation and dispatch failures from [`W4A16Matmul`].
-fn wna16_matmul_inner(
+pub fn wna16_matmul_to(
     x: &Tensor,
     qweight: &Tensor,
     qzeros: &Tensor,
     scales: &Tensor,
     bits: u32,
+    out_dtype: DType,
 ) -> Result<Tensor> {
-    let out_features = scales.dim(1)?;
-    let m = x.dim(0)?;
-    let out = Tensor::zeros((m, out_features), DType::F32, x.device())?;
-    out.inplace_op1(&W4A16Matmul {
-        x: x.clone(),
+    let out = x.apply_op1_no_bwd(&W4A16Matmul {
         qweight: qweight.clone(),
         qzeros: qzeros.clone(),
         scales: scales.clone(),
         bits,
+        out_dtype,
     })?;
-    out.to_dtype(x.dtype())
+    if out.dtype() == out_dtype {
+        Ok(out)
+    } else {
+        out.to_dtype(out_dtype)
+    }
 }
 
 /// Dequantizes an AWQ W4 weight to dense `[in, out]` in the scales' dtype.
@@ -2137,6 +2200,7 @@ struct GptqParams {
     k_splits: u32,
     chunk: u32,
     m: u32,
+    out_f32: u32,
 }
 
 /// Validated geometry of a GPTQ-layout weight: input-packed `qweight`
@@ -2176,7 +2240,14 @@ impl GptqShape {
     }
 
     /// Fills the kernel argument block for one dispatch.
-    fn params(&self, group_shift: usize, k_splits: usize, chunk: usize, m: usize) -> GptqParams {
+    fn params(
+        &self,
+        group_shift: usize,
+        k_splits: usize,
+        chunk: usize,
+        m: usize,
+        out_f32: bool,
+    ) -> GptqParams {
         GptqParams {
             in_features: self.in_features as u32,
             out_features: self.out_features as u32,
@@ -2185,22 +2256,23 @@ impl GptqShape {
             k_splits: k_splits as u32,
             chunk: chunk as u32,
             m: m as u32,
+            out_f32: u32::from(out_f32),
         }
     }
 }
 
 /// GPTQ decode GEMV: the input-packed counterpart of [`W4A16Matmul`], with
-/// the same F32 accumulator, deterministic fixed-order reduction, and
-/// [`QUANT_GEMV_ATOMIC`] escape hatch.
+/// the same F32 accumulation stored once in `out_dtype`, deterministic
+/// fixed-order reduction, and [`QUANT_GEMV_ATOMIC`] escape hatch.
 struct GptqMatmul {
-    x: Tensor,
     qweight: Tensor,
     qzeros: Tensor,
     scales: Tensor,
     bits: u32,
+    out_dtype: DType,
 }
 
-impl InplaceOp1 for GptqMatmul {
+impl CustomOp1 for GptqMatmul {
     fn name(&self) -> &'static str {
         match self.bits {
             8 => "gptq8-matmul",
@@ -2208,20 +2280,15 @@ impl InplaceOp1 for GptqMatmul {
         }
     }
 
-    fn cpu_fwd(&self, _s: &mut CpuStorage, _l: &Layout) -> Result<()> {
+    fn cpu_fwd(&self, _s: &CpuStorage, _l: &Layout) -> Result<(CpuStorage, Shape)> {
         candle_core::bail!(
             "GptqMatmul (bits={}): Metal-only; use the CPU dequantize_gptq path",
             self.bits
         )
     }
 
-    fn metal_fwd(&self, out: &mut MetalStorage, out_l: &Layout) -> Result<()> {
-        if out.dtype() != DType::F32 {
-            candle_core::bail!("GptqMatmul: accumulator must be F32, got {:?}", out.dtype());
-        }
+    fn metal_fwd(&self, x: &MetalStorage, x_l: &Layout) -> Result<(MetalStorage, Shape)> {
         let pack_factor = (32 / self.bits) as usize;
-        let x_sl = self.x.storage_and_layout();
-        let x_l = x_sl.1;
         if !x_l.is_contiguous() {
             candle_core::bail!("GptqMatmul: x must be contiguous");
         }
@@ -2257,18 +2324,11 @@ impl InplaceOp1 for GptqMatmul {
                 shape.in_features
             );
         }
-        if out_l.dims() != [m, shape.out_features] {
-            candle_core::bail!(
-                "GptqMatmul: accumulator shape {:?} != [{m}, {}]",
-                out_l.dims(),
-                shape.out_features
-            );
-        }
-        if self.scales.dtype() != self.x.dtype() {
+        if self.scales.dtype() != x.dtype() {
             candle_core::bail!(
                 "GptqMatmul: scales dtype {:?} must match x dtype {:?}",
                 self.scales.dtype(),
-                self.x.dtype()
+                x.dtype()
             );
         }
         if !shape.group_size.is_power_of_two() {
@@ -2280,7 +2340,7 @@ impl InplaceOp1 for GptqMatmul {
 
         let atomic = quant_gemv_atomic();
         let kernel_name = if atomic {
-            match (self.bits, self.x.dtype(), m) {
+            match (self.bits, x.dtype(), m) {
                 (4, DType::F16, 1) => "gptq4_gemv_f16_atomic",
                 (4, DType::BF16, 1) => "gptq4_gemv_bf16_atomic",
                 (8, DType::F16, 1) => "gptq8_gemv_f16_atomic",
@@ -2294,7 +2354,7 @@ impl InplaceOp1 for GptqMatmul {
                 ),
             }
         } else {
-            match (self.bits, self.x.dtype(), m) {
+            match (self.bits, x.dtype(), m) {
                 (4, DType::F16, 1) => "gptq4_gemv_f16",
                 (4, DType::BF16, 1) => "gptq4_gemv_bf16",
                 (8, DType::F16, 1) => "gptq8_gemv_f16",
@@ -2327,15 +2387,23 @@ impl InplaceOp1 for GptqMatmul {
             (shape.in_features.div_ceil(chunk), chunk)
         };
         let group_shift = shape.group_size.trailing_zeros() as usize;
-        let params = shape.params(group_shift, k_splits, chunk, m);
-
-        let dtype_bytes = self.x.dtype().size_in_bytes();
-        let device = out.device();
-
-        let x_buf = match &*x_sl.0 {
-            candle_core::Storage::Metal(ms) => ms.buffer(),
-            _ => candle_core::bail!("GptqMatmul: x must be Metal-resident"),
+        let device = x.device();
+        let out_elems = m * shape.out_features;
+        let output = if atomic {
+            device.zeros_impl(&Shape::from_dims(&[m, shape.out_features]), DType::F32)?
+        } else {
+            let buffer = device.new_buffer(out_elems, self.out_dtype, "gptq_matmul")?;
+            MetalStorage::new(buffer, device.clone(), out_elems, self.out_dtype)
         };
+        let params = shape.params(
+            group_shift,
+            k_splits,
+            chunk,
+            m,
+            output.dtype() == DType::F32,
+        );
+        let dtype_bytes = x.dtype().size_in_bytes();
+
         let qw_sl = self.qweight.storage_and_layout();
         let qz_sl = self.qzeros.storage_and_layout();
         let sc_sl = self.scales.storage_and_layout();
@@ -2356,11 +2424,11 @@ impl InplaceOp1 for GptqMatmul {
         let encoder = device.command_encoder()?;
         let encoder = encoder.as_ref();
         encoder.set_compute_pipeline_state(&pipeline);
-        encoder.set_input_buffer(0, Some(x_buf), x_l.start_offset() * dtype_bytes);
+        encoder.set_input_buffer(0, Some(x.buffer()), x_l.start_offset() * dtype_bytes);
         encoder.set_input_buffer(1, Some(qweight_buf), qw_sl.1.start_offset() * 4);
         encoder.set_input_buffer(2, Some(qzeros_buf), qz_sl.1.start_offset() * 4);
         encoder.set_input_buffer(3, Some(scales_buf), sc_sl.1.start_offset() * dtype_bytes);
-        encoder.set_output_buffer(4, Some(out.buffer()), out_l.start_offset() * 4);
+        encoder.set_output_buffer(4, Some(output.buffer()), 0);
         encoder.set_bytes(5, &params);
 
         if atomic {
@@ -2392,7 +2460,7 @@ impl InplaceOp1 for GptqMatmul {
             );
         }
 
-        Ok(())
+        Ok((output, Shape::from_dims(&[m, shape.out_features])))
     }
 }
 
@@ -2464,7 +2532,7 @@ impl CustomOp1 for DequantizeGptqPacked {
         let out_elems = shape.in_features * shape.out_features;
         let device = qweight.device();
         let output = device.new_buffer(out_elems, out_dtype, "dequant_gptq")?;
-        let params = shape.params(0, 0, 0, 1);
+        let params = shape.params(0, 0, 0, 1, false);
 
         let qz_sl = self.qzeros.storage_and_layout();
         let sc_sl = self.scales.storage_and_layout();
@@ -2513,6 +2581,7 @@ impl CustomOp1 for DequantizeGptqPacked {
 ///
 /// ## Errors
 /// Fails off-Metal, when `m > 8`, or on packing, shape, or dtype mismatches.
+#[cfg(test)]
 pub fn gptq_matmul(
     x: &Tensor,
     qweight: &Tensor,
@@ -2520,17 +2589,34 @@ pub fn gptq_matmul(
     scales: &Tensor,
     bits: u32,
 ) -> Result<Tensor> {
-    let out_features = scales.dim(1)?;
-    let m = x.dim(0)?;
-    let out = Tensor::zeros((m, out_features), DType::F32, x.device())?;
-    out.inplace_op1(&GptqMatmul {
-        x: x.clone(),
+    gptq_matmul_to(x, qweight, qzeros, scales, bits, x.dtype())
+}
+
+/// [`gptq_matmul`] with its output in `out_dtype`, F32 kept as accumulated
+/// (see [`wna16_matmul_to`]).
+///
+/// ## Errors
+/// Fails off-Metal, when `m > 8`, or on packing, shape, or dtype mismatches.
+pub fn gptq_matmul_to(
+    x: &Tensor,
+    qweight: &Tensor,
+    qzeros: &Tensor,
+    scales: &Tensor,
+    bits: u32,
+    out_dtype: DType,
+) -> Result<Tensor> {
+    let out = x.apply_op1_no_bwd(&GptqMatmul {
         qweight: qweight.clone(),
         qzeros: qzeros.clone(),
         scales: scales.clone(),
         bits,
+        out_dtype,
     })?;
-    out.to_dtype(x.dtype())
+    if out.dtype() == out_dtype {
+        Ok(out)
+    } else {
+        out.to_dtype(out_dtype)
+    }
 }
 
 /// Dequantizes a GPTQ weight to dense `[in, out]` in the scales' dtype.
@@ -3453,6 +3539,130 @@ impl CustomOp1 for GgufMatvec {
     }
 }
 
+/// `x [m, k] @ w^T` for a dense BF16 weight `w [n, k]` and up to
+/// [`GGUF_BATCH_MAX`] rows of `x`, through the crate's own gemv, one source
+/// instantiated for one row and for a batch, in the dtype the layer wants
+/// out.
+///
+/// candle serves one row with its gemv and more with its tiled GEMM, two
+/// reductions in different orders, so a token of a dense checkpoint decoded
+/// beside others came out with other logits than the same token decoded
+/// alone, which this closes for decode batches of up to eight.
+struct Bf16Gemv {
+    weight: Tensor,
+    out_dtype: DType,
+}
+
+impl CustomOp1 for Bf16Gemv {
+    fn name(&self) -> &'static str {
+        "bf16-gemv"
+    }
+
+    fn cpu_fwd(&self, _s: &CpuStorage, _l: &Layout) -> Result<(CpuStorage, Shape)> {
+        candle_core::bail!("Bf16Gemv: Metal-only")
+    }
+
+    fn metal_fwd(&self, x: &MetalStorage, x_l: &Layout) -> Result<(MetalStorage, Shape)> {
+        if x.dtype() != DType::BF16 || self.weight.dtype() != DType::BF16 {
+            candle_core::bail!("Bf16Gemv: x and weight must be BF16");
+        }
+        if !x_l.is_contiguous() {
+            candle_core::bail!("Bf16Gemv: x must be contiguous");
+        }
+        let (n, k) = self.weight.dims2()?;
+        let m = match x_l.dims() {
+            [m, xk] if *xk == k && (1..=GGUF_BATCH_MAX).contains(m) => *m,
+            dims => {
+                candle_core::bail!("Bf16Gemv: x shape {dims:?} is not [1..={GGUF_BATCH_MAX}, {k}]")
+            }
+        };
+        if !k.is_multiple_of(8) {
+            candle_core::bail!("Bf16Gemv: k {k} is not a multiple of eight");
+        }
+        let w_sl = self.weight.storage_and_layout();
+        if !w_sl.1.is_contiguous() {
+            candle_core::bail!("Bf16Gemv: weight must be contiguous");
+        }
+        let w_buf = match &*w_sl.0 {
+            candle_core::Storage::Metal(ms) => ms.buffer(),
+            _ => candle_core::bail!("Bf16Gemv: weight must be Metal-resident"),
+        };
+        let device = x.device();
+        let out_elems = m * n;
+        let output = device.new_buffer(out_elems, self.out_dtype, "bf16_gemv")?;
+        let kernel = if m == 1 {
+            "bf16_gemv_bf16"
+        } else {
+            "bf16_gemv_batch_bf16"
+        };
+        let pipeline = get_or_compile_quant_pipeline(device.device(), kernel)?;
+        let encoder = device.command_encoder()?;
+        let encoder = encoder.as_ref();
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_input_buffer(0, Some(x.buffer()), x_l.start_offset() * 2);
+        encoder.set_input_buffer(1, Some(w_buf), w_sl.1.start_offset() * 2);
+        encoder.set_output_buffer(2, Some(&*output), 0);
+        encoder.set_bytes(
+            3,
+            &GgufBatchParams {
+                in_features: k as u32,
+                out_features: n as u32,
+                m_batch: m as u32,
+                out_f32: u32::from(self.out_dtype == DType::F32),
+            },
+        );
+        encoder.dispatch_thread_groups(
+            MTLSize {
+                width: n.div_ceil(4),
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: 64,
+                height: 1,
+                depth: 1,
+            },
+        );
+        Ok((
+            MetalStorage::new(output, device.clone(), out_elems, self.out_dtype),
+            Shape::from_dims(&[m, n]),
+        ))
+    }
+}
+
+/// `x @ weight_t` through [`Bf16Gemv`] in a decode step of up to
+/// [`GGUF_BATCH_MAX`] rows, where `weight_t` is the transposed view of a
+/// contiguous `[n, k]` BF16 weight, else `None` so the caller takes candle's
+/// GEMM; the phase is the engine's (see [`crate::common::phase`]), so
+/// outside it the row count alone decides as before.
+///
+/// ## Errors
+/// Propagates kernel failures.
+pub fn maybe_bf16_gemv(x: &Tensor, weight_t: &Tensor, out_dtype: DType) -> Result<Option<Tensor>> {
+    if crate::common::phase::current() != Some(crate::common::phase::Phase::Prefill)
+        && crate::common::phase::current().is_some()
+    {
+        let dims = x.dims();
+        if dims.len() != 2
+            || dims[0] > GGUF_BATCH_MAX
+            || !x.is_contiguous()
+            || x.dtype() != DType::BF16
+            || weight_t.dtype() != DType::BF16
+            || !x.device().is_metal()
+        {
+            return Ok(None);
+        }
+        let weight = weight_t.t()?;
+        if !weight.is_contiguous() || weight.dim(1)? != dims[1] || !dims[1].is_multiple_of(8) {
+            return Ok(None);
+        }
+        return x
+            .apply_op1_no_bwd(&Bf16Gemv { weight, out_dtype })
+            .map(Some);
+    }
+    Ok(None)
+}
+
 /// Rows `tokens` of a table only this crate's kernels decode, one simdgroup
 /// per token, decoded straight to BF16.
 struct MppOwnedGather {
@@ -3702,7 +3912,7 @@ pub fn mpp_quant_matmul(
 
 /// Routes a quantized matmul onto the staged TensorOps GEMM when
 /// profitable, else `Ok(None)`; the decline rules mirror
-/// [`maybe_mpp_matmul`].
+/// [`maybe_mpp_matmul`], a prefill taking the GEMM whatever its row count.
 ///
 /// ## Errors
 /// Propagates kernel failures other than a broken TensorOps runtime.
@@ -3721,7 +3931,8 @@ pub fn maybe_mpp_quant_matmul(
         return Ok(None);
     };
     let dims = x.dims();
-    if dims.len() != 2 || dims[0] < MPP_GEMM_MIN_M || !x.is_contiguous() {
+    let prefill = crate::common::phase::current() == Some(crate::common::phase::Phase::Prefill);
+    if dims.len() != 2 || (dims[0] < MPP_GEMM_MIN_M && !prefill) || !x.is_contiguous() {
         return Ok(None);
     }
     if !mpp_gemm_available(md.device()) {
@@ -4277,11 +4488,15 @@ mod fused_kernel_parity_tests {
         q: &Tensor,
         k: &Tensor,
         v: &Tensor,
-        scale: f32,
-        softcap: Option<f32>,
-        prefix_len: usize,
-        window: usize,
+        call: FlashAttnCall<'_>,
     ) -> Result<Tensor> {
+        let FlashAttnCall {
+            scale,
+            softcap,
+            prefix_len,
+            window,
+            sinks,
+        } = call;
         let out_dtype = q.dtype();
         let (q, k, v) = (
             &q.to_dtype(DType::F32)?,
@@ -4328,7 +4543,20 @@ mod fused_kernel_parity_tests {
             Tensor::from_vec(mask_data, (1, 1, t_q, t_kv), device)?.to_dtype(scores.dtype())?;
         let masked = scores.broadcast_add(&mask)?;
 
-        let attn = crate::common::linear::softmax_last_dim(&masked)?;
+        let attn = match sinks {
+            Some(sinks) => {
+                let sink_col = sinks
+                    .to_dtype(DType::F32)?
+                    .reshape((1, h, 1, 1))?
+                    .broadcast_as((b, h, t_q, 1))?
+                    .contiguous()?;
+                let with_sink = Tensor::cat(&[&masked, &sink_col], D::Minus1)?;
+                crate::common::linear::softmax_last_dim(&with_sink)?
+                    .narrow(D::Minus1, 0, t_kv)?
+                    .contiguous()?
+            }
+            None => crate::common::linear::softmax_last_dim(&masked)?,
+        };
         attn.matmul(&v_exp)?.to_dtype(out_dtype)
     }
 
@@ -4349,6 +4577,7 @@ mod fused_kernel_parity_tests {
         dtype: DType,
         case: FaCase,
         softcap: Option<f32>,
+        sinks: Option<&Tensor>,
         tol: f32,
         label: &str,
     ) {
@@ -4385,11 +4614,33 @@ mod fused_kernel_parity_tests {
             .to_dtype(dtype)
             .unwrap();
 
-        let out_fa = flash_attention_metal_prefill(&q, &k, &v, scale, softcap, prefix, window)
-            .expect("FA kernel must not error");
+        let out_fa = flash_attention_metal_prefill(
+            &q,
+            &k,
+            &v,
+            FlashAttnCall {
+                scale,
+                softcap,
+                prefix_len: prefix,
+                window,
+                sinks,
+            },
+        )
+        .expect("FA kernel must not error");
 
-        let out_ref = naive_attention_reference(&q, &k, &v, scale, softcap, prefix, window)
-            .expect("naive reference must not error");
+        let out_ref = naive_attention_reference(
+            &q,
+            &k,
+            &v,
+            FlashAttnCall {
+                scale,
+                softcap,
+                prefix_len: prefix,
+                window,
+                sinks,
+            },
+        )
+        .expect("naive reference must not error");
 
         let f = out_fa
             .to_dtype(DType::F32)
@@ -4502,10 +4753,32 @@ mod fused_kernel_parity_tests {
             let case = format!(
                 "seed {seed}: {dtype:?} h={h} h_kv={h_kv} t_q={t_q} prefix={prefix} d={d} mag={mag} window={window}"
             );
-            let fa = flash_attention_metal_prefill(&q, &k, &v, scale, None, prefix, window)
-                .unwrap_or_else(|e| panic!("{case}: kernel failed: {e}"));
-            let rf = naive_attention_reference(&q, &k, &v, scale, None, prefix, window)
-                .unwrap_or_else(|e| panic!("{case}: reference failed: {e}"));
+            let fa = flash_attention_metal_prefill(
+                &q,
+                &k,
+                &v,
+                FlashAttnCall {
+                    scale,
+                    softcap: None,
+                    prefix_len: prefix,
+                    window,
+                    sinks: None,
+                },
+            )
+            .unwrap_or_else(|e| panic!("{case}: kernel failed: {e}"));
+            let rf = naive_attention_reference(
+                &q,
+                &k,
+                &v,
+                FlashAttnCall {
+                    scale,
+                    softcap: None,
+                    prefix_len: prefix,
+                    window,
+                    sinks: None,
+                },
+            )
+            .unwrap_or_else(|e| panic!("{case}: reference failed: {e}"));
 
             let f: Vec<f32> = fa
                 .to_dtype(DType::F32)
@@ -4585,7 +4858,19 @@ mod fused_kernel_parity_tests {
                         };
                         let got = flat(&sdpa(&q, &k, &v, None, false, scale, 1.0).unwrap());
                         let want = flat(
-                            &naive_attention_reference(&q, &k, &v, scale, None, kv - 1, 0).unwrap(),
+                            &naive_attention_reference(
+                                &q,
+                                &k,
+                                &v,
+                                FlashAttnCall {
+                                    scale,
+                                    softcap: None,
+                                    prefix_len: kv - 1,
+                                    window: 0,
+                                    sinks: None,
+                                },
+                            )
+                            .unwrap(),
                         );
                         assert!(
                             got.iter().all(|x| x.is_finite()),
@@ -4736,16 +5021,30 @@ mod fused_kernel_parity_tests {
                     &q,
                     &k_view.contiguous().unwrap(),
                     &v_view.contiguous().unwrap(),
-                    scale,
-                    None,
-                    prefix,
-                    window,
+                    FlashAttnCall {
+                        scale,
+                        softcap: None,
+                        prefix_len: prefix,
+                        window,
+                        sinks: None,
+                    },
                 )
                 .unwrap(),
             );
             let visto = flat(
-                &flash_attention_metal_prefill(&q, &k_view, &v_view, scale, None, prefix, window)
-                    .unwrap(),
+                &flash_attention_metal_prefill(
+                    &q,
+                    &k_view,
+                    &v_view,
+                    FlashAttnCall {
+                        scale,
+                        softcap: None,
+                        prefix_len: prefix,
+                        window,
+                        sinks: None,
+                    },
+                )
+                .unwrap(),
             );
             assert_eq!(
                 copiato, visto,
@@ -4826,12 +5125,36 @@ mod fused_kernel_parity_tests {
                     .to_vec1::<f32>()
                     .unwrap()
             };
-            let base =
-                flat(&flash_attention_metal_prefill(&q, &k, &v, scale, None, prefix, 0).unwrap());
+            let base = flat(
+                &flash_attention_metal_prefill(
+                    &q,
+                    &k,
+                    &v,
+                    FlashAttnCall {
+                        scale,
+                        softcap: None,
+                        prefix_len: prefix,
+                        window: 0,
+                        sinks: None,
+                    },
+                )
+                .unwrap(),
+            );
             for window in [t_kv, t_kv + 10] {
                 let wide = flat(
-                    &flash_attention_metal_prefill(&q, &k, &v, scale, None, prefix, window)
-                        .unwrap(),
+                    &flash_attention_metal_prefill(
+                        &q,
+                        &k,
+                        &v,
+                        FlashAttnCall {
+                            scale,
+                            softcap: None,
+                            prefix_len: prefix,
+                            window,
+                            sinks: None,
+                        },
+                    )
+                    .unwrap(),
                 );
                 assert_eq!(
                     base, wide,
@@ -4866,6 +5189,7 @@ mod fused_kernel_parity_tests {
                     window: 0,
                 },
                 None,
+                None,
                 1e-3,
                 &format!("f32 d128 prefill t={t}"),
             );
@@ -4890,6 +5214,7 @@ mod fused_kernel_parity_tests {
                 window: 0,
             },
             None,
+            None,
             1e-4,
             "f32/d64/no-prefix",
         );
@@ -4912,6 +5237,7 @@ mod fused_kernel_parity_tests {
                 d: 64,
                 window: 0,
             },
+            None,
             None,
             0.05,
             "bf16/d64/no-prefix",
@@ -4936,6 +5262,7 @@ mod fused_kernel_parity_tests {
                 window: 0,
             },
             None,
+            None,
             0.05,
             "bf16/d128/no-prefix",
         );
@@ -4958,6 +5285,7 @@ mod fused_kernel_parity_tests {
                 d: 256,
                 window: 0,
             },
+            None,
             None,
             0.05,
             "bf16/d256/gqa/prefix",
@@ -4983,6 +5311,7 @@ mod fused_kernel_parity_tests {
                 window: 0,
             },
             None,
+            None,
             0.05,
             "bf16/d64/gqa",
         );
@@ -5007,6 +5336,7 @@ mod fused_kernel_parity_tests {
                 window: 0,
             },
             Some(30.0),
+            None,
             0.05,
             "bf16/d64/softcap",
         );
@@ -5031,9 +5361,76 @@ mod fused_kernel_parity_tests {
                 window: 0,
             },
             None,
+            None,
             0.05,
             "bf16/d64/prefix=24",
         );
+    }
+
+    fn sinks_for(dev: &Device, h: usize) -> Tensor {
+        Tensor::from_vec(
+            (0..h).map(|i| (i as f32 - 1.5) * 0.7).collect::<Vec<f32>>(),
+            h,
+            dev,
+        )
+        .unwrap()
+    }
+
+    /// Contract: with a per-head sink the tiled kernel matches the reference
+    /// that folds the sink into the softmax denominator, so a sink model's
+    /// prefill can leave the row-count-dependent GEMM fallback.
+    #[test]
+    fn flash_attn_bf16_d64_sink_matches_naive() {
+        let Some(dev) = metal_device_or_skip() else {
+            return;
+        };
+        let sinks = sinks_for(&dev, 4);
+        run_fa_parity(
+            &dev,
+            DType::BF16,
+            FaCase {
+                b: 1,
+                h: 4,
+                h_kv: 2,
+                t_q: 40,
+                t_kv: 40,
+                d: 64,
+                window: 0,
+            },
+            None,
+            Some(&sinks),
+            0.05,
+            "bf16/d64/sink",
+        );
+    }
+
+    /// Contract: the sink holds across a cached prefix and a sliding window,
+    /// the shape of every gpt-oss layer, the cached tail of one query included.
+    #[test]
+    fn flash_attn_bf16_d64_sink_with_prefix_and_window_matches_naive() {
+        let Some(dev) = metal_device_or_skip() else {
+            return;
+        };
+        let sinks = sinks_for(&dev, 4);
+        for (t_q, t_kv, window) in [(8usize, 32usize, 0usize), (1, 300, 128), (40, 300, 128)] {
+            run_fa_parity(
+                &dev,
+                DType::BF16,
+                FaCase {
+                    b: 1,
+                    h: 4,
+                    h_kv: 4,
+                    t_q,
+                    t_kv,
+                    d: 64,
+                    window,
+                },
+                None,
+                Some(&sinks),
+                0.05,
+                &format!("bf16/d64/sink/prefix={}/window={window}", t_kv - t_q),
+            );
+        }
     }
 
     #[test]
@@ -5054,6 +5451,7 @@ mod fused_kernel_parity_tests {
                 window: 0,
             },
             None,
+            None,
             0.02,
             "f16/d64/no-prefix",
         );
@@ -5065,8 +5463,19 @@ mod fused_kernel_parity_tests {
         let q = Tensor::zeros((1, 4, 4, 64), DType::F32, &dev).unwrap();
         let k = Tensor::zeros((1, 4, 4, 64), DType::F32, &dev).unwrap();
         let v = Tensor::zeros((1, 4, 4, 64), DType::F32, &dev).unwrap();
-        let err = flash_attention_metal_prefill(&q, &k, &v, 0.125, None, 0, 0)
-            .expect_err("must reject CPU tensors");
+        let err = flash_attention_metal_prefill(
+            &q,
+            &k,
+            &v,
+            FlashAttnCall {
+                scale: 0.125,
+                softcap: None,
+                prefix_len: 0,
+                window: 0,
+                sinks: None,
+            },
+        )
+        .expect_err("must reject CPU tensors");
         assert!(format!("{err}").contains("Metal"));
     }
 
@@ -5119,6 +5528,7 @@ mod fused_kernel_parity_tests {
                 window: 0,
             },
             None,
+            None,
             0.05,
             "bf16/d64/long-prefix",
         );
@@ -5162,7 +5572,13 @@ mod fused_kernel_parity_tests {
             })
             .collect();
         let scales: Vec<f32> = (0..groups)
-            .flat_map(|g| (0..out_features).map(move |j| 0.01 + 0.003 * ((g + j) % 5) as f32))
+            .flat_map(|g| {
+                (0..out_features).map(move |j| {
+                    let h = ((g * 7919 + j) as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 40;
+                    (0.004 + 0.012 * (h & 0xFFFF) as f32 / 65536.0)
+                        * (1u64 << ((h >> 16) & 3)) as f32
+                })
+            })
             .collect();
 
         let qweight = Tensor::from_vec(
@@ -5605,7 +6021,7 @@ mod fused_kernel_parity_tests {
         run_dequant_w8_parity(&dev, DType::BF16, 256, 128, 128, "w8/bf16/g128");
     }
 
-    fn build_gptq_triplet(
+    pub(super) fn build_gptq_triplet(
         dev: &Device,
         dtype: DType,
         bits: u32,
@@ -7108,8 +7524,12 @@ impl CustomOp1 for Mxfp4MulMM {
     }
 }
 
-/// MXFP4 matmul for x `[m, k]`: batched gemv for m <= [`GGUF_BATCH_MAX`],
-/// tiled mul_mm above.
+/// MXFP4 matmul for x `[m, k]`, the kernel following the phase of the forward
+/// as the other quantized paths do (see [`crate::common::phase`]): a decode
+/// step of up to [`GGUF_BATCH_MAX`] rows takes the batched gemv, a prefill
+/// the tiled mul_mm whatever its row count, so the tokens an expert sees
+/// get the same bits cold, behind a cached prefix and beside other prompts;
+/// outside the engine the row count alone decides.
 ///
 /// ## Errors
 /// Fails off-Metal, on non-BF16 `x`, when `k` is not a multiple of 32, or on
@@ -7122,7 +7542,8 @@ pub fn mxfp4_matmul(
     n: usize,
 ) -> Result<Tensor> {
     let m = x.dim(0)?;
-    if m <= GGUF_BATCH_MAX {
+    let prefill = crate::common::phase::current() == Some(crate::common::phase::Phase::Prefill);
+    if m <= GGUF_BATCH_MAX && !prefill {
         let out = Tensor::zeros((m, n), DType::BF16, x.device())?;
         out.inplace_op1(&Mxfp4Matmul {
             x: x.clone(),
@@ -7712,7 +8133,16 @@ mod quantized_matmul_floor {
         };
         let fused = || {
             crate::common::metal_ops::flash_attention_metal_prefill(
-                &q, &k, &v, scale, None, prefix, 0,
+                &q,
+                &k,
+                &v,
+                crate::common::metal_ops::FlashAttnCall {
+                    scale,
+                    softcap: None,
+                    prefix_len: prefix,
+                    window: 0,
+                    sinks: None,
+                },
             )
             .unwrap()
         };
@@ -8510,6 +8940,8 @@ mod row_invariance_tests {
     use candle_core::quantized::{GgmlDType, QMatMul, QTensor};
     use candle_core::{Device, Module};
 
+    type Run<'a> = Box<dyn Fn(&Tensor) -> Tensor + 'a>;
+
     fn activations(m: usize, k: usize, dev: &Device) -> Tensor {
         let x: Vec<f32> = (0..m * k)
             .map(|i| (((i * 7 + (i / k) * 13) % 23) as f32 - 11.0) * 0.05)
@@ -8623,6 +9055,147 @@ mod row_invariance_tests {
         }
     }
 
+    /// Contract: the staged packed-quant TensorOps GEMM, which serves AWQ
+    /// and GPTQ prefills, gives a row the same bits whatever rows share the
+    /// forward, on the projection shapes of a 4B model, across the 64-row
+    /// tile boundary: a prompt prefilled beside others lands its rows in
+    /// other tiles than alone.
+    #[test]
+    fn the_packed_quant_gemm_gives_a_row_the_same_bits_in_any_batch() {
+        use crate::common::awq::PackDim;
+        let Ok(dev) = Device::new_metal(0) else {
+            return;
+        };
+        let Device::Metal(md) = &dev else {
+            return;
+        };
+        if !mpp_gemm_available(md.device()) {
+            return;
+        }
+        for (k, n) in [(2560usize, 256usize), (1536, 8960)] {
+            let awq =
+                super::fused_kernel_parity_tests::build_awq_triplet(&dev, DType::BF16, k, n, 128);
+            let gptq = super::fused_kernel_parity_tests::build_gptq_triplet(
+                &dev,
+                DType::BF16,
+                4,
+                k,
+                n,
+                128,
+            );
+            let kernels: [(&str, Run); 2] = [
+                (
+                    "awq4",
+                    Box::new(|x: &Tensor| {
+                        mpp_quant_matmul(
+                            x,
+                            &awq.qweight,
+                            awq.qzeros.as_ref().unwrap(),
+                            &awq.scales,
+                            4,
+                            PackDim::Out,
+                        )
+                        .unwrap()
+                    }),
+                ),
+                (
+                    "gptq4",
+                    Box::new(|x: &Tensor| {
+                        mpp_quant_matmul(
+                            x,
+                            &gptq.qweight,
+                            gptq.qzeros.as_ref().unwrap(),
+                            &gptq.scales,
+                            4,
+                            PackDim::In,
+                        )
+                        .unwrap()
+                    }),
+                ),
+            ];
+            for (name, run) in &kernels {
+                for m in [1usize, 7, 60, 67, 100, 191] {
+                    let x = activations(m, k, &dev);
+                    let batched = run(&x);
+                    let bad = differing_rows(&batched, &x, |row| run(row));
+                    assert!(
+                        bad.is_empty(),
+                        "{name} [{k}->{n}] m={m}: rows {bad:?} differ from the row alone"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Contract: the tiled MXFP4 mul_mm, which serves every gpt-oss expert
+    /// in a prefill, gives a row the same bits whatever rows share the
+    /// forward, and the phase decides the kernel: a prefill of four rows
+    /// gets the mul_mm bits of a prefill of a hundred, a decode step of
+    /// four rows the gemv's. On this data the two kernels happen to agree;
+    /// the contract is the choice, not their disagreement.
+    #[test]
+    fn the_mxfp4_mul_mm_gives_a_row_the_same_bits_in_any_batch_and_the_phase_routes() {
+        use crate::common::phase::{Phase, with_phase};
+        let Ok(dev) = Device::new_metal(0) else {
+            return;
+        };
+        let (n, k) = (256usize, 512usize);
+        let nb = k / 32;
+        let blocks: Vec<u8> = (0..n * nb * 16)
+            .map(|i| ((i as u64).wrapping_mul(2654435761) >> 7) as u8)
+            .collect();
+        let scales: Vec<u8> = (0..n * nb).map(|i| 124 + (i % 7) as u8).collect();
+        let blocks = Tensor::from_vec(blocks, n * nb * 16, &dev).unwrap();
+        let scales = Tensor::from_vec(scales, n * nb, &dev).unwrap();
+        let rough: Vec<f32> = (0..100 * k)
+            .map(|i| {
+                let h = (i as u64)
+                    .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                    .rotate_left(23);
+                let mantissa = (h & 0xFFFF) as f32 / 65536.0 + 1.0;
+                let sign = if (h >> 20) & 1 == 0 { 1.0 } else { -1.0 };
+                sign * mantissa * (2f32).powi(((h >> 16) & 3) as i32 - 2)
+            })
+            .collect();
+        let wide = Tensor::from_vec(rough, (100, k), &dev)
+            .unwrap()
+            .to_dtype(DType::BF16)
+            .unwrap();
+        let mm = |x: &Tensor| {
+            with_phase(Phase::Prefill, || {
+                mxfp4_matmul(x, &blocks, &scales, k, n).unwrap()
+            })
+        };
+        let batched = mm(&wide);
+        let bad = differing_rows(&batched, &wide, |row| mm(row));
+        assert!(
+            bad.is_empty(),
+            "mul_mm: rows {bad:?} differ from the row alone"
+        );
+
+        let four = wide.narrow(0, 0, 4).unwrap().contiguous().unwrap();
+        let in_prefill = mm(&four);
+        assert_eq!(bits(&in_prefill), bits(&batched.narrow(0, 0, 4).unwrap()));
+        let in_decode = with_phase(Phase::Decode, || {
+            mxfp4_matmul(&four, &blocks, &scales, k, n).unwrap()
+        });
+        let gemv = mxfp4_matmul(&four, &blocks, &scales, k, n).unwrap();
+        assert_eq!(
+            bits(&in_decode),
+            bits(&gemv),
+            "a decode step takes the gemv"
+        );
+        let differing = bits(&in_decode)
+            .iter()
+            .zip(bits(&in_prefill))
+            .filter(|(a, b)| *a != b)
+            .count();
+        eprintln!(
+            "mxfp4 gemv against mul_mm on four rows: {differing} of {} values differ",
+            4 * n
+        );
+    }
+
     /// Contract: candle's BF16 GEMM, which serves dense decode, gives a row
     /// the same bits whatever rows share the forward, up to the eight rows a
     /// decode batch holds and beyond, on the shapes of a dense model's
@@ -8701,20 +9274,21 @@ mod kernel_inventory_tests {
         ))
         .expect("read this module's source");
         let mut orphans = Vec::new();
+        let mut previous = "";
         for line in super::QUANT_METAL_SOURCE.lines() {
             let name = if let Some(rest) = line.strip_prefix("kernel void ") {
-                rest.split(|c: char| !c.is_alphanumeric() && c != '_')
-                    .next()
-            } else if line.chars().next().is_some_and(|c| c.is_ascii_uppercase())
-                && line.contains("_KERNEL(")
-                || line.starts_with("GGUF_LEGACY_GEMV_BATCH(")
-            {
-                line.split('(')
-                    .nth(1)
-                    .and_then(|args| args.split(',').next())
+                (!previous.starts_with("template <"))
+                    .then(|| {
+                        rest.split(|c: char| !c.is_alphanumeric() && c != '_')
+                            .next()
+                    })
+                    .flatten()
+            } else if let Some(rest) = line.strip_prefix("template [[host_name(\"") {
+                rest.split('"').next()
             } else {
                 None
             };
+            previous = line;
             if let Some(name) = name
                 .map(str::trim)
                 .filter(|n| !n.is_empty() && *n != "NAME")
@@ -9026,6 +9600,18 @@ mod packed_quant_instantiation_tests {
     use super::*;
     use candle_core::Device;
 
+    /// A hidden-state-like value from a hash: full mantissa, four octaves
+    /// of magnitude and the odd outlier, so that sums of its products are
+    /// inexact and a kernel pair that associates differently shows it.
+    fn rough(h: u64) -> f32 {
+        let h = h.wrapping_mul(0x9E37_79B9_7F4A_7C15).rotate_left(23);
+        let mantissa = (h & 0xFFFF) as f32 / 65536.0 + 1.0;
+        let octave = ((h >> 16) & 3) as i32 - 2;
+        let sign = if (h >> 20) & 1 == 0 { 1.0 } else { -1.0 };
+        let outlier = if (h >> 21) & 0x3F == 0 { 32.0 } else { 1.0 };
+        sign * mantissa * (2f32).powi(octave) * outlier
+    }
+
     /// Contract: the single-row and the batch W4A16 kernels give a row the
     /// same bits, on the shapes of a model's projections, so an AWQ token
     /// decoded in a batch gets the logits it gets alone; holds while the
@@ -9040,6 +9626,10 @@ mod packed_quant_instantiation_tests {
             (256usize, 128usize, 64usize),
             (2048, 1024, 128),
             (1536, 8960, 128),
+            (2560, 4096, 128),
+            (2560, 6144, 128),
+            (9728, 2560, 128),
+            (2560, 19456, 128),
         ] {
             let raw = super::fused_kernel_parity_tests::build_awq_triplet(
                 &dev,
@@ -9050,7 +9640,7 @@ mod packed_quant_instantiation_tests {
             );
             for seed in 0..3u64 {
                 let x: Vec<f32> = (0..4 * in_features)
-                    .map(|i| ((((i as u64) * 2654435761 + seed * 97) % 211) as f32 - 105.0) * 0.011)
+                    .map(|i| rough(i as u64 * 2654435761 + seed * 97))
                     .collect();
                 let x = Tensor::from_vec(x, (4, in_features), &dev)
                     .unwrap()
@@ -9094,5 +9684,373 @@ mod packed_quant_instantiation_tests {
             }
         }
         assert!(report.is_empty(), "{report:?}");
+    }
+
+    /// Contract: the single-row and the batch GPTQ kernels, 4-bit and
+    /// 8-bit, give a row the same bits, on the shapes of a model's
+    /// projections.
+    #[test]
+    fn gptq_single_row_and_batch_kernels_agree_bit_for_bit() {
+        let Ok(dev) = Device::new_metal(0) else {
+            return;
+        };
+        let mut report = Vec::new();
+        for bits in [4u32, 8] {
+            for (in_features, out_features) in [(256usize, 128usize), (2048, 1024), (1536, 8960)] {
+                let qw = super::fused_kernel_parity_tests::build_gptq_triplet(
+                    &dev,
+                    DType::BF16,
+                    bits,
+                    in_features,
+                    out_features,
+                    128,
+                );
+                let qz = qw.qzeros.as_ref().unwrap();
+                for seed in 0..3u64 {
+                    let x: Vec<f32> = (0..4 * in_features)
+                        .map(|i| rough(i as u64 * 2654435761 + seed * 97))
+                        .collect();
+                    let x = Tensor::from_vec(x, (4, in_features), &dev)
+                        .unwrap()
+                        .to_dtype(DType::BF16)
+                        .unwrap();
+                    let batched = gptq_matmul(&x, &qw.qweight, qz, &qw.scales, bits).unwrap();
+                    for i in 0..4 {
+                        let single = gptq_matmul(
+                            &x.narrow(0, i, 1).unwrap().contiguous().unwrap(),
+                            &qw.qweight,
+                            qz,
+                            &qw.scales,
+                            bits,
+                        )
+                        .unwrap();
+                        let a: Vec<f32> = batched
+                            .narrow(0, i, 1)
+                            .unwrap()
+                            .to_dtype(DType::F32)
+                            .unwrap()
+                            .flatten_all()
+                            .unwrap()
+                            .to_vec1()
+                            .unwrap();
+                        let b: Vec<f32> = single
+                            .to_dtype(DType::F32)
+                            .unwrap()
+                            .flatten_all()
+                            .unwrap()
+                            .to_vec1()
+                            .unwrap();
+                        let diff = a
+                            .iter()
+                            .zip(&b)
+                            .filter(|(x, y)| x.to_bits() != y.to_bits())
+                            .count();
+                        if diff > 0 {
+                            report.push(format!(
+                                "gptq{bits} [{in_features}->{out_features}] seed {seed} row {i}: {diff} of {out_features} differ"
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(report.is_empty(), "{report:?}");
+    }
+
+    fn bits_of(t: &Tensor) -> Vec<u32> {
+        t.to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+            .iter()
+            .map(|v| v.to_bits())
+            .collect()
+    }
+
+    /// Contract: the deterministic AWQ and GPTQ kernels store the hidden
+    /// states in the activation dtype themselves, as the F32 result rounded
+    /// once, so the zeroed accumulator and the cast they replaced left no
+    /// trace in the bits; in BF16 and F16, for one row and for a batch.
+    #[test]
+    fn packed_kernels_store_the_rounded_accumulator_in_the_activation_dtype() {
+        let Ok(dev) = Device::new_metal(0) else {
+            return;
+        };
+        let (in_features, out_features) = (1536usize, 2048usize);
+        for dtype in [DType::BF16, DType::F16] {
+            let awq = super::fused_kernel_parity_tests::build_awq_triplet(
+                &dev,
+                dtype,
+                in_features,
+                out_features,
+                128,
+            );
+            let gptq = super::fused_kernel_parity_tests::build_gptq_triplet(
+                &dev,
+                dtype,
+                4,
+                in_features,
+                out_features,
+                128,
+            );
+            let (awq_z, gptq_z) = (awq.qzeros.as_ref().unwrap(), gptq.qzeros.as_ref().unwrap());
+            for m in [1usize, 5] {
+                let x: Vec<f32> = (0..m * in_features)
+                    .map(|i| ((((i as u64) * 2654435761) % 211) as f32 - 105.0) * 0.011)
+                    .collect();
+                let x = Tensor::from_vec(x, (m, in_features), &dev)
+                    .unwrap()
+                    .to_dtype(dtype)
+                    .unwrap();
+                let awq_in =
+                    |d| wna16_matmul_to(&x, &awq.qweight, awq_z, &awq.scales, 4, d).unwrap();
+                let gptq_in =
+                    |d| gptq_matmul_to(&x, &gptq.qweight, gptq_z, &gptq.scales, 4, d).unwrap();
+                for (name, accumulated, stored) in [
+                    ("awq", awq_in(DType::F32), awq_in(dtype)),
+                    ("gptq", gptq_in(DType::F32), gptq_in(dtype)),
+                ] {
+                    assert_eq!(stored.dtype(), dtype, "{name} {dtype:?} m={m}");
+                    let rounded = bits_of(&accumulated.to_dtype(dtype).unwrap());
+                    let direct = bits_of(&stored);
+                    let diff = rounded.iter().zip(&direct).filter(|(a, b)| a != b).count();
+                    assert_eq!(
+                        diff,
+                        0,
+                        "{name} {dtype:?} m={m}: {diff} of {} stored values differ from the rounded accumulator",
+                        direct.len()
+                    );
+                }
+            }
+        }
+    }
+
+    /// Contract: the single-row and the batch F8 kernels give a row the same
+    /// bits, on the Qwen3.6 expert shapes.
+    #[test]
+    fn f8_single_row_and_batch_kernels_agree_bit_for_bit() {
+        let Ok(dev) = Device::new_metal(0) else {
+            return;
+        };
+        let mut report = Vec::new();
+        for (out_f, in_f, s_r, s_c) in [
+            (512usize, 2048usize, 4usize, 16usize),
+            (2048, 512, 16, 4),
+            (96, 160, 3, 5),
+        ] {
+            let bytes: Vec<u8> = (0..out_f * in_f)
+                .map(|i| {
+                    let b = (i as u32 * 29 + 13) as u8;
+                    if b & 0x7F == 0x7F { b ^ 0x08 } else { b }
+                })
+                .collect();
+            let scales: Vec<f32> = (0..s_r * s_c).map(|i| 0.2 + (i % 7) as f32 * 0.3).collect();
+            let w_dev = Tensor::from_raw_buffer(&bytes, DType::U8, &[out_f, in_f], &dev).unwrap();
+            let sc_dev = Tensor::from_vec(scales, (s_r, s_c), &dev).unwrap();
+            for seed in 0..3u64 {
+                let x: Vec<f32> = (0..4 * in_f)
+                    .map(|i| ((((i as u64) * 2654435761 + seed * 97) % 211) as f32 - 105.0) * 0.011)
+                    .collect();
+                let x = Tensor::from_vec(x, (4, in_f), &dev)
+                    .unwrap()
+                    .to_dtype(DType::BF16)
+                    .unwrap();
+                let batched = f8_gemv(&x, &w_dev, &sc_dev).unwrap();
+                for r in 0..4 {
+                    let single = f8_gemv(
+                        &x.narrow(0, r, 1).unwrap().contiguous().unwrap(),
+                        &w_dev,
+                        &sc_dev,
+                    )
+                    .unwrap();
+                    let a: Vec<f32> = batched
+                        .narrow(0, r, 1)
+                        .unwrap()
+                        .to_dtype(DType::F32)
+                        .unwrap()
+                        .flatten_all()
+                        .unwrap()
+                        .to_vec1()
+                        .unwrap();
+                    let b: Vec<f32> = single
+                        .to_dtype(DType::F32)
+                        .unwrap()
+                        .flatten_all()
+                        .unwrap()
+                        .to_vec1()
+                        .unwrap();
+                    let diff = a
+                        .iter()
+                        .zip(&b)
+                        .filter(|(x, y)| x.to_bits() != y.to_bits())
+                        .count();
+                    if diff > 0 {
+                        report.push(format!(
+                            "f8 [{in_f}->{out_f}] seed {seed} row {r}: {diff} of {out_f} differ"
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(report.is_empty(), "{report:?}");
+    }
+}
+
+#[cfg(test)]
+mod dense_gemv_tests {
+    use super::*;
+    use crate::common::phase::{Phase, with_phase};
+    use candle_core::Device;
+
+    fn rows(m: usize, k: usize, seed: u64, dev: &Device) -> Tensor {
+        let x: Vec<f32> = (0..m * k)
+            .map(|i| ((((i as u64) * 2654435761 + seed * 97) % 211) as f32 - 105.0) * 0.011)
+            .collect();
+        Tensor::from_vec(x, (m, k), &Device::Cpu)
+            .unwrap()
+            .to_dtype(DType::BF16)
+            .unwrap()
+            .to_device(dev)
+            .unwrap()
+    }
+
+    fn values(t: &Tensor) -> Vec<f32> {
+        t.to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap()
+    }
+
+    fn bits(t: &Tensor) -> Vec<u32> {
+        values(t).iter().map(|v| v.to_bits()).collect()
+    }
+
+    fn gemv(x: &Tensor, w: &Tensor, out_dtype: DType) -> Tensor {
+        x.apply_op1_no_bwd(&Bf16Gemv {
+            weight: w.clone(),
+            out_dtype,
+        })
+        .unwrap()
+    }
+
+    /// Contract: one row through a dense weight of a model's shapes agrees
+    /// with the F32 reference on every output, in F32 and rounded to BF16,
+    /// for row counts that are and are not multiples of a threadgroup's four,
+    /// and gives the same bits on every run.
+    #[test]
+    fn a_single_row_matches_the_reference_on_every_output() {
+        let Ok(dev) = Device::new_metal(0) else {
+            return;
+        };
+        for (n, k) in [
+            (37usize, 512usize),
+            (3072, 1024),
+            (1024, 3072),
+            (151936, 1024),
+        ] {
+            let w = rows(n, k, 3, &dev);
+            let x = rows(1, k, 5, &dev);
+            let expected = values(
+                &x.to_dtype(DType::F32)
+                    .unwrap()
+                    .matmul(&w.to_dtype(DType::F32).unwrap().t().unwrap())
+                    .unwrap(),
+            );
+            let peak = expected.iter().fold(0f32, |a, v| a.max(v.abs()));
+            for (out_dtype, tolerance) in [(DType::F32, 1e-5), (DType::BF16, 8e-3)] {
+                let out = gemv(&x, &w, out_dtype);
+                assert_eq!(out.dtype(), out_dtype);
+                let got = values(&out);
+                let worst = expected
+                    .iter()
+                    .zip(&got)
+                    .fold(0f32, |a, (e, g)| a.max((e - g).abs()))
+                    / peak;
+                assert!(
+                    worst < tolerance,
+                    "[{n}x{k}] {out_dtype:?}: relative error {worst}"
+                );
+                assert_eq!(
+                    got,
+                    values(&gemv(&x, &w, out_dtype)),
+                    "[{n}x{k}]: deterministic"
+                );
+            }
+        }
+    }
+
+    /// Contract: a batch of rows gives, row by row, the bits the single-row
+    /// instantiation gives, for every batch size up to eight.
+    #[test]
+    fn a_batch_of_rows_gives_the_bits_of_the_rows_one_at_a_time() {
+        let Ok(dev) = Device::new_metal(0) else {
+            return;
+        };
+        let (n, k) = (1030usize, 1536usize);
+        let w = rows(n, k, 3, &dev);
+        let mut differing = Vec::new();
+        for m in [2usize, 5, GGUF_BATCH_MAX] {
+            let x = rows(m, k, 11, &dev);
+            let batched = gemv(&x, &w, DType::F32);
+            for i in 0..m {
+                let single = gemv(
+                    &x.narrow(0, i, 1).unwrap().contiguous().unwrap(),
+                    &w,
+                    DType::F32,
+                );
+                if bits(&batched.narrow(0, i, 1).unwrap()) != bits(&single) {
+                    differing.push(format!("row {i} of {m}"));
+                }
+            }
+        }
+        assert!(
+            differing.is_empty(),
+            "rows that differ from the row alone: {differing:?}"
+        );
+    }
+
+    /// Contract: the dense gemv serves a decode step of up to eight rows on
+    /// a transposed contiguous weight, and nothing else: a prefill, a
+    /// forward outside the engine, a ninth row or a weight whose row length
+    /// is not a multiple of eight stay on candle.
+    #[test]
+    fn the_gemv_serves_decode_steps_only() {
+        let Ok(dev) = Device::new_metal(0) else {
+            return;
+        };
+        let (n, k) = (256usize, 512usize);
+        let w = rows(n, k, 3, &dev);
+        let w_t = w.t().unwrap();
+        let x = rows(4, k, 7, &dev);
+        let served = with_phase(Phase::Decode, || {
+            maybe_bf16_gemv(&x, &w_t, DType::BF16).unwrap()
+        });
+        assert_eq!(
+            bits(served.as_ref().unwrap()),
+            bits(&gemv(&x, &w, DType::BF16))
+        );
+        assert!(
+            with_phase(Phase::Prefill, || maybe_bf16_gemv(&x, &w_t, DType::BF16)
+                .unwrap())
+            .is_none()
+        );
+        assert!(maybe_bf16_gemv(&x, &w_t, DType::BF16).unwrap().is_none());
+        let nine = rows(9, k, 7, &dev);
+        assert!(
+            with_phase(Phase::Decode, || maybe_bf16_gemv(&nine, &w_t, DType::BF16)
+                .unwrap())
+            .is_none()
+        );
+        let odd = rows(n, 12, 3, &dev).t().unwrap();
+        let x12 = rows(2, 12, 7, &dev);
+        assert!(
+            with_phase(Phase::Decode, || maybe_bf16_gemv(&x12, &odd, DType::BF16)
+                .unwrap())
+            .is_none()
+        );
     }
 }

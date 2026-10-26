@@ -1284,7 +1284,8 @@ fn load_standard_safetensors(
                 let extra = raw.runtime_size_bytes();
                 (
                     AnyLinear::from_awq(&raw, None, device, dtype)
-                        .map_err(|e| anyhow::anyhow!("{e}"))?,
+                        .map_err(|e| anyhow::anyhow!("{e}"))?
+                        .with_out_dtype(DType::F32),
                     extra,
                 )
             } else {

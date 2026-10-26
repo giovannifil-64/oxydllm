@@ -58,6 +58,7 @@ struct FlashAttnParams {
     uint  prefix_len;  // = t_kv - t_q
     uint  window;      // sliding window in tokens; 0 = attend to the whole prefix
     uint  kv_head_stride;  // elements between two KV heads; t_kv * d when packed
+    uint  has_sink;    // 1: `sinks[head]` is a logit that joins every row's softmax with no value
 };
 
 constant float M_LOG2E_F_CONST = 1.4426950408889634f;
@@ -74,6 +75,7 @@ inline void flash_attention_prefill_impl(
     device const T*               V,
     device       T*               O,
     constant     FlashAttnParams& p,
+    device const float*           sinks,
     threadgroup  uchar*           tg_mem,
     uint                          gid,
     uint                          tid,
@@ -99,9 +101,14 @@ inline void flash_attention_prefill_impl(
     threadgroup T*     q_tile    = (threadgroup T*)(s_scratch + p.br * p.bc);
     threadgroup T*     kv_tile   = q_tile + p.br * p.d;
 
+    // A sink is a key with no value: it starts the running softmax as the
+    // maximum so far with a weight of one, and the blocks rescale it like
+    // any earlier contribution.
+    const float m_init = p.has_sink ? sinks[head_idx] : -INFINITY;
+    const float l_init = p.has_sink ? 1.0f : 0.0f;
     for (uint i = tid; i < br_act; i += tg_size) {
-        m_row[i] = -INFINITY;
-        l_row[i] = 0.0f;
+        m_row[i] = m_init;
+        l_row[i] = l_init;
     }
     for (uint k = tid; k < br_act * p.d; k += tg_size) {
         o_acc[k] = 0.0f;
@@ -281,6 +288,7 @@ inline void flash_attention_prefill_mma_impl(
     device const T*               V,
     device       T*               O,
     constant     FlashAttnParams& p,
+    device const float*           sinks,
     threadgroup  uchar*           tg_mem,
     uint                          gid,
     uint                          tid,
@@ -308,10 +316,13 @@ inline void flash_attention_prefill_mma_impl(
     threadgroup T*     q_tile    = p_tile + p.br * p.bc;
     threadgroup T*     kv_tile   = q_tile + p.br * p.d;
 
-    // Init FULL br rows so MMA dummy rows are zeroed.
+    // Init FULL br rows so MMA dummy rows are zeroed; the sink, when there is
+    // one, starts the running softmax as in the scalar kernel.
+    const float m_init = p.has_sink ? sinks[head_idx] : -INFINITY;
+    const float l_init = p.has_sink ? 1.0f : 0.0f;
     for (uint i = tid; i < p.br; i += tg_size) {
-        m_row[i] = -INFINITY;
-        l_row[i] = 0.0f;
+        m_row[i] = m_init;
+        l_row[i] = l_init;
     }
     for (uint k = tid; k < p.br * p.d; k += tg_size) {
         o_acc[k] = 0.0f;
@@ -518,12 +529,13 @@ kernel void flash_attention_prefill_f32(
     device const float*           V      [[buffer(2)]],
     device       float*           O      [[buffer(3)]],
     constant     FlashAttnParams& p      [[buffer(4)]],
+    device const float*           sinks  [[buffer(5)]],
     threadgroup  uchar*           tg_mem [[threadgroup(0)]],
     uint                          gid    [[threadgroup_position_in_grid]],
     uint                          tid    [[thread_position_in_threadgroup]],
     uint                          tg_sz  [[threads_per_threadgroup]]
 ) {
-    flash_attention_prefill_impl<float>(Q, K, V, O, p, tg_mem, gid, tid, tg_sz);
+    flash_attention_prefill_impl<float>(Q, K, V, O, p, sinks, tg_mem, gid, tid, tg_sz);
 }
 
 kernel void flash_attention_prefill_f16(
@@ -532,12 +544,13 @@ kernel void flash_attention_prefill_f16(
     device const half*            V      [[buffer(2)]],
     device       half*            O      [[buffer(3)]],
     constant     FlashAttnParams& p      [[buffer(4)]],
+    device const float*           sinks  [[buffer(5)]],
     threadgroup  uchar*           tg_mem [[threadgroup(0)]],
     uint                          gid    [[threadgroup_position_in_grid]],
     uint                          tid    [[thread_position_in_threadgroup]],
     uint                          tg_sz  [[threads_per_threadgroup]]
 ) {
-    flash_attention_prefill_impl<half>(Q, K, V, O, p, tg_mem, gid, tid, tg_sz);
+    flash_attention_prefill_impl<half>(Q, K, V, O, p, sinks, tg_mem, gid, tid, tg_sz);
 }
 
 kernel void flash_attention_prefill_mma_f32(
@@ -546,13 +559,14 @@ kernel void flash_attention_prefill_mma_f32(
     device const float*           V      [[buffer(2)]],
     device       float*           O      [[buffer(3)]],
     constant     FlashAttnParams& p      [[buffer(4)]],
+    device const float*           sinks  [[buffer(5)]],
     threadgroup  uchar*           tg_mem [[threadgroup(0)]],
     uint                          gid    [[threadgroup_position_in_grid]],
     uint                          tid    [[thread_position_in_threadgroup]],
     uint                          tg_sz  [[threads_per_threadgroup]],
     uint                          sg_idx [[simdgroup_index_in_threadgroup]]
 ) {
-    flash_attention_prefill_mma_impl<float>(Q, K, V, O, p, tg_mem, gid, tid, tg_sz, sg_idx);
+    flash_attention_prefill_mma_impl<float>(Q, K, V, O, p, sinks, tg_mem, gid, tid, tg_sz, sg_idx);
 }
 
 kernel void flash_attention_prefill_mma_f16(
@@ -561,13 +575,14 @@ kernel void flash_attention_prefill_mma_f16(
     device const half*            V      [[buffer(2)]],
     device       half*            O      [[buffer(3)]],
     constant     FlashAttnParams& p      [[buffer(4)]],
+    device const float*           sinks  [[buffer(5)]],
     threadgroup  uchar*           tg_mem [[threadgroup(0)]],
     uint                          gid    [[threadgroup_position_in_grid]],
     uint                          tid    [[thread_position_in_threadgroup]],
     uint                          tg_sz  [[threads_per_threadgroup]],
     uint                          sg_idx [[simdgroup_index_in_threadgroup]]
 ) {
-    flash_attention_prefill_mma_impl<half>(Q, K, V, O, p, tg_mem, gid, tid, tg_sz, sg_idx);
+    flash_attention_prefill_mma_impl<half>(Q, K, V, O, p, sinks, tg_mem, gid, tid, tg_sz, sg_idx);
 }
 
 #if defined(__HAVE_BFLOAT__)
@@ -577,13 +592,14 @@ kernel void flash_attention_prefill_mma_bf16(
     device const bfloat*          V      [[buffer(2)]],
     device       bfloat*          O      [[buffer(3)]],
     constant     FlashAttnParams& p      [[buffer(4)]],
+    device const float*           sinks  [[buffer(5)]],
     threadgroup  uchar*           tg_mem [[threadgroup(0)]],
     uint                          gid    [[threadgroup_position_in_grid]],
     uint                          tid    [[thread_position_in_threadgroup]],
     uint                          tg_sz  [[threads_per_threadgroup]],
     uint                          sg_idx [[simdgroup_index_in_threadgroup]]
 ) {
-    flash_attention_prefill_mma_impl<bfloat>(Q, K, V, O, p, tg_mem, gid, tid, tg_sz, sg_idx);
+    flash_attention_prefill_mma_impl<bfloat>(Q, K, V, O, p, sinks, tg_mem, gid, tid, tg_sz, sg_idx);
 }
 #endif
 
@@ -594,11 +610,12 @@ kernel void flash_attention_prefill_bf16(
     device const bfloat*          V      [[buffer(2)]],
     device       bfloat*          O      [[buffer(3)]],
     constant     FlashAttnParams& p      [[buffer(4)]],
+    device const float*           sinks  [[buffer(5)]],
     threadgroup  uchar*           tg_mem [[threadgroup(0)]],
     uint                          gid    [[threadgroup_position_in_grid]],
     uint                          tid    [[thread_position_in_threadgroup]],
     uint                          tg_sz  [[threads_per_threadgroup]]
 ) {
-    flash_attention_prefill_impl<bfloat>(Q, K, V, O, p, tg_mem, gid, tid, tg_sz);
+    flash_attention_prefill_impl<bfloat>(Q, K, V, O, p, sinks, tg_mem, gid, tid, tg_sz);
 }
 #endif

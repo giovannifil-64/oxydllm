@@ -845,30 +845,30 @@ kernel void mpp_gemm_q4k_staged(
     gemm_staged<block_q4_K, Q4K_TN, Q4K_BK>(a, weight, d, p, sB[0], sB[1], tgid, lid);
 }
 
-#define MPP_STAGED_KERNEL(NAME, BLOCK, BK)                                      \
-kernel void NAME(                                                              \
-    device bfloat*      a       [[buffer(0)]],                                 \
-    device BLOCK*       weight  [[buffer(1)]],                                 \
-    device bfloat*      d       [[buffer(2)]],                                 \
-    constant MppQuantGemmParams& p [[buffer(3)]],                              \
-    uint2 tgid [[threadgroup_position_in_grid]],                               \
-    uint  lid  [[thread_index_in_threadgroup]])                                \
-{                                                                              \
-    threadgroup bfloat sB[2][BK * Q4K_TN];                                     \
-    gemm_staged<BLOCK, Q4K_TN, BK>(a, weight, d, p, sB[0], sB[1], tgid, lid);  \
+template <typename BLOCK, int BK>
+kernel void mpp_staged_kernel(
+    device bfloat*      a       [[buffer(0)]],
+    device BLOCK*       weight  [[buffer(1)]],
+    device bfloat*      d       [[buffer(2)]],
+    constant MppQuantGemmParams& p [[buffer(3)]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint  lid  [[thread_index_in_threadgroup]])
+{
+    threadgroup bfloat sB[2][BK * Q4K_TN];
+    gemm_staged<BLOCK, Q4K_TN, BK>(a, weight, d, p, sB[0], sB[1], tgid, lid);
 }
 
-MPP_STAGED_KERNEL(mpp_gemm_q4_0_staged, block_q4_0, Q4K_BK)
-MPP_STAGED_KERNEL(mpp_gemm_q4_1_staged, block_q4_1, Q4K_BK)
-MPP_STAGED_KERNEL(mpp_gemm_q5_0_staged, block_q5_0, Q4K_BK)
-MPP_STAGED_KERNEL(mpp_gemm_q5_1_staged, block_q5_1, Q4K_BK)
-MPP_STAGED_KERNEL(mpp_gemm_q8_0_staged, block_q8_0, Q4K_BK)
-MPP_STAGED_KERNEL(mpp_gemm_q2k_staged, block_q2_K, Q4K_BK)
-MPP_STAGED_KERNEL(mpp_gemm_q3k_staged, block_q3_K, Q4K_BK)
-MPP_STAGED_KERNEL(mpp_gemm_q5k_staged, block_q5_K, Q4K_BK)
-MPP_STAGED_KERNEL(mpp_gemm_iq4_nl_staged, block_iq4_nl, Q4K_BK)
-MPP_STAGED_KERNEL(mpp_gemm_iq4_xs_staged, block_iq4_xs, Q4K_BK)
-MPP_STAGED_KERNEL(mpp_gemm_iq3_s_staged, block_iq3_s, Q4K_BK)
+template [[host_name("mpp_gemm_q4_0_staged")]] kernel void mpp_staged_kernel<block_q4_0, Q4K_BK>(device bfloat*, device block_q4_0*, device bfloat*, constant MppQuantGemmParams&, uint2, uint);
+template [[host_name("mpp_gemm_q4_1_staged")]] kernel void mpp_staged_kernel<block_q4_1, Q4K_BK>(device bfloat*, device block_q4_1*, device bfloat*, constant MppQuantGemmParams&, uint2, uint);
+template [[host_name("mpp_gemm_q5_0_staged")]] kernel void mpp_staged_kernel<block_q5_0, Q4K_BK>(device bfloat*, device block_q5_0*, device bfloat*, constant MppQuantGemmParams&, uint2, uint);
+template [[host_name("mpp_gemm_q5_1_staged")]] kernel void mpp_staged_kernel<block_q5_1, Q4K_BK>(device bfloat*, device block_q5_1*, device bfloat*, constant MppQuantGemmParams&, uint2, uint);
+template [[host_name("mpp_gemm_q8_0_staged")]] kernel void mpp_staged_kernel<block_q8_0, Q4K_BK>(device bfloat*, device block_q8_0*, device bfloat*, constant MppQuantGemmParams&, uint2, uint);
+template [[host_name("mpp_gemm_q2k_staged")]] kernel void mpp_staged_kernel<block_q2_K, Q4K_BK>(device bfloat*, device block_q2_K*, device bfloat*, constant MppQuantGemmParams&, uint2, uint);
+template [[host_name("mpp_gemm_q3k_staged")]] kernel void mpp_staged_kernel<block_q3_K, Q4K_BK>(device bfloat*, device block_q3_K*, device bfloat*, constant MppQuantGemmParams&, uint2, uint);
+template [[host_name("mpp_gemm_q5k_staged")]] kernel void mpp_staged_kernel<block_q5_K, Q4K_BK>(device bfloat*, device block_q5_K*, device bfloat*, constant MppQuantGemmParams&, uint2, uint);
+template [[host_name("mpp_gemm_iq4_nl_staged")]] kernel void mpp_staged_kernel<block_iq4_nl, Q4K_BK>(device bfloat*, device block_iq4_nl*, device bfloat*, constant MppQuantGemmParams&, uint2, uint);
+template [[host_name("mpp_gemm_iq4_xs_staged")]] kernel void mpp_staged_kernel<block_iq4_xs, Q4K_BK>(device bfloat*, device block_iq4_xs*, device bfloat*, constant MppQuantGemmParams&, uint2, uint);
+template [[host_name("mpp_gemm_iq3_s_staged")]] kernel void mpp_staged_kernel<block_iq3_s, Q4K_BK>(device bfloat*, device block_iq3_s*, device bfloat*, constant MppQuantGemmParams&, uint2, uint);
 
 kernel void mpp_gemm_q6k_staged(
     device bfloat*      a       [[buffer(0)]],
@@ -945,25 +945,25 @@ inline void matvec_owned(
     }
 }
 
-#define MPP_MATVEC_KERNEL(NAME, BLOCK, M)                                      \
-kernel void NAME(                                                              \
-    device const bfloat* a       [[buffer(0)]],                                \
-    device const BLOCK*  weight  [[buffer(1)]],                                \
-    device bfloat*       d       [[buffer(2)]],                                \
-    constant MppQuantGemmParams& p [[buffer(3)]],                              \
-    uint tg   [[threadgroup_position_in_grid]],                                \
-    uint sg   [[simdgroup_index_in_threadgroup]],                              \
-    uint lane [[thread_index_in_simdgroup]])                                   \
-{                                                                              \
-    matvec_owned<BLOCK, M>(a, weight, d, p, tg, sg, lane);                     \
+template <typename BLOCK, int M>
+kernel void mpp_matvec_kernel(
+    device const bfloat* a       [[buffer(0)]],
+    device const BLOCK*  weight  [[buffer(1)]],
+    device bfloat*       d       [[buffer(2)]],
+    constant MppQuantGemmParams& p [[buffer(3)]],
+    uint tg   [[threadgroup_position_in_grid]],
+    uint sg   [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+    matvec_owned<BLOCK, M>(a, weight, d, p, tg, sg, lane);
 }
 
-MPP_MATVEC_KERNEL(mpp_mv_iq4_nl, block_iq4_nl, 1)
-MPP_MATVEC_KERNEL(mpp_mv_iq4_xs, block_iq4_xs, 1)
-MPP_MATVEC_KERNEL(mpp_mv_iq3_s, block_iq3_s, 1)
-MPP_MATVEC_KERNEL(mpp_mv_iq4_nl_batch, block_iq4_nl, MV_MAX_M)
-MPP_MATVEC_KERNEL(mpp_mv_iq4_xs_batch, block_iq4_xs, MV_MAX_M)
-MPP_MATVEC_KERNEL(mpp_mv_iq3_s_batch, block_iq3_s, MV_MAX_M)
+template [[host_name("mpp_mv_iq4_nl")]] kernel void mpp_matvec_kernel<block_iq4_nl, 1>(device const bfloat*, device const block_iq4_nl*, device bfloat*, constant MppQuantGemmParams&, uint, uint, uint);
+template [[host_name("mpp_mv_iq4_xs")]] kernel void mpp_matvec_kernel<block_iq4_xs, 1>(device const bfloat*, device const block_iq4_xs*, device bfloat*, constant MppQuantGemmParams&, uint, uint, uint);
+template [[host_name("mpp_mv_iq3_s")]] kernel void mpp_matvec_kernel<block_iq3_s, 1>(device const bfloat*, device const block_iq3_s*, device bfloat*, constant MppQuantGemmParams&, uint, uint, uint);
+template [[host_name("mpp_mv_iq4_nl_batch")]] kernel void mpp_matvec_kernel<block_iq4_nl, MV_MAX_M>(device const bfloat*, device const block_iq4_nl*, device bfloat*, constant MppQuantGemmParams&, uint, uint, uint);
+template [[host_name("mpp_mv_iq4_xs_batch")]] kernel void mpp_matvec_kernel<block_iq4_xs, MV_MAX_M>(device const bfloat*, device const block_iq4_xs*, device bfloat*, constant MppQuantGemmParams&, uint, uint, uint);
+template [[host_name("mpp_mv_iq3_s_batch")]] kernel void mpp_matvec_kernel<block_iq3_s, MV_MAX_M>(device const bfloat*, device const block_iq3_s*, device bfloat*, constant MppQuantGemmParams&, uint, uint, uint);
 
 // Rows of a table candle cannot serve, gathered for the token embedding: one
 // simdgroup per token, each lane decoding spans of the row into BF16.
@@ -994,22 +994,22 @@ inline void gather_owned(
     }
 }
 
-#define MPP_GATHER_KERNEL(NAME, BLOCK)                                         \
-kernel void NAME(                                                              \
-    device const uint*   tokens  [[buffer(0)]],                                \
-    device const BLOCK*  table   [[buffer(1)]],                                \
-    device bfloat*       out     [[buffer(2)]],                                \
-    constant MppQuantGemmParams& p [[buffer(3)]],                              \
-    uint tg   [[threadgroup_position_in_grid]],                                \
-    uint sg   [[simdgroup_index_in_threadgroup]],                              \
-    uint lane [[thread_index_in_simdgroup]])                                   \
-{                                                                              \
-    gather_owned<BLOCK>(tokens, table, out, p, tg, sg, lane);                  \
+template <typename BLOCK>
+kernel void mpp_gather_kernel(
+    device const uint*   tokens  [[buffer(0)]],
+    device const BLOCK*  table   [[buffer(1)]],
+    device bfloat*       out     [[buffer(2)]],
+    constant MppQuantGemmParams& p [[buffer(3)]],
+    uint tg   [[threadgroup_position_in_grid]],
+    uint sg   [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+    gather_owned<BLOCK>(tokens, table, out, p, tg, sg, lane);
 }
 
-MPP_GATHER_KERNEL(mpp_embed_iq4_nl, block_iq4_nl)
-MPP_GATHER_KERNEL(mpp_embed_iq4_xs, block_iq4_xs)
-MPP_GATHER_KERNEL(mpp_embed_iq3_s, block_iq3_s)
+template [[host_name("mpp_embed_iq4_nl")]] kernel void mpp_gather_kernel<block_iq4_nl>(device const uint*, device const block_iq4_nl*, device bfloat*, constant MppQuantGemmParams&, uint, uint, uint);
+template [[host_name("mpp_embed_iq4_xs")]] kernel void mpp_gather_kernel<block_iq4_xs>(device const uint*, device const block_iq4_xs*, device bfloat*, constant MppQuantGemmParams&, uint, uint, uint);
+template [[host_name("mpp_embed_iq3_s")]] kernel void mpp_gather_kernel<block_iq3_s>(device const uint*, device const block_iq3_s*, device bfloat*, constant MppQuantGemmParams&, uint, uint, uint);
 
 template<uint BITS, bool GPTQ>
 inline void mpp_gemm_quant_impl(
@@ -1073,25 +1073,25 @@ inline void mpp_gemm_quant_impl(
     }
 }
 
-#define MPP_QUANT_KERNEL(NAME, BITS, GPTQ)                                     \
-kernel void NAME(                                                              \
-    device bfloat*  a       [[buffer(0)]],                                     \
-    device uint*    qweight [[buffer(1)]],                                     \
-    device uint*    qzeros  [[buffer(2)]],                                     \
-    device bfloat*  scales  [[buffer(3)]],                                     \
-    device bfloat*  d       [[buffer(4)]],                                     \
-    constant MppQuantGemmParams& p [[buffer(5)]],                              \
-    uint2 tgid [[threadgroup_position_in_grid]],                               \
-    uint  lid  [[thread_index_in_threadgroup]])                                \
-{                                                                              \
-    threadgroup bfloat sB[QBK * TN];                                           \
-    mpp_gemm_quant_impl<BITS, GPTQ>(a, qweight, qzeros, scales, d, p, sB, tgid, lid); \
+template <uint BITS, bool GPTQ>
+kernel void mpp_quant_kernel(
+    device bfloat*  a       [[buffer(0)]],
+    device uint*    qweight [[buffer(1)]],
+    device uint*    qzeros  [[buffer(2)]],
+    device bfloat*  scales  [[buffer(3)]],
+    device bfloat*  d       [[buffer(4)]],
+    constant MppQuantGemmParams& p [[buffer(5)]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint  lid  [[thread_index_in_threadgroup]])
+{
+    threadgroup bfloat sB[QBK * TN];
+    mpp_gemm_quant_impl<BITS, GPTQ>(a, qweight, qzeros, scales, d, p, sB, tgid, lid);
 }
 
-MPP_QUANT_KERNEL(mpp_gemm_w4_staged, 4, false)
-MPP_QUANT_KERNEL(mpp_gemm_w8_staged, 8, false)
-MPP_QUANT_KERNEL(mpp_gemm_gptq4_staged, 4, true)
-MPP_QUANT_KERNEL(mpp_gemm_gptq8_staged, 8, true)
+template [[host_name("mpp_gemm_w4_staged")]] kernel void mpp_quant_kernel<4, false>(device bfloat*, device uint*, device uint*, device bfloat*, device bfloat*, constant MppQuantGemmParams&, uint2, uint);
+template [[host_name("mpp_gemm_w8_staged")]] kernel void mpp_quant_kernel<8, false>(device bfloat*, device uint*, device uint*, device bfloat*, device bfloat*, constant MppQuantGemmParams&, uint2, uint);
+template [[host_name("mpp_gemm_gptq4_staged")]] kernel void mpp_quant_kernel<4, true>(device bfloat*, device uint*, device uint*, device bfloat*, device bfloat*, constant MppQuantGemmParams&, uint2, uint);
+template [[host_name("mpp_gemm_gptq8_staged")]] kernel void mpp_quant_kernel<8, true>(device bfloat*, device uint*, device uint*, device bfloat*, device bfloat*, constant MppQuantGemmParams&, uint2, uint);
 
 // ── FlashAttention prefill ──────────────────────────────────────────────────
 //
@@ -1497,46 +1497,46 @@ inline void mpp_fa_wide_impl(
     }
 }
 
-#define MPP_FA_WIDE_KERNEL(NAME, D, BR, BC)                                    \
-kernel void NAME(                                                              \
-    device bfloat* q [[buffer(0)]],                                            \
-    device bfloat* k [[buffer(1)]],                                            \
-    device bfloat* v [[buffer(2)]],                                            \
-    device bfloat* o [[buffer(3)]],                                            \
-    constant MppFaParams& p [[buffer(4)]],                                     \
-    uint2 tgid [[threadgroup_position_in_grid]],                               \
-    uint lane [[thread_index_in_threadgroup]])                                 \
-{                                                                              \
-    threadgroup float tg_m[BR];                                                \
-    threadgroup float tg_l[BR];                                                \
-    threadgroup float tg_a[BR];                                                \
-    threadgroup float tg_r[BR];                                                \
-    threadgroup bfloat tg_p[BR * BC];                                          \
-    threadgroup bfloat tg_q[BR * D];                                           \
-    mpp_fa_wide_impl<D, BR, BC>(q, k, v, o, p, tg_m, tg_l, tg_a, tg_r, tg_p, tg_q, tgid, lane); \
+template <int D, int BR, int BC>
+kernel void mpp_fa_wide_kernel(
+    device bfloat* q [[buffer(0)]],
+    device bfloat* k [[buffer(1)]],
+    device bfloat* v [[buffer(2)]],
+    device bfloat* o [[buffer(3)]],
+    constant MppFaParams& p [[buffer(4)]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]])
+{
+    threadgroup float tg_m[BR];
+    threadgroup float tg_l[BR];
+    threadgroup float tg_a[BR];
+    threadgroup float tg_r[BR];
+    threadgroup bfloat tg_p[BR * BC];
+    threadgroup bfloat tg_q[BR * D];
+    mpp_fa_wide_impl<D, BR, BC>(q, k, v, o, p, tg_m, tg_l, tg_a, tg_r, tg_p, tg_q, tgid, lane);
 }
 
-MPP_FA_WIDE_KERNEL(mpp_fa_bf16_d512, 512, 16, 128)
+template [[host_name("mpp_fa_bf16_d512")]] kernel void mpp_fa_wide_kernel<512, 16, 128>(device bfloat*, device bfloat*, device bfloat*, device bfloat*, constant MppFaParams&, uint2, uint);
 
-#define MPP_FA_KERNEL(NAME, D)                                                 \
-kernel void NAME(                                                              \
-    device bfloat* q [[buffer(0)]],                                            \
-    device bfloat* k [[buffer(1)]],                                            \
-    device bfloat* v [[buffer(2)]],                                            \
-    device bfloat* o [[buffer(3)]],                                            \
-    constant MppFaParams& p [[buffer(4)]],                                     \
-    uint2 tgid [[threadgroup_position_in_grid]],                               \
-    uint lane [[thread_index_in_threadgroup]])                                 \
-{                                                                              \
-    threadgroup float tg_m[FA_BR];                                             \
-    threadgroup float tg_l[FA_BR];                                             \
-    threadgroup float tg_a[FA_BR];                                             \
-    threadgroup float tg_r[FA_BR];                                             \
-    threadgroup bfloat tg_p[FA_BR * FA_BC];                                    \
-    threadgroup bfloat tg_v[FA_BC * D];                                        \
-    mpp_fa_impl<D>(q, k, v, o, p, tg_m, tg_l, tg_a, tg_r, tg_p, tg_v, tgid, lane); \
+template <int D>
+kernel void mpp_fa_kernel(
+    device bfloat* q [[buffer(0)]],
+    device bfloat* k [[buffer(1)]],
+    device bfloat* v [[buffer(2)]],
+    device bfloat* o [[buffer(3)]],
+    constant MppFaParams& p [[buffer(4)]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]])
+{
+    threadgroup float tg_m[FA_BR];
+    threadgroup float tg_l[FA_BR];
+    threadgroup float tg_a[FA_BR];
+    threadgroup float tg_r[FA_BR];
+    threadgroup bfloat tg_p[FA_BR * FA_BC];
+    threadgroup bfloat tg_v[FA_BC * D];
+    mpp_fa_impl<D>(q, k, v, o, p, tg_m, tg_l, tg_a, tg_r, tg_p, tg_v, tgid, lane);
 }
 
-MPP_FA_KERNEL(mpp_fa_bf16_d64, 64)
-MPP_FA_KERNEL(mpp_fa_bf16_d128, 128)
-MPP_FA_KERNEL(mpp_fa_bf16_d256, 256)
+template [[host_name("mpp_fa_bf16_d64")]] kernel void mpp_fa_kernel<64>(device bfloat*, device bfloat*, device bfloat*, device bfloat*, constant MppFaParams&, uint2, uint);
+template [[host_name("mpp_fa_bf16_d128")]] kernel void mpp_fa_kernel<128>(device bfloat*, device bfloat*, device bfloat*, device bfloat*, constant MppFaParams&, uint2, uint);
+template [[host_name("mpp_fa_bf16_d256")]] kernel void mpp_fa_kernel<256>(device bfloat*, device bfloat*, device bfloat*, device bfloat*, constant MppFaParams&, uint2, uint);

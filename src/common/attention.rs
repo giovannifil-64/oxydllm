@@ -811,17 +811,20 @@ impl Attention {
                 seg.num_tokens,
             )?;
 
+            // A sink model's prefill, cached tail included, takes the tiled
+            // kernel whatever the hardware path: the GEMM fallback reduces by
+            // row count and the cached prefix would carry its bits onward.
             #[cfg(feature = "metal")]
             let use_metal_fa = metal_fa_base_ok
-                && self.sinks.is_none()
                 && if seg.num_tokens > 1 || prefill_tail {
-                    super::metal_ops::flash_attention_uses_hardware_path(
-                        self.head_dim,
-                        q.dtype(),
-                        device,
-                    )
+                    self.sinks.is_some()
+                        || super::metal_ops::flash_attention_uses_hardware_path(
+                            self.head_dim,
+                            q.dtype(),
+                            device,
+                        )
                 } else {
-                    !sdpa_base_ok
+                    self.sinks.is_none() && !sdpa_base_ok
                 }
                 && mask.is_none()
                 && kv_len >= seg.num_tokens
@@ -848,6 +851,7 @@ impl Attention {
             let use_sink_sdpa = device.is_metal()
                 && self.sinks.is_some()
                 && seg.num_tokens == 1
+                && !prefill
                 && q.dtype() == DType::BF16
                 && self.head_dim <= 128
                 && self.attn_softcap.is_none()
@@ -863,10 +867,13 @@ impl Attention {
                         &q_seg.contiguous()?,
                         &k_seg,
                         &v_seg,
-                        self.scale as f32,
-                        self.attn_softcap.map(|s| s as f32),
-                        prefix_len,
-                        self.sliding_window.unwrap_or(0),
+                        super::metal_ops::FlashAttnCall {
+                            scale: self.scale as f32,
+                            softcap: self.attn_softcap.map(|s| s as f32),
+                            prefix_len,
+                            window: self.sliding_window.unwrap_or(0),
+                            sinks: self.sinks.as_ref(),
+                        },
                     )?;
                     out_buf.slice_set(&seg_out.contiguous()?, 2, q_offset)?;
                 }

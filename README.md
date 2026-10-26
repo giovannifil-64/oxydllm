@@ -57,7 +57,7 @@ A rust-based inference engine for Large Language Models.
 - Thinking/reasoning models with a separated `reasoning_content` field: `<think>`-style (Qwen3/Qwen3.5, toggled with `enable_thinking`) and harmony channels (gpt-oss, scaled with `reasoning_effort`)
 - Metal acceleration on Apple Silicon with fused attention, RMSNorm, RoPE, and Softmax kernels; on macOS 26+ prefill matmuls use Metal 4 TensorOps (M5 neural accelerator) automatically
 - Continuous batching: all active sequences share each GPU forward pass; `max_num_seqs` is auto-computed at load and can be overridden with `--max-num-seqs`
-- Batch-invariant decoding: a request gets the same logits bit for bit whether its prompt is prefilled alone, beside other prompts or behind a cached prefix, and, on GGUF, importance-quantized and AWQ checkpoints, whether its tokens decode alone or in a batch of up to eight sequences (Metal; see Known Limitations for the edges)
+- Batch-invariant decoding: a request gets the same logits bit for bit whether its prompt is prefilled alone, beside other prompts or behind a cached prefix, whether its tokens decode alone or in a batch (Metal; see Known Limitations for the batch sizes it holds for)
 - Paged KV cache with prefix caching, plus optional KV cache quantization (Lossless/Balanced/Aggressive, 2-4× smaller)
 - Multi-model server with LRU eviction and configurable memory budgets
 - Quantized checkpoint support, auto-detected per checkpoint with no flags:
@@ -486,20 +486,35 @@ Options specific to the `oxydllm run` interactive chat command (not available in
 The following options are shared between `start` and `run`:
 `--models-dir`, `--devices`, `--max-context-len`, `--kv-quant`, `--allow-cpu`.
 
+## Platform and Compatibility
+
+Verified on macOS on Apple Silicon (M-series, Metal), where every checkpoint in the tables above was run through the regression sweep; the reference machine is an M5 with 24 GB. CUDA compiles in CI and is unverified at runtime (see CUDA Status below). The CPU path serves the unit tests and small models and is not a performance target.
+
+The OpenAI-compatible request and response shapes, the model registry (`~/.oxydllm/models/.oxydllm_registry.json`) and the configuration files are kept backward-compatible across 0.x releases on a best-effort basis: a newer binary reads what an older one wrote, reconciles the registry with what is on disk and prunes stale entries, and any change that breaks a client or a config gets a BREAKING section in the changelog. Those formats and a written deprecation policy freeze at 1.0.
+
 ## Known Limitations and Work in Progress
-- Batch invariance holds for GGUF, importance-quantized and AWQ checkpoints for decode batches of up to eight sequences; from the ninth concurrent sequence on, candle's tiled GEMM serves the GGUF decode with its own reduction order. Dense BF16 checkpoints are prefill-invariant (cold, cached and packed prefills agree) but a token decoded beside others can differ from the same token decoded alone in the last bits, since candle serves one row with a gemv and more with its GEMM; the GPTQ, W8A16 and FP8 kernels are not yet verified either way. On a Mac without Metal 4 TensorOps a prompt whose uncached tail is one token is prefilled by candle's matvec rather than its GEMM, and can differ from the cold prefill in the last bits.
+- Batch invariance holds for GGUF, importance-quantized, AWQ, GPTQ and dense BF16 checkpoints (FP8 ones dequantized to BF16 at load included) for decode batches of up to eight sequences, sixteen on AWQ and thirty-two on GPTQ; beyond that candle's tiled GEMM serves the decode with its own reduction order. The native F8 kernels of the streamed experts are verified to give a row the same bits alone and in a batch.
 - GGUF compatibility: MoE GGUF checkpoints are not yet wired. The importance-quantized types IQ4_XS, IQ4_NL and IQ3_S load through the engine's own kernels, which covers unsloth's UD-Q*_K_M and UD-Q*_K_XL builds; a GGUF holding any other IQ or ternary type is refused before the download rather than after it.
 - Thinking mode is template-dependent: `enable_thinking` is applied only when the tokenizer chat template supports it.
 - Byte-level tokenizers: Streaming decode uses incremental buffering; occasional model-specific Unicode artifacts can still appear.
-- Tool / schema adherence is model-dependent: the OpenAI-compatible request fields, response shapes, and streaming semantics are implemented server-side, but local models can still ignore tool instructions or emit invalid JSON / tool arguments.
 - Only function tools are implemented: OpenAI custom tools are not supported on `/v1/chat/completions` yet.
 - Gemma4 edge cases: Some checkpoints may require architecture-specific tuning.
 - Metal softcap SDPA policy: The Metal SDPA path with attention softcap is currently hard-disabled in runtime (no experimental toggle) and falls back to the standard attention path.
-- Attention-sink models (gpt-oss): decode runs a dedicated fused sink-aware SDPA kernel; prefill falls back to the standard attention path, so long-prompt TTFT is higher than on comparable non-sink models.
+- Attention-sink models (gpt-oss): decode runs a dedicated fused sink-aware SDPA kernel and prefill the tiled Flash Attention kernel with the sink folded into its softmax; the TensorOps attention kernel does not take sinks, so long-prompt TTFT stays above that of comparable non-sink models on the M5.
 - Metal SDPA head-dim coverage: The fused Metal SDPA kernel supports head dimensions `32, 64, 72, 80, 96, 128, 256`. Models with other head dimensions remain functionally correct but fall back to the non-fused attention path with a measurable throughput cost.
 - GPTQ act-order (`desc_act=true`) not supported: load fails fast; only sequential `desc_act=false` checkpoints are accepted. `g_idx` is loaded but ignored on the supported path.
 - FP8 on Apple Silicon doubles resident memory: Metal has no FP8 compute kernels, so all FP8 checkpoints are dequanted to BF16 at load time. A 4B-FP8 model needs ~8 GB resident instead of the ~4 GB on-disk footprint. CUDA / CPU retain the Level-2 resident FP8 path.
 - MoE perf is dispatch-bound: the hybrid sparse/naive path is correct and decode-competitive, but per-expert Metal command-buffer overhead caps prefill throughput. A custom fused MoE kernel would unlock the next ~2-3× speedup on long prompts.
+
+### Model behaviour, not the runtime
+
+The E2E sweep labels every failure as runtime, model or budget, and a release ships with runtime defects at zero. The behaviours below are the checkpoints' own: they reproduce at temperature 0 on a server that passes its determinism, batching, streaming and stop checks on the same checkpoint, and where noted llama.cpp gives the same answer to the same prompt and tool definitions. The server does not paper over them.
+
+- Tool and schema adherence is model-dependent: the OpenAI-compatible request fields, response shapes and streaming semantics are implemented server-side, but a model can still ignore tool instructions or emit invalid JSON or tool arguments.
+- Llama 3.x (1B, 3B and 8B) write a tool call as JSON in the message text, with `finish_reason` `stop` and no `tool_calls` entry; llama.cpp returns the same text.
+- Granite 3.3 (2B and 8B) and Qwen2-1.5B call an offered tool whether or not the question needs it: "What is 2+2?" beside a weather tool returns a `get_weather` call at a probability near one, and llama.cpp emits the same call. `tool_choice: "none"`, or an `allowed_tools` subset, is the remedy when a turn must not call.
+- Checkpoints under a billion parameters and 2-bit quantizations (Qwen3-0.6B at every quantization, Qwen2.5-1.5B Q2_K) lose a needle after about 1.5k tokens of repeated text, drop simple arithmetic across turns, and answer a one-word question with markdown: on Qwen3-0.6B Q8_0, "Color of a banana? One word." gets `One word: **orange**.` from this server and from llama.cpp alike, token for token on five such prompts. On Qwen3-1.7B the two engines agree on four prompts of five and split on the multi-turn sum, each giving an answer the other gives in another quantization: a greedy near-tie of the model, not a defect of either. Larger or less quantized checkpoints of the same family pass.
+- Reasoning models (Qwen3, Qwen3.5, the DeepSeek-R1 distills, gpt-oss, Gemma 4) spend the completion budget thinking: with a small `max_tokens` the reply can come back empty with `finish_reason` `length` while `reasoning_content` holds the thought. Raise `max_tokens` or disable thinking for the turn.
 
 ## CUDA Status
 CUDA is currently a functional compatibility path, not a performance-tuned backend.

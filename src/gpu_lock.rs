@@ -65,3 +65,20 @@ pub fn gpu_lock_for(device: &Device) -> GpuLock {
         .clone();
     GpuLock { inner }
 }
+
+/// Runs `f` inside an autorelease pool on the Metal build, where candle's
+/// backend creates each command encoder and blit label as an autoreleased
+/// Objective-C object: a thread without a pool keeps every one of them for
+/// its whole life, some three hundred encoders a decode step, which the
+/// eight-hour soak of 2026-10-22 saw as 480 MB an hour of resident memory.
+/// The pool drains when `f` returns. Elsewhere it is `f` itself.
+pub fn in_autorelease_pool<T>(f: impl FnOnce() -> T) -> T {
+    #[cfg(feature = "metal")]
+    {
+        objc2::rc::autoreleasepool(|_| f())
+    }
+    #[cfg(not(feature = "metal"))]
+    {
+        f()
+    }
+}

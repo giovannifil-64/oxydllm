@@ -128,10 +128,13 @@ pub struct Linear {
 fn matmul_with_bias(x: &Tensor, weight_t: &Tensor, bias: Option<&Tensor>) -> Result<Tensor> {
     #[cfg(feature = "metal")]
     let mm = |x2: &Tensor| -> Result<Tensor> {
-        match super::metal_ops::maybe_mpp_matmul(x2, weight_t)? {
-            Some(y) => Ok(y),
-            None => x2.matmul(weight_t),
+        if let Some(y) = super::metal_ops::maybe_mpp_matmul(x2, weight_t)? {
+            return Ok(y);
         }
+        if let Some(y) = super::metal_ops::maybe_bf16_gemv(x2, weight_t, x2.dtype())? {
+            return Ok(y);
+        }
+        x2.matmul(weight_t)
     };
     #[cfg(not(feature = "metal"))]
     let mm = |x2: &Tensor| x2.matmul(weight_t);
@@ -401,6 +404,10 @@ pub struct PackedQuantLinear {
     out_features: usize,
     bits: u32,
     pack_dim: PackDim,
+    /// The dtype the layer answers in: the scales' dtype, or F32 for the
+    /// vocabulary projection, whose logits then skip the BF16 rounding that
+    /// lands tokens on exact ties.
+    out_dtype: DType,
 }
 
 #[cfg(feature = "metal")]
@@ -436,7 +443,14 @@ impl PackedQuantLinear {
             out_features,
             bits: raw.bits,
             pack_dim: raw.pack_dim,
+            out_dtype: dtype,
         })
+    }
+
+    /// The layer answering in `out_dtype` rather than in the scales' dtype.
+    pub fn with_out_dtype(mut self, out_dtype: DType) -> Self {
+        self.out_dtype = out_dtype;
+        self
     }
 
     fn gemv_max_m(&self) -> usize {
@@ -447,16 +461,23 @@ impl PackedQuantLinear {
     }
 
     fn chunked_batch_gemv(&self, x_2d: &Tensor, m: usize) -> Result<Tensor> {
-        let gemv = |xc: &Tensor| match (self.pack_dim, self.bits) {
-            (PackDim::Out, 8) => {
-                super::metal_ops::w8a16_matmul(xc, &self.qweight, &self.qzeros, &self.scales)
-            }
-            (PackDim::Out, _) => {
-                super::metal_ops::w4a16_matmul(xc, &self.qweight, &self.qzeros, &self.scales)
-            }
-            (PackDim::In, bits) => {
-                super::metal_ops::gptq_matmul(xc, &self.qweight, &self.qzeros, &self.scales, bits)
-            }
+        let gemv = |xc: &Tensor| match self.pack_dim {
+            PackDim::Out => super::metal_ops::wna16_matmul_to(
+                xc,
+                &self.qweight,
+                &self.qzeros,
+                &self.scales,
+                self.bits,
+                self.out_dtype,
+            ),
+            PackDim::In => super::metal_ops::gptq_matmul_to(
+                xc,
+                &self.qweight,
+                &self.qzeros,
+                &self.scales,
+                self.bits,
+                self.out_dtype,
+            ),
         };
         if m <= 8 {
             return gemv(x_2d);
@@ -471,6 +492,15 @@ impl PackedQuantLinear {
         Tensor::cat(&parts, 0)
     }
 
+    /// The kernel family follows the phase of the forward (see
+    /// [`crate::common::phase`]), as the GGUF path's does: a decode step of
+    /// up to the gemv's row count takes the fused gemv in chunks of eight
+    /// rows, the same reduction alone or in a batch, and a prefill takes the
+    /// TensorOps GEMM whatever its row count, except the F32 vocabulary
+    /// projection, which keeps the gemv in chunks of eight rows however many
+    /// sequences finish their prefill together, so a first token gets the
+    /// logits its successors get. Outside the engine the row count alone
+    /// decides.
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let dims = x.dims().to_vec();
         let in_features = *dims.last().unwrap();
@@ -482,8 +512,14 @@ impl PackedQuantLinear {
         }
         let m: usize = dims[..dims.len() - 1].iter().product();
         let x_2d = x.reshape((m, in_features))?.contiguous()?;
+        let prefill = super::phase::current() == Some(super::phase::Phase::Prefill);
 
-        let y_2d = if m <= self.gemv_max_m() {
+        let gemv = if prefill {
+            self.out_dtype == DType::F32
+        } else {
+            m <= self.gemv_max_m()
+        };
+        let y_2d = if gemv {
             self.chunked_batch_gemv(&x_2d, m)?
         } else if let Some(y) = super::metal_ops::maybe_mpp_quant_matmul(
             &x_2d,
@@ -514,6 +550,11 @@ impl PackedQuantLinear {
                 None => x_2d.matmul(&w)?,
             }
         };
+        let y_2d = if y_2d.dtype() == self.out_dtype {
+            y_2d
+        } else {
+            y_2d.to_dtype(self.out_dtype)?
+        };
 
         let mut out_dims = dims;
         *out_dims.last_mut().unwrap() = self.out_features;
@@ -534,6 +575,16 @@ pub enum AnyLinear {
 }
 
 impl AnyLinear {
+    /// A packed-quant layer answering in `out_dtype`; the other kinds keep
+    /// theirs.
+    #[cfg(feature = "metal")]
+    pub fn with_out_dtype(self, out_dtype: DType) -> Self {
+        match self {
+            Self::PackedQuant(p) => Self::PackedQuant(p.with_out_dtype(out_dtype)),
+            other => other,
+        }
+    }
+
     pub fn from_weight(weight: Tensor, bias: Option<Tensor>) -> Result<Self> {
         Self::from_weight_with_scale_inv(weight, None, bias)
     }
@@ -1138,5 +1189,152 @@ mod tests {
         let diff = (out - ref_out)?.abs()?.max_all()?.to_scalar::<f32>()?;
         assert!(diff < 1e-4, "block-wise FP8 output diverged: {diff}");
         Ok(())
+    }
+}
+
+#[cfg(all(test, feature = "metal"))]
+mod packed_quant_phase_tests {
+    use super::*;
+    use crate::common::phase::{Phase, with_phase};
+
+    fn layer(dev: &Device, out_dtype: DType) -> PackedQuantLinear {
+        let (out_features, in_features) = (256usize, 512usize);
+        let w: Vec<f32> = (0..out_features * in_features)
+            .map(|i| ((((i as u64) * 2654435761) % 97) as f32 - 48.0) * 0.02)
+            .collect();
+        let w = Tensor::from_vec(w, (out_features, in_features), &Device::Cpu).unwrap();
+        let raw = crate::common::awq::rtn_quantize_awq(&w, 128)
+            .unwrap()
+            .to_device(dev)
+            .unwrap();
+        PackedQuantLinear::new(raw, None, DType::BF16)
+            .unwrap()
+            .with_out_dtype(out_dtype)
+    }
+
+    fn rows(m: usize, k: usize, dev: &Device) -> Tensor {
+        let x: Vec<f32> = (0..m * k)
+            .map(|i| (((i * 7 + (i / k) * 13) % 23) as f32 - 11.0) * 0.05)
+            .collect();
+        Tensor::from_vec(x, (m, k), &Device::Cpu)
+            .unwrap()
+            .to_dtype(DType::BF16)
+            .unwrap()
+            .to_device(dev)
+            .unwrap()
+    }
+
+    fn bits(t: &Tensor) -> Vec<u32> {
+        t.to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+            .iter()
+            .map(|v| v.to_bits())
+            .collect()
+    }
+
+    /// Contract: a layer asked for F32 answers in the F32 its kernel
+    /// accumulates in, the same values the BF16 layer rounds, so the
+    /// vocabulary projection's logits never land on BF16 ties.
+    #[test]
+    fn the_vocabulary_projection_answers_in_f32() {
+        let Ok(dev) = Device::new_metal(0) else {
+            return;
+        };
+        let x = rows(3, 512, &dev);
+        let logits = layer(&dev, DType::F32).forward(&x).unwrap();
+        assert_eq!(logits.dtype(), DType::F32);
+        let rounded = layer(&dev, DType::BF16).forward(&x).unwrap();
+        assert_eq!(rounded.dtype(), DType::BF16);
+        assert_eq!(bits(&logits.to_dtype(DType::BF16).unwrap()), bits(&rounded));
+    }
+
+    /// Contract: in a decode step every row of a batch, past the gemv's
+    /// eight rows included, gets the bits it gets decoded alone.
+    #[test]
+    fn a_decode_batch_gives_each_row_the_bits_it_gets_alone() {
+        let Ok(dev) = Device::new_metal(0) else {
+            return;
+        };
+        let layer = layer(&dev, DType::BF16);
+        let x = rows(12, 512, &dev);
+        let batched = with_phase(Phase::Decode, || layer.forward(&x).unwrap());
+        for i in 0..12 {
+            let alone = with_phase(Phase::Decode, || {
+                layer
+                    .forward(&x.narrow(0, i, 1).unwrap().contiguous().unwrap())
+                    .unwrap()
+            });
+            assert_eq!(
+                bits(&batched.narrow(0, i, 1).unwrap()),
+                bits(&alone),
+                "row {i}"
+            );
+        }
+    }
+
+    /// Contract: a prefill gives a row the same bits whatever rows share it,
+    /// four or seventy, since it takes the one GEMM whatever its row count;
+    /// the F32 vocabulary projection of a few rows keeps the gemv, so its
+    /// first logits are the decode step's bits.
+    #[test]
+    fn a_prefill_takes_one_kernel_family_whatever_its_row_count() {
+        let Ok(dev) = Device::new_metal(0) else {
+            return;
+        };
+        let Device::Metal(md) = &dev else {
+            return;
+        };
+        if !crate::common::metal_ops::mpp_gemm_available(md.device()) {
+            return;
+        }
+        let layer = layer(&dev, DType::BF16);
+        let x = rows(70, 512, &dev);
+        let wide = with_phase(Phase::Prefill, || layer.forward(&x).unwrap());
+        let narrow = with_phase(Phase::Prefill, || {
+            layer
+                .forward(&x.narrow(0, 0, 4).unwrap().contiguous().unwrap())
+                .unwrap()
+        });
+        assert_eq!(bits(&wide.narrow(0, 0, 4).unwrap()), bits(&narrow));
+
+        let head = self::layer(&dev, DType::F32);
+        let few = x.narrow(0, 0, 4).unwrap().contiguous().unwrap();
+        let in_prefill = with_phase(Phase::Prefill, || head.forward(&few).unwrap());
+        let in_decode = with_phase(Phase::Decode, || head.forward(&few).unwrap());
+        assert_eq!(bits(&in_prefill), bits(&in_decode));
+    }
+
+    /// Contract: the F32 vocabulary projection keeps the gemv's bits in a
+    /// prefill of any width, past the gemv's own row cap, so the first token
+    /// of a sequence that finishes its prefill beside many others gets the
+    /// logits it gets alone and its successors get in decode.
+    #[test]
+    fn the_f32_head_of_a_wide_prefill_gives_each_row_the_bits_it_gets_alone() {
+        let Ok(dev) = Device::new_metal(0) else {
+            return;
+        };
+        let Device::Metal(md) = &dev else {
+            return;
+        };
+        if !crate::common::metal_ops::mpp_gemm_available(md.device()) {
+            return;
+        }
+        let head = layer(&dev, DType::F32);
+        let x = rows(20, 512, &dev);
+        let wide = with_phase(Phase::Prefill, || head.forward(&x).unwrap());
+        assert_eq!(wide.dtype(), DType::F32);
+        for i in 0..20 {
+            let row = x.narrow(0, i, 1).unwrap().contiguous().unwrap();
+            let alone = with_phase(Phase::Decode, || head.forward(&row).unwrap());
+            assert_eq!(
+                bits(&wide.narrow(0, i, 1).unwrap()),
+                bits(&alone),
+                "row {i} of a 20-row prefill differs from the row decoded alone"
+            );
+        }
     }
 }

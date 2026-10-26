@@ -58,16 +58,18 @@ pub(super) async fn embeddings(
         tokio::task::spawn_blocking(move || -> anyhow::Result<(Vec<Vec<f32>>, usize)> {
             let gpu = crate::gpu_lock::gpu_lock_for(handle_for_embed.model.device());
             let _gpu = gpu.acquire();
-            let mut vectors = Vec::with_capacity(batch.len());
-            let mut prompt_tokens = 0usize;
-            for text in &batch {
-                let ids = handle_for_embed
-                    .tokenizer
-                    .encode_with_special_tokens(text)?;
-                prompt_tokens += ids.len();
-                vectors.push(handle_for_embed.model.embed(&ids)?);
-            }
-            Ok((vectors, prompt_tokens))
+            crate::gpu_lock::in_autorelease_pool(|| {
+                let mut vectors = Vec::with_capacity(batch.len());
+                let mut prompt_tokens = 0usize;
+                for text in &batch {
+                    let ids = handle_for_embed
+                        .tokenizer
+                        .encode_with_special_tokens(text)?;
+                    prompt_tokens += ids.len();
+                    vectors.push(handle_for_embed.model.embed(&ids)?);
+                }
+                Ok((vectors, prompt_tokens))
+            })
         })
         .await;
 

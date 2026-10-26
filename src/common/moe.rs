@@ -102,11 +102,15 @@ impl Fp8Cached {
         crate::common::linear::Linear::new(w, None)
     }
 
-    /// Applies the projection to `x` (`[m, in]`): the native F8 GEMV for
-    /// decode-sized batches, the dequantize-then-matmul path beyond it.
+    /// Applies the projection to `x` (`[m, in]`): the native F8 GEMV for a
+    /// decode step of up to eight rows, the dequantize-then-matmul path for
+    /// a prefill whatever its row count and for decode batches beyond
+    /// eight, the phase of the forward deciding as it does for every other
+    /// quantized path (see [`crate::common::phase`]).
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let m = x.dim(0)?;
-        if (1..=8).contains(&m) && x.device().is_metal() && x.dtype() == DType::BF16 {
+        let prefill = crate::common::phase::current() == Some(crate::common::phase::Phase::Prefill);
+        if (1..=8).contains(&m) && !prefill && x.device().is_metal() && x.dtype() == DType::BF16 {
             return crate::common::metal_ops::f8_gemv(x, &self.bytes, &self.scales);
         }
         self.linear()?.forward(x)

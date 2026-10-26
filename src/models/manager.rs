@@ -28,6 +28,7 @@ use crate::common::kv_quant::KvQuantMode;
 use crate::common::paged::{
     GlobalKvBudget, PagedKvCache, SharedGlobalKvBudget, detect_system_kv_budget,
 };
+use crate::common::phase::{Phase, with_phase};
 use crate::engine::Engine;
 use crate::models::estimate::{
     awq_qweight_expansion, read_quantization_config, sum_safetensors_bytes,
@@ -863,107 +864,105 @@ struct SpawnLoadParams {
     memory_budget_bytes: Option<usize>,
 }
 
-/// JIT-compile all SDPA kernels before marking the model Ready, otherwise the
-/// first real request pays multi-second compilation latency. Phase 3 (full
-/// prefill) MUST be last: a Metal candle bug emits NaN logits on the first
-/// `call_sdpa_full` after a `call_sdpa_vector` call without an intervening full.
+/// Tokens of the prefill that closes the warm-up: a full chunk of the
+/// recurrent scans and more rows than any GEMM threshold.
+const FULL_WARMUP_TOKENS: usize = 64;
+
+/// Runs the forwards a request will run, under the phases the engine states
+/// for them, before the model is marked Ready: two prompts prefilled
+/// together, one of them decoded alone, both decoded together, then a
+/// prefill of [`FULL_WARMUP_TOKENS`] on a fresh cache. Each compiles the
+/// pipelines its phase selects (the TensorOps GEMM and the attention of a
+/// prefill, the one-row and the batched gemv of a decode), which would
+/// otherwise be compiled inside the first request that reaches them. The
+/// full prefill MUST be last: a Metal candle bug emits NaN logits on the
+/// first `call_sdpa_full` after a `call_sdpa_vector` call without an
+/// intervening full.
 pub(crate) fn warm_up_model(model: &dyn BatchModel) {
+    fn step(
+        model: &dyn BatchModel,
+        phase: Phase,
+        tokens: Vec<u32>,
+        positions: Vec<u32>,
+        caches: &mut [&mut [PagedKvCache]],
+        counts: &[usize],
+        what: &str,
+    ) {
+        let t = tokens.len();
+        let device = model.device();
+        let run = || -> candle_core::Result<()> {
+            let input = Tensor::from_vec(tokens, (1, t), device)?;
+            let position_ids = Tensor::from_vec(positions, (t,), device)?;
+            with_phase(phase, || {
+                model.forward_batch(&input, &position_ids, caches, counts)
+            })?;
+            if phase == Phase::Prefill {
+                crate::common::block::flush_caches(caches)?;
+            }
+            Ok(())
+        };
+        if let Err(e) = run() {
+            tracing::warn!(error = %e, "warmup {what} failed (non-fatal)");
+        }
+    }
+
     let device = model.device();
     let allocators = model.allocators();
 
     let lock = crate::gpu_lock::gpu_lock_for(device);
     let _gpu = lock.acquire();
 
-    let mut caches: Vec<PagedKvCache> = allocators
-        .iter()
-        .map(|a| PagedKvCache::new(std::sync::Arc::clone(a)))
-        .collect();
+    let fresh = || -> Vec<PagedKvCache> {
+        allocators
+            .iter()
+            .map(|a| PagedKvCache::new(std::sync::Arc::clone(a)))
+            .collect()
+    };
+    let (mut first, mut second) = (fresh(), fresh());
 
-    {
-        let dummy_tokens: Vec<u32> = (1..=8).collect();
-        let positions: Vec<u32> = (0..8).collect();
-        let input = match Tensor::from_vec(dummy_tokens, (1, 8), device) {
-            Ok(t) => t,
-            Err(e) => {
-                tracing::warn!(error = %e, "warmup failed to create prefill tensor");
-                return;
-            }
-        };
-        let position_ids = match Tensor::from_vec(positions, (8,), device) {
-            Ok(t) => t,
-            Err(e) => {
-                tracing::warn!(error = %e, "warmup failed to create prefill position ids");
-                return;
-            }
-        };
-
-        let mut cache_slices: Vec<&mut [PagedKvCache]> = vec![caches.as_mut_slice()];
-        if let Err(e) = model.forward_batch(&input, &position_ids, &mut cache_slices, &[8]) {
-            tracing::warn!(error = %e, "warmup prefill forward failed (non-fatal)");
-        } else if let Err(e) = crate::common::block::flush_caches(&mut cache_slices) {
-            tracing::warn!(error = %e, "warmup prefill flush failed (non-fatal)");
-        }
-    }
-
-    {
-        let input = match Tensor::from_vec(vec![1u32], (1, 1), device) {
-            Ok(t) => t,
-            Err(e) => {
-                tracing::warn!(error = %e, "warmup failed to create decode tensor");
-                return;
-            }
-        };
-        let position_ids = match Tensor::from_vec(vec![8u32], (1,), device) {
-            Ok(t) => t,
-            Err(e) => {
-                tracing::warn!(error = %e, "warmup failed to create decode position ids");
-                return;
-            }
-        };
-
-        let mut cache_slices: Vec<&mut [PagedKvCache]> = vec![caches.as_mut_slice()];
-        if let Err(e) = model.forward_batch(&input, &position_ids, &mut cache_slices, &[1]) {
-            tracing::warn!(error = %e, "warmup decode forward failed (non-fatal)");
-        }
-    }
-
-    for cache in &mut caches {
+    let prompt: Vec<u32> = (1..=8).collect();
+    let prompt_positions: Vec<u32> = (0..8).collect();
+    step(
+        model,
+        Phase::Prefill,
+        [prompt.clone(), prompt].concat(),
+        [prompt_positions.clone(), prompt_positions].concat(),
+        &mut [first.as_mut_slice(), second.as_mut_slice()],
+        &[8, 8],
+        "prefill of two prompts",
+    );
+    step(
+        model,
+        Phase::Decode,
+        vec![1],
+        vec![8],
+        &mut [first.as_mut_slice()],
+        &[1],
+        "decode of one sequence",
+    );
+    step(
+        model,
+        Phase::Decode,
+        vec![1, 1],
+        vec![9, 8],
+        &mut [first.as_mut_slice(), second.as_mut_slice()],
+        &[1, 1],
+        "decode of two sequences",
+    );
+    for cache in first.iter_mut().chain(second.iter_mut()) {
         cache.clear();
     }
 
-    const FULL_WARMUP_TOKENS: usize = 16;
-    {
-        let dummy_tokens: Vec<u32> = (1..=FULL_WARMUP_TOKENS as u32).collect();
-        let positions: Vec<u32> = (0..FULL_WARMUP_TOKENS as u32).collect();
-        let input = match Tensor::from_vec(dummy_tokens, (1, FULL_WARMUP_TOKENS), device) {
-            Ok(t) => t,
-            Err(e) => {
-                tracing::warn!(error = %e, "warmup failed to create full-path prefill tensor");
-                return;
-            }
-        };
-        let position_ids = match Tensor::from_vec(positions, (FULL_WARMUP_TOKENS,), device) {
-            Ok(t) => t,
-            Err(e) => {
-                tracing::warn!(error = %e, "warmup failed to create full-path position ids");
-                return;
-            }
-        };
-
-        let mut cache_slices: Vec<&mut [PagedKvCache]> = vec![caches.as_mut_slice()];
-        if let Err(e) = model.forward_batch(
-            &input,
-            &position_ids,
-            &mut cache_slices,
-            &[FULL_WARMUP_TOKENS],
-        ) {
-            tracing::warn!(error = %e, "warmup full-path prefill forward failed (non-fatal)");
-        } else if let Err(e) = crate::common::block::flush_caches(&mut cache_slices) {
-            tracing::warn!(error = %e, "warmup full-path prefill flush failed (non-fatal)");
-        }
-    }
-
-    for cache in &mut caches {
+    step(
+        model,
+        Phase::Prefill,
+        (1..=FULL_WARMUP_TOKENS as u32).collect(),
+        (0..FULL_WARMUP_TOKENS as u32).collect(),
+        &mut [first.as_mut_slice()],
+        &[FULL_WARMUP_TOKENS],
+        "full prefill",
+    );
+    for cache in &mut first {
         cache.clear();
     }
 

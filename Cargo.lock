@@ -2115,6 +2115,7 @@ dependencies = [
  "memmap2",
  "minijinja",
  "minijinja-contrib",
+ "objc2",
  "objc2-foundation",
  "objc2-metal",
  "opentelemetry",

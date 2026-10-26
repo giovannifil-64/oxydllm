@@ -299,6 +299,9 @@ fn is_incomplete_download(dir: &Path) -> bool {
                 Ok(m) => disk_bytes += m.len(),
                 Err(_) => return true,
             }
+            if safetensors_truncated(&dir.join(shard)) {
+                return true;
+            }
         }
         if let Some(total) = json["metadata"]["total_size"].as_u64() {
             return disk_bytes < total;
@@ -307,20 +310,50 @@ fn is_incomplete_download(dir: &Path) -> bool {
     }
 
     if dir.join("config.json").exists() {
-        let has_weights = std::fs::read_dir(dir)
+        let weights: Vec<PathBuf> = std::fs::read_dir(dir)
             .into_iter()
             .flatten()
             .flatten()
-            .any(|e| {
-                e.path()
-                    .extension()
-                    .map(|x| x == "safetensors")
-                    .unwrap_or(false)
-            });
-        return !has_weights;
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x == "safetensors"))
+            .collect();
+        return weights.is_empty() || weights.iter().any(|p| safetensors_truncated(p));
     }
 
     true
+}
+
+/// Whether a safetensors file holds fewer bytes than its header promises:
+/// the header names every tensor's byte range, so a download that stopped
+/// short ends before the last range does. A header that cannot be read is
+/// treated as truncated too.
+fn safetensors_truncated(path: &Path) -> bool {
+    use std::io::Read;
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return true;
+    };
+    let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+    let mut head = [0u8; 8];
+    if file.read_exact(&mut head).is_err() {
+        return true;
+    }
+    let header_len = u64::from_le_bytes(head);
+    if header_len > (256 << 20) || len < 8 + header_len {
+        return true;
+    }
+    let mut header = vec![0u8; header_len as usize];
+    if file.read_exact(&mut header).is_err() {
+        return true;
+    }
+    let Ok(serde_json::Value::Object(tensors)) = serde_json::from_slice(&header) else {
+        return true;
+    };
+    let data_end = tensors
+        .values()
+        .filter_map(|t| t["data_offsets"][1].as_u64())
+        .max()
+        .unwrap_or(0);
+    len < 8 + header_len + data_end
 }
 
 pub fn pull(config: &PullConfig) -> anyhow::Result<()> {
@@ -1293,12 +1326,47 @@ mod tests {
         assert!(is_incomplete_download(tmp.path()));
     }
 
+    /// A safetensors file whose header promises `declared` data bytes and
+    /// which holds `present` of them.
+    fn safetensors_file(declared: u64, present: usize) -> Vec<u8> {
+        let header = format!(
+            r#"{{"__metadata__":{{"format":"pt"}},"w":{{"dtype":"F32","shape":[{}],"data_offsets":[0,{declared}]}}}}"#,
+            declared / 4
+        );
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend_from_slice(header.as_bytes());
+        bytes.extend(std::iter::repeat_n(7u8, present));
+        bytes
+    }
+
     #[test]
     fn is_incomplete_download_returns_false_when_config_and_weights_present() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("config.json"), "{}").unwrap();
-        std::fs::write(tmp.path().join("model.safetensors"), b"weights").unwrap();
+        std::fs::write(
+            tmp.path().join("model.safetensors"),
+            safetensors_file(16, 16),
+        )
+        .unwrap();
         assert!(!is_incomplete_download(tmp.path()));
+    }
+
+    /// Contract: a single-file safetensors checkpoint whose weights file
+    /// stopped short of what its header promises is incomplete, so the next
+    /// pull resumes it instead of refusing because the directory exists and
+    /// the server does not try to load it.
+    #[test]
+    fn single_file_safetensors_truncated_is_incomplete() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("config.json"), "{}").unwrap();
+        std::fs::write(
+            tmp.path().join("model.safetensors"),
+            safetensors_file(16, 8),
+        )
+        .unwrap();
+        assert!(is_incomplete_download(tmp.path()));
+        std::fs::write(tmp.path().join("model.safetensors"), b"short").unwrap();
+        assert!(is_incomplete_download(tmp.path()));
     }
 
     // Contract: a sharded safetensors dir is incomplete when a shard is missing
@@ -1306,39 +1374,35 @@ mod tests {
     #[test]
     fn sharded_safetensors_truncated_shard_is_incomplete() {
         let tmp = tempfile::tempdir().unwrap();
+        let shard = safetensors_file(8, 8);
+        let total = 2 * shard.len() as u64;
         let index = serde_json::json!({
-            "metadata": { "total_size": 16 },
-            "weight_map": { "a": "model-00000-of-00002.safetensors",
-                            "b": "model-00001-of-00002.safetensors" }
+            "metadata": { "total_size": total },
+            "weight_map": {
+                "a": "model-00000-of-00002.safetensors",
+                "b": "model-00001-of-00002.safetensors"
+            }
         });
         std::fs::write(
             tmp.path().join("model.safetensors.index.json"),
-            index.to_string(),
+            serde_json::to_string(&index).unwrap(),
         )
         .unwrap();
 
         // Missing second shard.
-        std::fs::write(
-            tmp.path().join("model-00000-of-00002.safetensors"),
-            [0u8; 8],
-        )
-        .unwrap();
+        std::fs::write(tmp.path().join("model-00000-of-00002.safetensors"), &shard).unwrap();
         assert!(is_incomplete_download(tmp.path()));
 
-        // Both present but truncated (8 + 4 < 16).
+        // Both present but the second stopped short of its header's promise.
         std::fs::write(
             tmp.path().join("model-00001-of-00002.safetensors"),
-            [0u8; 4],
+            safetensors_file(8, 4),
         )
         .unwrap();
         assert!(is_incomplete_download(tmp.path()));
 
         // Both present, full size.
-        std::fs::write(
-            tmp.path().join("model-00001-of-00002.safetensors"),
-            [0u8; 8],
-        )
-        .unwrap();
+        std::fs::write(tmp.path().join("model-00001-of-00002.safetensors"), &shard).unwrap();
         assert!(!is_incomplete_download(tmp.path()));
     }
 }

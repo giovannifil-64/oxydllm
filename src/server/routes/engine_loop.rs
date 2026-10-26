@@ -615,7 +615,7 @@ pub fn engine_loop(
         if engine.has_pending_work() {
             let step_result = {
                 let _gpu = gpu_lock.acquire();
-                engine.step()
+                crate::gpu_lock::in_autorelease_pool(|| engine.step())
             };
             match step_result {
                 Ok(step) => {
@@ -1293,6 +1293,67 @@ mod metrics_loop_tests {
                 "thinking requested: {wants}"
             );
             assert_eq!(content.trim(), "b", "thinking requested: {wants}");
+        }
+    }
+
+    /// Contract: a reasoning channel gemma-4 opens with its name,
+    /// `<|channel>thought` and a line break, goes to reasoning with the name
+    /// stripped, and the content after `<channel|>` to content, whether the
+    /// reply is read whole or as deltas: the loop emits the same events for
+    /// both.
+    #[test]
+    fn a_named_reasoning_channel_streams_as_reasoning_without_its_name() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let model = WordLevel::builder()
+            .vocab(
+                [
+                    ("[UNK]".to_string(), 0u32),
+                    ("<|channel>".to_string(), 1u32),
+                    ("thought\n".to_string(), 2u32),
+                    ("reasoned".to_string(), 3u32),
+                    ("<channel|>".to_string(), 4u32),
+                    ("answer".to_string(), 5u32),
+                ]
+                .into_iter()
+                .collect(),
+            )
+            .unk_token("[UNK]".to_string())
+            .build()
+            .unwrap_or_else(|e| panic!("build wordlevel: {e}"));
+        let mut inner = tokenizers::Tokenizer::new(model);
+        inner.with_pre_tokenizer(Some(Whitespace {}));
+        inner
+            .save(tmp.path().join("tokenizer.json"), false)
+            .unwrap_or_else(|e| panic!("save tokenizer: {e}"));
+        let tok = Arc::new(
+            Tokenizer::from_dir(tmp.path().to_str().expect("utf-8 path")).expect("load tokenizer"),
+        );
+        for (wants, want_reasoning) in [(true, "reasoned"), (false, "")] {
+            let events = drive_one_request_with_ids(
+                StubModel::scripted(vec![1, 2, 3, 4, 5]),
+                Arc::clone(&tok),
+                "m",
+                "m",
+                vec![5],
+                5,
+                wants,
+                vec![],
+            );
+            let (mut content, mut reasoning) = (String::new(), String::new());
+            for event in events {
+                match event {
+                    EngineEvent::Token { text, .. } => content.push_str(&text),
+                    EngineEvent::ReasoningToken(text) => reasoning.push_str(&text),
+                    _ => {}
+                }
+            }
+            assert_eq!(
+                reasoning.trim(),
+                want_reasoning,
+                "thinking requested: {wants}"
+            );
+            assert_eq!(content.trim(), "answer", "thinking requested: {wants}");
+            assert!(!content.contains("thought"), "{content:?}");
         }
     }
 

@@ -905,7 +905,7 @@ pub fn engine_loop(
 #[cfg(test)]
 pub(crate) mod test_support {
     use crate::common::paged::{
-        BlockAllocator, DEFAULT_BLOCK_SIZE, PagedKvCache, SharedBlockAllocator,
+        BlockAllocator, DEFAULT_BLOCK_SIZE, PagedKvCache, PoolSpec, SharedBlockAllocator,
     };
     use crate::models::traits::BatchModel;
     use candle_core::{DType, Device, Tensor};
@@ -927,14 +927,16 @@ pub(crate) mod test_support {
     impl StubModel {
         pub(crate) fn new(forced: u32, fail: bool) -> Self {
             let alloc = BlockAllocator::growing(
-                64,
-                64,
-                DEFAULT_BLOCK_SIZE,
-                1,
-                8,
-                DType::F32,
+                PoolSpec {
+                    max_blocks: 64,
+                    segment_blocks: 64,
+                    block_size: DEFAULT_BLOCK_SIZE,
+                    n_kv_heads: 1,
+                    head_dim: 8,
+                    dtype: DType::F32,
+                    quantizer: None,
+                },
                 &Device::Cpu,
-                None,
             )
             .expect("alloc");
             Self {
@@ -1058,12 +1060,14 @@ mod metrics_loop_tests {
         drive_one_request_with_ids(
             stub,
             tok,
-            engine_model_id,
-            request_model_id,
-            prompt_tokens,
-            max_tokens,
-            false,
-            vec![],
+            DrivenRequest {
+                engine_model_id,
+                request_model_id,
+                prompt_tokens,
+                max_tokens,
+                enable_thinking: false,
+                stop_strings: vec![],
+            },
         )
     }
 
@@ -1076,26 +1080,41 @@ mod metrics_loop_tests {
         drive_one_request_with_ids(
             stub,
             tok,
-            "m",
-            "m",
-            prompt_tokens,
-            max_tokens,
-            false,
-            vec![],
+            DrivenRequest {
+                engine_model_id: "m",
+                request_model_id: "m",
+                prompt_tokens,
+                max_tokens,
+                enable_thinking: false,
+                stop_strings: vec![],
+            },
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn drive_one_request_with_ids(
-        stub: StubModel,
-        tok: Arc<Tokenizer>,
-        engine_model_id: &str,
-        request_model_id: &str,
+    /// One request driven through a stub engine: the model ids the engine
+    /// and the request carry, the prompt, the budget, thinking and stops.
+    struct DrivenRequest<'a> {
+        engine_model_id: &'a str,
+        request_model_id: &'a str,
         prompt_tokens: Vec<u32>,
         max_tokens: usize,
         enable_thinking: bool,
         stop_strings: Vec<String>,
+    }
+
+    fn drive_one_request_with_ids(
+        stub: StubModel,
+        tok: Arc<Tokenizer>,
+        request: DrivenRequest<'_>,
     ) -> Vec<EngineEvent> {
+        let DrivenRequest {
+            engine_model_id,
+            request_model_id,
+            prompt_tokens,
+            max_tokens,
+            enable_thinking,
+            stop_strings,
+        } = request;
         let engine = Engine::new_with_stop_controls(
             Box::new(stub),
             SchedulerConfig {
@@ -1272,12 +1291,14 @@ mod metrics_loop_tests {
             let events = drive_one_request_with_ids(
                 StubModel::scripted(vec![2, 1, 3, 4]),
                 Arc::clone(&tok),
-                "m",
-                "m",
-                vec![1],
-                4,
-                wants,
-                vec![],
+                DrivenRequest {
+                    engine_model_id: "m",
+                    request_model_id: "m",
+                    prompt_tokens: vec![1],
+                    max_tokens: 4,
+                    enable_thinking: wants,
+                    stop_strings: vec![],
+                },
             );
             let (mut content, mut reasoning) = (String::new(), String::new());
             for event in events {
@@ -1332,12 +1353,14 @@ mod metrics_loop_tests {
             let events = drive_one_request_with_ids(
                 StubModel::scripted(vec![1, 2, 3, 4, 5]),
                 Arc::clone(&tok),
-                "m",
-                "m",
-                vec![5],
-                5,
-                wants,
-                vec![],
+                DrivenRequest {
+                    engine_model_id: "m",
+                    request_model_id: "m",
+                    prompt_tokens: vec![5],
+                    max_tokens: 5,
+                    enable_thinking: wants,
+                    stop_strings: vec![],
+                },
             );
             let (mut content, mut reasoning) = (String::new(), String::new());
             for event in events {
@@ -1368,12 +1391,14 @@ mod metrics_loop_tests {
             let events = drive_one_request_with_ids(
                 StubModel::scripted(tokens),
                 Arc::clone(&tok),
-                "m",
-                "m",
-                vec![1],
-                max_tokens,
-                false,
-                stops.into_iter().map(str::to_string).collect(),
+                DrivenRequest {
+                    engine_model_id: "m",
+                    request_model_id: "m",
+                    prompt_tokens: vec![1],
+                    max_tokens,
+                    enable_thinking: false,
+                    stop_strings: stops.into_iter().map(str::to_string).collect(),
+                },
             );
             let mut content = String::new();
             let mut finish = None;

@@ -25,7 +25,7 @@ use crate::common::{
     linear::{AnyLinear, Embedding},
     norm::RMSNorm,
     paged::{
-        BlockAllocator, DEFAULT_BLOCK_SIZE, GlobalKvBudget, SharedBlockAllocator,
+        BlockAllocator, DEFAULT_BLOCK_SIZE, GlobalKvBudget, PoolSpec, SharedBlockAllocator,
         SharedGlobalKvBudget,
     },
     rope::RotaryEmbedding,
@@ -1063,17 +1063,42 @@ fn auto_expert_stream_budget(
         .saturating_add(STREAM_HEADROOM);
     let cache = usable.saturating_sub(reserved);
     if cache < MIN_EXPERT_CACHE {
-        anyhow::bail!(
-            "model needs {:.1} GB resident plus a streamed-expert cache, but only \
-             {:.1} GB of the {:.1} GB detected envelope is safely usable; free memory, \
-             pin a larger budget with --memory-budget, or use a smaller quant",
-            (reserved + MIN_EXPERT_CACHE) as f64 / 1_073_741_824.0,
-            usable as f64 / 1_073_741_824.0,
-            available_bytes as f64 / 1_073_741_824.0,
-        );
+        return Err(MemoryEnvelopeRefused {
+            needed_bytes: reserved + MIN_EXPERT_CACHE,
+            usable_bytes: usable,
+            available_bytes,
+        }
+        .into());
     }
     Ok(Some(cache))
 }
+
+/// A streamed-expert model refused at load because the memory envelope the
+/// machine shows cannot hold the resident part beside a usable expert cache:
+/// a condition of the machine, retryable once memory is freed, which the
+/// server reports as such rather than as a defect.
+#[derive(Debug)]
+pub struct MemoryEnvelopeRefused {
+    pub needed_bytes: usize,
+    pub usable_bytes: usize,
+    pub available_bytes: usize,
+}
+
+impl std::fmt::Display for MemoryEnvelopeRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "model needs {:.1} GB resident plus a streamed-expert cache, but only \
+             {:.1} GB of the {:.1} GB detected envelope is safely usable; free memory, \
+             pin a larger budget with --memory-budget, or use a smaller quant",
+            self.needed_bytes as f64 / 1_073_741_824.0,
+            self.usable_bytes as f64 / 1_073_741_824.0,
+            self.available_bytes as f64 / 1_073_741_824.0,
+        )
+    }
+}
+
+impl std::error::Error for MemoryEnvelopeRefused {}
 
 /// Loads a safetensors checkpoint into a [`StandardTransformer`].
 ///
@@ -1388,14 +1413,16 @@ fn load_standard_safetensors(
                 if !layer_is_linear[i] {
                     real[i] = Some(Arc::new(Mutex::new(
                         BlockAllocator::growing(
-                            num_blocks,
-                            ctx.div_ceil(DEFAULT_BLOCK_SIZE).max(1),
-                            DEFAULT_BLOCK_SIZE,
-                            per_layer_kv_heads[i],
-                            per_layer_head_dims[i],
-                            dtype,
+                            PoolSpec {
+                                max_blocks: num_blocks,
+                                segment_blocks: ctx.div_ceil(DEFAULT_BLOCK_SIZE).max(1),
+                                block_size: DEFAULT_BLOCK_SIZE,
+                                n_kv_heads: per_layer_kv_heads[i],
+                                head_dim: per_layer_head_dims[i],
+                                dtype,
+                                quantizer: layer_quantizers[i].clone(),
+                            },
                             device,
-                            layer_quantizers[i].clone(),
                         )?
                         .with_sliding_window(per_layer_sliding_windows[i]),
                     )));

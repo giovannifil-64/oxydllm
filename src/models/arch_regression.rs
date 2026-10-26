@@ -233,14 +233,16 @@ mod tests {
         let allocators = (0..LAYERS)
             .map(|_| -> Result<SharedBlockAllocator> {
                 Ok(Arc::new(Mutex::new(BlockAllocator::growing(
-                    KV_BLOCKS,
-                    KV_BLOCKS,
-                    DEFAULT_BLOCK_SIZE,
-                    KV_HEADS,
-                    HEAD_DIM,
-                    dtype,
+                    PoolSpec {
+                        max_blocks: KV_BLOCKS,
+                        segment_blocks: KV_BLOCKS,
+                        block_size: DEFAULT_BLOCK_SIZE,
+                        n_kv_heads: KV_HEADS,
+                        head_dim: HEAD_DIM,
+                        dtype,
+                        quantizer: kv_quantizer.clone(),
+                    },
                     &dev,
-                    kv_quantizer.clone(),
                 )?)))
             })
             .collect::<Result<Vec<_>>>()?;

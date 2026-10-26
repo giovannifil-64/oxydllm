@@ -36,7 +36,7 @@ use super::types::{
     ResponseFormat, StopParam, ToolCall, ToolCallFunction, ToolDefinition,
 };
 use crate::chat_template;
-use crate::models::manager::GetResult;
+use crate::models::manager::{GetResult, LoadFailureKind};
 use crate::sampling::SamplingParams;
 use crate::tokenizer::Tokenizer;
 
@@ -1984,12 +1984,8 @@ pub(super) async fn chat_completions(
                 )
             })?;
             let h = load_result.map_err(|e| {
-                let status = if e.contains("not found") {
-                    StatusCode::NOT_FOUND
-                } else {
-                    StatusCode::INTERNAL_SERVER_ERROR
-                };
-                error_response(status, e, "server_error")
+                let (status, kind) = load_failure_status(e.kind);
+                error_response(status, e.message, kind)
             })?;
             tracing::debug!(
                 model_id = %model_id,
@@ -3043,8 +3039,39 @@ pub(super) async fn chat_completions(
     }
 }
 
+/// The status a request gets when the model it asked for did not come up: a
+/// model that is not there is the client's error, a machine without the
+/// memory for it is a temporary condition to retry once memory is freed, and
+/// anything else is the server's.
+fn load_failure_status(kind: LoadFailureKind) -> (StatusCode, &'static str) {
+    match kind {
+        LoadFailureKind::NotFound => (StatusCode::NOT_FOUND, "model_not_found"),
+        LoadFailureKind::Memory => (StatusCode::SERVICE_UNAVAILABLE, "server_error"),
+        LoadFailureKind::Other => (StatusCode::INTERNAL_SERVER_ERROR, "server_error"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    /// Contract: a model refused for memory answers 503, retryable, where a
+    /// missing model answers 404 and any other load failure 500.
+    #[test]
+    fn a_load_failure_maps_to_the_status_its_kind_deserves() {
+        use super::{LoadFailureKind, StatusCode, load_failure_status};
+        assert_eq!(
+            load_failure_status(LoadFailureKind::Memory),
+            (StatusCode::SERVICE_UNAVAILABLE, "server_error")
+        );
+        assert_eq!(
+            load_failure_status(LoadFailureKind::NotFound),
+            (StatusCode::NOT_FOUND, "model_not_found")
+        );
+        assert_eq!(
+            load_failure_status(LoadFailureKind::Other),
+            (StatusCode::INTERNAL_SERVER_ERROR, "server_error")
+        );
+    }
+
     use super::*;
     use serde_json::json;
 

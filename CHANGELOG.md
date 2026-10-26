@@ -23,10 +23,14 @@ The release that leaves alpha. A token gets the same logits whatever shares its 
 
 - The server's resident memory grew without bound on Metal, about 0.4 MB per chat request, which the eight-hour soak that gates this release saw as 1.5 GB to 6.4 GB over 12,400 requests with latencies flat. The growth was reachable memory, not a leak the tools flag: candle's Metal backend creates each command encoder and blit label as an autoreleased Objective-C object, and a thread without an autorelease pool, which a Rust thread is, keeps every one of them for its whole life, some three hundred encoders a decode step. The engine step and the embedding batch now run inside an autorelease pool that drains when they return. The growth predates this release: alpha.16 grew by 38 MB per hundred requests and alpha.12.2, on candle 0.10, by 208.
 
+- A model refused at load for memory, by the KV budget, by the streamed-expert envelope or by the memory budget after loading, answers the waiting requests with 503 and the reason, where it answered 500 as if the server were broken: the condition is the machine's and clears once memory is freed, and a client can tell it from a defect. A model that is not there answers 404 with `model_not_found`.
+
 - A single-file safetensors download that stopped short could not be resumed: `pull` saw the directory and refused with "already exists", though its own message had promised a resume, and the server tried to load the truncated file and answered 500. A weights file shorter than its header promises now counts as incomplete, so `pull` resumes it and nothing serves it.
 
 ### Build and Tooling
 - The Metal kernels that a backslash macro used to stamp out under two or more names are template kernels with explicit `[[host_name]]` instantiations: the same bodies, readable as code, 821 continuation lines gone from the two sources; the kernel tests pass bit for bit, the inventory test reads the host names, and the eight local checkpoints (K-quants, Q4_0, IQ4_XS, Phi-3, the hybrid Qwen3.5 and the embedder) answer token for token and bit for bit as before.
+
+- No lint suppression is left in the tree: the five `#[allow]` attributes gave way to parameter structs (`PoolSpec` for the KV pool, `Fetch` for a download, `FlashAttnCall` for the attention entry points, one for the engine test driver), a type alias for the GGUF loader's result, and the current Metal math-mode API in place of the deprecated fast-math switch, with the same mode.
 
 - `objc2` is a direct optional dependency of the Metal feature, for the autorelease pool around the engine step; it was already in the tree through the Metal bindings.
 

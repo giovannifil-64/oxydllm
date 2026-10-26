@@ -1677,8 +1677,7 @@ fn get_or_compile_quant_pipeline(
 /// fast math off altogether did the same at eight percent of decode speed.
 fn exact_math() -> impl std::ops::Deref<Target = objc2_metal::MTLCompileOptions> {
     let opts = objc2_metal::MTLCompileOptions::new();
-    #[allow(deprecated)]
-    opts.setFastMathEnabled(true);
+    opts.setMathMode(objc2_metal::MTLMathMode::Fast);
     opts
 }
 

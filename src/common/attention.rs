@@ -1162,7 +1162,7 @@ mod tests {
 
     #[test]
     fn forward_batch_prefill_output_is_correct_shape_and_finite() -> Result<()> {
-        use crate::common::paged::{BlockAllocator, DEFAULT_BLOCK_SIZE, PagedKvCache};
+        use crate::common::paged::{BlockAllocator, DEFAULT_BLOCK_SIZE, PagedKvCache, PoolSpec};
         use crate::common::rope::RotaryEmbedding;
         use std::sync::{Arc, Mutex};
 
@@ -1181,14 +1181,16 @@ mod tests {
         let x = Tensor::from_vec(x_data, (1, seq_len, hidden), &device)?;
 
         let allocator = Arc::new(Mutex::new(BlockAllocator::growing(
-            16,
-            16,
-            DEFAULT_BLOCK_SIZE,
-            n_kv_heads,
-            head_dim,
-            candle_core::DType::F32,
+            PoolSpec {
+                max_blocks: 16,
+                segment_blocks: 16,
+                block_size: DEFAULT_BLOCK_SIZE,
+                n_kv_heads,
+                head_dim,
+                dtype: candle_core::DType::F32,
+                quantizer: None,
+            },
             &device,
-            None,
         )?));
         let mut cache = PagedKvCache::new(Arc::clone(&allocator));
         let mut segments = vec![SegmentInfo {
@@ -1209,7 +1211,7 @@ mod tests {
 
     #[test]
     fn forward_batch_with_softcap_produces_finite_output() -> Result<()> {
-        use crate::common::paged::{BlockAllocator, DEFAULT_BLOCK_SIZE, PagedKvCache};
+        use crate::common::paged::{BlockAllocator, DEFAULT_BLOCK_SIZE, PagedKvCache, PoolSpec};
         use crate::common::rope::RotaryEmbedding;
         use std::sync::{Arc, Mutex};
 
@@ -1228,14 +1230,16 @@ mod tests {
         let x = Tensor::from_vec(x_data, (1, seq_len, hidden), &device)?;
 
         let allocator = Arc::new(Mutex::new(BlockAllocator::growing(
-            16,
-            16,
-            DEFAULT_BLOCK_SIZE,
-            n_kv_heads,
-            head_dim,
-            candle_core::DType::F32,
+            PoolSpec {
+                max_blocks: 16,
+                segment_blocks: 16,
+                block_size: DEFAULT_BLOCK_SIZE,
+                n_kv_heads,
+                head_dim,
+                dtype: candle_core::DType::F32,
+                quantizer: None,
+            },
             &device,
-            None,
         )?));
         let mut cache = PagedKvCache::new(Arc::clone(&allocator));
         let mut segments = vec![SegmentInfo {

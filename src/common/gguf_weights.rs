@@ -540,21 +540,23 @@ pub fn qtensor_with_staged(
     Ok((QTensor::new(storage, dims)?, staged))
 }
 
-/// Builds every tensor from the file in parallel (rayon), keyed by name: the
-/// tensors candle holds, beside them the staged handles of those a kernel of
-/// this crate reads in place, and apart the weights only this crate decodes.
-#[allow(clippy::type_complexity)]
+/// Every tensor of a file by name: the ones candle holds, beside them the
+/// staged handles of those a kernel of this crate reads in place, and apart
+/// the weights only this crate decodes.
+type LoadedTensors = (
+    FxHashMap<String, Arc<QTensor>>,
+    FxHashMap<String, StagedWeight>,
+    FxHashMap<String, StagedWeight>,
+);
+
+/// Builds every tensor from the file in parallel (rayon), keyed by name.
 fn parallelise_tensor_load(
     file: &std::fs::File,
     file_len: usize,
     data_offset: u64,
     entries: &[TensorEntry],
     device: &Device,
-) -> anyhow::Result<(
-    FxHashMap<String, Arc<QTensor>>,
-    FxHashMap<String, StagedWeight>,
-    FxHashMap<String, StagedWeight>,
-)> {
+) -> anyhow::Result<LoadedTensors> {
     let mut infos: Vec<&TensorEntry> = entries.iter().collect();
     infos.sort_unstable_by_key(|e| e.offset);
     let built: anyhow::Result<Vec<(String, Built)>> = infos

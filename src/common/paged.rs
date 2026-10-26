@@ -536,24 +536,38 @@ pub struct StagedKvData<'a> {
     pub norms_v: &'a [f32],
 }
 
+/// What sizes and lays out a KV pool: how many blocks it may reach, how many
+/// it materialises at a time, the block and head geometry, the dtype and the
+/// optional quantizer of its blocks.
+#[derive(Clone)]
+pub struct PoolSpec {
+    pub max_blocks: usize,
+    pub segment_blocks: usize,
+    pub block_size: usize,
+    pub n_kv_heads: usize,
+    pub head_dim: usize,
+    pub dtype: DType,
+    pub quantizer: Option<Arc<KvQuantizer>>,
+}
+
 impl BlockAllocator {
-    /// A pool that may reach `max_blocks`, materialised `segment_blocks` at a
-    /// time as blocks are taken; the first segment is allocated here so a
-    /// device that cannot hold even that says so at load.
+    /// A pool that may reach `spec.max_blocks`, materialised
+    /// `spec.segment_blocks` at a time as blocks are taken; the first segment
+    /// is allocated here so a device that cannot hold even that says so at
+    /// load.
     ///
     /// ## Errors
     /// Fails when the device cannot hold the first segment.
-    #[allow(clippy::too_many_arguments)]
-    pub fn growing(
-        max_blocks: usize,
-        segment_blocks: usize,
-        block_size: usize,
-        n_kv_heads: usize,
-        head_dim: usize,
-        dtype: DType,
-        device: &Device,
-        quantizer: Option<Arc<KvQuantizer>>,
-    ) -> Result<Self> {
+    pub fn growing(spec: PoolSpec, device: &Device) -> Result<Self> {
+        let PoolSpec {
+            max_blocks,
+            segment_blocks,
+            block_size,
+            n_kv_heads,
+            head_dim,
+            dtype,
+            quantizer,
+        } = spec;
         let segment_blocks = segment_blocks.clamp(1, max_blocks.max(1));
         let pool = if let Some(q) = quantizer {
             KvPool::Quantized {
@@ -1700,10 +1714,33 @@ mod tests {
     #[test]
     fn a_pool_materialises_a_segment_at_a_time_up_to_its_ceiling() {
         let dev = Device::Cpu;
-        let mut pool = BlockAllocator::growing(10, 4, 2, 1, 8, DType::F32, &dev, None).unwrap();
-        let per_block = BlockAllocator::growing(1, 1, 2, 1, 8, DType::F32, &dev, None)
-            .unwrap()
-            .reserved_bytes();
+        let mut pool = BlockAllocator::growing(
+            PoolSpec {
+                max_blocks: 10,
+                segment_blocks: 4,
+                block_size: 2,
+                n_kv_heads: 1,
+                head_dim: 8,
+                dtype: DType::F32,
+                quantizer: None,
+            },
+            &dev,
+        )
+        .unwrap();
+        let per_block = BlockAllocator::growing(
+            PoolSpec {
+                max_blocks: 1,
+                segment_blocks: 1,
+                block_size: 2,
+                n_kv_heads: 1,
+                head_dim: 8,
+                dtype: DType::F32,
+                quantizer: None,
+            },
+            &dev,
+        )
+        .unwrap()
+        .reserved_bytes();
         assert_eq!(pool.num_total(), 10, "the scheduler sees the ceiling");
         assert_eq!(pool.num_free(), 10, "every block below the ceiling is free");
         assert_eq!(
@@ -1744,7 +1781,19 @@ mod tests {
         let dev = Device::Cpu;
         const BS: usize = 2;
         const DIM: usize = 4;
-        let mut pool = BlockAllocator::growing(6, 2, BS, 1, DIM, DType::F32, &dev, None).unwrap();
+        let mut pool = BlockAllocator::growing(
+            PoolSpec {
+                max_blocks: 6,
+                segment_blocks: 2,
+                block_size: BS,
+                n_kv_heads: 1,
+                head_dim: DIM,
+                dtype: DType::F32,
+                quantizer: None,
+            },
+            &dev,
+        )
+        .unwrap();
         let mut blocks = Vec::new();
         for _ in 0..6 {
             blocks.push(pool.allocate().unwrap());
@@ -1790,9 +1839,20 @@ mod tests {
         const W: usize = 12;
         const DIM: usize = 4;
         let alloc = Arc::new(Mutex::new(
-            BlockAllocator::growing(256, 256, 4, 1, DIM, DType::F32, &Device::Cpu, None)
-                .unwrap()
-                .with_sliding_window(Some(W)),
+            BlockAllocator::growing(
+                PoolSpec {
+                    max_blocks: 256,
+                    segment_blocks: 256,
+                    block_size: 4,
+                    n_kv_heads: 1,
+                    head_dim: DIM,
+                    dtype: DType::F32,
+                    quantizer: None,
+                },
+                &Device::Cpu,
+            )
+            .unwrap()
+            .with_sliding_window(Some(W)),
         ));
         let mut cache = PagedKvCache::new(alloc);
         let dev = Device::Cpu;
@@ -1841,9 +1901,20 @@ mod tests {
         for seed in 0u64..24 {
             let mut rng = Rng::new(seed ^ 0xF1_0E_57);
             let alloc = Arc::new(Mutex::new(
-                BlockAllocator::growing(256, 256, 4, HEADS, DIM, DType::F32, &Device::Cpu, None)
-                    .unwrap()
-                    .with_sliding_window(Some(W)),
+                BlockAllocator::growing(
+                    PoolSpec {
+                        max_blocks: 256,
+                        segment_blocks: 256,
+                        block_size: 4,
+                        n_kv_heads: HEADS,
+                        head_dim: DIM,
+                        dtype: DType::F32,
+                        quantizer: None,
+                    },
+                    &Device::Cpu,
+                )
+                .unwrap()
+                .with_sliding_window(Some(W)),
             ));
             let mut cache = PagedKvCache::new(alloc);
             let dev = Device::Cpu;
@@ -1953,14 +2024,16 @@ mod tests {
     fn make_allocator(num_blocks: usize, block_size: usize) -> SharedBlockAllocator {
         Arc::new(Mutex::new(
             BlockAllocator::growing(
-                num_blocks,
-                num_blocks,
-                block_size,
-                2,
-                4,
-                DType::F32,
+                PoolSpec {
+                    max_blocks: num_blocks,
+                    segment_blocks: num_blocks,
+                    block_size,
+                    n_kv_heads: 2,
+                    head_dim: 4,
+                    dtype: DType::F32,
+                    quantizer: None,
+                },
                 &Device::Cpu,
-                None,
             )
             .unwrap(),
         ))
@@ -2254,7 +2327,19 @@ mod tests {
     #[test]
     fn a_run_across_a_segment_boundary_is_written_whole() {
         let alloc = Arc::new(Mutex::new(
-            BlockAllocator::growing(8, 4, 4, 1, 4, DType::F32, &Device::Cpu, None).unwrap(),
+            BlockAllocator::growing(
+                PoolSpec {
+                    max_blocks: 8,
+                    segment_blocks: 4,
+                    block_size: 4,
+                    n_kv_heads: 1,
+                    head_dim: 4,
+                    dtype: DType::F32,
+                    quantizer: None,
+                },
+                &Device::Cpu,
+            )
+            .unwrap(),
         ));
         {
             let mut a = alloc.lock().unwrap();
@@ -2435,7 +2520,19 @@ mod tests {
     #[test]
     fn contig_buffer_growth_retires_old_to_pool() {
         let alloc = Arc::new(Mutex::new(
-            BlockAllocator::growing(256, 256, 4, 2, 4, DType::F32, &Device::Cpu, None).unwrap(),
+            BlockAllocator::growing(
+                PoolSpec {
+                    max_blocks: 256,
+                    segment_blocks: 256,
+                    block_size: 4,
+                    n_kv_heads: 2,
+                    head_dim: 4,
+                    dtype: DType::F32,
+                    quantizer: None,
+                },
+                &Device::Cpu,
+            )
+            .unwrap(),
         ));
         let dev = Device::Cpu;
         let mut cache = PagedKvCache::new(Arc::clone(&alloc));
@@ -2475,8 +2572,19 @@ mod tests {
             4, DIM, true,
         ));
         let alloc = Arc::new(Mutex::new(
-            BlockAllocator::growing(64, 64, 4, HEADS, DIM, DType::F32, &dev, Some(q.clone()))
-                .unwrap(),
+            BlockAllocator::growing(
+                PoolSpec {
+                    max_blocks: 64,
+                    segment_blocks: 64,
+                    block_size: 4,
+                    n_kv_heads: HEADS,
+                    head_dim: DIM,
+                    dtype: DType::F32,
+                    quantizer: Some(q.clone()),
+                },
+                &dev,
+            )
+            .unwrap(),
         ));
         let mut cache = PagedKvCache::new(alloc.clone());
         let value =
@@ -2543,7 +2651,19 @@ mod tests {
             4, DIM, true,
         ));
         let alloc = Arc::new(Mutex::new(
-            BlockAllocator::growing(16, 16, BS, HEADS, DIM, dtype, &dev, Some(q.clone())).unwrap(),
+            BlockAllocator::growing(
+                PoolSpec {
+                    max_blocks: 16,
+                    segment_blocks: 16,
+                    block_size: BS,
+                    n_kv_heads: HEADS,
+                    head_dim: DIM,
+                    dtype,
+                    quantizer: Some(q.clone()),
+                },
+                &dev,
+            )
+            .unwrap(),
         ));
         let value =
             |t: usize, h: usize, d: usize| -> f32 { ((t * 7 + h * 3 + d) % 23) as f32 * 0.1 - 1.1 };
@@ -2621,7 +2741,19 @@ mod tests {
                 4, DIM, false,
             ));
             let alloc = Arc::new(Mutex::new(
-                BlockAllocator::growing(64, 64, 4, HEADS, DIM, dtype, &dev, Some(q)).unwrap(),
+                BlockAllocator::growing(
+                    PoolSpec {
+                        max_blocks: 64,
+                        segment_blocks: 64,
+                        block_size: 4,
+                        n_kv_heads: HEADS,
+                        head_dim: DIM,
+                        dtype,
+                        quantizer: Some(q),
+                    },
+                    &dev,
+                )
+                .unwrap(),
             ));
             let prompt = |salt: f32| -> Tensor {
                 let v: Vec<f32> = (0..HEADS * T * DIM)
@@ -2691,10 +2823,34 @@ mod tests {
             4, 64, true,
         ));
         let alloc_q = Arc::new(Mutex::new(
-            BlockAllocator::growing(4, 4, 2, 2, 64, DType::F32, &Device::Cpu, Some(q)).unwrap(),
+            BlockAllocator::growing(
+                PoolSpec {
+                    max_blocks: 4,
+                    segment_blocks: 4,
+                    block_size: 2,
+                    n_kv_heads: 2,
+                    head_dim: 64,
+                    dtype: DType::F32,
+                    quantizer: Some(q),
+                },
+                &Device::Cpu,
+            )
+            .unwrap(),
         ));
         let alloc_f = Arc::new(Mutex::new(
-            BlockAllocator::growing(4, 4, 2, 2, 64, DType::F32, &Device::Cpu, None).unwrap(),
+            BlockAllocator::growing(
+                PoolSpec {
+                    max_blocks: 4,
+                    segment_blocks: 4,
+                    block_size: 2,
+                    n_kv_heads: 2,
+                    head_dim: 64,
+                    dtype: DType::F32,
+                    quantizer: None,
+                },
+                &Device::Cpu,
+            )
+            .unwrap(),
         ));
         let q_bytes = alloc_q.lock().unwrap().pool_bytes();
         let f_bytes = alloc_f.lock().unwrap().pool_bytes();

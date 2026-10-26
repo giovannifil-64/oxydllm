@@ -26,7 +26,7 @@ use crate::common::{
     kv_quant::KvQuantizer,
     linear::{AnyLinear, Embedding, QLinear},
     norm::RMSNorm,
-    paged::{BlockAllocator, DEFAULT_BLOCK_SIZE, PagedKvCache, SharedBlockAllocator},
+    paged::{BlockAllocator, DEFAULT_BLOCK_SIZE, PagedKvCache, PoolSpec, SharedBlockAllocator},
     rope::{RopeScaling, RotaryEmbedding},
 };
 use crate::models::traits::BatchModel;
@@ -697,22 +697,30 @@ impl StandardTransformer {
                 if !topo.layer_is_linear(i) {
                     *slot = Some(Arc::new(Mutex::new(
                         BlockAllocator::growing(
-                            num_kv_blocks,
-                            context_len.div_ceil(DEFAULT_BLOCK_SIZE).max(1),
-                            DEFAULT_BLOCK_SIZE,
-                            topo.per_layer
-                                .as_ref()
-                                .map_or(num_key_value_heads, |g| g.kv_heads[i]),
-                            topo.per_layer.as_ref().map_or(head_dim, |g| g.head_dims[i]),
-                            dtype,
+                            PoolSpec {
+                                max_blocks: num_kv_blocks,
+                                segment_blocks: context_len.div_ceil(DEFAULT_BLOCK_SIZE).max(1),
+                                block_size: DEFAULT_BLOCK_SIZE,
+                                n_kv_heads: topo
+                                    .per_layer
+                                    .as_ref()
+                                    .map_or(num_key_value_heads, |g| g.kv_heads[i]),
+                                head_dim: topo
+                                    .per_layer
+                                    .as_ref()
+                                    .map_or(head_dim, |g| g.head_dims[i]),
+                                dtype,
+                                quantizer: kv_quant.map(|(bits, qjl)| {
+                                    Arc::new(KvQuantizer::new_with_qjl(
+                                        bits,
+                                        topo.per_layer
+                                            .as_ref()
+                                            .map_or(head_dim, |g| g.head_dims[i]),
+                                        qjl,
+                                    ))
+                                }),
+                            },
                             device,
-                            kv_quant.map(|(bits, qjl)| {
-                                Arc::new(KvQuantizer::new_with_qjl(
-                                    bits,
-                                    topo.per_layer.as_ref().map_or(head_dim, |g| g.head_dims[i]),
-                                    qjl,
-                                ))
-                            }),
                         )
                         .map_err(|e| anyhow::anyhow!("Failed to create block allocator: {e}"))?
                         .with_sliding_window(layer_windows[i]),

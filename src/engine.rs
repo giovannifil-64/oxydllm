@@ -1163,7 +1163,7 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::common::paged::BlockAllocator;
+    use crate::common::paged::{BlockAllocator, PoolSpec};
     use candle_core::DType;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1620,14 +1620,16 @@ mod tests {
             .map(|_| {
                 Arc::new(Mutex::new(
                     BlockAllocator::growing(
-                        num_blocks,
-                        num_blocks,
-                        DEFAULT_BLOCK_SIZE,
-                        1,
-                        8,
-                        DType::F32,
+                        PoolSpec {
+                            max_blocks: num_blocks,
+                            segment_blocks: num_blocks,
+                            block_size: DEFAULT_BLOCK_SIZE,
+                            n_kv_heads: 1,
+                            head_dim: 8,
+                            dtype: DType::F32,
+                            quantizer: None,
+                        },
                         &Device::Cpu,
-                        None,
                     )
                     .unwrap(),
                 ))

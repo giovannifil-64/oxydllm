@@ -421,7 +421,7 @@ impl Scheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::common::paged::BlockAllocator;
+    use crate::common::paged::{BlockAllocator, PoolSpec};
     use candle_core::{DType, Device};
     use std::sync::Mutex;
 
@@ -430,14 +430,16 @@ mod tests {
             .map(|_| {
                 Arc::new(Mutex::new(
                     BlockAllocator::growing(
-                        num_blocks,
-                        num_blocks,
-                        DEFAULT_BLOCK_SIZE,
-                        2,
-                        4,
-                        DType::F32,
+                        PoolSpec {
+                            max_blocks: num_blocks,
+                            segment_blocks: num_blocks,
+                            block_size: DEFAULT_BLOCK_SIZE,
+                            n_kv_heads: 2,
+                            head_dim: 4,
+                            dtype: DType::F32,
+                            quantizer: None,
+                        },
                         &Device::Cpu,
-                        None,
                     )
                     .unwrap(),
                 ))

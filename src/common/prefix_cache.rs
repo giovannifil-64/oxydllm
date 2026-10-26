@@ -231,7 +231,7 @@ fn chain_hash(block_tokens: &[u32], prev: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::common::paged::{BlockAllocator, DEFAULT_BLOCK_SIZE};
+    use crate::common::paged::{BlockAllocator, DEFAULT_BLOCK_SIZE, PoolSpec};
     use candle_core::{DType, Device};
     use std::sync::{Arc, Mutex};
 
@@ -256,14 +256,16 @@ mod tests {
     fn allocator(blocks: usize) -> Vec<SharedBlockAllocator> {
         vec![Arc::new(Mutex::new(
             BlockAllocator::growing(
-                blocks,
-                blocks,
-                DEFAULT_BLOCK_SIZE,
-                1,
-                4,
-                DType::F32,
+                PoolSpec {
+                    max_blocks: blocks,
+                    segment_blocks: blocks,
+                    block_size: DEFAULT_BLOCK_SIZE,
+                    n_kv_heads: 1,
+                    head_dim: 4,
+                    dtype: DType::F32,
+                    quantizer: None,
+                },
                 &Device::Cpu,
-                None,
             )
             .unwrap(),
         ))]

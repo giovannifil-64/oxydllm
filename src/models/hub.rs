@@ -743,7 +743,16 @@ fn download_file(
             return Ok(());
         }
         match runtime.block_on(fetch_from(
-            client, url, repo_id, dest_path, have, expected, token, &label,
+            client,
+            Fetch {
+                url,
+                repo_id,
+                dest_path,
+                have,
+                expected,
+                token,
+                label: &label,
+            },
         )) {
             Ok(()) => return Ok(()),
             Err(FetchError::Fatal(e)) => return Err(e),
@@ -774,17 +783,28 @@ fn content_range_total(resp: &reqwest::Response) -> Option<u64> {
         .ok()
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn fetch_from(
-    client: &reqwest::Client,
-    url: &str,
-    repo_id: &str,
-    dest_path: &Path,
+/// One file to fetch: where from, where to, how much of it is already on
+/// disk, how long it should be, the token and the progress label.
+struct Fetch<'a> {
+    url: &'a str,
+    repo_id: &'a str,
+    dest_path: &'a Path,
     have: u64,
     expected: Option<u64>,
-    token: Option<&str>,
-    label: &str,
-) -> Result<(), FetchError> {
+    token: Option<&'a str>,
+    label: &'a str,
+}
+
+async fn fetch_from(client: &reqwest::Client, fetch: Fetch<'_>) -> Result<(), FetchError> {
+    let Fetch {
+        url,
+        repo_id,
+        dest_path,
+        have,
+        expected,
+        token,
+        label,
+    } = fetch;
     let mut builder = client.get(url);
     if let Some(tok) = token {
         builder = builder.bearer_auth(tok);

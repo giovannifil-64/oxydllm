@@ -62,7 +62,7 @@ pub struct ReadyHandle {
 /// thread exit and drop the model.
 enum SlotState {
     Loading {
-        waiters: Vec<oneshot::Sender<Result<ReadyHandle, String>>>,
+        waiters: Vec<oneshot::Sender<Result<ReadyHandle, LoadFailure>>>,
     },
     Ready {
         request_tx: tokio_mpsc::Sender<IncomingRequest>,
@@ -164,12 +164,63 @@ const DISCOVERY_CACHE_TTL: Duration = Duration::from_secs(5);
 /// Shared, async-locked handle to the [`ModelManager`] used by all routes.
 pub type SharedModelManager = Arc<tokio::sync::Mutex<ModelManager>>;
 
+/// Why a model did not come up, for the response a waiting request gets:
+/// a model that is not there, a machine without the memory for it (a KV
+/// budget or a streamed-expert envelope refusal, retryable once memory is
+/// freed), or anything else.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LoadFailureKind {
+    NotFound,
+    Memory,
+    Other,
+}
+
+/// A load that failed, with the message for the client and the kind the
+/// status code follows.
+#[derive(Clone, Debug)]
+pub struct LoadFailure {
+    pub message: String,
+    pub kind: LoadFailureKind,
+}
+
+impl LoadFailure {
+    fn other(message: String) -> Self {
+        Self {
+            message,
+            kind: LoadFailureKind::Other,
+        }
+    }
+
+    /// The failure of a load whose error chain says whether memory was the
+    /// cause.
+    fn from_load_error(e: &anyhow::Error) -> Self {
+        let memory = e.chain().any(|c| {
+            c.downcast_ref::<loader::KvBudgetExhausted>().is_some()
+                || c.downcast_ref::<loader::MemoryEnvelopeRefused>().is_some()
+        });
+        Self {
+            message: format!("Failed to load model: {e:#}"),
+            kind: if memory {
+                LoadFailureKind::Memory
+            } else {
+                LoadFailureKind::Other
+            },
+        }
+    }
+}
+
+impl std::fmt::Display for LoadFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
 /// Outcome of [`ModelManager::get_or_load`]: `Ready` carries an immediately
 /// usable handle, `Wait` a receiver that resolves when the (possibly already
 /// in-flight) load completes or fails.
 pub enum GetResult {
     Ready(ReadyHandle),
-    Wait(oneshot::Receiver<Result<ReadyHandle, String>>),
+    Wait(oneshot::Receiver<Result<ReadyHandle, LoadFailure>>),
 }
 
 /// Path of the registry file inside the models directory.
@@ -612,10 +663,10 @@ impl ModelManager {
             Some(p) => p,
             None => {
                 let (tx, rx) = oneshot::channel();
-                let _ = tx.send(Err(format!(
-                    "model '{}' not found in models directory",
-                    model_id
-                )));
+                let _ = tx.send(Err(LoadFailure {
+                    message: format!("model '{}' not found in models directory", model_id),
+                    kind: LoadFailureKind::NotFound,
+                }));
                 return GetResult::Wait(rx);
             }
         };
@@ -1056,7 +1107,7 @@ fn spawn_load(params: SpawnLoadParams) {
         memory_budget_bytes,
     } = params;
 
-    let (result_tx, result_rx) = oneshot::channel::<Result<LoadResult, String>>();
+    let (result_tx, result_rx) = oneshot::channel::<Result<LoadResult, LoadFailure>>();
 
     let manager_thread = Arc::clone(&manager);
     let model_id_thread = model_id.clone();
@@ -1079,7 +1130,9 @@ fn spawn_load(params: SpawnLoadParams) {
         let tokenizer = match Tokenizer::from_dir(&model_dir) {
             Ok(t) => Arc::new(t),
             Err(e) => {
-                let _ = result_tx.send(Err(format!("Failed to load tokenizer: {e:#}")));
+                let _ = result_tx.send(Err(LoadFailure::other(format!(
+                    "Failed to load tokenizer: {e:#}"
+                ))));
                 return;
             }
         };
@@ -1088,7 +1141,9 @@ fn spawn_load(params: SpawnLoadParams) {
         let device = match loader::select_device_at(cuda_idx, require_gpu_thread) {
             Ok(d) => d,
             Err(e) => {
-                let _ = result_tx.send(Err(format!("Failed to select device: {e:#}")));
+                let _ = result_tx.send(Err(LoadFailure::other(format!(
+                    "Failed to select device: {e:#}"
+                ))));
                 return;
             }
         };
@@ -1142,7 +1197,7 @@ fn spawn_load(params: SpawnLoadParams) {
                     if let Some(reserved) = draft_kv_reservation {
                         kv_budget.release(reserved);
                     }
-                    let _ = result_tx.send(Err(format!("Failed to load model: {e:#}")));
+                    let _ = result_tx.send(Err(LoadFailure::from_load_error(&e)));
                     return;
                 }
             }
@@ -1328,7 +1383,8 @@ fn spawn_load(params: SpawnLoadParams) {
                 mgr.kv_budget.release(result.kv_cache_bytes);
                 drop(mgr);
 
-                let err = format!("Model '{}' engine died during startup", model_id);
+                let err =
+                    LoadFailure::other(format!("Model '{}' engine died during startup", model_id));
                 tracing::error!(model_id = %model_id, error = %err, "engine loop died before its slot was installed");
                 for waiter in waiters {
                     let _ = waiter.send(Err(err.clone()));
@@ -1401,14 +1457,17 @@ fn spawn_load(params: SpawnLoadParams) {
                         if let Some(s) = shutdown {
                             s.store(true, Ordering::Release);
                         }
-                        let err = format!(
-                            "model '{}' ({:.2} GB) exceeds memory budget ({:.2} GB): \
-                             use --memory-budget to increase the limit or --max-context-len \
-                             to reduce KV cache size",
-                            model_id,
-                            model_bytes as f64 / 1_073_741_824.0,
-                            budget as f64 / 1_073_741_824.0,
-                        );
+                        let err = LoadFailure {
+                            message: format!(
+                                "model '{}' ({:.2} GB) exceeds memory budget ({:.2} GB): \
+                                 use --memory-budget to increase the limit or --max-context-len \
+                                 to reduce KV cache size",
+                                model_id,
+                                model_bytes as f64 / 1_073_741_824.0,
+                                budget as f64 / 1_073_741_824.0,
+                            ),
+                            kind: LoadFailureKind::Memory,
+                        };
                         tracing::error!(model_id = %model_id, error = %err, "loaded model exceeds memory budget");
                         for waiter in waiters {
                             let _ = waiter.send(Err(err.clone()));
@@ -1446,7 +1505,8 @@ fn spawn_load(params: SpawnLoadParams) {
                 };
                 drop(mgr);
 
-                let err = format!("Model '{}' loader thread panicked", model_id);
+                let err =
+                    LoadFailure::other(format!("Model '{}' loader thread panicked", model_id));
                 tracing::error!(model_id = %model_id, error = %err, "model loader thread panicked");
                 for waiter in waiters {
                     let _ = waiter.send(Err(err.clone()));
@@ -1473,6 +1533,39 @@ pub fn spawn_eviction_task(manager: SharedModelManager) {
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    /// Contract: a load refused for memory, by the KV budget or by the
+    /// streamed-expert envelope, is reported as a memory failure, so the
+    /// request gets a retryable status; any other load error is not.
+    #[test]
+    fn a_load_refused_for_memory_is_reported_as_such() {
+        let budget = anyhow::Error::new(loader::KvBudgetExhausted {
+            needed_bytes: 1 << 30,
+            available_bytes: 1 << 29,
+        })
+        .context("Failed to allocate the KV pool");
+        assert_eq!(
+            LoadFailure::from_load_error(&budget).kind,
+            LoadFailureKind::Memory
+        );
+        let envelope = anyhow::Error::new(loader::MemoryEnvelopeRefused {
+            needed_bytes: 8 << 30,
+            usable_bytes: 4 << 30,
+            available_bytes: 9 << 30,
+        });
+        let failure = LoadFailure::from_load_error(&envelope);
+        assert_eq!(failure.kind, LoadFailureKind::Memory);
+        assert!(
+            failure.message.contains("detected envelope"),
+            "{}",
+            failure.message
+        );
+        let other = anyhow::anyhow!("config.json: missing field `architectures`");
+        assert_eq!(
+            LoadFailure::from_load_error(&other).kind,
+            LoadFailureKind::Other
+        );
+    }
     use tokenizers::models::wordlevel::WordLevel;
     use tokenizers::pre_tokenizers::whitespace::Whitespace;
 

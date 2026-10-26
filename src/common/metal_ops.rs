@@ -17,9 +17,9 @@
 //!   [`rope_fused`], [`gated_silu_fused`], [`silu_mul_fused`],
 //!   [`gated_gelu_tanh_fused`], [`gelu_tanh_mul_fused`], [`softcap_fused`].
 //! - Packed-int quant (AWQ, GPTQ, W8A16): the deterministic decode GEMVs
-//!   [`w4a16_matmul`], [`w8a16_matmul`], [`gptq_matmul`], and the prefill
-//!   dequantizers [`dequantize_w4`], [`dequantize_w8`],
-//!   [`dequantize_gptq_packed`].
+//!   [`wna16_matmul_to`] and [`gptq_matmul_to`], the staged prefill GEMM
+//!   [`maybe_mpp_quant_matmul`], and the dequantizers [`dequantize_w4`],
+//!   [`dequantize_w8`], [`dequantize_gptq_packed`].
 //! - GGUF block quants: candle's own quantized matmul carries these, and this
 //!   module only measures it.
 //! - FP8 block-scaled E4M3: [`cast_f8e4m3_to_f32`],
@@ -2592,8 +2592,8 @@ pub fn gptq_matmul(
     gptq_matmul_to(x, qweight, qzeros, scales, bits, x.dtype())
 }
 
-/// [`gptq_matmul`] with its output in `out_dtype`, F32 kept as accumulated
-/// (see [`wna16_matmul_to`]).
+/// The GPTQ decode GEMV with its output in `out_dtype`, F32 kept as
+/// accumulated (see [`wna16_matmul_to`]).
 ///
 /// ## Errors
 /// Fails off-Metal, when `m > 8`, or on packing, shape, or dtype mismatches.

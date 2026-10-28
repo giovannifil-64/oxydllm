@@ -1883,8 +1883,6 @@ kernel void sdpa_vector_sink_bf16(
 constant uint QDET_TGW = 32u;
 constant uint QDET_S = 16u;       // k-splits for the GPTQ M=1 GEMV (TG = 512)
 constant uint QDET_S_BATCH = 16u; // k-splits for the GPTQ batched variant
-constant uint QDET_A_TGW = 32u;   // AWQ M=1: TG = 1024, epilogue in two
-constant uint QDET_A_S = 32u;     // half-pack rounds (scratch 16 KB at 4-bit)
 constant uint QDET_AB_TGW = 16u;  // AWQ batch: narrower tile, more k-splits
 constant uint QDET_AB_S = 32u;    // (TG = 512, threadgroup scratch 16 KB at 4-bit)
 

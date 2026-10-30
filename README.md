@@ -506,7 +506,7 @@ The OpenAI-compatible request and response shapes, the model registry (`~/.oxydl
 - FP8 on Apple Silicon doubles resident memory: Metal has no FP8 compute kernels, so all FP8 checkpoints are dequanted to BF16 at load time. A 4B-FP8 model needs ~8 GB resident instead of the ~4 GB on-disk footprint. CUDA / CPU retain the Level-2 resident FP8 path.
 - MoE perf is dispatch-bound: the hybrid sparse/naive path is correct and decode-competitive, but per-expert Metal command-buffer overhead caps prefill throughput. A custom fused MoE kernel would unlock the next ~2-3× speedup on long prompts.
 
-### Limits of the models, not of the server
+### Models limitations
 
 The E2E sweep labels every failure as runtime, model or budget, and a release ships with runtime defects at zero. The behaviours below are the checkpoints' own: they reproduce at temperature 0 on a server that passes its determinism, batching, streaming and stop checks on the same checkpoint, and where noted llama.cpp gives the same answer to the same prompt and tool definitions. The server does not paper over them.
 

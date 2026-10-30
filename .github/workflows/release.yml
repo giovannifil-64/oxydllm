@@ -1,5 +1,5 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# release.yml — Build + publish on version tags
+# release.yml: build and publish on version tags
 #
 # Triggered by: push of a tag matching v* (e.g. v0.1.0)
 #
@@ -75,9 +75,9 @@ jobs:
             # link and inter-section "---" separators so they don't duplicate
             # the auto-generated notes appended by softprops/action-gh-release.
             # The heading is matched as a literal prefix (via index()) so any
-            # regex meta-characters in the version — `.`, `+` (semver build
-            # metadata), `-` — are treated as plain text. Falls back to a
-            # placeholder if the tag has no entry yet — release proceeds,
+            # regex meta-characters in the version, `.`, `+` (semver build
+            # metadata), `-`, are treated as plain text. Falls back to a
+            # placeholder if the tag has no entry yet, the release proceeds,
             # but we surface a warning.
             HEADING="## ${VERSION}"
             BODY=$(awk -v h="$HEADING" '
@@ -129,12 +129,12 @@ jobs:
             curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/main/install.sh | sh
             ```
 
-            **Linux x86_64 (CUDA — Ada / Hopper / Blackwell / Blackwell Ultra / Blackwell Desktop)**
+            **Linux x86_64 (CUDA: Ada, Hopper, Blackwell, Blackwell Ultra, Blackwell Desktop)**
             ```bash
             curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/main/install.sh | sh
             ```
 
-            **Linux arm64 (CUDA — GH200 / GB300 / Jetson Thor / DGX Spark)**
+            **Linux arm64 (CUDA: GH200, GB300, Jetson Thor, DGX Spark)**
             ```bash
             curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/main/install.sh | sh
             ```

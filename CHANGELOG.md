@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## Unreleased
+## 0.1.0 (2026-10-30)
 
 The release that leaves alpha. A token gets the same logits whatever shares its forward, on every path the server runs: the AWQ, GPTQ and dense BF16 projections join the GGUF ones, the MXFP4 and streamed FP8 experts of the mixture models follow the phase of the forward, and the sink attention of gpt-oss has its own Flash Attention kernel instead of a GEMM fallback whose bits leaked through the prefix cache into later answers. An eight-hour soak found and then confirmed the fix of a memory growth as old as the Metal backend, the autoreleased command encoders of candle's Metal backend that a Rust thread never freed. A truncated download resumes instead of being refused, the warm-up runs what a request runs, the packed-quant decode saves two dispatches per projection, and the Metal kernels are template kernels instead of backslash macros. The limits that belong to the models rather than to the runtime are written down, with llama.cpp giving the same answers where it was checked.
 
@@ -35,6 +35,8 @@ The release that leaves alpha. A token gets the same logits whatever shares its 
 - `objc2` is a direct optional dependency of the Metal feature, for the autorelease pool around the engine step; it was already in the tree through the Metal bindings.
 
 ### Tests
+- The full sweep of 67 checkpoints on the release binary: 65 served through the whole battery, every memory slope flat, no runtime defect; the two refused at load are the documented machine limits and the one not served the mixture GGUF `pull` refuses by design.
+
 - An eight-hour soak on the release binary, mixed chat, streamed chat and embeddings every two seconds, 12,262 requests, none failed, resident memory flat over the last four hours; the run before the fix grew by 4.9 GB on the same load.
 
 - 511 unit tests green: the single-row and batch instantiations of the dense BF16, AWQ, GPTQ (4 and 8 bit) and native F8 kernels are checked bit for bit on a model's projection shapes; the AWQ and GPTQ kernels' BF16 and F16 stores are checked bit for bit against their F32 result rounded, for one row and for a batch; the packed-quant layer is checked for its F32 vocabulary output, for a decode batch past the gemv's eight rows against the rows alone, and for a prefill of four rows against one of seventy; the staged packed-quant GEMM and the MXFP4 mul_mm are checked row by row against the row alone across the tile boundary; and the tiled Flash Attention is checked against the reference with a sink, alone, behind a cached prefix and within a sliding window.

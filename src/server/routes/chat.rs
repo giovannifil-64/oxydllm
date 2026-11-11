@@ -1636,6 +1636,14 @@ fn prompt_opens_thinking(prompt: &str) -> bool {
     prompt.ends_with("<think>") || prompt.ends_with("<|channel>thought")
 }
 
+/// Whether a thinking block comes back as `reasoning_content`: always,
+/// unless the request declined it. A model that thinks unasked, as the
+/// DeepSeek-R1 distills do, otherwise answers nothing on a budget its
+/// reasoning exhausts.
+fn returns_reasoning(asked: Option<bool>) -> bool {
+    asked != Some(false)
+}
+
 /// Whether this model's chat template renders the tool definitions itself,
 /// read off the render: a template that knows `tools` produces a different
 /// prompt with them than without. Such a model gets the definitions once,
@@ -2220,6 +2228,7 @@ pub(super) async fn chat_completions(
                 enqueued_at: std::time::Instant::now(),
                 enable_thinking,
                 thinking_open: prompt_opens_thinking(&prompt),
+                return_reasoning: returns_reasoning(body.enable_thinking),
                 stop_strings: stop_strings.clone(),
                 json_mode,
                 parent_span: http_span.clone(),
@@ -3053,6 +3062,16 @@ fn load_failure_status(kind: LoadFailureKind) -> (StatusCode, &'static str) {
 
 #[cfg(test)]
 mod tests {
+    /// Contract: reasoning is returned when the request asks to think and
+    /// when it says nothing, and dropped only when the request declines it.
+    #[test]
+    fn reasoning_is_returned_unless_the_request_declines_it() {
+        use super::returns_reasoning;
+        assert!(returns_reasoning(Some(true)));
+        assert!(returns_reasoning(None));
+        assert!(!returns_reasoning(Some(false)));
+    }
+
     /// Contract: a model refused for memory answers 503, retryable, where a
     /// missing model answers 404 and any other load failure 500.
     #[test]

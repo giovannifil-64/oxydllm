@@ -167,6 +167,12 @@ pub struct IncomingRequest {
     /// gemma-4 after a tool result and the templates that end with `<think>`
     /// do, so the first generated tokens are reasoning before any marker.
     pub thinking_open: bool,
+    /// Whether a thinking block comes back as `reasoning_content` instead of
+    /// being dropped: always, unless the request set `enable_thinking` to
+    /// false. A model that thinks unasked (the DeepSeek-R1 distills open
+    /// `<think>` whatever the request says) otherwise answers nothing on a
+    /// budget its reasoning exhausts, with the tokens spent and no text.
+    pub return_reasoning: bool,
     /// Stop strings matched on the decoded content; the reply ends before
     /// the first one found.
     pub stop_strings: Vec<String>,

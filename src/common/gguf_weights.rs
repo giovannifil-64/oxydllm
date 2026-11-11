@@ -577,7 +577,7 @@ fn parallelise_tensor_load(
                 if let Some(handle) = handle {
                     staged.insert(name.clone(), handle);
                 }
-                tensors.insert(name, Arc::new(qt));
+                tensors.insert(name, qt);
             }
             Built::Owned(w) => {
                 owned.insert(name, w);
@@ -589,7 +589,7 @@ fn parallelise_tensor_load(
 
 /// One tensor as the loader built it.
 enum Built {
-    Candle(QTensor, Option<StagedWeight>),
+    Candle(Arc<QTensor>, Option<StagedWeight>),
     #[cfg_attr(not(feature = "metal"), allow(dead_code))]
     Owned(StagedWeight),
 }
@@ -659,7 +659,7 @@ fn build_tensor(
             .then(|| crate::common::weights::metal_alloc_lock().lock().unwrap());
         let (qt, staged) = qtensor_with_staged(dtype, &bytes, entry.dims.clone(), device)
             .map_err(|e| anyhow::anyhow!("building the tensor failed: {}", e))?;
-        return Ok(Built::Candle(qt, staged));
+        return Ok(Built::Candle(Arc::new(qt), staged));
     }
     build_owned(file, file_len, data_offset, entry, device)
 }

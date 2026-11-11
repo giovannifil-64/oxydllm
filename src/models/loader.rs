@@ -1387,14 +1387,21 @@ fn load_standard_safetensors(
                     .unwrap_or(per_layer_head_dims[i])
             })
             .collect();
-        let ropes = (0..cfg.num_hidden_layers)
-            .map(|i| {
+        let geometries: Vec<(usize, f64)> = per_layer_rotary_dims
+            .iter()
+            .copied()
+            .zip(per_layer_rope_thetas.iter().copied())
+            .collect();
+        let (distinct, per_layer_table) = super::gguf_model::rope_sharing_plan(&geometries);
+        let tables = distinct
+            .iter()
+            .map(|&(dim, theta)| {
                 RotaryEmbedding::new_with_scaling(
-                    per_layer_rotary_dims[i],
+                    dim,
                     ctx,
-                    per_layer_rope_thetas[i],
+                    theta,
                     crate::common::rope::scaling_for_theta(
-                        per_layer_rope_thetas[i],
+                        theta,
                         cfg.rope_theta,
                         &cfg.rope_scaling,
                     ),
@@ -1403,6 +1410,8 @@ fn load_standard_safetensors(
                 )
             })
             .collect::<candle_core::Result<Vec<_>>>()?;
+        let ropes: Vec<RotaryEmbedding> =
+            per_layer_table.iter().map(|&t| tables[t].clone()).collect();
 
         // Linear-attention layers never allocate KV blocks; they alias the
         // first full-attention layer's allocator so the scheduler's

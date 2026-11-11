@@ -373,7 +373,7 @@ pub(crate) fn parse_gguf_topology(gguf: &GgufWeights) -> anyhow::Result<GgufTopo
 /// room to run. Comparing theta by its bits is deliberate: these come from file
 /// metadata and are either the same value or a different one, never the result
 /// of arithmetic that could land a hair apart.
-fn rope_sharing_plan(geometries: &[(usize, f64)]) -> (Vec<(usize, f64)>, Vec<usize>) {
+pub(super) fn rope_sharing_plan(geometries: &[(usize, f64)]) -> (Vec<(usize, f64)>, Vec<usize>) {
     let mut distinct: Vec<(usize, f64)> = Vec::new();
     let mut per_layer = Vec::with_capacity(geometries.len());
     for &(dim, theta) in geometries {

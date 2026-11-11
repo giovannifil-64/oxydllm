@@ -826,8 +826,9 @@ inline float gguf_dot_y(device const block_q5_1 *qb,
 
 
 // Batched legacy-quant decode GEMV (2 simdgroups x GGUF_N_DST rows), one
-// instantiation per quant: only the block type and dot_y differ. Weights are
-// read once per (row, block) and L2-amortized across the inner M-loop.
+// instantiation per quant: only the block type and dot_y differ. The
+// activations are converted once per block and batch row and serve every
+// output row; the weight words are re-read per output row from cache.
 template <typename BLOCK, int MAXM>
 kernel void gguf_legacy_gemv_kernel(
     device const bfloat        *x        [[buffer(0)]],
@@ -852,20 +853,20 @@ kernel void gguf_legacy_gemv_kernel(
     for (uint row = 0; row < GGUF_N_DST; ++row)
         for (uint m = 0; m < MAXM; ++m) sumf[row][m] = 0.f;
     for (uint ib = ix; ib < nb; ib += GGUF_N_SIMDWIDTH / 2) {
-        for (uint row = 0; row < GGUF_N_DST; ++row) {
-            if (first_row + row >= N) continue;
-            device const BLOCK *blk = x_blocks + ib + row * nb;
-            for (uint m = 0; m < M; ++m) {
-                device const bfloat *yb =
-                    x + (ulong)m * (ulong)K + (ulong)ib * QK5_0 + il;
-                float yl[16]; float sumy = 0.f;
-                for (int i = 0; i < 8; i += 2) {
-                    const float a0=(float)yb[i+0], a1=(float)yb[i+1];
-                    const float a16=(float)yb[i+16], a17=(float)yb[i+17];
-                    sumy += a0 + a1 + a16 + a17;
-                    yl[i+0]=a0; yl[i+1]=a1/256.f;
-                    yl[i+8]=a16/16.f; yl[i+9]=a17/4096.f;
-                }
+        for (uint m = 0; m < M; ++m) {
+            device const bfloat *yb =
+                x + (ulong)m * (ulong)K + (ulong)ib * QK5_0 + il;
+            float yl[16]; float sumy = 0.f;
+            for (int i = 0; i < 8; i += 2) {
+                const float a0=(float)yb[i+0], a1=(float)yb[i+1];
+                const float a16=(float)yb[i+16], a17=(float)yb[i+17];
+                sumy += a0 + a1 + a16 + a17;
+                yl[i+0]=a0; yl[i+1]=a1/256.f;
+                yl[i+8]=a16/16.f; yl[i+9]=a17/4096.f;
+            }
+            for (uint row = 0; row < GGUF_N_DST; ++row) {
+                if (first_row + row >= N) continue;
+                device const BLOCK *blk = x_blocks + ib + row * nb;
                 sumf[row][m] += gguf_dot_y(blk, sumy, yl, il);
             }
         }
@@ -897,7 +898,9 @@ typedef struct {
 } block_q8_0;
 
 
-// Batched Q8_0 decode GEMV (2 simdgroups x GGUF_N_DST rows per TG).
+// Batched Q8_0 decode GEMV (2 simdgroups x GGUF_N_DST rows per TG): the
+// weights of the four rows and the activations of each batch row are
+// converted once per block.
 template <int MAXM>
 kernel void gguf_q8_0_gemv_kernel(
     device const bfloat        *x        [[buffer(0)]],
@@ -932,20 +935,34 @@ kernel void gguf_q8_0_gemv_kernel(
     }
 
     for (uint ib = ix; ib < nb; ib += GGUF_N_SIMDWIDTH / 4) {
+        float wq[GGUF_N_DST][NB_Q8_0];
+        float wd[GGUF_N_DST];
         for (uint row = 0; row < GGUF_N_DST; ++row) {
             if (first_row + row >= N) {
                 continue;
             }
             device const int8_t *qs = x_blocks[ib + row * nb].qs + NB_Q8_0 * il;
-            const float d = (float)x_blocks[ib + row * nb].d;
-            for (uint m = 0; m < M; ++m) {
-                device const bfloat *yb =
-                    x + (ulong)m * (ulong)K + (ulong)ib * QK8_0 + y_off;
+            for (uint iq = 0; iq < NB_Q8_0; ++iq) {
+                wq[row][iq] = (float)qs[iq];
+            }
+            wd[row] = (float)x_blocks[ib + row * nb].d;
+        }
+        for (uint m = 0; m < M; ++m) {
+            device const bfloat *yb =
+                x + (ulong)m * (ulong)K + (ulong)ib * QK8_0 + y_off;
+            float yv[NB_Q8_0];
+            for (uint iq = 0; iq < NB_Q8_0; ++iq) {
+                yv[iq] = (float)yb[iq];
+            }
+            for (uint row = 0; row < GGUF_N_DST; ++row) {
+                if (first_row + row >= N) {
+                    continue;
+                }
                 float sumq = 0.f;
                 for (uint iq = 0; iq < NB_Q8_0; ++iq) {
-                    sumq += (float)qs[iq] * (float)yb[iq];
+                    sumq += wq[row][iq] * yv[iq];
                 }
-                sumf[row][m] += sumq * d;
+                sumf[row][m] += sumq * wd[row];
             }
         }
     }
@@ -977,7 +994,8 @@ typedef struct {
 
 
 // Batched Q4_K decode GEMV (1 simdgroup x GGUF_N_DST rows, same geometry as the
-// gemv): weights read once per (row, super-block), reused across the inner M-loop.
+// gemv): the activations are converted and summed once per super-block and
+// batch row and serve every output row.
 template <int MAXM>
 kernel void gguf_q4k_gemv_kernel(
     device const bfloat        *x        [[buffer(0)]],
@@ -1022,33 +1040,33 @@ kernel void gguf_q4k_gemv_kernel(
     thread const uint8_t *sc8 = (thread const uint8_t *)sc16;
 
     for (uint ib = ix; ib < nb; ib += 4) {
-        for (uint row = 0; row < GGUF_N_DST; ++row) {
-            if (first_row + row >= N) break;
-            device const block_q4_K *xb = x_row0 + ib + row * nb;
-            device const uint16_t *sc = (device const uint16_t *)xb->scales + iq;
-            device const uint16_t *q1 = (device const uint16_t *)xb->qs + 16 * iq + 4 * ir;
-            device const half     *dh = &xb->d;
+        for (uint m = 0; m < M; ++m) {
+            device const bfloat *y4 =
+                x + (ulong)m * (ulong)K + (ulong)ib * QK_K + y_off;
+            float yl[16], yh[16];
+            float4 sumy = {0.f, 0.f, 0.f, 0.f};
+            for (int i = 0; i < 8; ++i) {
+                yl[i+0] = (float)y4[i+  0]; sumy[0] += yl[i+0];
+                yl[i+8] = (float)y4[i+ 32]; sumy[1] += yl[i+8];
+                yh[i+0] = (float)y4[i+128]; sumy[2] += yh[i+0];
+                yh[i+8] = (float)y4[i+160]; sumy[3] += yh[i+8];
+            }
 
-            sc16[0] = sc[0] & kmask1;
-            sc16[1] = sc[2] & kmask1;
-            sc16[2] = ((sc[4] >> 0) & kmask2) | ((sc[0] & kmask3) >> 2);
-            sc16[3] = ((sc[4] >> 4) & kmask2) | ((sc[2] & kmask3) >> 2);
+            for (uint row = 0; row < GGUF_N_DST; ++row) {
+                if (first_row + row >= N) break;
+                device const block_q4_K *xb = x_row0 + ib + row * nb;
+                device const uint16_t *sc = (device const uint16_t *)xb->scales + iq;
+                device const uint16_t *q1 = (device const uint16_t *)xb->qs + 16 * iq + 4 * ir;
+                device const half     *dh = &xb->d;
 
-            device const uint16_t *q2 = q1 + 32;
-            const float dall = (float)dh[0];
-            const float dmin = (float)dh[1];
+                sc16[0] = sc[0] & kmask1;
+                sc16[1] = sc[2] & kmask1;
+                sc16[2] = ((sc[4] >> 0) & kmask2) | ((sc[0] & kmask3) >> 2);
+                sc16[3] = ((sc[4] >> 4) & kmask2) | ((sc[2] & kmask3) >> 2);
 
-            for (uint m = 0; m < M; ++m) {
-                device const bfloat *y4 =
-                    x + (ulong)m * (ulong)K + (ulong)ib * QK_K + y_off;
-                float yl[16], yh[16];
-                float4 sumy = {0.f, 0.f, 0.f, 0.f};
-                for (int i = 0; i < 8; ++i) {
-                    yl[i+0] = (float)y4[i+  0]; sumy[0] += yl[i+0];
-                    yl[i+8] = (float)y4[i+ 32]; sumy[1] += yl[i+8];
-                    yh[i+0] = (float)y4[i+128]; sumy[2] += yh[i+0];
-                    yh[i+8] = (float)y4[i+160]; sumy[3] += yh[i+8];
-                }
+                device const uint16_t *q2 = q1 + 32;
+                const float dall = (float)dh[0];
+                const float dmin = (float)dh[1];
 
                 float4 acc1 = {0.f, 0.f, 0.f, 0.f};
                 float4 acc2 = {0.f, 0.f, 0.f, 0.f};
@@ -1096,9 +1114,41 @@ typedef struct {
 } block_q5_K;
 
 
-// Batched Q5_K decode GEMV (2 simdgroups x 2 rows per TG): the single-row
-// kernel's arithmetic, run for each of the M rows in turn, so a row gets the
-// bits it gets alone.
+// Batched Q5_K decode GEMV (2 simdgroups x 2 rows per TG): one arithmetic
+// (`gguf_q5k_accumulate`) under two loop orders, the single-row instantiation
+// reading each row's bytes as it goes, the batch one keeping both rows' bytes,
+// scales and deltas in registers across the batch.
+// One super-block of one output row against one activation row: the whole
+// arithmetic of the Q5_K gemv, shared by both loop orders below so that a row
+// gets the same bits alone and in a batch; `P` is the address space the
+// weight bytes are read from.
+template <typename P>
+inline void gguf_q5k_accumulate(P q1, P q2, P qh, thread const uint8_t *sc8,
+                                float dall, float dmin, thread const float *yl,
+                                thread const float *yh, float4 sumy, uchar4 hm,
+                                thread float &sf)
+{
+    float4 acc1 = {0.f, 0.f, 0.f, 0.f};
+    float4 acc2 = {0.f, 0.f, 0.f, 0.f};
+    for (uint l = 0; l < 8; ++l) {
+        uint8_t h = qh[l];
+        acc1[0] += yl[l+0] * (q1[l] & 0x0F);
+        acc1[1] += yl[l+8] * (q1[l] & 0xF0);
+        acc1[2] += yh[l+0] * (q2[l] & 0x0F);
+        acc1[3] += yh[l+8] * (q2[l] & 0xF0);
+        acc2[0] += (h & hm[0]) ? yl[l+0] : 0.f;
+        acc2[1] += (h & hm[1]) ? yl[l+8] : 0.f;
+        acc2[2] += (h & hm[2]) ? yh[l+0] : 0.f;
+        acc2[3] += (h & hm[3]) ? yh[l+8] : 0.f;
+    }
+    sf += dall * (sc8[0] * (acc1[0]      + 16.f*acc2[0]) +
+                  sc8[1] * (acc1[1]/16.f + 16.f*acc2[1]) +
+                  sc8[4] * (acc1[2]      + 16.f*acc2[2]) +
+                  sc8[5] * (acc1[3]/16.f + 16.f*acc2[3])) -
+          dmin * (sumy[0]*sc8[2] + sumy[1]*sc8[3] +
+                  sumy[2]*sc8[6] + sumy[3]*sc8[7]);
+}
+
 template <int MAXM>
 kernel void gguf_q5k_gemv_kernel(
     device const bfloat        *x        [[buffer(0)]],
@@ -1136,12 +1186,7 @@ kernel void gguf_q5k_gemv_kernel(
     const uint y_offset = 64 * iq + l0;
 
     const uint8_t hm1 = 1u << (2 * iq);
-    const uint8_t hm2 = hm1 << 1;
-    const uint8_t hm3 = hm1 << 4;
-    const uint8_t hm4 = hm2 << 4;
-
-    uint16_t sc16[4];
-    thread const uint8_t *sc8 = (thread const uint8_t *)sc16;
+    const uchar4 hm = {hm1, (uint8_t)(hm1 << 1), (uint8_t)(hm1 << 4), (uint8_t)(hm1 << 5)};
 
     float yl[16], yh[16];
 
@@ -1153,8 +1198,8 @@ kernel void gguf_q5k_gemv_kernel(
     }
 
     for (uint i = ix; i < nb; i += 4) {
-        for (uint m = 0; m < M; ++m) {
-            device const bfloat *y1 = x + (ulong)m * (ulong)K + (ulong)i * QK_K + y_offset;
+        if (MAXM == 1) {
+            device const bfloat *y1 = x + (ulong)i * QK_K + y_offset;
             device const bfloat *y2 = y1 + 128;
             float4 sumy = {0.f, 0.f, 0.f, 0.f};
             for (uint l = 0; l < 8; ++l) {
@@ -1163,41 +1208,61 @@ kernel void gguf_q5k_gemv_kernel(
                 yh[l+0] = (float)y2[l+ 0]; sumy[2] += yh[l+0];
                 yh[l+8] = (float)y2[l+32]; sumy[3] += yh[l+8];
             }
-
+            for (uint row = 0; row < 2; ++row) {
+                device const block_q5_K *xb = x_blocks + i + row * nb;
+                device const uint8_t *q1 = xb->qs + q_offset;
+                device const uint16_t *a = (device const uint16_t *)xb->scales + iq;
+                uint16_t sc16[4];
+                sc16[0] = a[0] & kmask1;
+                sc16[1] = a[2] & kmask1;
+                sc16[2] = ((a[4] >> 0) & kmask2) | ((a[0] & kmask3) >> 2);
+                sc16[3] = ((a[4] >> 4) & kmask2) | ((a[2] & kmask3) >> 2);
+                gguf_q5k_accumulate(q1, q1 + 64, xb->qh + l0, (thread const uint8_t *)sc16,
+                                    (float)xb->d, (float)xb->dmin, yl, yh, sumy, hm,
+                                    sumf[row][0]);
+            }
+        } else {
+            uint8_t q1r[2][8], q2r[2][8], qhr[2][8];
+            uint16_t scr[2][4];
+            float dallr[2], dminr[2];
             for (uint row = 0; row < 2; ++row) {
                 device const block_q5_K *xb = x_blocks + i + row * nb;
                 device const uint8_t *q1 = xb->qs + q_offset;
                 device const uint8_t *q2 = q1 + 64;
                 device const uint8_t *qh = xb->qh + l0;
-                device const half    *dh = &xb->d;
                 device const uint16_t *a = (device const uint16_t *)xb->scales + iq;
 
-                sc16[0] = a[0] & kmask1;
-                sc16[1] = a[2] & kmask1;
-                sc16[2] = ((a[4] >> 0) & kmask2) | ((a[0] & kmask3) >> 2);
-                sc16[3] = ((a[4] >> 4) & kmask2) | ((a[2] & kmask3) >> 2);
-
-                float4 acc1 = {0.f, 0.f, 0.f, 0.f};
-                float4 acc2 = {0.f, 0.f, 0.f, 0.f};
+                scr[row][0] = a[0] & kmask1;
+                scr[row][1] = a[2] & kmask1;
+                scr[row][2] = ((a[4] >> 0) & kmask2) | ((a[0] & kmask3) >> 2);
+                scr[row][3] = ((a[4] >> 4) & kmask2) | ((a[2] & kmask3) >> 2);
                 for (uint l = 0; l < nn; ++l) {
-                    uint8_t h = qh[l];
-                    acc1[0] += yl[l+0] * (q1[l] & 0x0F);
-                    acc1[1] += yl[l+8] * (q1[l] & 0xF0);
-                    acc1[2] += yh[l+0] * (q2[l] & 0x0F);
-                    acc1[3] += yh[l+8] * (q2[l] & 0xF0);
-                    acc2[0] += (h & hm1) ? yl[l+0] : 0.f;
-                    acc2[1] += (h & hm2) ? yl[l+8] : 0.f;
-                    acc2[2] += (h & hm3) ? yh[l+0] : 0.f;
-                    acc2[3] += (h & hm4) ? yh[l+8] : 0.f;
+                    q1r[row][l] = q1[l];
+                    q2r[row][l] = q2[l];
+                    qhr[row][l] = qh[l];
                 }
-                const float dall = (float)dh[0];
-                const float dmin = (float)dh[1];
-                sumf[row][m] += dall * (sc8[0] * (acc1[0]      + 16.f*acc2[0]) +
-                                        sc8[1] * (acc1[1]/16.f + 16.f*acc2[1]) +
-                                        sc8[4] * (acc1[2]      + 16.f*acc2[2]) +
-                                        sc8[5] * (acc1[3]/16.f + 16.f*acc2[3])) -
-                                dmin * (sumy[0]*sc8[2] + sumy[1]*sc8[3] +
-                                        sumy[2]*sc8[6] + sumy[3]*sc8[7]);
+                dallr[row] = (float)xb->d;
+                dminr[row] = (float)xb->dmin;
+            }
+
+            for (uint m = 0; m < M; ++m) {
+                device const bfloat *y1 = x + (ulong)m * (ulong)K + (ulong)i * QK_K + y_offset;
+                device const bfloat *y2 = y1 + 128;
+                float4 sumy = {0.f, 0.f, 0.f, 0.f};
+                for (uint l = 0; l < 8; ++l) {
+                    yl[l+0] = (float)y1[l+ 0]; sumy[0] += yl[l+0];
+                    yl[l+8] = (float)y1[l+32]; sumy[1] += yl[l+8];
+                    yh[l+0] = (float)y2[l+ 0]; sumy[2] += yh[l+0];
+                    yh[l+8] = (float)y2[l+32]; sumy[3] += yh[l+8];
+                }
+                for (uint row = 0; row < 2; ++row) {
+                    gguf_q5k_accumulate((thread const uint8_t *)q1r[row],
+                                        (thread const uint8_t *)q2r[row],
+                                        (thread const uint8_t *)qhr[row],
+                                        (thread const uint8_t *)scr[row],
+                                        dallr[row], dminr[row], yl, yh, sumy, hm,
+                                        sumf[row][m]);
+                }
             }
         }
     }
@@ -1226,7 +1291,7 @@ typedef struct {
 
 // Batched Q6_K decode GEMV (2 simdgroups x 1 row per TG): the single-row
 // kernel's arithmetic, run for each of the M rows in turn, so a row gets the
-// bits it gets alone.
+// bits it gets alone; the span's weights are decoded once per block.
 template <int MAXM>
 kernel void gguf_q6k_gemv_kernel(
     device const bfloat        *x        [[buffer(0)]],
@@ -1279,21 +1344,27 @@ kernel void gguf_q6k_gemv_kernel(
         device const int8_t  *sc = xb->scales + is;
         const float dall = (float)xb->d;
 
+        float w0[4], w1[4], w2[4], w3[4];
+        for (uint l = 0; l < nn; ++l) {
+            w0[l] = (float)((int8_t)((q1[l] & 0xF) | ((qh[l] & kmask1) << 4)) - 32);
+            w1[l] = (float)((int8_t)((q2[l] & 0xF) | ((qh[l] & kmask2) << 2)) - 32);
+            w2[l] = (float)((int8_t)((q1[l]  >> 4) | ((qh[l] & kmask3) << 0)) - 32);
+            w3[l] = (float)((int8_t)((q2[l]  >> 4) | ((qh[l] & kmask4) >> 2)) - 32);
+        }
+        const float s0 = (float)sc[0], s2 = (float)sc[2];
+        const float s4 = (float)sc[4], s6 = (float)sc[6];
+
         for (uint m = 0; m < M; ++m) {
             device const bfloat *y = x + (ulong)m * (ulong)K + (ulong)i * QK_K + y_offset;
             float4 sums = {0.f, 0.f, 0.f, 0.f};
             for (uint l = 0; l < nn; ++l) {
-                sums[0] += (float)y[l+ 0] *
-                           (float)((int8_t)((q1[l] & 0xF) | ((qh[l] & kmask1) << 4)) - 32);
-                sums[1] += (float)y[l+32] *
-                           (float)((int8_t)((q2[l] & 0xF) | ((qh[l] & kmask2) << 2)) - 32);
-                sums[2] += (float)y[l+64] *
-                           (float)((int8_t)((q1[l]  >> 4) | ((qh[l] & kmask3) << 0)) - 32);
-                sums[3] += (float)y[l+96] *
-                           (float)((int8_t)((q2[l]  >> 4) | ((qh[l] & kmask4) >> 2)) - 32);
+                sums[0] += (float)y[l+ 0] * w0[l];
+                sums[1] += (float)y[l+32] * w1[l];
+                sums[2] += (float)y[l+64] * w2[l];
+                sums[3] += (float)y[l+96] * w3[l];
             }
-            sumf[m] += dall * (sums[0]*sc[0] + sums[1]*sc[2] +
-                               sums[2]*sc[4] + sums[3]*sc[6]);
+            sumf[m] += dall * (sums[0]*s0 + sums[1]*s2 +
+                               sums[2]*s4 + sums[3]*s6);
         }
     }
 
@@ -1316,7 +1387,8 @@ typedef struct {
 } block_q2_K;
 
 
-// Batched Q2_K decode GEMV (2 simdgroups x GGUF_N_DST rows per TG, step-advance).
+// Batched Q2_K decode GEMV (2 simdgroups x GGUF_N_DST rows per TG, step-advance):
+// the activations are converted and summed once per super-block and batch row.
 template <int MAXM>
 kernel void gguf_q2k_gemv_kernel(
     device const bfloat        *x        [[buffer(0)]],
@@ -1357,25 +1429,26 @@ kernel void gguf_q2k_gemv_kernel(
 
     for (uint ib = ix; ib < nb; ib += 4) {
         device const block_q2_K *xb0 = x_blocks + ib;
-        device const uint8_t  *sc = (device const uint8_t  *)xb0->scales + 8 * iq + is;
-        device const uint16_t *qs = (device const uint16_t *)xb0->qs + 16 * iq + 4 * ir;
-        device const half     *dh = &xb0->d;
 
-        for (uint row = 0; row < GGUF_N_DST; ++row) {
-            if (first_row + row >= N) break;
-            const float dall = (float)dh[0];
-            const float dmin = (float)dh[1] * (1.f / 16.f);
+        for (uint m = 0; m < M; ++m) {
+            device const bfloat *y4 = x + (ulong)m * (ulong)K + (ulong)ib * QK_K + y_off;
+            float yl[32];
+            float4 sumy = {0.f, 0.f, 0.f, 0.f};
+            for (int i = 0; i < 8; ++i) {
+                yl[i+ 0] = (float)y4[i+ 0]; sumy[0] += yl[i+ 0];
+                yl[i+ 8] = (float)y4[i+32]; sumy[1] += yl[i+ 8];
+                yl[i+16] = (float)y4[i+64]; sumy[2] += yl[i+16];
+                yl[i+24] = (float)y4[i+96]; sumy[3] += yl[i+24];
+            }
 
-            for (uint m = 0; m < M; ++m) {
-                device const bfloat *y4 = x + (ulong)m * (ulong)K + (ulong)ib * QK_K + y_off;
-                float yl[32];
-                float4 sumy = {0.f, 0.f, 0.f, 0.f};
-                for (int i = 0; i < 8; ++i) {
-                    yl[i+ 0] = (float)y4[i+ 0]; sumy[0] += yl[i+ 0];
-                    yl[i+ 8] = (float)y4[i+32]; sumy[1] += yl[i+ 8];
-                    yl[i+16] = (float)y4[i+64]; sumy[2] += yl[i+16];
-                    yl[i+24] = (float)y4[i+96]; sumy[3] += yl[i+24];
-                }
+            device const uint8_t  *sc = (device const uint8_t  *)xb0->scales + 8 * iq + is;
+            device const uint16_t *qs = (device const uint16_t *)xb0->qs + 16 * iq + 4 * ir;
+            device const half     *dh = &xb0->d;
+
+            for (uint row = 0; row < GGUF_N_DST; ++row) {
+                if (first_row + row >= N) break;
+                const float dall = (float)dh[0];
+                const float dmin = (float)dh[1] * (1.f / 16.f);
 
                 float4 acc1 = {0.f, 0.f, 0.f, 0.f};
                 float4 acc2 = {0.f, 0.f, 0.f, 0.f};
@@ -1395,11 +1468,11 @@ kernel void gguf_q2k_gemv_kernel(
                                         (acc1[3] + 1.f/256.f * acc2[3]) * (sc[6] & 0xF) * (1.f / 64.f)) -
                                 dmin * (sumy[0] * (sc[0] & 0xF0) + sumy[1] * (sc[2] & 0xF0) +
                                         sumy[2] * (sc[4] & 0xF0) + sumy[3] * (sc[6] & 0xF0));
-            }
 
-            qs = (device const uint16_t *)((device const uint8_t *)qs + step);
-            sc = (device const uint8_t  *)((device const uint8_t *)sc + step);
-            dh = (device const half     *)((device const uint8_t *)dh + step);
+                qs = (device const uint16_t *)((device const uint8_t *)qs + step);
+                sc = (device const uint8_t  *)((device const uint8_t *)sc + step);
+                dh = (device const half     *)((device const uint8_t *)dh + step);
+            }
         }
     }
 
@@ -1425,10 +1498,77 @@ typedef struct {
 } block_q3_K;
 
 
-// Batched Q3_K decode GEMV (2 simdgroups x 2 rows per TG, step-advance): the
-// single-row kernel's arithmetic, run for each of the M rows in turn, so a row
-// gets the bits it gets alone; weights and scales are read once per (row,
-// super-block) and reused across the M-loop.
+// Batched Q3_K decode GEMV (2 simdgroups x 2 rows per TG): one arithmetic
+// (`gguf_q3k_accumulate`) under two loop orders, the single-row instantiation
+// converting the activations once for both output rows, the batch one keeping
+// a row's weights across the batch, since the other order spills registers.
+// The per-lane constants of the Q3_K gemv: the high-bit masks of the lane's
+// span, the two-bit masks of its nibble pair and the two offsets of the sign
+// correction.
+struct GgufQ3kLane {
+    ushort4 hm;
+    int4 qm;
+    float v1;
+    float v2;
+};
+
+// The four six-bit scales a lane uses, packed as ggml packs them.
+inline uint32_t gguf_q3k_scales(device const uint16_t *a, uint il,
+                                uint16_t s_shift1, uint16_t s_shift2)
+{
+    uint32_t scales32, aux32;
+    thread uint16_t *scales16 = (thread uint16_t *)&scales32;
+    scales16[0] = a[4];
+    scales16[1] = a[5];
+    aux32 = ((scales32 >> s_shift2) << 4) & 0x30303030u;
+    scales16[0] = a[il + 0u];
+    scales16[1] = a[il + 1u];
+    return ((scales32 >> s_shift1) & 0x0f0f0f0fu) | aux32;
+}
+
+// One super-block of one output row against one activation row: the whole
+// arithmetic of the Q3_K gemv, shared by both loop orders below so that a
+// row gets the same bits alone and in a batch.
+inline void gguf_q3k_accumulate(device const uint16_t *q, device const uint16_t *h,
+                                uint32_t scales32, float d_all, thread const float *yl,
+                                GgufQ3kLane lane, thread float &sf1, thread float &sf2)
+{
+    thread const int8_t *scales = (thread const int8_t *)&scales32;
+    float s1 = 0.f, s2 = 0.f, s3 = 0.f, s4 = 0.f, s5 = 0.f, s6 = 0.f;
+    for (uint l = 0; l < 8; l += 2) {
+        const int32_t qs = (int32_t)q[l / 2];
+        s1 += yl[l + 0] * (float)(qs & lane.qm[0]);
+        s2 += yl[l + 1] * (float)(qs & lane.qm[1]);
+        s3 += ((h[l / 2] & lane.hm[0]) ? 0.f : yl[l + 0]) +
+              ((h[l / 2] & lane.hm[1]) ? 0.f : yl[l + 1]);
+        s4 += yl[l + 16] * (float)(qs & lane.qm[2]);
+        s5 += yl[l + 17] * (float)(qs & lane.qm[3]);
+        s6 += ((h[l / 2] & lane.hm[2]) ? 0.f : yl[l + 16]) +
+              ((h[l / 2] & lane.hm[3]) ? 0.f : yl[l + 17]);
+    }
+    float d1 = d_all * (s1 + 1.f / 256.f * s2 - s3 * lane.v1);
+    float d2 = d_all * (s4 + 1.f / 256.f * s5 - s6 * lane.v2);
+    sf1 += d1 * (float)(scales[0] - 32);
+    sf2 += d2 * (float)(scales[2] - 32);
+
+    s1 = s2 = s3 = s4 = s5 = s6 = 0.f;
+    for (uint l = 0; l < 8; l += 2) {
+        const int32_t qs = (int32_t)q[l / 2 + 8];
+        s1 += yl[l + 8] * (float)(qs & lane.qm[0]);
+        s2 += yl[l + 9] * (float)(qs & lane.qm[1]);
+        s3 += ((h[l / 2 + 8] & lane.hm[0]) ? 0.f : yl[l +  8]) +
+              ((h[l / 2 + 8] & lane.hm[1]) ? 0.f : yl[l +  9]);
+        s4 += yl[l + 24] * (float)(qs & lane.qm[2]);
+        s5 += yl[l + 25] * (float)(qs & lane.qm[3]);
+        s6 += ((h[l / 2 + 8] & lane.hm[2]) ? 0.f : yl[l + 24]) +
+              ((h[l / 2 + 8] & lane.hm[3]) ? 0.f : yl[l + 25]);
+    }
+    d1 = d_all * (s1 + 1.f / 256.f * s2 - s3 * lane.v1);
+    d2 = d_all * (s4 + 1.f / 256.f * s5 - s6 * lane.v2);
+    sf1 += d1 * (float)(scales[1] - 32);
+    sf2 += d2 * (float)(scales[3] - 32);
+}
+
 template <int MAXM>
 kernel void gguf_q3k_gemv_kernel(
     device const bfloat        *x        [[buffer(0)]],
@@ -1480,11 +1620,7 @@ kernel void gguf_q3k_gemv_kernel(
     const uint q_offset = 32u * ip + l0;
     const uint y_offset = 128u * ip + 32u * il + l0;
 
-    const uint step_bytes = (uint)sizeof(block_q3_K) * nb;
-
-    uint32_t scales32, aux32;
-    thread uint16_t   *scales16 = (thread uint16_t   *)&scales32;
-    thread const int8_t *scales = (thread const int8_t *)&scales32;
+    const GgufQ3kLane lane = {hm, qm[il / 2u], v1, v2};
 
     float sumf1[2][MAXM];
     float sumf2[2][MAXM];
@@ -1496,69 +1632,43 @@ kernel void gguf_q3k_gemv_kernel(
     }
 
     for (uint i = ix; i < nb; i += 4) {
-        device const uint16_t *q = (device const uint16_t *)(x_blocks[i].qs    + q_offset);
-        device const uint16_t *h = (device const uint16_t *)(x_blocks[i].hmask + l0);
-        device const uint16_t *a = (device const uint16_t *)(x_blocks[i].scales);
-        device const half     *dh = &x_blocks[i].d;
-
-        for (uint row = 0; row < 2; ++row) {
-            const float d_all = (float)dh[0];
-
-            scales16[0] = a[4];
-            scales16[1] = a[5];
-            aux32 = ((scales32 >> s_shift2) << 4) & 0x30303030u;
-            scales16[0] = a[il + 0u];
-            scales16[1] = a[il + 1u];
-            scales32 = ((scales32 >> s_shift1) & 0x0f0f0f0fu) | aux32;
-
-            for (uint m = 0; m < M; ++m) {
-                device const bfloat *y1 = x + (ulong)m * (ulong)K + (ulong)i * QK_K + y_offset;
-                for (uint l = 0; l < 8; ++l) {
-                    yl[l +  0] = (float)y1[l +  0];
-                    yl[l +  8] = (float)y1[l + 16];
-                    yl[l + 16] = (float)y1[l + 32];
-                    yl[l + 24] = (float)y1[l + 48];
-                }
-
-                float s1 = 0.f, s2 = 0.f, s3 = 0.f, s4 = 0.f, s5 = 0.f, s6 = 0.f;
-                for (uint l = 0; l < n; l += 2) {
-                    const int32_t qs = (int32_t)q[l / 2];
-                    s1 += yl[l + 0] * (float)(qs & qm[il / 2u][0]);
-                    s2 += yl[l + 1] * (float)(qs & qm[il / 2u][1]);
-                    s3 += ((h[l / 2] & hm[0]) ? 0.f : yl[l + 0]) +
-                          ((h[l / 2] & hm[1]) ? 0.f : yl[l + 1]);
-                    s4 += yl[l + 16] * (float)(qs & qm[il / 2u][2]);
-                    s5 += yl[l + 17] * (float)(qs & qm[il / 2u][3]);
-                    s6 += ((h[l / 2] & hm[2]) ? 0.f : yl[l + 16]) +
-                          ((h[l / 2] & hm[3]) ? 0.f : yl[l + 17]);
-                }
-                float d1 = d_all * (s1 + 1.f / 256.f * s2 - s3 * v1);
-                float d2 = d_all * (s4 + 1.f / 256.f * s5 - s6 * v2);
-                sumf1[row][m] += d1 * (float)(scales[0] - 32);
-                sumf2[row][m] += d2 * (float)(scales[2] - 32);
-
-                s1 = s2 = s3 = s4 = s5 = s6 = 0.f;
-                for (uint l = 0; l < n; l += 2) {
-                    const int32_t qs = (int32_t)q[l / 2 + 8];
-                    s1 += yl[l + 8] * (float)(qs & qm[il / 2u][0]);
-                    s2 += yl[l + 9] * (float)(qs & qm[il / 2u][1]);
-                    s3 += ((h[l / 2 + 8] & hm[0]) ? 0.f : yl[l +  8]) +
-                          ((h[l / 2 + 8] & hm[1]) ? 0.f : yl[l +  9]);
-                    s4 += yl[l + 24] * (float)(qs & qm[il / 2u][2]);
-                    s5 += yl[l + 25] * (float)(qs & qm[il / 2u][3]);
-                    s6 += ((h[l / 2 + 8] & hm[2]) ? 0.f : yl[l + 24]) +
-                          ((h[l / 2 + 8] & hm[3]) ? 0.f : yl[l + 25]);
-                }
-                d1 = d_all * (s1 + 1.f / 256.f * s2 - s3 * v1);
-                d2 = d_all * (s4 + 1.f / 256.f * s5 - s6 * v2);
-                sumf1[row][m] += d1 * (float)(scales[1] - 32);
-                sumf2[row][m] += d2 * (float)(scales[3] - 32);
+        if (MAXM == 1) {
+            device const bfloat *y1 = x + (ulong)i * QK_K + y_offset;
+            for (uint l = 0; l < 8; ++l) {
+                yl[l +  0] = (float)y1[l +  0];
+                yl[l +  8] = (float)y1[l + 16];
+                yl[l + 16] = (float)y1[l + 32];
+                yl[l + 24] = (float)y1[l + 48];
             }
-
-            q  = (device const uint16_t *)((device const uint8_t *)q  + step_bytes);
-            h  = (device const uint16_t *)((device const uint8_t *)h  + step_bytes);
-            a  = (device const uint16_t *)((device const uint8_t *)a  + step_bytes);
-            dh = (device const half     *)((device const uint8_t *)dh + step_bytes);
+            for (uint row = 0; row < 2; ++row) {
+                device const block_q3_K *xb = x_blocks + i + row * nb;
+                const uint32_t scales32 =
+                    gguf_q3k_scales((device const uint16_t *)xb->scales, il, s_shift1, s_shift2);
+                gguf_q3k_accumulate((device const uint16_t *)(xb->qs + q_offset),
+                                    (device const uint16_t *)(xb->hmask + l0),
+                                    scales32, (float)xb->d, yl, lane,
+                                    sumf1[row][0], sumf2[row][0]);
+            }
+        } else {
+            for (uint row = 0; row < 2; ++row) {
+                device const block_q3_K *xb = x_blocks + i + row * nb;
+                const uint32_t scales32 =
+                    gguf_q3k_scales((device const uint16_t *)xb->scales, il, s_shift1, s_shift2);
+                const float d_all = (float)xb->d;
+                device const uint16_t *q = (device const uint16_t *)(xb->qs + q_offset);
+                device const uint16_t *h = (device const uint16_t *)(xb->hmask + l0);
+                for (uint m = 0; m < M; ++m) {
+                    device const bfloat *y1 = x + (ulong)m * (ulong)K + (ulong)i * QK_K + y_offset;
+                    for (uint l = 0; l < 8; ++l) {
+                        yl[l +  0] = (float)y1[l +  0];
+                        yl[l +  8] = (float)y1[l + 16];
+                        yl[l + 16] = (float)y1[l + 32];
+                        yl[l + 24] = (float)y1[l + 48];
+                    }
+                    gguf_q3k_accumulate(q, h, scales32, d_all, yl, lane,
+                                        sumf1[row][m], sumf2[row][m]);
+                }
+            }
         }
     }
 

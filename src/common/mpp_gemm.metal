@@ -198,9 +198,10 @@ inline void gptq_stage_tile(
 
 #define QK_K 256
 
-// A taller tile than the packed-quant path uses: each staged tile of the weight
-// then serves twice as many rows of the activation, which is the ratio that
-// decides how much the dequantisation costs per multiply.
+// The long-prefill tile, taller than the packed-quant path uses: each staged
+// tile of the weight then serves twice as many rows of the activation, which
+// is the ratio that decides how much the dequantisation costs per multiply.
+// Short prefills take the smaller tiles instantiated at the end of the file.
 constant constexpr int Q4K_TM = 128;
 constant constexpr int Q4K_BK = 64;
 constant constexpr int Q6K_BK = 128;
@@ -767,7 +768,7 @@ inline void stage_tile(
     }
 }
 
-template <typename Block, int TNS, int BKS>
+template <typename Block, int TMS, int TNS, int BKS>
 inline void gemm_staged(
     device bfloat* a,
     device Block* weight,
@@ -778,12 +779,12 @@ inline void gemm_staged(
     uint2 tgid, uint lid)
 {
     constexpr auto desc = matmul2d_descriptor(
-        Q4K_TM, TNS, BKS, false, false, false, matmul2d_descriptor::mode::multiply_accumulate);
+        TMS, TNS, BKS, false, false, false, matmul2d_descriptor::mode::multiply_accumulate);
     matmul2d<desc, execution_simdgroups<4>> op;
 
-    int row0 = int(tgid.y) * Q4K_TM;
+    int row0 = int(tgid.y) * TMS;
     int col0 = int(tgid.x) * TNS;
-    int tm = min(Q4K_TM, p.m - row0);
+    int tm = min(TMS, p.m - row0);
     int tn = min(TNS, p.n - col0);
     if (tm <= 0 || tn <= 0) {
         return;
@@ -833,19 +834,10 @@ inline void gemm_staged(
     }
 }
 
-kernel void mpp_gemm_q4k_staged(
-    device bfloat*      a       [[buffer(0)]],
-    device block_q4_K*  weight  [[buffer(1)]],
-    device bfloat*      d       [[buffer(2)]],
-    constant MppQuantGemmParams& p [[buffer(3)]],
-    uint2 tgid [[threadgroup_position_in_grid]],
-    uint  lid  [[thread_index_in_threadgroup]])
-{
-    threadgroup bfloat sB[2][Q4K_BK * Q4K_TN];
-    gemm_staged<block_q4_K, Q4K_TN, Q4K_BK>(a, weight, d, p, sB[0], sB[1], tgid, lid);
-}
-
-template <typename BLOCK, int BK>
+// The staged GEMM of every block type, in the four tiles the host picks by
+// row count (see `StagedTile` in metal_ops.rs): the tile never touches the
+// bits, since every tile reduces k in the same order.
+template <typename BLOCK, int TM, int TN, int BK>
 kernel void mpp_staged_kernel(
     device bfloat*      a       [[buffer(0)]],
     device BLOCK*       weight  [[buffer(1)]],
@@ -854,33 +846,62 @@ kernel void mpp_staged_kernel(
     uint2 tgid [[threadgroup_position_in_grid]],
     uint  lid  [[thread_index_in_threadgroup]])
 {
-    threadgroup bfloat sB[2][BK * Q4K_TN];
-    gemm_staged<BLOCK, Q4K_TN, BK>(a, weight, d, p, sB[0], sB[1], tgid, lid);
+    threadgroup bfloat sB[2][BK * TN];
+    gemm_staged<BLOCK, TM, TN, BK>(a, weight, d, p, sB[0], sB[1], tgid, lid);
 }
 
-template [[host_name("mpp_gemm_q4_0_staged")]] kernel void mpp_staged_kernel<block_q4_0, Q4K_BK>(device bfloat*, device block_q4_0*, device bfloat*, constant MppQuantGemmParams&, uint2, uint);
-template [[host_name("mpp_gemm_q4_1_staged")]] kernel void mpp_staged_kernel<block_q4_1, Q4K_BK>(device bfloat*, device block_q4_1*, device bfloat*, constant MppQuantGemmParams&, uint2, uint);
-template [[host_name("mpp_gemm_q5_0_staged")]] kernel void mpp_staged_kernel<block_q5_0, Q4K_BK>(device bfloat*, device block_q5_0*, device bfloat*, constant MppQuantGemmParams&, uint2, uint);
-template [[host_name("mpp_gemm_q5_1_staged")]] kernel void mpp_staged_kernel<block_q5_1, Q4K_BK>(device bfloat*, device block_q5_1*, device bfloat*, constant MppQuantGemmParams&, uint2, uint);
-template [[host_name("mpp_gemm_q8_0_staged")]] kernel void mpp_staged_kernel<block_q8_0, Q4K_BK>(device bfloat*, device block_q8_0*, device bfloat*, constant MppQuantGemmParams&, uint2, uint);
-template [[host_name("mpp_gemm_q2k_staged")]] kernel void mpp_staged_kernel<block_q2_K, Q4K_BK>(device bfloat*, device block_q2_K*, device bfloat*, constant MppQuantGemmParams&, uint2, uint);
-template [[host_name("mpp_gemm_q3k_staged")]] kernel void mpp_staged_kernel<block_q3_K, Q4K_BK>(device bfloat*, device block_q3_K*, device bfloat*, constant MppQuantGemmParams&, uint2, uint);
-template [[host_name("mpp_gemm_q5k_staged")]] kernel void mpp_staged_kernel<block_q5_K, Q4K_BK>(device bfloat*, device block_q5_K*, device bfloat*, constant MppQuantGemmParams&, uint2, uint);
-template [[host_name("mpp_gemm_iq4_nl_staged")]] kernel void mpp_staged_kernel<block_iq4_nl, Q4K_BK>(device bfloat*, device block_iq4_nl*, device bfloat*, constant MppQuantGemmParams&, uint2, uint);
-template [[host_name("mpp_gemm_iq4_xs_staged")]] kernel void mpp_staged_kernel<block_iq4_xs, Q4K_BK>(device bfloat*, device block_iq4_xs*, device bfloat*, constant MppQuantGemmParams&, uint2, uint);
-template [[host_name("mpp_gemm_iq3_s_staged")]] kernel void mpp_staged_kernel<block_iq3_s, Q4K_BK>(device bfloat*, device block_iq3_s*, device bfloat*, constant MppQuantGemmParams&, uint2, uint);
-
-kernel void mpp_gemm_q6k_staged(
-    device bfloat*      a       [[buffer(0)]],
-    device block_q6_K*  weight  [[buffer(1)]],
-    device bfloat*      d       [[buffer(2)]],
-    constant MppQuantGemmParams& p [[buffer(3)]],
-    uint2 tgid [[threadgroup_position_in_grid]],
-    uint  lid  [[thread_index_in_threadgroup]])
-{
-    threadgroup bfloat sB[2][Q6K_BK * Q4K_TN];
-    gemm_staged<block_q6_K, Q4K_TN, Q6K_BK>(a, weight, d, p, sB[0], sB[1], tgid, lid);
-}
+template [[host_name("mpp_gemm_q4_0_staged")]] kernel void mpp_staged_kernel<block_q4_0, Q4K_TM, Q4K_TN, Q4K_BK>(device bfloat*, device block_q4_0*, device bfloat*, constant MppQuantGemmParams&, uint2, uint);
+template [[host_name("mpp_gemm_q4_0_staged_128x32")]] kernel void mpp_staged_kernel<block_q4_0, 128, 32, Q4K_BK>(device bfloat*, device block_q4_0*, device bfloat*, constant MppQuantGemmParams&, uint2, uint);
+template [[host_name("mpp_gemm_q4_0_staged_64x32")]] kernel void mpp_staged_kernel<block_q4_0, 64, 32, Q4K_BK>(device bfloat*, device block_q4_0*, device bfloat*, constant MppQuantGemmParams&, uint2, uint);
+template [[host_name("mpp_gemm_q4_0_staged_32x32")]] kernel void mpp_staged_kernel<block_q4_0, 32, 32, Q4K_BK>(device bfloat*, device block_q4_0*, device bfloat*, constant MppQuantGemmParams&, uint2, uint);
+template [[host_name("mpp_gemm_q4_1_staged")]] kernel void mpp_staged_kernel<block_q4_1, Q4K_TM, Q4K_TN, Q4K_BK>(device bfloat*, device block_q4_1*, device bfloat*, constant MppQuantGemmParams&, uint2, uint);
+template [[host_name("mpp_gemm_q4_1_staged_128x32")]] kernel void mpp_staged_kernel<block_q4_1, 128, 32, Q4K_BK>(device bfloat*, device block_q4_1*, device bfloat*, constant MppQuantGemmParams&, uint2, uint);
+template [[host_name("mpp_gemm_q4_1_staged_64x32")]] kernel void mpp_staged_kernel<block_q4_1, 64, 32, Q4K_BK>(device bfloat*, device block_q4_1*, device bfloat*, constant MppQuantGemmParams&, uint2, uint);
+template [[host_name("mpp_gemm_q4_1_staged_32x32")]] kernel void mpp_staged_kernel<block_q4_1, 32, 32, Q4K_BK>(device bfloat*, device block_q4_1*, device bfloat*, constant MppQuantGemmParams&, uint2, uint);
+template [[host_name("mpp_gemm_q5_0_staged")]] kernel void mpp_staged_kernel<block_q5_0, Q4K_TM, Q4K_TN, Q4K_BK>(device bfloat*, device block_q5_0*, device bfloat*, constant MppQuantGemmParams&, uint2, uint);
+template [[host_name("mpp_gemm_q5_0_staged_128x32")]] kernel void mpp_staged_kernel<block_q5_0, 128, 32, Q4K_BK>(device bfloat*, device block_q5_0*, device bfloat*, constant MppQuantGemmParams&, uint2, uint);
+template [[host_name("mpp_gemm_q5_0_staged_64x32")]] kernel void mpp_staged_kernel<block_q5_0, 64, 32, Q4K_BK>(device bfloat*, device block_q5_0*, device bfloat*, constant MppQuantGemmParams&, uint2, uint);
+template [[host_name("mpp_gemm_q5_0_staged_32x32")]] kernel void mpp_staged_kernel<block_q5_0, 32, 32, Q4K_BK>(device bfloat*, device block_q5_0*, device bfloat*, constant MppQuantGemmParams&, uint2, uint);
+template [[host_name("mpp_gemm_q5_1_staged")]] kernel void mpp_staged_kernel<block_q5_1, Q4K_TM, Q4K_TN, Q4K_BK>(device bfloat*, device block_q5_1*, device bfloat*, constant MppQuantGemmParams&, uint2, uint);
+template [[host_name("mpp_gemm_q5_1_staged_128x32")]] kernel void mpp_staged_kernel<block_q5_1, 128, 32, Q4K_BK>(device bfloat*, device block_q5_1*, device bfloat*, constant MppQuantGemmParams&, uint2, uint);
+template [[host_name("mpp_gemm_q5_1_staged_64x32")]] kernel void mpp_staged_kernel<block_q5_1, 64, 32, Q4K_BK>(device bfloat*, device block_q5_1*, device bfloat*, constant MppQuantGemmParams&, uint2, uint);
+template [[host_name("mpp_gemm_q5_1_staged_32x32")]] kernel void mpp_staged_kernel<block_q5_1, 32, 32, Q4K_BK>(device bfloat*, device block_q5_1*, device bfloat*, constant MppQuantGemmParams&, uint2, uint);
+template [[host_name("mpp_gemm_q8_0_staged")]] kernel void mpp_staged_kernel<block_q8_0, Q4K_TM, Q4K_TN, Q4K_BK>(device bfloat*, device block_q8_0*, device bfloat*, constant MppQuantGemmParams&, uint2, uint);
+template [[host_name("mpp_gemm_q8_0_staged_128x32")]] kernel void mpp_staged_kernel<block_q8_0, 128, 32, Q4K_BK>(device bfloat*, device block_q8_0*, device bfloat*, constant MppQuantGemmParams&, uint2, uint);
+template [[host_name("mpp_gemm_q8_0_staged_64x32")]] kernel void mpp_staged_kernel<block_q8_0, 64, 32, Q4K_BK>(device bfloat*, device block_q8_0*, device bfloat*, constant MppQuantGemmParams&, uint2, uint);
+template [[host_name("mpp_gemm_q8_0_staged_32x32")]] kernel void mpp_staged_kernel<block_q8_0, 32, 32, Q4K_BK>(device bfloat*, device block_q8_0*, device bfloat*, constant MppQuantGemmParams&, uint2, uint);
+template [[host_name("mpp_gemm_q2k_staged")]] kernel void mpp_staged_kernel<block_q2_K, Q4K_TM, Q4K_TN, Q4K_BK>(device bfloat*, device block_q2_K*, device bfloat*, constant MppQuantGemmParams&, uint2, uint);
+template [[host_name("mpp_gemm_q2k_staged_128x32")]] kernel void mpp_staged_kernel<block_q2_K, 128, 32, Q4K_BK>(device bfloat*, device block_q2_K*, device bfloat*, constant MppQuantGemmParams&, uint2, uint);
+template [[host_name("mpp_gemm_q2k_staged_64x32")]] kernel void mpp_staged_kernel<block_q2_K, 64, 32, Q4K_BK>(device bfloat*, device block_q2_K*, device bfloat*, constant MppQuantGemmParams&, uint2, uint);
+template [[host_name("mpp_gemm_q2k_staged_32x32")]] kernel void mpp_staged_kernel<block_q2_K, 32, 32, Q4K_BK>(device bfloat*, device block_q2_K*, device bfloat*, constant MppQuantGemmParams&, uint2, uint);
+template [[host_name("mpp_gemm_q3k_staged")]] kernel void mpp_staged_kernel<block_q3_K, Q4K_TM, Q4K_TN, Q4K_BK>(device bfloat*, device block_q3_K*, device bfloat*, constant MppQuantGemmParams&, uint2, uint);
+template [[host_name("mpp_gemm_q3k_staged_128x32")]] kernel void mpp_staged_kernel<block_q3_K, 128, 32, Q4K_BK>(device bfloat*, device block_q3_K*, device bfloat*, constant MppQuantGemmParams&, uint2, uint);
+template [[host_name("mpp_gemm_q3k_staged_64x32")]] kernel void mpp_staged_kernel<block_q3_K, 64, 32, Q4K_BK>(device bfloat*, device block_q3_K*, device bfloat*, constant MppQuantGemmParams&, uint2, uint);
+template [[host_name("mpp_gemm_q3k_staged_32x32")]] kernel void mpp_staged_kernel<block_q3_K, 32, 32, Q4K_BK>(device bfloat*, device block_q3_K*, device bfloat*, constant MppQuantGemmParams&, uint2, uint);
+template [[host_name("mpp_gemm_q4k_staged")]] kernel void mpp_staged_kernel<block_q4_K, Q4K_TM, Q4K_TN, Q4K_BK>(device bfloat*, device block_q4_K*, device bfloat*, constant MppQuantGemmParams&, uint2, uint);
+template [[host_name("mpp_gemm_q4k_staged_128x32")]] kernel void mpp_staged_kernel<block_q4_K, 128, 32, Q4K_BK>(device bfloat*, device block_q4_K*, device bfloat*, constant MppQuantGemmParams&, uint2, uint);
+template [[host_name("mpp_gemm_q4k_staged_64x32")]] kernel void mpp_staged_kernel<block_q4_K, 64, 32, Q4K_BK>(device bfloat*, device block_q4_K*, device bfloat*, constant MppQuantGemmParams&, uint2, uint);
+template [[host_name("mpp_gemm_q4k_staged_32x32")]] kernel void mpp_staged_kernel<block_q4_K, 32, 32, Q4K_BK>(device bfloat*, device block_q4_K*, device bfloat*, constant MppQuantGemmParams&, uint2, uint);
+template [[host_name("mpp_gemm_q5k_staged")]] kernel void mpp_staged_kernel<block_q5_K, Q4K_TM, Q4K_TN, Q4K_BK>(device bfloat*, device block_q5_K*, device bfloat*, constant MppQuantGemmParams&, uint2, uint);
+template [[host_name("mpp_gemm_q5k_staged_128x32")]] kernel void mpp_staged_kernel<block_q5_K, 128, 32, Q4K_BK>(device bfloat*, device block_q5_K*, device bfloat*, constant MppQuantGemmParams&, uint2, uint);
+template [[host_name("mpp_gemm_q5k_staged_64x32")]] kernel void mpp_staged_kernel<block_q5_K, 64, 32, Q4K_BK>(device bfloat*, device block_q5_K*, device bfloat*, constant MppQuantGemmParams&, uint2, uint);
+template [[host_name("mpp_gemm_q5k_staged_32x32")]] kernel void mpp_staged_kernel<block_q5_K, 32, 32, Q4K_BK>(device bfloat*, device block_q5_K*, device bfloat*, constant MppQuantGemmParams&, uint2, uint);
+template [[host_name("mpp_gemm_q6k_staged")]] kernel void mpp_staged_kernel<block_q6_K, Q4K_TM, Q4K_TN, Q6K_BK>(device bfloat*, device block_q6_K*, device bfloat*, constant MppQuantGemmParams&, uint2, uint);
+template [[host_name("mpp_gemm_q6k_staged_128x32")]] kernel void mpp_staged_kernel<block_q6_K, 128, 32, Q6K_BK>(device bfloat*, device block_q6_K*, device bfloat*, constant MppQuantGemmParams&, uint2, uint);
+template [[host_name("mpp_gemm_q6k_staged_64x32")]] kernel void mpp_staged_kernel<block_q6_K, 64, 32, Q6K_BK>(device bfloat*, device block_q6_K*, device bfloat*, constant MppQuantGemmParams&, uint2, uint);
+template [[host_name("mpp_gemm_q6k_staged_32x32")]] kernel void mpp_staged_kernel<block_q6_K, 32, 32, Q6K_BK>(device bfloat*, device block_q6_K*, device bfloat*, constant MppQuantGemmParams&, uint2, uint);
+template [[host_name("mpp_gemm_iq4_nl_staged")]] kernel void mpp_staged_kernel<block_iq4_nl, Q4K_TM, Q4K_TN, Q4K_BK>(device bfloat*, device block_iq4_nl*, device bfloat*, constant MppQuantGemmParams&, uint2, uint);
+template [[host_name("mpp_gemm_iq4_nl_staged_128x32")]] kernel void mpp_staged_kernel<block_iq4_nl, 128, 32, Q4K_BK>(device bfloat*, device block_iq4_nl*, device bfloat*, constant MppQuantGemmParams&, uint2, uint);
+template [[host_name("mpp_gemm_iq4_nl_staged_64x32")]] kernel void mpp_staged_kernel<block_iq4_nl, 64, 32, Q4K_BK>(device bfloat*, device block_iq4_nl*, device bfloat*, constant MppQuantGemmParams&, uint2, uint);
+template [[host_name("mpp_gemm_iq4_nl_staged_32x32")]] kernel void mpp_staged_kernel<block_iq4_nl, 32, 32, Q4K_BK>(device bfloat*, device block_iq4_nl*, device bfloat*, constant MppQuantGemmParams&, uint2, uint);
+template [[host_name("mpp_gemm_iq4_xs_staged")]] kernel void mpp_staged_kernel<block_iq4_xs, Q4K_TM, Q4K_TN, Q4K_BK>(device bfloat*, device block_iq4_xs*, device bfloat*, constant MppQuantGemmParams&, uint2, uint);
+template [[host_name("mpp_gemm_iq4_xs_staged_128x32")]] kernel void mpp_staged_kernel<block_iq4_xs, 128, 32, Q4K_BK>(device bfloat*, device block_iq4_xs*, device bfloat*, constant MppQuantGemmParams&, uint2, uint);
+template [[host_name("mpp_gemm_iq4_xs_staged_64x32")]] kernel void mpp_staged_kernel<block_iq4_xs, 64, 32, Q4K_BK>(device bfloat*, device block_iq4_xs*, device bfloat*, constant MppQuantGemmParams&, uint2, uint);
+template [[host_name("mpp_gemm_iq4_xs_staged_32x32")]] kernel void mpp_staged_kernel<block_iq4_xs, 32, 32, Q4K_BK>(device bfloat*, device block_iq4_xs*, device bfloat*, constant MppQuantGemmParams&, uint2, uint);
+template [[host_name("mpp_gemm_iq3_s_staged")]] kernel void mpp_staged_kernel<block_iq3_s, Q4K_TM, Q4K_TN, Q4K_BK>(device bfloat*, device block_iq3_s*, device bfloat*, constant MppQuantGemmParams&, uint2, uint);
+template [[host_name("mpp_gemm_iq3_s_staged_128x32")]] kernel void mpp_staged_kernel<block_iq3_s, 128, 32, Q4K_BK>(device bfloat*, device block_iq3_s*, device bfloat*, constant MppQuantGemmParams&, uint2, uint);
+template [[host_name("mpp_gemm_iq3_s_staged_64x32")]] kernel void mpp_staged_kernel<block_iq3_s, 64, 32, Q4K_BK>(device bfloat*, device block_iq3_s*, device bfloat*, constant MppQuantGemmParams&, uint2, uint);
+template [[host_name("mpp_gemm_iq3_s_staged_32x32")]] kernel void mpp_staged_kernel<block_iq3_s, 32, 32, Q4K_BK>(device bfloat*, device block_iq3_s*, device bfloat*, constant MppQuantGemmParams&, uint2, uint);
 
 // Activation rows the matvec takes at once, and output rows per threadgroup.
 #define MV_MAX_M 8

@@ -262,7 +262,7 @@ pub fn start_server(args: StartServerArgs) -> anyhow::Result<()> {
         tracing::info!(method = "GET", endpoint = %metrics_endpoint, "Prometheus metrics endpoint");
         tracing::info!(
             keep_alive_s = keep_alive.as_secs(),
-            "models evicted after keep-alive timeout"
+            "idle models are evicted after the keep-alive"
         );
         match memory_budget_bytes {
             Some(b) => tracing::info!(

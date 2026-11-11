@@ -2731,12 +2731,11 @@ pub fn mpp_owned_kernels_available(device: &candle_metal_kernels::metal::Device)
     [WeightKind::Iq4Nl, WeightKind::Iq4Xs, WeightKind::Iq3S]
         .into_iter()
         .flat_map(|kind| {
-            [
-                Some(kind.staged_kernel()),
+            kind.staged_kernels().into_iter().map(Some).chain([
                 kind.matvec_kernel(false),
                 kind.matvec_kernel(true),
                 kind.gather_kernel(),
-            ]
+            ])
         })
         .flatten()
         .all(|name| get_or_compile_mpp_pipeline(device, name).is_ok())
@@ -2806,12 +2805,49 @@ struct MppGemmParams {
 /// match the kernel's tile constants.
 const MPP_GEMM_TILE: usize = 64;
 
-/// Rows of the activation and columns of the weight one threadgroup of the
-/// staged GEMM serves; must match `Q4K_TM` and `Q4K_TN` in the kernel source.
-/// The grid is derived from them, so a kernel retuned to another tile cannot
-/// leave rows or columns uncomputed.
-const MPP_STAGED_TM: usize = 128;
-const MPP_STAGED_TN: usize = 64;
+/// The tile of the staged GEMM, rows of the activation by columns of the
+/// weight one threadgroup serves, which the host picks by row count. The
+/// tile never touches the bits, since every tile reduces `k` in the same
+/// order (the row-invariance tests hold a row through each tile against
+/// the row alone), so the choice is speed alone: measured on the shapes of
+/// Qwen2.5-1.5B on 2026-10-30, the 32x32 tile serves sixteen rows in two
+/// fifths of the time of 128x64, whose matmul is mostly padding there, and
+/// 128x64 keeps the long prefills, where the 32-column tile loses on the
+/// narrow projections. The grid is derived from the tile, so a kernel
+/// retuned to another one cannot leave rows or columns uncomputed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StagedTile {
+    M128N64,
+    M128N32,
+    M64N32,
+    M32N32,
+}
+
+impl StagedTile {
+    fn for_rows(m: usize) -> Self {
+        match m {
+            0..=32 => Self::M32N32,
+            33..=64 => Self::M64N32,
+            65..=128 => Self::M128N32,
+            _ => Self::M128N64,
+        }
+    }
+
+    fn rows(self) -> usize {
+        match self {
+            Self::M128N64 | Self::M128N32 => 128,
+            Self::M64N32 => 64,
+            Self::M32N32 => 32,
+        }
+    }
+
+    fn cols(self) -> usize {
+        match self {
+            Self::M128N64 => 64,
+            _ => 32,
+        }
+    }
+}
 
 /// TensorOps BF16 GEMM `x [m, k] @ b [k, n]`, accepting `b` either
 /// contiguous (`nn` kernel) or as a transposed view with stride `[1, k]`
@@ -3059,23 +3095,94 @@ impl WeightKind {
         }
     }
 
-    /// The staged GEMM kernel that reads this kind at prefill.
-    fn staged_kernel(self) -> &'static str {
+    /// The staged GEMM kernels that read this kind at prefill, one per
+    /// [`StagedTile`] in the order of its variants.
+    fn staged_kernels(self) -> [&'static str; 4] {
         match self {
-            Self::Q4_0 => "mpp_gemm_q4_0_staged",
-            Self::Q4_1 => "mpp_gemm_q4_1_staged",
-            Self::Q5_0 => "mpp_gemm_q5_0_staged",
-            Self::Q5_1 => "mpp_gemm_q5_1_staged",
-            Self::Q8_0 => "mpp_gemm_q8_0_staged",
-            Self::Q2K => "mpp_gemm_q2k_staged",
-            Self::Q3K => "mpp_gemm_q3k_staged",
-            Self::Q4K => "mpp_gemm_q4k_staged",
-            Self::Q5K => "mpp_gemm_q5k_staged",
-            Self::Q6K => "mpp_gemm_q6k_staged",
-            Self::Iq4Nl => "mpp_gemm_iq4_nl_staged",
-            Self::Iq4Xs => "mpp_gemm_iq4_xs_staged",
-            Self::Iq3S => "mpp_gemm_iq3_s_staged",
+            Self::Q4_0 => [
+                "mpp_gemm_q4_0_staged",
+                "mpp_gemm_q4_0_staged_128x32",
+                "mpp_gemm_q4_0_staged_64x32",
+                "mpp_gemm_q4_0_staged_32x32",
+            ],
+            Self::Q4_1 => [
+                "mpp_gemm_q4_1_staged",
+                "mpp_gemm_q4_1_staged_128x32",
+                "mpp_gemm_q4_1_staged_64x32",
+                "mpp_gemm_q4_1_staged_32x32",
+            ],
+            Self::Q5_0 => [
+                "mpp_gemm_q5_0_staged",
+                "mpp_gemm_q5_0_staged_128x32",
+                "mpp_gemm_q5_0_staged_64x32",
+                "mpp_gemm_q5_0_staged_32x32",
+            ],
+            Self::Q5_1 => [
+                "mpp_gemm_q5_1_staged",
+                "mpp_gemm_q5_1_staged_128x32",
+                "mpp_gemm_q5_1_staged_64x32",
+                "mpp_gemm_q5_1_staged_32x32",
+            ],
+            Self::Q8_0 => [
+                "mpp_gemm_q8_0_staged",
+                "mpp_gemm_q8_0_staged_128x32",
+                "mpp_gemm_q8_0_staged_64x32",
+                "mpp_gemm_q8_0_staged_32x32",
+            ],
+            Self::Q2K => [
+                "mpp_gemm_q2k_staged",
+                "mpp_gemm_q2k_staged_128x32",
+                "mpp_gemm_q2k_staged_64x32",
+                "mpp_gemm_q2k_staged_32x32",
+            ],
+            Self::Q3K => [
+                "mpp_gemm_q3k_staged",
+                "mpp_gemm_q3k_staged_128x32",
+                "mpp_gemm_q3k_staged_64x32",
+                "mpp_gemm_q3k_staged_32x32",
+            ],
+            Self::Q4K => [
+                "mpp_gemm_q4k_staged",
+                "mpp_gemm_q4k_staged_128x32",
+                "mpp_gemm_q4k_staged_64x32",
+                "mpp_gemm_q4k_staged_32x32",
+            ],
+            Self::Q5K => [
+                "mpp_gemm_q5k_staged",
+                "mpp_gemm_q5k_staged_128x32",
+                "mpp_gemm_q5k_staged_64x32",
+                "mpp_gemm_q5k_staged_32x32",
+            ],
+            Self::Q6K => [
+                "mpp_gemm_q6k_staged",
+                "mpp_gemm_q6k_staged_128x32",
+                "mpp_gemm_q6k_staged_64x32",
+                "mpp_gemm_q6k_staged_32x32",
+            ],
+            Self::Iq4Nl => [
+                "mpp_gemm_iq4_nl_staged",
+                "mpp_gemm_iq4_nl_staged_128x32",
+                "mpp_gemm_iq4_nl_staged_64x32",
+                "mpp_gemm_iq4_nl_staged_32x32",
+            ],
+            Self::Iq4Xs => [
+                "mpp_gemm_iq4_xs_staged",
+                "mpp_gemm_iq4_xs_staged_128x32",
+                "mpp_gemm_iq4_xs_staged_64x32",
+                "mpp_gemm_iq4_xs_staged_32x32",
+            ],
+            Self::Iq3S => [
+                "mpp_gemm_iq3_s_staged",
+                "mpp_gemm_iq3_s_staged_128x32",
+                "mpp_gemm_iq3_s_staged_64x32",
+                "mpp_gemm_iq3_s_staged_32x32",
+            ],
         }
+    }
+
+    /// The staged GEMM kernel that reads this kind at prefill in `tile`.
+    fn staged_kernel(self, tile: StagedTile) -> &'static str {
+        self.staged_kernels()[tile as usize]
     }
 
     /// The kernel that multiplies one activation row, or a batch of up to
@@ -3201,31 +3308,8 @@ impl StagedWeight {
         out
     }
 
-    fn kernel(&self) -> &'static str {
-        self.kind.staged_kernel()
-    }
-
-    /// The batch size from which the staged kernel beats candle's quantized
-    /// matmul on this block type, measured by `staged_quant_crossover_probe`
-    /// on the shapes of the reference checkpoint.
-    ///
-    /// The kernel stages the whole weight once per 128-row tile of the batch,
-    /// so its cost is flat from M=32 to M=128 and the crossover is where
-    /// candle's cost, linear in M, climbs past it. The four-bit and five-bit
-    /// blocks of 32, and Q4_K with its word-wise stager, are level with candle
-    /// at 64 and 1.8-2.0x ahead from 128; the rest cost more to unpack per
-    /// tile and leave candle a few percent ahead at 64, so they wait for 128.
-    /// A kind candle cannot serve has the owned matvec below this and nothing
-    /// else, so it hands over as soon as the matvec's rows run out.
-    fn min_m(&self) -> usize {
-        match self.kind {
-            WeightKind::Q4_0 | WeightKind::Q4_1 | WeightKind::Q5_0 | WeightKind::Q5_1 => {
-                MPP_GEMM_MIN_M
-            }
-            WeightKind::Q4K => MPP_GEMM_MIN_M,
-            WeightKind::Iq4Nl | WeightKind::Iq4Xs | WeightKind::Iq3S => MPP_MATVEC_MAX_M + 1,
-            _ => 128,
-        }
+    fn kernel(&self, tile: StagedTile) -> &'static str {
+        self.kind.staged_kernel(tile)
     }
 }
 
@@ -3269,7 +3353,8 @@ impl CustomOp1 for MppStagedMatmul {
             group_shift: 0,
         };
 
-        let pipeline = get_or_compile_mpp_pipeline(device.device(), self.weight.kernel())?;
+        let tile = StagedTile::for_rows(m);
+        let pipeline = get_or_compile_mpp_pipeline(device.device(), self.weight.kernel(tile))?;
         let encoder = device.command_encoder()?;
         let encoder = encoder.as_ref();
         encoder.set_compute_pipeline_state(&pipeline);
@@ -3280,8 +3365,8 @@ impl CustomOp1 for MppStagedMatmul {
 
         encoder.dispatch_thread_groups(
             MTLSize {
-                width: n.div_ceil(MPP_STAGED_TN),
-                height: m.div_ceil(MPP_STAGED_TM),
+                width: n.div_ceil(tile.cols()),
+                height: m.div_ceil(tile.rows()),
                 depth: 1,
             },
             MTLSize {
@@ -3322,8 +3407,10 @@ pub fn mpp_staged_matmul(x: &Tensor, weight: &StagedWeight) -> Result<Tensor> {
 /// cached prefix gets the logits it gets alone, except the vocabulary
 /// projection of up to eight rows, which takes the gemv for its F32 logits.
 /// Outside the engine the row count alone decides: the gemv up to
-/// [`GGUF_BATCH_MAX`], the staged GEMM from [`StagedWeight::min_m`] rows,
-/// measured per block type, and candle's tiled GEMM between the two.
+/// [`GGUF_BATCH_MAX`] and the staged GEMM above it, which in its 32-row tile
+/// beats candle's quantized matmul from nine rows on every block type
+/// (measured 2026-10-30), except the F32 logits of more rows than the gemv
+/// takes, which keep candle's matmul since the staged GEMM stores BF16.
 pub fn maybe_staged_quant_matmul(
     x: &Tensor,
     weight: &StagedWeight,
@@ -3351,7 +3438,7 @@ pub fn maybe_staged_quant_matmul(
             })
             .map(Some);
     }
-    if dims[0] < weight.min_m() && !prefill {
+    if !prefill && (dims[0] <= GGUF_BATCH_MAX || out_dtype == DType::F32) {
         return Ok(None);
     }
     if !mpp_gemm_available(md.device()) {
@@ -3757,7 +3844,7 @@ pub fn mpp_owned_matmul(x: &Tensor, weight: &StagedWeight) -> Result<Tensor> {
         x.contiguous()?
     };
     let prefill = crate::common::phase::current() == Some(crate::common::phase::Phase::Prefill);
-    if x.dim(0)? < weight.min_m() && !prefill {
+    if x.dim(0)? <= MPP_MATVEC_MAX_M && !prefill {
         x.apply_op1_no_bwd(&MppOwnedMatvec {
             weight: weight.clone(),
         })
@@ -8876,6 +8963,126 @@ mod gguf_matvec_tests {
         }
     }
 
+    /// Kernel time of the crate's gemv at one and eight rows, of the staged
+    /// GEMM and of candle's quantized matmul at the row counts a short prompt
+    /// prefills, on the shapes of Qwen2.5-1.5B (findings 7 and 8 of the
+    /// October 2026 audit). With `GGUF_PROBE_BITS=write` the staged output
+    /// bits go to `/tmp/staged_bits_<kind>_<n>x<k>.bin`; with `=check` they
+    /// are compared against those files.
+    #[test]
+    #[ignore = "perf probe (requires macOS 26 / Metal 4)"]
+    fn gguf_kernel_time_probe() {
+        use candle_core::Module;
+        use candle_core::quantized::QMatMul;
+        use std::time::Instant;
+        let Ok(dev) = Device::new_metal(0) else {
+            return;
+        };
+        let mode = std::env::var("GGUF_PROBE_BITS").unwrap_or_default();
+        let time = |f: &dyn Fn() -> Tensor| -> f64 {
+            for _ in 0..5 {
+                f().to_device(&Device::Cpu).unwrap();
+            }
+            let iters = 50;
+            let t = Instant::now();
+            let mut sink = Vec::with_capacity(iters);
+            for _ in 0..iters {
+                sink.push(f());
+            }
+            sink.last().unwrap().to_device(&Device::Cpu).unwrap();
+            t.elapsed().as_secs_f64() / iters as f64
+        };
+        let mut rows = Vec::new();
+        for (dtype, _) in KINDS {
+            for (n, k) in [(8960usize, 1536usize), (1536, 8960), (1536, 1536)] {
+                let w: Vec<f32> = (0..n * k)
+                    .map(|i| {
+                        let h = (i as u64).wrapping_mul(2654435761).wrapping_add(7) % 97;
+                        (h as f32 - 48.0) * 0.02
+                    })
+                    .collect();
+                let bytes =
+                    QTensor::quantize(&Tensor::from_vec(w, (n, k), &Device::Cpu).unwrap(), dtype)
+                        .unwrap()
+                        .data()
+                        .unwrap()
+                        .into_owned();
+                let (qt, staged) = crate::common::gguf_weights::qtensor_with_staged(
+                    dtype,
+                    &bytes,
+                    vec![n, k],
+                    &dev,
+                )
+                .unwrap();
+                let candle = QMatMul::from_arc(std::sync::Arc::new(qt)).unwrap();
+                rows.push((dtype, n, k, bytes.len() as f64, staged.unwrap(), candle));
+            }
+        }
+        let spin = activations(GGUF_BATCH_MAX, rows[0].2)
+            .to_device(&dev)
+            .unwrap();
+        let t = Instant::now();
+        while t.elapsed().as_millis() < 400 {
+            maybe_staged_quant_matmul(&spin, &rows[0].4, DType::BF16)
+                .unwrap()
+                .unwrap()
+                .to_device(&Device::Cpu)
+                .unwrap();
+        }
+        for (dtype, n, k, weight_bytes, staged, candle) in &rows {
+            let (n, k, weight_bytes) = (*n, *k, *weight_bytes);
+            let mut line = format!("{dtype:?} [{n}x{k}]");
+            for m in [1usize, 4, GGUF_BATCH_MAX] {
+                let x = activations(m, k).to_device(&dev).unwrap();
+                let run = || {
+                    maybe_staged_quant_matmul(&x, staged, DType::BF16)
+                        .unwrap()
+                        .unwrap()
+                };
+                let t = time(&run).min(time(&run));
+                line += &format!(
+                    "  gemv{m}: {:6.1} us {:4.0} GB/s",
+                    t * 1e6,
+                    weight_bytes / t / 1e9
+                );
+                let path = format!("/tmp/gemv_bits_{dtype:?}_{n}x{k}_m{m}.bin");
+                let got: Vec<u8> = bits(&run()).iter().flat_map(|b| b.to_le_bytes()).collect();
+                if mode == "write" {
+                    std::fs::write(&path, &got).unwrap();
+                } else if mode == "check" {
+                    let same = std::fs::read(&path).map(|r| r == got).unwrap_or(false);
+                    line += if same { " same" } else { " DIFFER" };
+                }
+            }
+            for m in [16usize, 32, 128, 512] {
+                let x = activations(m, k).to_device(&dev).unwrap();
+                if m <= 32 {
+                    let x32 = x.to_dtype(DType::F32).unwrap();
+                    let run = || candle.forward(&x32).unwrap();
+                    let t = time(&run).min(time(&run));
+                    line += &format!("  candle{m}: {:6.1} us", t * 1e6);
+                }
+                if let Ok(out) = mpp_staged_matmul(&x, staged) {
+                    let run = || mpp_staged_matmul(&x, staged).unwrap();
+                    let t = time(&run).min(time(&run));
+                    line += &format!("  staged{m}: {:6.1} us", t * 1e6);
+                    if m == 16 {
+                        let path = format!("/tmp/staged_bits_{dtype:?}_{n}x{k}.bin");
+                        let got: Vec<u8> =
+                            bits(&out).iter().flat_map(|b| b.to_le_bytes()).collect();
+                        if mode == "write" {
+                            std::fs::write(&path, &got).unwrap();
+                        } else if mode == "check" {
+                            let same = std::fs::read(&path).map(|r| r == got).unwrap_or(false);
+                            line += if same { "  bits=same" } else { "  bits=DIFFER" };
+                        }
+                    }
+                }
+            }
+            println!("{line}");
+        }
+    }
+
     /// Contract: a batch of rows gives, row by row, the bits the single-row
     /// kernel gives, for every kind and every batch size up to the kernels'
     /// eight, so a token decoded beside others gets the logits it gets alone.
@@ -8913,20 +9120,28 @@ mod gguf_matvec_tests {
         );
     }
 
-    /// Contract: more rows than the batch kernels take go to candle's tiled
-    /// GEMM below the staged GEMM's floor.
+    /// Contract: more rows than the batch kernels take go to the staged
+    /// GEMM, in BF16, and the F32 logits of that many rows stay with
+    /// candle's matmul.
     #[test]
-    fn more_rows_than_the_batch_kernels_take_still_go_to_candle() {
+    fn more_rows_than_the_batch_kernels_take_go_to_the_staged_gemm() {
         let Ok(dev) = Device::new_metal(0) else {
             return;
         };
         let Device::Metal(md) = &dev else {
             return;
         };
+        if !mpp_gemm_available(md.device()) {
+            return;
+        }
         let (staged, _) = weight(md, GgmlDType::Q4K, WeightKind::Q4K, 64, 512);
         let x = Tensor::zeros((GGUF_BATCH_MAX + 1, 512), DType::BF16, &dev).unwrap();
+        let out = maybe_staged_quant_matmul(&x, &staged, DType::BF16)
+            .unwrap()
+            .expect("nine rows take the staged GEMM");
+        assert_eq!(out.dtype(), DType::BF16);
         assert!(
-            maybe_staged_quant_matmul(&x, &staged, DType::BF16)
+            maybe_staged_quant_matmul(&x, &staged, DType::F32)
                 .unwrap()
                 .is_none()
         );
@@ -8976,8 +9191,9 @@ mod row_invariance_tests {
 
     /// Contract: the TensorOps GEMM over a staged quantized weight gives a
     /// row the same bits whatever rows share the forward, from one row to a
-    /// prefill's worth, which is what lets a prompt prefilled beside others,
-    /// or behind a cached prefix, get the logits it gets alone.
+    /// prefill's worth and through each of the tiles the host picks by row
+    /// count, which is what lets a prompt prefilled beside others, or behind
+    /// a cached prefix, get the logits it gets alone.
     #[test]
     fn the_staged_gemm_gives_a_row_the_same_bits_in_any_batch() {
         let Ok(dev) = Device::new_metal(0) else {
@@ -9013,7 +9229,7 @@ mod row_invariance_tests {
                     &[n, k],
                 )
                 .unwrap();
-                for m in [1usize, 4, 60, 100] {
+                for m in [1usize, 4, 33, 60, 100, 200] {
                     let x = activations(m, k, &dev);
                     let batched = mpp_staged_matmul(&x, &staged).unwrap();
                     let bad = differing_rows(&batched, &x, |row| {

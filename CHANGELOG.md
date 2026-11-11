@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## Unreleased
+## 0.1.1 (2026-11-11)
 
 A patch for the two performance regressions the 0.1.0 determinism work left on GGUF checkpoints, found to be something else once measured at the kernel. The prefill of a short prompt went through the staged TensorOps GEMM in a tile sized for long prompts; the tile does not touch the bits, so the host now picks it by row count and the first token of an 8-word prompt arrives in half the time. The decode gemv kernels converted the activations once per output row; converting them once per block, with every output's arithmetic untouched, gives the same bits as 0.1.0 on every checkpoint on disk and more tokens per second, most of all when several sequences decode together.
 

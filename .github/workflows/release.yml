@@ -101,6 +101,8 @@ jobs:
               echo "::warning::No changelog entry found for ${VERSION} in CHANGELOG.md."
               BODY="_No changelog entry for \`${VERSION}\` in CHANGELOG.md._"
             fi
+            # The section's subsections read as second-level headings on GitHub.
+            BODY=$(printf '%s\n' "$BODY" | sed 's/^### /## /')
           fi
 
           # Hand the multi-line body to subsequent steps via $GITHUB_OUTPUT

@@ -16,6 +16,10 @@ A patch for the two performance regressions the 0.1.0 determinism work left on G
 
 - The startup log line that named the keep-alive read as if models had just been evicted; it reads as the setting it is.
 
+### Build and Tooling
+
+- The audit passes over the fourth zip extraction advisory (RUSTSEC-2026-0429) for the reason it passes over the first three: the crate is reached only through candle's npz reader, which this server never calls.
+
 ### Tests
 
 - `gguf_kernel_time_probe` (ignored): kernel time of the gemv at one, four and eight rows, of the staged GEMM and of candle's matmul at the row counts a short prompt prefills, on the Qwen2.5-1.5B shapes, with `GGUF_PROBE_BITS=write|check` to record and compare the output bits across kernel changes.

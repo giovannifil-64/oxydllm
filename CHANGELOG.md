@@ -18,6 +18,7 @@ A patch for the two performance regressions the 0.1.0 determinism work left on G
 
 ### Build and Tooling
 
+- The macOS release asset builds on the `macos-26` runner, the image the checks already run on, since GitHub retired `macos-14` under the first 0.1.1 release run and cancelled its build.
 - The audit passes over the fourth zip extraction advisory (RUSTSEC-2026-0429) for the reason it passes over the first three: the crate is reached only through candle's npz reader, which this server never calls.
 
 ### Tests

@@ -22,6 +22,12 @@ impl GgufVariant {
     fn total_size(&self) -> u64 {
         self.files.iter().map(|(_, s)| s).sum()
     }
+    /// The quantization the label names, without the publisher's prefix a
+    /// shared label is told apart by.
+    fn quant(&self) -> String {
+        crate::models::estimate::extract_quant_from_filename(&self.quant_name)
+            .unwrap_or_else(|| self.quant_name.clone())
+    }
     fn is_split(&self) -> bool {
         self.files.len() > 1
             || self
@@ -122,15 +128,58 @@ fn group_gguf_variants(gguf_files: &[(String, u64)]) -> Vec<GgufVariant> {
         }
     }
 
-    groups
+    let mut variants: Vec<(String, GgufVariant)> = groups
         .into_iter()
         .map(|(key, mut files)| {
             files.sort_by_key(|(f, _)| f.clone());
             let quant_name = crate::models::estimate::extract_quant_from_filename(&key)
                 .unwrap_or_else(|| key.clone());
-            GgufVariant { quant_name, files }
+            (key, GgufVariant { quant_name, files })
         })
-        .collect()
+        .collect();
+    tell_shared_labels_apart(&mut variants);
+    variants.into_iter().map(|(_, v)| v).collect()
+}
+
+/// Renames the variants that share a quantization label after what differs in
+/// their file names.
+///
+/// Publishers ship two builds of one quantization side by side, as
+/// `X-Q4_K_M.gguf` and `X-UD-Q4_K_M.gguf`, and a label that stops at the
+/// quantization made `--variant Q4_K_M` take whichever the listing named first.
+/// The leading name segments the group has in common are dropped and the rest
+/// is the label, so the two become `Q4_K_M` and `UD-Q4_K_M` and each can be
+/// asked for.
+fn tell_shared_labels_apart(variants: &mut [(String, GgufVariant)]) {
+    let labels: Vec<String> = variants
+        .iter()
+        .map(|(_, v)| v.quant_name.to_uppercase())
+        .collect();
+    for label in &labels {
+        let group: Vec<usize> = (0..variants.len())
+            .filter(|&i| variants[i].1.quant_name.eq_ignore_ascii_case(label))
+            .collect();
+        if group.len() < 2 {
+            continue;
+        }
+        let names: Vec<Vec<&str>> = group
+            .iter()
+            .map(|&i| {
+                let key = variants[i].0.as_str();
+                key.rsplit('/').next().unwrap_or(key).split('-').collect()
+            })
+            .collect();
+        let shortest = names.iter().map(Vec::len).min().unwrap_or(0);
+        let common = (0..shortest.saturating_sub(1))
+            .take_while(|&s| names.iter().all(|n| n[s] == names[0][s]))
+            .count();
+        let renamed: Vec<String> = names.iter().map(|n| n[common..].join("-")).collect();
+        for (&i, name) in group.iter().zip(renamed) {
+            if !name.eq_ignore_ascii_case(label) {
+                variants[i].1.quant_name = name;
+            }
+        }
+    }
 }
 
 fn select_variant<'a>(
@@ -174,7 +223,7 @@ fn select_variant<'a>(
                 "    \u{2713} {:<16}  {:>10}  {}",
                 v.quant_name,
                 fmt_size_f(v.total_size()),
-                crate::models::estimate::quant_accuracy_str(&v.quant_name),
+                crate::models::estimate::quant_accuracy_str(&v.quant()),
             );
         }
         println!();
@@ -211,7 +260,7 @@ fn select_variant<'a>(
             v.quant_name,
             fmt_size_f(v.total_size()),
             files_label,
-            crate::models::estimate::quant_accuracy_str(&v.quant_name),
+            crate::models::estimate::quant_accuracy_str(&v.quant()),
             star,
         );
     }
@@ -251,13 +300,13 @@ fn select_variant<'a>(
 fn best_variant_idx(variants: &[&GgufVariant]) -> Option<usize> {
     if let Some(i) = variants
         .iter()
-        .position(|v| v.quant_name.eq_ignore_ascii_case("Q4_K_M"))
+        .position(|v| v.quant().eq_ignore_ascii_case("Q4_K_M"))
     {
         return Some(i);
     }
     variants.iter().position(|v| {
         matches!(
-            v.quant_name.to_uppercase().as_str(),
+            v.quant().to_uppercase().as_str(),
             "Q4_K_S" | "Q4_K" | "Q4_0" | "Q4_1" | "IQ4_NL" | "IQ4_XS" | "Q5_K_M"
         )
     })
@@ -1087,6 +1136,48 @@ mod tests {
             .collect();
         names.sort();
         assert_eq!(names, ["Q6_K", "Q6_K_M", "Q6_K_XL", "Q8_K_XL"]);
+    }
+
+    /// Contract: two builds of one quantization are two variants with two
+    /// names, so `--variant` reaches either and never the first by accident.
+    #[test]
+    fn builds_sharing_a_quant_label_are_told_apart() {
+        let files = vec![
+            ("X-27B-UD-Q4_K_M.gguf".to_string(), 2u64),
+            ("X-27B-Q4_K_M.gguf".to_string(), 1u64),
+            ("X-27B-Q8_0.gguf".to_string(), 3u64),
+        ];
+        let variants = group_gguf_variants(&files);
+        let names: Vec<&str> = variants.iter().map(|v| v.quant_name.as_str()).collect();
+        assert_eq!(names, ["UD-Q4_K_M", "Q4_K_M", "Q8_0"]);
+
+        let none = std::collections::HashSet::new();
+        let plain = select_variant(&variants, Some("q4_k_m"), &none).unwrap();
+        assert_eq!(plain.files[0].0, "X-27B-Q4_K_M.gguf");
+        let ud = select_variant(&variants, Some("UD-Q4_K_M"), &none).unwrap();
+        assert_eq!(ud.files[0].0, "X-27B-UD-Q4_K_M.gguf");
+        assert_eq!(ud.quant(), "Q4_K_M");
+    }
+
+    /// Contract: when no build carries the bare label, asking for it names the
+    /// choices instead of taking one.
+    #[test]
+    fn a_bare_label_two_prefixed_builds_share_selects_neither() {
+        let files = vec![
+            ("X-UD-Q4_K_M-00001-of-00002.gguf".to_string(), 2u64),
+            ("X-UD-Q4_K_M-00002-of-00002.gguf".to_string(), 2u64),
+            ("X-i1-Q4_K_M.gguf".to_string(), 1u64),
+        ];
+        let variants = group_gguf_variants(&files);
+        let none = std::collections::HashSet::new();
+        let err = select_variant(&variants, Some("Q4_K_M"), &none)
+            .err()
+            .expect("ambiguous label")
+            .to_string();
+        assert!(
+            err.contains("UD-Q4_K_M") && err.contains("i1-Q4_K_M"),
+            "{err}"
+        );
     }
 
     #[test]

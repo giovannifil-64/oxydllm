@@ -310,6 +310,9 @@ impl ForwardChunk {
 /// come first and the decode sequences from `split_at` on, and no chunk holds
 /// both: a forward is either a prefill or a decode step, since the kernels
 /// are chosen by that phase (see [`crate::common::phase`]).
+///
+/// A prompt is cut only [`SPLIT_GRID`] tokens or a multiple of it into its own
+/// tokens, so where the cuts fall does not depend on what else is in the batch.
 struct ChunkPlanner<'a> {
     counts: &'a [usize],
     split_at: usize,
@@ -317,6 +320,16 @@ struct ChunkPlanner<'a> {
     done_in_seq: usize,
     start: usize,
 }
+
+/// Tokens between the places a prompt may be cut across forwards.
+///
+/// The linear-attention layers of the hybrid models scan a forward's tokens
+/// in blocks of this many counted from the forward's first, and the blocks are
+/// the same algebra at any offset but not the same bits. Alone, a prompt is
+/// cut at multiples of the cap, which this divides; in a batch the room left
+/// by the sequences ahead of it used to decide, and the same prompt answered
+/// differently beside five others than by itself.
+const SPLIT_GRID: usize = crate::common::gdn::CHUNK_SIZE;
 
 impl<'a> ChunkPlanner<'a> {
     fn new(counts: &'a [usize], split_at: usize) -> Self {
@@ -348,7 +361,16 @@ impl<'a> ChunkPlanner<'a> {
             if self.seq == self.split_at && !counts.is_empty() {
                 break;
             }
-            let take = (self.counts[self.seq] - self.done_in_seq).min(room);
+            let left = self.counts[self.seq] - self.done_in_seq;
+            let mut take = left.min(room);
+            if take < left {
+                let on_grid = (self.done_in_seq + take) / SPLIT_GRID * SPLIT_GRID;
+                if on_grid > self.done_in_seq {
+                    take = on_grid - self.done_in_seq;
+                } else if !counts.is_empty() {
+                    break;
+                }
+            }
             counts.push(take);
             room -= take;
             self.done_in_seq += take;
@@ -1267,6 +1289,43 @@ mod tests {
                 .wrapping_mul(6364136223846793005)
                 .wrapping_add(1442695040888963407);
             lo + ((self.0 >> 33) as usize) % (hi - lo + 1)
+        }
+    }
+
+    /// Contract: a prompt is cut at the same places whatever shares its batch,
+    /// and those places are multiples of [`SPLIT_GRID`] into the prompt.
+    ///
+    /// A layer that scans a forward in blocks gives a cut prompt bits that
+    /// depend on where the cuts fall, so a prompt cut where the sequences
+    /// ahead of it happened to leave room answered differently in a batch
+    /// than alone. Holds for any cap of at least one grid step, which is every
+    /// cap but the two smallest a failing device can be walked down to.
+    #[test]
+    fn a_prompt_is_cut_on_the_grid_whatever_shares_the_batch() {
+        for seed in 0u64..256 {
+            let mut rng = Rng::new(seed);
+            let cap = SPLIT_GRID * rng.between(1, 16);
+            let counts: Vec<usize> = (0..rng.between(1, 8))
+                .map(|_| rng.between(1, 3000))
+                .collect();
+            let mut done = vec![0usize; counts.len()];
+            for chunk in plan_forward_chunks(&counts, cap) {
+                assert!(
+                    chunk.len() <= cap && !chunk.counts.is_empty(),
+                    "seed {seed}"
+                );
+                for (i, &n) in chunk.counts.iter().enumerate() {
+                    let seq = chunk.seq_base + i;
+                    done[seq] += n;
+                    assert!(
+                        done[seq] == counts[seq] || done[seq].is_multiple_of(SPLIT_GRID),
+                        "seed {seed}: sequence {seq} of {} tokens cut at {}",
+                        counts[seq],
+                        done[seq]
+                    );
+                }
+            }
+            assert_eq!(done, counts, "seed {seed}");
         }
     }
 

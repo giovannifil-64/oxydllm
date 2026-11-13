@@ -29,7 +29,7 @@ use candle_core::{D, DType, Result, Tensor};
 /// reference. The blocked recurrence is algebraically the same at any chunk
 /// size but not numerically, so this is not a tuning knob: changing it moves
 /// the output without telling anyone.
-const CHUNK_SIZE: usize = 64;
+pub(crate) const CHUNK_SIZE: usize = 64;
 /// Base size for the blocked triangular inversion, see `invert_unit_lower`.
 const INVERT_BLOCK: usize = 16;
 const L2_NORM_EPS: f64 = 1e-6;

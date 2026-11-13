@@ -131,6 +131,46 @@ fn truncate_kv_window(
     }
 }
 
+/// Trims what a windowed cache holds so that its first token sits on a
+/// multiple of [`WINDOW_GRID`](super::paged::WINDOW_GRID) in the sequence, for
+/// the prefill kernels.
+///
+/// Those kernels fold the keys into the running softmax a tile at a time,
+/// counting tiles from the first key they are handed, and the bits of a row
+/// depend on where the tiles fall. A layer without a window always hands over
+/// the sequence from its first token. A windowed one hands over what its
+/// buffer holds, which starts wherever the last compaction left it, so the
+/// same prompt gave different logits prefilled in one chunk, in several, or
+/// beside other sequences. With the start on the grid a row reads the same
+/// tiles in every case; the tiles before its window are skipped or wholly
+/// masked, which adds nothing.
+///
+/// `held` tokens end at the sequence's `total`; the forward's `num_tokens`
+/// queries are its last. Returns `None` when no start on the grid still covers
+/// the oldest query's window, which the cache's margin rules out.
+#[cfg(feature = "metal")]
+fn grid_aligned_window(
+    k: &candle_core::Tensor,
+    v: &candle_core::Tensor,
+    held: usize,
+    total: usize,
+    window: usize,
+    num_tokens: usize,
+) -> Result<Option<(candle_core::Tensor, candle_core::Tensor, usize)>> {
+    let grid = super::paged::WINDOW_GRID;
+    let first_held = total - held;
+    let cut = (grid - first_held % grid) % grid;
+    let oldest_read = (total + 1 - num_tokens).saturating_sub(window);
+    if first_held + cut > oldest_read {
+        return Ok(None);
+    }
+    Ok(Some((
+        k.narrow(2, cut, held - cut)?,
+        v.narrow(2, cut, held - cut)?,
+        held - cut,
+    )))
+}
+
 fn compute_sliding_window(cfg: &BlockConfig) -> Option<usize> {
     cfg.sliding_window
 }
@@ -862,6 +902,18 @@ impl Attention {
             if use_metal_fa {
                 #[cfg(feature = "metal")]
                 {
+                    let on_grid = match self.sliding_window {
+                        Some(w) => grid_aligned_window(
+                            &k_parts[i],
+                            &v_parts[i],
+                            kv_lengths[i],
+                            seg.cache.num_tokens(),
+                            w,
+                            seg.num_tokens,
+                        )?,
+                        None => None,
+                    };
+                    let (k_seg, v_seg, kv_len) = on_grid.unwrap_or((k_seg, v_seg, kv_len));
                     let prefix_len = kv_len - seg.num_tokens;
                     let seg_out = super::metal_ops::flash_attention_metal_prefill(
                         &q_seg.contiguous()?,
@@ -1100,6 +1152,37 @@ mod tests {
     fn compute_sliding_window_keeps_standard_setting() {
         let cfg = test_block_cfg(NormType::Standard, Some(256));
         assert_eq!(compute_sliding_window(&cfg), Some(256));
+    }
+
+    /// Contract: what a windowed layer hands the prefill kernel starts on the
+    /// grid and still reaches the oldest query's window, for a sequence the
+    /// buffer holds whole and for one it has slid along.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn a_windowed_layer_hands_over_keys_that_start_on_the_grid() -> Result<()> {
+        let grid = crate::common::paged::WINDOW_GRID;
+        let window = 512;
+        for (held, total, num_tokens) in [
+            (300usize, 300usize, 300usize),
+            (1262, 1262, 750),
+            (512 + 144, 1262, 1),
+            (512 + 237 + 144, 1262, 238),
+            (512 + 127, 1262, 1),
+        ] {
+            let (k, v) = make_kv_tensors(held, 4)?;
+            let (k, _, len) = grid_aligned_window(&k, &v, held, total, window, num_tokens)?
+                .expect("the margin leaves a start on the grid");
+            let first = total - len;
+            assert_eq!(first % grid, 0, "held {held} of {total}");
+            assert_eq!(k.dim(2)?, len);
+            assert!(
+                first <= (total + 1 - num_tokens).saturating_sub(window),
+                "held {held} of {total}: the oldest window is cut"
+            );
+        }
+        let (k, v) = make_kv_tensors(512 + 10, 4)?;
+        assert!(grid_aligned_window(&k, &v, 522, 1262, window, 1)?.is_none());
+        Ok(())
     }
 
     #[test]

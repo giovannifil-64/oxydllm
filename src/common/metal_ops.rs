@@ -5303,6 +5303,89 @@ mod fused_kernel_parity_tests {
     /// tolerance at all and a single wrongly masked token fails it. The shapes
     /// cover both kernels: BF16 at 64/128/256 goes to the TensorOps path, F32
     /// and 512 to the tiled one.
+    /// Contract: under a window, a row's bits do not depend on how many rows
+    /// run with it nor on how far back the keys handed over reach, as long as
+    /// they start on the same tile grid.
+    ///
+    /// This is what lets a windowed model answer the same in one chunk, in
+    /// several, from the cache and inside a batch. The last row of a
+    /// 1262-token sequence is computed alone and among 20, 238 and 750 rows,
+    /// over keys starting 0, 128, 512 and 640 tokens in. A start off the grid
+    /// is the case the caller must not produce: at 256-wide BF16 heads it
+    /// moved 23 of 1024 values.
+    #[test]
+    fn a_windowed_row_is_the_same_in_any_chunk_on_the_grid() {
+        let Some(dev) = metal_device_or_skip() else {
+            return;
+        };
+        let (total, window) = (1262usize, 512usize);
+        for (dtype, d, h, h_kv) in [
+            (DType::BF16, 256usize, 4usize, 1usize),
+            (DType::BF16, 64, 4, 2),
+            (DType::BF16, 128, 4, 4),
+            (DType::F32, 128, 2, 1),
+            (DType::BF16, 512, 2, 1),
+        ] {
+            let mkt = |n: usize, salt: u64, shape: (usize, usize, usize, usize)| {
+                let data: Vec<f32> = (0..n)
+                    .map(|i| {
+                        let x = (i as u64).wrapping_mul(2654435761).wrapping_add(salt * 977) % 1009;
+                        (x as f32 - 504.0) * 0.004
+                    })
+                    .collect();
+                Tensor::from_vec(data, shape, &dev)
+                    .unwrap()
+                    .to_dtype(dtype)
+                    .unwrap()
+            };
+            let q = mkt(h * total * d, 1, (1, h, total, d));
+            let k = mkt(h_kv * total * d, 7, (1, h_kv, total, d));
+            let v = mkt(h_kv * total * d, 13, (1, h_kv, total, d));
+            let last_row = |t_q: usize, kv_from: usize| -> Vec<f32> {
+                let held = total - kv_from;
+                let out = flash_attention_metal_prefill(
+                    &q.narrow(2, total - t_q, t_q).unwrap().contiguous().unwrap(),
+                    &k.narrow(2, kv_from, held).unwrap(),
+                    &v.narrow(2, kv_from, held).unwrap(),
+                    FlashAttnCall {
+                        scale: 1.0 / (d as f32).sqrt(),
+                        softcap: None,
+                        prefix_len: held - t_q,
+                        window,
+                        sinks: None,
+                    },
+                )
+                .unwrap();
+                out.narrow(2, t_q - 1, 1)
+                    .unwrap()
+                    .to_dtype(DType::F32)
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap()
+            };
+            let alone = last_row(1, 640);
+            for (t_q, kv_from) in [
+                (1usize, 0usize),
+                (1, 128),
+                (1, 512),
+                (20, 640),
+                (20, 0),
+                (238, 512),
+                (238, 0),
+                (750, 0),
+                (1262, 0),
+            ] {
+                assert_eq!(
+                    last_row(t_q, kv_from),
+                    alone,
+                    "{dtype:?} d={d}: {t_q} rows over keys from {kv_from}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn a_window_wider_than_the_sequence_changes_nothing() {
         let Some(dev) = metal_device_or_skip() else {

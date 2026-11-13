@@ -1064,10 +1064,16 @@ impl BlockTable {
     }
 }
 
-/// Tokens a windowed cache keeps beyond its window, so that rolling back the
-/// handful of tokens a speculative verify can reject still leaves the whole
-/// window materialised.
-const WINDOW_KEEP_MARGIN: usize = 16;
+/// Tokens the key tiles of every prefill attention kernel divide (the widest
+/// is the 128 keys of the 512-wide head's): a windowed layer hands its kernel
+/// keys that start on a multiple of this in the sequence, so the tiles fall on
+/// the same tokens whatever the cache held.
+pub(crate) const WINDOW_GRID: usize = 128;
+
+/// Tokens a windowed cache keeps beyond its window: the handful a speculative
+/// verify can roll back, so the whole window stays materialised, and one
+/// [`WINDOW_GRID`], so a start on the grid is always among them.
+const WINDOW_KEEP_MARGIN: usize = 16 + WINDOW_GRID;
 
 fn contig_buf_capacity(total_needed: usize) -> usize {
     let cap = if total_needed < 1024 {

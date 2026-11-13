@@ -97,7 +97,7 @@ impl RMSNorm {
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         #[cfg(feature = "metal")]
         if x.device().is_metal() {
-            let x_c = x.contiguous()?;
+            let x_c = super::metal_ops::materialize(x)?;
             let w_c = self.weight.contiguous()?;
             return super::metal_ops::rms_norm_fused(&x_c, &w_c, self.eps as f32);
         }

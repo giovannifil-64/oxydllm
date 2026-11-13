@@ -316,6 +316,8 @@ impl RotaryEmbedding {
             let cos = self.cos.index_select(position_ids, 0)?;
             let sin = self.sin.index_select(position_ids, 0)?;
 
+            let q = &super::metal_ops::materialize(q)?;
+            let k = &super::metal_ops::materialize(k)?;
             let qk = Tensor::cat(&[q, k], 1)?;
             let qk_c = qk.contiguous()?;
             let cos_c = cos.contiguous()?;

@@ -81,3 +81,12 @@ pub mod prefix_cache;
 pub mod profile;
 pub mod rope;
 pub mod weights;
+
+/// Copies `t` into contiguous storage, through the row-moving kernel on Metal
+/// where the view is a swap of two axes (see `metal_ops::materialize`).
+pub(crate) fn materialize(t: &candle_core::Tensor) -> candle_core::Result<candle_core::Tensor> {
+    #[cfg(feature = "metal")]
+    return metal_ops::materialize(t);
+    #[cfg(not(feature = "metal"))]
+    t.contiguous()
+}

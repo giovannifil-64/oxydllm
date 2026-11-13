@@ -909,6 +909,65 @@ impl CustomOp1 for SoftcapOp {
     }
 }
 
+/// Copy of a view that swaps the two leading axes of a contiguous block.
+struct SwapAxesCopyOp;
+
+/// Reads a layout as `(outer, inner, width)` when it is the two leading axes
+/// of a contiguous `[inner, outer, width]` block swapped, leading unit
+/// dimensions aside.
+fn swapped_axes(l: &Layout) -> Option<(usize, usize, usize)> {
+    let lead = l.dims().iter().take_while(|&&d| d == 1).count();
+    let (dims, stride) = (&l.dims()[lead..], &l.stride()[lead..]);
+    let &[outer, inner, width] = dims else {
+        return None;
+    };
+    (outer > 1 && inner > 1 && stride == [width, outer * width, 1]).then_some((outer, inner, width))
+}
+
+impl CustomOp1 for SwapAxesCopyOp {
+    fn name(&self) -> &'static str {
+        "metal-swap-axes-copy"
+    }
+
+    fn cpu_fwd(&self, _s: &CpuStorage, _l: &Layout) -> Result<(CpuStorage, Shape)> {
+        candle_core::bail!("SwapAxesCopyOp: Metal-only")
+    }
+
+    fn metal_fwd(&self, x: &MetalStorage, l: &Layout) -> Result<(MetalStorage, Shape)> {
+        let Some((outer, inner, width)) = swapped_axes(l) else {
+            candle_core::bail!("SwapAxesCopyOp: not a swap of two leading axes");
+        };
+        let kernel_name: &'static str = match x.dtype().size_in_bytes() {
+            2 => "swap_axes_copy_16",
+            4 => "swap_axes_copy_32",
+            other => candle_core::bail!("SwapAxesCopyOp: unsupported element size {other}"),
+        };
+        let elem_count = l.shape().elem_count();
+        let device = x.device();
+        let output = device.new_buffer(elem_count, x.dtype(), "swap_axes_out")?;
+        let pipeline = get_or_compile_ffn_pipeline(device.device(), kernel_name)?;
+        let encoder = device.command_encoder()?;
+        let encoder = encoder.as_ref();
+
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_input_buffer(
+            0,
+            Some(x.buffer()),
+            l.start_offset() * x.dtype().size_in_bytes(),
+        );
+        encoder.set_output_buffer(1, Some(&*output), 0);
+        encoder.set_bytes(2, &(outer as u32));
+        encoder.set_bytes(3, &(inner as u32));
+        encoder.set_bytes(4, &(width as u32));
+        ffn_dispatch(&pipeline, encoder, outer * inner);
+
+        Ok((
+            MetalStorage::new(output, device.clone(), elem_count, x.dtype()),
+            l.shape().clone(),
+        ))
+    }
+}
+
 /// Flash Attention prefill kernel source (Dao et al., BSD-3-Clause).
 const FA_METAL_SOURCE: &str = include_str!("flash_attn.metal");
 
@@ -1479,6 +1538,28 @@ pub fn gelu_tanh_mul_fused(gate: &Tensor, up: &Tensor) -> Result<Tensor> {
 /// Fails on CPU tensors, non-contiguous input, or an unsupported dtype.
 pub fn softcap_fused(x: &Tensor, softcap: f32) -> Result<Tensor> {
     x.apply_op1_no_bwd(&SoftcapOp { softcap })
+}
+
+/// Copies `t` into contiguous storage, the same bytes [`Tensor::contiguous`]
+/// gives.
+///
+/// A view that swaps the two leading axes of a contiguous block, which is
+/// what every head/sequence transpose in attention produces, goes through a
+/// kernel that moves whole rows. candle's strided copy resolves each element's
+/// index with a division and a remainder per dimension, and on a 612-token
+/// prompt took about a millisecond per call, five or six times per layer.
+/// Anything else is left to candle.
+///
+/// ## Errors
+/// Propagates the copy's failure.
+pub fn materialize(t: &Tensor) -> Result<Tensor> {
+    if t.device().is_metal()
+        && matches!(t.dtype().size_in_bytes(), 2 | 4)
+        && swapped_axes(t.layout()).is_some()
+    {
+        return t.apply_op1_no_bwd(&SwapAxesCopyOp);
+    }
+    t.contiguous()
 }
 
 /// What a prefill attention call needs besides q, k and v.
@@ -4501,6 +4582,54 @@ mod fused_kernel_parity_tests {
             .unwrap();
         let res = silu_mul_fused(&gate, &up);
         assert!(res.is_err());
+    }
+
+    /// Contract: [`materialize`] returns the bytes candle's own copy returns,
+    /// on the head/sequence swaps attention makes, on a swap that starts
+    /// inside its buffer, and on the views it leaves to candle.
+    #[test]
+    fn materialize_copies_what_candle_copies() {
+        let Some(dev) = metal_device_or_skip() else {
+            return;
+        };
+        let bytes = |t: &Tensor| -> Vec<f32> {
+            t.to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1()
+                .unwrap()
+        };
+        for dtype in [DType::F32, DType::F16, DType::BF16] {
+            let n = 37 * 6 * 20;
+            let data: Vec<f32> = (0..n).map(|i| (i % 251) as f32 - 125.0).collect();
+            let x = Tensor::from_vec(data, (1, 37, 6, 20), &dev)
+                .unwrap()
+                .to_dtype(dtype)
+                .unwrap();
+            let views = [
+                x.transpose(1, 2).unwrap(),
+                x.squeeze(0).unwrap().transpose(0, 1).unwrap(),
+                x.narrow(1, 5, 30).unwrap().transpose(1, 2).unwrap(),
+                x.narrow(2, 1, 4).unwrap().transpose(1, 2).unwrap(),
+                x.transpose(2, 3).unwrap(),
+                x.clone(),
+            ];
+            for (i, v) in views.iter().enumerate() {
+                let ours = materialize(v).unwrap();
+                assert!(ours.is_contiguous(), "{dtype:?} view {i}");
+                assert_eq!(ours.dims(), v.dims(), "{dtype:?} view {i}");
+                assert_eq!(
+                    bytes(&ours),
+                    bytes(&v.contiguous().unwrap()),
+                    "{dtype:?} view {i}"
+                );
+            }
+            assert!(swapped_axes(views[0].layout()).is_some());
+            assert!(swapped_axes(views[2].layout()).is_some());
+            assert!(swapped_axes(views[3].layout()).is_none());
+            assert!(swapped_axes(views[4].layout()).is_none());
+        }
     }
 
     #[test]

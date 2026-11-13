@@ -1235,8 +1235,8 @@ impl PagedKvCache {
     /// Fails when the pool has no free block, or on a tensor operation.
     pub fn append(&mut self, new_k: &Tensor, new_v: &Tensor) -> Result<(Tensor, Tensor)> {
         let (_, _, new_seq, _) = new_k.dims4()?;
-        let new_k = &new_k.contiguous()?;
-        let new_v = &new_v.contiguous()?;
+        let new_k = &super::materialize(new_k)?;
+        let new_v = &super::materialize(new_v)?;
         let k_flat = new_k.squeeze(0)?.transpose(0, 1)?;
         let v_flat = new_v.squeeze(0)?.transpose(0, 1)?;
         let block_size = self.block_size;
@@ -1299,8 +1299,8 @@ impl PagedKvCache {
 
         if !runs.is_empty() {
             self.pending_writes.push(PendingBatch {
-                k_src: k_flat.contiguous()?,
-                v_src: v_flat.contiguous()?,
+                k_src: super::materialize(&k_flat)?,
+                v_src: super::materialize(&v_flat)?,
                 runs,
             });
         }

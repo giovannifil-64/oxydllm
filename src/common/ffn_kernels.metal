@@ -240,3 +240,28 @@ kernel void softcap_bf16(
     out[gid] = (bfloat)(cap * tanh(v / cap));
 }
 #endif
+
+// ── Axis-swap copy: out[o][i][x] = in[i][o][x] ───────────────────────────────
+// Materializes the view that swaps the two leading axes of a contiguous
+// [inner, outer, width] block, one thread per output row. The words are moved
+// as they are, so one kernel per element size serves every dtype.
+
+#define SWAP_AXES_COPY(NAME, WORD)                                          \
+kernel void NAME(                                                           \
+    device const WORD* src   [[buffer(0)]],                                 \
+    device       WORD* dst   [[buffer(1)]],                                 \
+    constant uint&     outer [[buffer(2)]],                                 \
+    constant uint&     inner [[buffer(3)]],                                 \
+    constant uint&     width [[buffer(4)]],                                 \
+    uint gid [[thread_position_in_grid]]                                    \
+) {                                                                         \
+    if (gid >= outer * inner) return;                                       \
+    const uint o = gid / inner;                                             \
+    const uint i = gid - o * inner;                                         \
+    const device WORD* from = src + (ulong)(i * outer + o) * width;         \
+    device WORD* to = dst + (ulong)gid * width;                             \
+    for (uint x = 0; x < width; ++x) to[x] = from[x];                       \
+}
+
+SWAP_AXES_COPY(swap_axes_copy_16, ushort)
+SWAP_AXES_COPY(swap_axes_copy_32, uint)

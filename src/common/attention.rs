@@ -996,9 +996,11 @@ impl Attention {
             q_offset += seg.num_tokens;
         }
 
-        let out = out_buf
-            .transpose(1, 2)?
-            .reshape((b, total_seq, self.n_heads * hd))?;
+        let out = super::materialize(&out_buf.transpose(1, 2)?)?.reshape((
+            b,
+            total_seq,
+            self.n_heads * hd,
+        ))?;
         let out = match &out_gate {
             Some(gate) => (out * super::linear::sigmoid(gate)?)?,
             None => out,

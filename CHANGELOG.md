@@ -2,6 +2,27 @@
 
 All notable changes to this project will be documented in this file.
 
+## Unreleased
+
+### Reliability and Correctness
+
+- A model that thinks without being asked returns its reasoning in `reasoning_content` unless the request sets `enable_thinking` to `false`. Before, the reasoning was dropped unless the request asked for it, so the DeepSeek-R1 distills, which open `<think>` as their first token whatever the request says, answered an empty `content` with `finish_reason` `length` and the tokens spent whenever the budget ran out inside the thought; gpt-oss follows the same rule. Streamed replies carry the reasoning deltas the same way.
+
+- A model with sliding-window layers (Gemma 2 and 3, any checkpoint with a window) answers a prompt longer than its window with the same logits alone, from the prefix cache and inside a batch. The prefill attention kernels fold the keys into the running softmax a tile at a time, counting tiles from the first key they are handed, and a windowed layer handed over whatever its buffer held, which starts where the last compaction left it: on gemma-3-1b-it a 1262-token prompt gave a first-token logprob of -0.0029744 in a six-way batch and -0.0028464 asked again by itself, in 0.1.0 and 0.1.1 alike. The keys now start on a multiple of 128 tokens in the sequence, which every kernel's tile divides, and the windowed cache keeps that much more margin so such a start is always in it. A windowed model's logits past its window therefore differ from 0.1.1's, which were not one answer; prompts within the window, and every model without one, are byte-identical to 0.1.1.
+- A hybrid GatedDeltaNet model (the Qwen3.5 family) answers a long prompt the same in a batch as alone. Its linear-attention layers scan a forward in blocks of 64 tokens counted from the forward's first, and a prompt cut across forwards in a batch was cut where the sequences ahead of it left room: Qwen3.5-0.8B gave a 1265-token prompt a different first-token logprob beside five short prompts than by itself in two or three rounds of four, in 0.1.0 and 0.1.1 alike. A prompt is now cut only at multiples of 64 tokens into itself, whatever shares the batch.
+- `pull` tells apart two builds of one quantization in a repository. Files such as `X-Q4_K_M.gguf` and `X-UD-Q4_K_M.gguf` shared the label `Q4_K_M`, so `--variant Q4_K_M` took whichever the listing named first and the menu showed two rows with one name. The label now keeps what differs in the file names: the two are `Q4_K_M` and `UD-Q4_K_M`, each reachable by `--variant`, and when no build carries the bare label asking for it lists the choices instead of taking one. Repositories with one build per quantization keep the labels they had.
+
+### Performance and Efficiency
+
+- The safetensors loader builds one RoPE table per distinct rotary dimension and base instead of one per layer, as the GGUF loader does: 150 MB less on Granite 3.3-2b at a 32k context (forty layers, measured on the process footprint), the outputs byte-identical there and on Gemma 3 1B, whose local and global layers rotate on two bases.
+
+- The head/sequence transposes of a prompt's attention are copied by a kernel of our own that moves whole rows. candle's strided copy resolves every element's index with a division and a remainder per dimension and took about a millisecond per call on a 612-token prompt, against 50 us for an elementwise pass over the same data, five or six times per layer (the q/k norms' input, RoPE's input, the KV cache's write, the attention output). A copy changes no bit: outputs byte-identical to 0.1.1 on the eight checkpoints compared. Time to first token on a 612-token prompt, median of six with the prefix cache missed: Qwen3-0.6B IQ4_XS 215 to 158 ms, Qwen3-4B Q5_K_M 876 to 766, Qwen2.5-1.5B Q4_K_M 284 to 264.
+
+### Dependencies
+
+- candle 0.11.1 (from 0.11.0): zip 9, so the four audit exclusions for candle's npz reader are gone; one `tokenizers` in the tree instead of two and 377 crates locked instead of 415; a Metal pipeline cache safe under concurrent loads and residency sets committed in batches. Outputs byte-identical to 0.1.1 on the eight GGUF checkpoints, the dense Granite and the embedder on disk. The loader's per-tensor enum holds candle's tensor behind its `Arc`, since the tensor grew.
+- quinn-udp 0.5.16 (from 0.5.14) for RUSTSEC-2026-0538, a receive loop that can spin after a truncated datagram; it sits under reqwest's QUIC support.
+
 ## 0.1.1 (2026-11-11)
 
 A patch for the two performance regressions the 0.1.0 determinism work left on GGUF checkpoints, found to be something else once measured at the kernel. The prefill of a short prompt went through the staged TensorOps GEMM in a tile sized for long prompts; the tile does not touch the bits, so the host now picks it by row count and the first token of an 8-word prompt arrives in half the time. The decode gemv kernels converted the activations once per output row; converting them once per block, with every output's arithmetic untouched, gives the same bits as 0.1.0 on every checkpoint on disk and more tokens per second, most of all when several sequences decode together.

@@ -121,7 +121,7 @@ Not supported yet. A cross-encoder scoring endpoint reusing the embeddings runti
 Formats span BF16 safetensors, GGUF, AWQ/GPTQ, compressed-tensors INT4, FP8, and MXFP4, auto-detected per checkpoint.
 
 > [!NOTE]
-> Qwen3, Qwen3.5, Qwen3.8, Gemma 4, the DeepSeek-R1 distills and gpt-oss have been tested with and without thinking enabled, with reasoning separated into `reasoning_content` in both streaming and non-streaming responses; a model that reasons whether or not it was asked (the R1 distills, gpt-oss) has its reasoning dropped from the reply when it was not asked for.
+> Qwen3, Qwen3.5, Qwen3.8, Gemma 4, the DeepSeek-R1 distills and gpt-oss have been tested with and without thinking enabled, with reasoning separated into `reasoning_content` in both streaming and non-streaming responses; a model that reasons whether or not it was asked (the R1 distills, gpt-oss) has its reasoning returned in `reasoning_content` unless the request sets `enable_thinking` to `false`, which drops it.
 
 ## Unsupported Model Families
 The following model families are not currently supported:
@@ -225,7 +225,7 @@ Pick by architecture (the compute-capability table above maps each one to its GP
 - `oxydllm-linux-arm64-cuda-blackwell-desktop.tar.gz`: Blackwell Desktop (sm_121)
 
 ## Usage
-Download a model from HuggingFace using the `user/model` repo ID. For GGUF repos, an interactive prompt lists available quantizations and lets you pick one; variants already on disk are shown with a check mark and excluded from the numbered choices. Use `--variant Q4_K_M` to skip the prompt, `--token` for gated models, and `--name` to save under a custom local name instead of the default `user/model` path. A download that stops, whether the machine slept, the network dropped or the process was killed, resumes from the bytes already on disk: a stalled connection is reopened on its own, and re-running the same `pull` after a shutdown picks up where it stopped. `--force` starts from zero.
+Download a model from HuggingFace using the `user/model` repo ID. For GGUF repos, an interactive prompt lists available quantizations and lets you pick one; variants already on disk are shown with a check mark and excluded from the numbered choices. Use `--variant Q4_K_M` to skip the prompt (a repository with two builds of one quantization lists them apart, as `Q4_K_M` and `UD-Q4_K_M`), `--token` for gated models, and `--name` to save under a custom local name instead of the default `user/model` path. A download that stops, whether the machine slept, the network dropped or the process was killed, resumes from the bytes already on disk: a stalled connection is reopened on its own, and re-running the same `pull` after a shutdown picks up where it stopped. `--force` starts from zero.
 ```bash
 oxydllm pull Qwen/Qwen3-4B-GGUF
 oxydllm pull Qwen/Qwen3-4B-GGUF --variant Q4_K_M

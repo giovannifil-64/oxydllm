@@ -255,9 +255,20 @@ pub fn format_mistral_inst_chat(
     prompt
 }
 
+/// Rewrites what transformers' Jinja accepts and minijinja does not: the
+/// reversed slice, and the `generation` block that marks the assistant's
+/// tokens for training and renders as its body, which becomes an `if true`
+/// so the whitespace control of its tags is kept.
 fn preprocess_template(template: &str) -> String {
-    let mut t = template.to_string();
-    t = t.replace("[::-1]", "|reverse");
+    let mut t = template.replace("[::-1]", "|reverse");
+    for (tag, plain) in [("endgeneration", "endif"), ("generation", "if true")] {
+        for (open, close) in [("{%-", "-%}"), ("{%-", "%}"), ("{%", "-%}"), ("{%", "%}")] {
+            t = t.replace(
+                &format!("{open} {tag} {close}"),
+                &format!("{open} {plain} {close}"),
+            );
+        }
+    }
     t
 }
 
@@ -408,6 +419,24 @@ mod tests {
     /// request's key order, which is how transformers and llama.cpp render
     /// tool definitions and how models saw them in training; the indented
     /// form keeps the pretty layout.
+    #[test]
+    fn a_generation_block_renders_as_its_body() {
+        let messages = vec![ChatMessage {
+            role: "assistant".to_string(),
+            content: Some("hi".to_string()),
+            reasoning_content: None,
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        }];
+        let template = "{%- for message in messages %}\n  {{- '<' + message.role + '>' }}\n  \
+                        {%- generation %}\n  {%- set seen = message.content %}\n  {{- seen }}\n  \
+                        {%- endgeneration %}\n  {{- '|' }}\n{%- endfor %}";
+        let rendered =
+            apply_chat_template(template, &messages, TemplateOptions::default()).unwrap();
+        assert_eq!(rendered, "<assistant>hi|");
+    }
+
     #[test]
     fn tojson_renders_like_python_json_dumps() {
         let source = r#"{"type": "function", "function": {"name": "f", "parameters": {"type": "object", "properties": {"z": {"type": "string"}, "a": {"enum": ["x", "y"]}}, "required": ["z"]}}}"#;

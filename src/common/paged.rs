@@ -1340,7 +1340,8 @@ impl PagedKvCache {
                 }
                 {
                     let start = self.contig_start + (self.contig_len - from_old);
-                    let (dst_k, dst_v, dst_cap, retired) = if keep <= cap {
+                    let onto_itself = start < from_old && self.n_kv == 1;
+                    let (dst_k, dst_v, dst_cap, retired) = if keep <= cap && !onto_itself {
                         (k_buf.clone(), v_buf.clone(), cap, None)
                     } else {
                         let (nk, nv, ncap) = self.acquire_contig(keep)?;
@@ -1356,9 +1357,12 @@ impl PagedKvCache {
                         // not detach them: a narrow of a single-KV-head buffer
                         // already satisfies candle's contiguity rule, so it
                         // hands back a view of the very storage about to be
-                        // written, and candle refuses the write. `copy` alone
-                        // does not either, since it keeps the layout it was
-                        // given and slice-set takes only contiguous sources.
+                        // written, and candle refuses the write. `copy` gets
+                        // past that refusal but on Metal shares the buffer, so
+                        // with one KV head the move is a blit within one
+                        // buffer: defined while source and destination are
+                        // apart, and when they overlap (`onto_itself`) the
+                        // tokens go to another buffer instead.
                         let detach = |t: &Tensor| -> Result<Tensor> {
                             if t.is_contiguous() {
                                 t.copy()
@@ -1884,6 +1888,93 @@ mod tests {
                 coda.to_vec(),
                 "after appending {n} the cache must show the most recent tokens"
             );
+        }
+    }
+
+    /// Contract: on Metal, a single-KV-head windowed cache that folds its live
+    /// tokens back over themselves still shows the tokens it was given.
+    ///
+    /// candle's Metal `copy` shares the buffer it is asked to copy, so the fold
+    /// was a blit whose source and destination overlapped in one buffer, and
+    /// what it left there depended on the GPU. With the 16-token margin the
+    /// overlap fell on tokens no window read; with the grid's margin it reached
+    /// the window, and Gemma 4 E2B gave the same 1262-token prompt five
+    /// different first logprobs in ten requests.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn a_fold_over_itself_keeps_the_tokens_on_metal() {
+        let Ok(dev) = Device::new_metal(0) else {
+            return;
+        };
+        const W: usize = 512;
+        const DIM: usize = 256;
+        const LAYERS: usize = 28;
+        let token = |next: usize, n: usize| -> Tensor {
+            let vals: Vec<f32> = (next..next + n)
+                .flat_map(|t| (0..DIM).map(move |c| ((t * 7 + c) % 4093) as f32))
+                .collect();
+            Tensor::from_vec(vals, (1, 1, n, DIM), &dev)
+                .unwrap()
+                .to_dtype(DType::BF16)
+                .unwrap()
+        };
+        for round in 0..24 {
+            let mut caches: Vec<PagedKvCache> = (0..LAYERS)
+                .map(|_| {
+                    PagedKvCache::new(Arc::new(Mutex::new(
+                        BlockAllocator::growing(
+                            PoolSpec {
+                                max_blocks: 256,
+                                segment_blocks: 256,
+                                block_size: 16,
+                                n_kv_heads: 1,
+                                head_dim: DIM,
+                                dtype: DType::BF16,
+                                quantizer: None,
+                            },
+                            &dev,
+                        )
+                        .unwrap()
+                        .with_sliding_window(Some(W)),
+                    )))
+                })
+                .collect();
+            let mut next = 0usize;
+            let mut seen = Vec::new();
+            for n in [512usize, 512, 238] {
+                let t = token(next, n);
+                next += n;
+                seen = caches
+                    .iter_mut()
+                    .map(|c| c.append(&t, &t).unwrap())
+                    .collect();
+            }
+            for (layer, (k, v)) in seen.iter().enumerate() {
+                let held = k.dim(2).unwrap();
+                assert!(held >= W, "round {round}: shorter than the window");
+                let want = token(next - held, held)
+                    .to_dtype(DType::F32)
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap();
+                for (nome, got) in [("k", k), ("v", v)] {
+                    let got: Vec<f32> = got
+                        .to_dtype(DType::F32)
+                        .unwrap()
+                        .flatten_all()
+                        .unwrap()
+                        .to_vec1()
+                        .unwrap();
+                    let bad = (0..held)
+                        .find(|&j| got[j * DIM..(j + 1) * DIM] != want[j * DIM..(j + 1) * DIM]);
+                    assert_eq!(
+                        bad, None,
+                        "round {round}, layer {layer}, {nome}: a slot of the {held} held shows another token"
+                    );
+                }
+            }
         }
     }
 

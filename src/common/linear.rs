@@ -282,6 +282,9 @@ pub struct QLinear {
 enum GgufMatmul {
     Candle(QMatMul),
     Owned(StagedWeight),
+    /// A float weight, transposed and in BF16, multiplied as a safetensors
+    /// model's is.
+    Dense(Tensor),
 }
 
 impl QLinear {
@@ -301,6 +304,15 @@ impl QLinear {
     /// A layer over a weight as the GGUF loader holds it, in either form.
     pub fn from_gguf(weight: LinearWeight, bias: Option<Tensor>, out_dtype: DType) -> Result<Self> {
         match weight {
+            LinearWeight::Candle { tensor, .. } if Self::runs_dense(&tensor, out_dtype) => {
+                let weight = tensor.dequantize(&tensor.device())?.to_dtype(DType::BF16)?;
+                Ok(Self {
+                    inner: GgufMatmul::Dense(weight.t()?),
+                    staged: None,
+                    bias,
+                    out_dtype,
+                })
+            }
             LinearWeight::Candle { tensor, staged } => {
                 Ok(Self::from_arc_with_bias(tensor, bias, out_dtype)?.with_staged(staged))
             }
@@ -311,6 +323,20 @@ impl QLinear {
                 out_dtype,
             }),
         }
+    }
+
+    /// Whether a weight is stored as floats on Metal.
+    /// Candle multiplies such a weight in half precision with a GEMM whose
+    /// rounding follows the row count, so a prompt read cold and its last
+    /// token recomputed from the cache disagreed in the second decimal of a
+    /// logprob; the kernels of the safetensors path give a row the same bits
+    /// in any batch.
+    fn runs_dense(tensor: &QTensor, out_dtype: DType) -> bool {
+        use candle_core::quantized::GgmlDType as G;
+        matches!(out_dtype, DType::BF16 | DType::F32)
+            && tensor.device().is_metal()
+            && tensor.rank() == 2
+            && matches!(tensor.dtype(), G::F16 | G::BF16 | G::F32)
     }
 
     /// Attaches the handle the staged GEMM reads this weight through, when the
@@ -327,6 +353,28 @@ impl QLinear {
 
         let inner = match &self.inner {
             GgufMatmul::Candle(inner) => inner,
+            GgufMatmul::Dense(weight_t) if self.out_dtype == x.dtype() => {
+                return matmul_with_bias(x, weight_t, self.bias.as_ref());
+            }
+            GgufMatmul::Dense(weight_t) => {
+                let x_2d = x.reshape((batch_flat, in_features))?;
+                #[cfg(feature = "metal")]
+                {
+                    use super::metal_ops::{GGUF_BATCH_MAX, bf16_gemv};
+                    let mut chunks = Vec::with_capacity(batch_flat.div_ceil(GGUF_BATCH_MAX));
+                    for start in (0..batch_flat).step_by(GGUF_BATCH_MAX) {
+                        let rows = x_2d.narrow(0, start, GGUF_BATCH_MAX.min(batch_flat - start))?;
+                        match bf16_gemv(&rows.contiguous()?, weight_t, self.out_dtype)? {
+                            Some(out) => chunks.push(out),
+                            None => break,
+                        }
+                    }
+                    if chunks.len() * GGUF_BATCH_MAX >= batch_flat {
+                        return self.finish(Tensor::cat(&chunks, 0)?, &original_dims);
+                    }
+                }
+                return self.finish(x_2d.matmul(weight_t)?, &original_dims);
+            }
             GgufMatmul::Owned(w) => {
                 #[cfg(feature = "metal")]
                 {
@@ -657,6 +705,67 @@ impl AnyLinear {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Contract: a GGUF weight stored as floats is multiplied by the kernels
+    /// a safetensors weight is, so a row gets the bits that path gives it at
+    /// any row count, and the vocabulary projection answers in F32.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn a_float_gguf_weight_multiplies_as_a_safetensors_weight() {
+        use candle_core::quantized::GgmlDType;
+        let Ok(dev) = Device::new_metal(0) else {
+            return;
+        };
+        let (n, k) = (96usize, 256usize);
+        let w: Vec<f32> = (0..n * k)
+            .map(|i| ((i % 23) as f32 - 11.0) * 0.01)
+            .collect();
+        let w = Tensor::from_vec(w, (n, k), &dev).unwrap();
+        let dense = Linear::new(w.to_dtype(DType::BF16).unwrap(), None).unwrap();
+        let bits = |t: &Tensor| {
+            t.to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+        };
+        for stored in [GgmlDType::F16, GgmlDType::F32] {
+            let weight = || LinearWeight::Candle {
+                tensor: Arc::new(QTensor::quantize(&w, stored).unwrap()),
+                staged: None,
+            };
+            let layer = QLinear::from_gguf(weight(), None, DType::BF16).unwrap();
+            let head = QLinear::from_gguf(weight(), None, DType::F32).unwrap();
+            for m in [1usize, 9, 200] {
+                let x: Vec<f32> = (0..m * k).map(|i| ((i % 17) as f32 - 8.0) * 0.05).collect();
+                let x = Tensor::from_vec(x, (1, m, k), &dev)
+                    .unwrap()
+                    .to_dtype(DType::BF16)
+                    .unwrap();
+                let out = layer.forward(&x).unwrap();
+                assert_eq!(out.dtype(), DType::BF16);
+                assert_eq!(
+                    bits(&out),
+                    bits(&dense.forward(&x).unwrap()),
+                    "{stored:?} m={m}"
+                );
+                assert_eq!(head.forward(&x).unwrap().dtype(), DType::F32);
+            }
+            let rows: Vec<f32> = (0..20 * k)
+                .map(|i| ((i % 13) as f32 - 6.0) * 0.07)
+                .collect();
+            let rows = Tensor::from_vec(rows, (20, k), &dev)
+                .unwrap()
+                .to_dtype(DType::BF16)
+                .unwrap();
+            let together = bits(&head.forward(&rows).unwrap());
+            for r in 0..20 {
+                let alone = bits(&head.forward(&rows.narrow(0, r, 1).unwrap()).unwrap());
+                assert_eq!(alone, together[r * n..(r + 1) * n], "{stored:?} row {r}");
+            }
+        }
+    }
 
     /// Contract: a layer over a weight candle cannot hold answers through this
     /// crate's kernels alone, on a three-dimensional input, in the output

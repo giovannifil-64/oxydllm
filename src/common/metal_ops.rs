@@ -3809,25 +3809,35 @@ pub fn maybe_bf16_gemv(x: &Tensor, weight_t: &Tensor, out_dtype: DType) -> Resul
     if crate::common::phase::current() != Some(crate::common::phase::Phase::Prefill)
         && crate::common::phase::current().is_some()
     {
-        let dims = x.dims();
-        if dims.len() != 2
-            || dims[0] > GGUF_BATCH_MAX
-            || !x.is_contiguous()
-            || x.dtype() != DType::BF16
-            || weight_t.dtype() != DType::BF16
-            || !x.device().is_metal()
-        {
-            return Ok(None);
-        }
-        let weight = weight_t.t()?;
-        if !weight.is_contiguous() || weight.dim(1)? != dims[1] || !dims[1].is_multiple_of(8) {
-            return Ok(None);
-        }
-        return x
-            .apply_op1_no_bwd(&Bf16Gemv { weight, out_dtype })
-            .map(Some);
+        return bf16_gemv(x, weight_t, out_dtype);
     }
     Ok(None)
+}
+
+/// `x @ weight_t` through [`Bf16Gemv`] for up to [`GGUF_BATCH_MAX`] rows in
+/// any phase, else `None`: what the vocabulary projection of a float GGUF
+/// takes, whose few rows per forward then get the same F32 logits in a
+/// prefill and in a decode step.
+///
+/// ## Errors
+/// Propagates kernel failures.
+pub fn bf16_gemv(x: &Tensor, weight_t: &Tensor, out_dtype: DType) -> Result<Option<Tensor>> {
+    let dims = x.dims();
+    if dims.len() != 2
+        || dims[0] > GGUF_BATCH_MAX
+        || !x.is_contiguous()
+        || x.dtype() != DType::BF16
+        || weight_t.dtype() != DType::BF16
+        || !x.device().is_metal()
+    {
+        return Ok(None);
+    }
+    let weight = weight_t.t()?;
+    if !weight.is_contiguous() || weight.dim(1)? != dims[1] || !dims[1].is_multiple_of(8) {
+        return Ok(None);
+    }
+    x.apply_op1_no_bwd(&Bf16Gemv { weight, out_dtype })
+        .map(Some)
 }
 
 /// Rows `tokens` of a table only this crate's kernels decode, one simdgroup

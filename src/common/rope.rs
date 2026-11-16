@@ -280,8 +280,11 @@ impl RotaryEmbedding {
     /// Applies RoPE to queries and keys at once, returning the rotated `(q, k)`.
     ///
     /// On Metal, when `q` and `k` share batch, sequence length, dtype and device,
-    /// they are concatenated along the head axis and rotated in one fused kernel
-    /// launch; otherwise each is rotated separately via
+    /// the cosines and sines of the positions are gathered once and the fused
+    /// kernel rotates each tensor where it lies. They used to be concatenated
+    /// along the head axis for a single launch, which copied both first; the
+    /// kernel works element by element, so the bits are the same either way.
+    /// Otherwise each is rotated through
     /// [`apply_with_positions`](Self::apply_with_positions).
     ///
     /// ## Errors
@@ -293,12 +296,12 @@ impl RotaryEmbedding {
         position_ids: &Tensor,
     ) -> Result<(Tensor, Tensor)> {
         #[cfg(feature = "metal")]
-        let (bq, qh, tq, d_q) = q.dims4()?;
+        let (bq, _, tq, d_q) = q.dims4()?;
         #[cfg(not(feature = "metal"))]
         let (_, _, _, d_q) = q.dims4()?;
 
         #[cfg(feature = "metal")]
-        let (bk, kh, tk, d_k) = k.dims4()?;
+        let (bk, _, tk, d_k) = k.dims4()?;
         #[cfg(not(feature = "metal"))]
         let (_, _, _, d_k) = k.dims4()?;
 
@@ -318,14 +321,10 @@ impl RotaryEmbedding {
 
             let q = &super::metal_ops::materialize(q)?;
             let k = &super::metal_ops::materialize(k)?;
-            let qk = Tensor::cat(&[q, k], 1)?;
-            let qk_c = qk.contiguous()?;
             let cos_c = cos.contiguous()?;
             let sin_c = sin.contiguous()?;
-
-            let rotated = super::metal_ops::rope_fused(&qk_c, &cos_c, &sin_c)?;
-            let q_rot = rotated.narrow(1, 0, qh)?;
-            let k_rot = rotated.narrow(1, qh, kh)?;
+            let q_rot = super::metal_ops::rope_fused(q, &cos_c, &sin_c)?;
+            let k_rot = super::metal_ops::rope_fused(k, &cos_c, &sin_c)?;
             return Ok((q_rot, k_rot));
         }
 
@@ -620,6 +619,46 @@ mod tests {
             max_diff < 1e-6,
             "YARN must be a no-op when max_seq_len ≤ original_max_pos (got max_diff {max_diff})"
         );
+    }
+
+    /// Contract: on Metal the pair entry point gives each of `q` and `k` the
+    /// bits it gets rotated alone, transposed views included.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn the_pair_rotates_each_tensor_as_alone_on_metal() -> Result<()> {
+        let Ok(device) = Device::new_metal(0) else {
+            return Ok(());
+        };
+        let (t, qh, kh, d) = (37usize, 6usize, 2usize, 64usize);
+        let rope = RotaryEmbedding::new(d, 128, 10_000.0, DType::BF16, &device)?;
+        let fill = |n: usize, seed: f32| -> Vec<f32> {
+            (0..n)
+                .map(|i| ((i as f32 * 0.37 + seed).sin()) * 3.0)
+                .collect()
+        };
+        let q = Tensor::from_vec(fill(t * qh * d, 0.1), (1, t, qh, d), &device)?
+            .to_dtype(DType::BF16)?
+            .transpose(1, 2)?;
+        let k = Tensor::from_vec(fill(t * kh * d, 0.7), (1, t, kh, d), &device)?
+            .to_dtype(DType::BF16)?
+            .transpose(1, 2)?;
+        let positions: Vec<u32> = (11..11 + t as u32).collect();
+        let position_ids = Tensor::from_vec(positions, (t,), &device)?;
+
+        let (q_pair, k_pair) = rope.apply_qk_with_positions(&q, &k, &position_ids)?;
+        let bits = |x: &Tensor| -> Result<Vec<u32>> {
+            let v: Vec<f32> = x.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
+            Ok(v.into_iter().map(f32::to_bits).collect())
+        };
+        assert_eq!(
+            bits(&q_pair)?,
+            bits(&rope.apply_with_positions(&q, &position_ids)?)?
+        );
+        assert_eq!(
+            bits(&k_pair)?,
+            bits(&rope.apply_with_positions(&k, &position_ids)?)?
+        );
+        Ok(())
     }
 
     #[test]

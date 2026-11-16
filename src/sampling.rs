@@ -8,7 +8,7 @@
 //! are deterministic: all randomness derives from splitmix64 over
 //! `seed + step`, including top-k tie breaking.
 
-use candle_core::{D, Result, Tensor};
+use candle_core::{D, DType, Result, Tensor};
 
 /// Per-request sampling configuration, OpenAI-style.
 ///
@@ -74,6 +74,28 @@ pub struct SampleOutput {
     pub token: u32,
     pub logprob: Option<f32>,
     pub top_logprobs: Vec<(u32, f32)>,
+}
+
+/// The greedy token of every row of `logits` (`[rows, vocab]`), and whether the
+/// row holds a NaN, in one readback.
+///
+/// A decode step of plain greedy sequences used to read the argmax and the
+/// NaN-guard sum back per row, two GPU round trips for each sequence. Here
+/// the row argmaxes, cast to F32 (exact for any vocabulary under 2^24), and
+/// the row sums leave the GPU as one tensor. The argmax is the reduction
+/// [`sample`] runs on a single row, so the tokens are the same.
+///
+/// ## Errors
+///
+/// Propagates tensor failures.
+pub fn greedy_rows(logits: &Tensor) -> Result<Vec<(u32, bool)>> {
+    let rows = logits.dim(0)?;
+    let picks = logits.argmax(D::Minus1)?.to_dtype(DType::F32)?;
+    let sums = logits.sum(D::Minus1)?.to_dtype(DType::F32)?;
+    let both: Vec<f32> = Tensor::cat(&[&picks, &sums], 0)?.to_vec1()?;
+    Ok((0..rows)
+        .map(|r| (both[r] as u32, both[rows + r].is_nan()))
+        .collect())
 }
 
 /// Samples the next token from a single logit row `[vocab]`.
@@ -814,6 +836,44 @@ mod tests {
                     fast, reference,
                     "{case} top_p={top_p}: fast path diverged from full-sort reference"
                 );
+            }
+        }
+    }
+
+    /// The batched pick names the token [`sample`] returns for each row alone,
+    /// and flags the row that holds a NaN, on the CPU and on Metal.
+    #[test]
+    fn greedy_rows_match_the_row_by_row_sampler() {
+        let mut devices = vec![candle_core::Device::Cpu];
+        if let Ok(dev) = candle_core::Device::new_metal(0) {
+            devices.push(dev);
+        }
+        let (rows, vocab) = (5usize, 4096usize);
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut data: Vec<f32> = (0..rows * vocab)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state % 20_000) as f32 / 1000.0 - 10.0
+            })
+            .collect();
+        data[3 * vocab + 17] = f32::NAN;
+        let params = SamplingParams {
+            temperature: 0.0,
+            ..SamplingParams::default()
+        };
+        for device in devices {
+            let logits = Tensor::from_vec(data.clone(), (rows, vocab), &device).unwrap();
+            let picks = greedy_rows(&logits).unwrap();
+            assert_eq!(picks.len(), rows);
+            for (row, &(token, has_nan)) in picks.iter().enumerate() {
+                assert_eq!(has_nan, row == 3, "row {row}");
+                let alone = sample(&logits.get(row).unwrap(), &params, &[], None, None);
+                match alone {
+                    Ok(out) => assert_eq!(out.token, token, "row {row}"),
+                    Err(_) => assert!(has_nan, "row {row} failed alone without a NaN"),
+                }
             }
         }
     }

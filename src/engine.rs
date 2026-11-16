@@ -654,6 +654,73 @@ fn run_forward_pass(
     combined_result
 }
 
+/// Whether a sequence's next token is the plain argmax of its logits: greedy
+/// sampling with nothing that reshapes the distribution, and no constraint.
+fn takes_plain_argmax(seq: &SequenceState) -> bool {
+    seq.sampling_params.is_plain_greedy() && seq.constraint.is_none()
+}
+
+/// The greedy picks of the rows `first_row..first_row + ids.len()` of
+/// `batch_logits`, read back once, or nothing when no sequence among `ids`
+/// takes the plain argmax.
+///
+/// ## Errors
+///
+/// Propagates tensor failures.
+fn greedy_picks(
+    scheduler: &Scheduler,
+    ids: &[SequenceId],
+    batch_logits: &Tensor,
+    first_row: usize,
+) -> Result<Vec<(u32, bool)>> {
+    let wanted = ids
+        .iter()
+        .any(|&id| takes_plain_argmax(scheduler.get_running(id).unwrap()));
+    if !wanted {
+        return Ok(Vec::new());
+    }
+    sampling::greedy_rows(&batch_logits.narrow(0, first_row, ids.len())?)
+}
+
+/// Samples the next token of one sequence from its row of `batch_logits`,
+/// through the pick already read back when the sequence takes the plain
+/// argmax.
+///
+/// ## Errors
+///
+/// Fails when the row holds a NaN; propagates indexing and sampling failures.
+fn sample_row(
+    scheduler: &Scheduler,
+    seq_id: SequenceId,
+    batch_logits: &Tensor,
+    row: usize,
+    pick: Option<&(u32, bool)>,
+) -> Result<sampling::SampleOutput> {
+    let seq = scheduler.get_running(seq_id).unwrap();
+    if let Some(&(token, has_nan)) = pick
+        && takes_plain_argmax(seq)
+    {
+        if has_nan {
+            candle_core::bail!("model returned NaN logits: numerical instability detected");
+        }
+        return Ok(sampling::SampleOutput {
+            token,
+            logprob: None,
+            top_logprobs: Vec::new(),
+        });
+    }
+    let seq_logits = batch_logits.get(row)?;
+    let vocab = seq_logits.dims1()?;
+    let allowed = seq.constraint.as_ref().map(|c| c.allowed(vocab));
+    sampling::sample(
+        &seq_logits,
+        &seq.sampling_params,
+        &seq.all_tokens,
+        Some(&seq.token_counts),
+        allowed.as_deref(),
+    )
+}
+
 /// Samples the first generated token for each prefill sequence from its last
 /// logit row, advances constraint and stop state, and registers the prompt's
 /// newly filled blocks in the prefix cache.
@@ -669,21 +736,10 @@ fn sample_prefill_outputs(
     stop: &StopRules,
     new_tokens: &mut Vec<NewToken>,
 ) -> Result<()> {
+    let ids: Vec<SequenceId> = prefill_infos.iter().map(|info| info.seq_id).collect();
+    let greedy = greedy_picks(scheduler, &ids, batch_logits, 0)?;
     for (row, info) in prefill_infos.iter().enumerate() {
-        let seq_logits = batch_logits.get(row)?;
-
-        let sample_out = {
-            let seq = scheduler.get_running(info.seq_id).unwrap();
-            let vocab = seq_logits.dims1()?;
-            let allowed = seq.constraint.as_ref().map(|c| c.allowed(vocab));
-            sampling::sample(
-                &seq_logits,
-                &seq.sampling_params,
-                &seq.all_tokens,
-                Some(&seq.token_counts),
-                allowed.as_deref(),
-            )?
-        };
+        let sample_out = sample_row(scheduler, info.seq_id, batch_logits, row, greedy.get(row))?;
         let next_token = sample_out.token;
         let emit = {
             let seq = scheduler.get_running_mut(info.seq_id).unwrap();
@@ -739,20 +795,15 @@ fn sample_decode_outputs(
     stop: &StopRules,
     new_tokens: &mut Vec<NewToken>,
 ) -> Result<()> {
+    let greedy = greedy_picks(scheduler, decode_ids, batch_logits, num_prefills)?;
     for (i, &seq_id) in decode_ids.iter().enumerate() {
-        let seq_logits = batch_logits.get(num_prefills + i)?;
-        let sample_out = {
-            let seq = scheduler.get_running(seq_id).unwrap();
-            let vocab = seq_logits.dims1()?;
-            let allowed = seq.constraint.as_ref().map(|c| c.allowed(vocab));
-            sampling::sample(
-                &seq_logits,
-                &seq.sampling_params,
-                &seq.all_tokens,
-                Some(&seq.token_counts),
-                allowed.as_deref(),
-            )?
-        };
+        let sample_out = sample_row(
+            scheduler,
+            seq_id,
+            batch_logits,
+            num_prefills + i,
+            greedy.get(i),
+        )?;
         let next_token = sample_out.token;
         let seq = scheduler.get_running_mut(seq_id).unwrap();
         if let Some(c) = seq.constraint.as_mut() {
